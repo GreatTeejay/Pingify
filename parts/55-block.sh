@@ -6,7 +6,7 @@
 #
 #   ICMP       stop the server answering pings
 #   speedtest  keep clients from burning the link on benchmark sites
-#   QUIC       force browsers back onto TCP, where the tunnel actually helps
+#   UDP 443    reject QUIC, so browsers fall back to TCP where the tunnel
 #
 # Everything goes in Pingify's own iptables chains, so nothing here touches
 # rules you or your panel put in place. State lives in $STATE_DIR and a boot
@@ -176,12 +176,12 @@ blocking_menu() {
         panel "RULES"
         row "$(pad_to "${C_DIM}Ping / ICMP${C_OFF}" 22)$(state_badge "$(block_state icmp)")"
         row "$(pad_to "${C_DIM}Speedtest sites${C_OFF}" 22)$(state_badge "$(block_state speedtest)")"
-        row "$(pad_to "${C_DIM}QUIC on UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
+        row "$(pad_to "${C_DIM}UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
         panel_end
         say ""
         item 1 "Ping / ICMP" "stop this server answering pings"
         item 2 "Speedtest sites" "block benchmark sites and their CDNs"
-        item 3 "QUIC" "reject UDP 443 so browsers fall back to TCP"
+        item 3 "Block UDP 443" "rejects QUIC, so browsers fall back to TCP"
         say ""
         item 4 "Show the live rules"
         item 5 "Clear everything"

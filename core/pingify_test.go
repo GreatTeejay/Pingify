@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -521,5 +522,80 @@ func TestStreamsAreRetiredWhenBothSidesFinish(t *testing.T) {
 			t.Fatalf("%d streams never left the carrier's table", open)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestTOMLConfig(t *testing.T) {
+	doc := `
+# Pingify tunnel
+name       = "main"
+role       = "server"
+mode       = "forward"
+transport  = "braid"
+listen     = "0.0.0.0:9443"
+psk        = "deadbeef"
+carriers   = 6
+window_kb  = 1024
+forwards   = ["443", "2053=8443", "udp:500"]   # ports clients reach
+log_level  = "info"
+
+[tun]
+name  = "pfy1"
+local = "10.71.1.1/30"
+peer  = "10.71.1.2"
+mtu   = 1380
+`
+	var c Config
+	if err := parseTOML(doc, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Name != "main" || c.Role != "server" || c.Transport != "braid" {
+		t.Fatalf("scalars wrong: %+v", c)
+	}
+	if c.Listen != "0.0.0.0:9443" || c.Connect != "" {
+		t.Fatalf("listen/connect wrong: %q %q", c.Listen, c.Connect)
+	}
+	if c.Carriers != 6 || c.WindowKB != 1024 {
+		t.Fatalf("numbers wrong: %d %d", c.Carriers, c.WindowKB)
+	}
+	if len(c.Forwards) != 3 || c.Forwards[1] != "2053=8443" || c.Forwards[2] != "udp:500" {
+		t.Fatalf("array wrong: %#v", c.Forwards)
+	}
+	if c.TUN.Name != "pfy1" || c.TUN.Local != "10.71.1.1/30" || c.TUN.MTU != 1380 {
+		t.Fatalf("tun table wrong: %+v", c.TUN)
+	}
+
+	// A key this build does not know must not stop it starting.
+	if err := parseTOML("name = \"x\"\nsomething_new = 5\n", &Config{}); err != nil {
+		t.Fatalf("unknown key should be ignored: %v", err)
+	}
+	// A hash inside a quoted value is not a comment.
+	var h Config
+	if err := parseTOML("psk = \"aa#bb\"\n", &h); err != nil || h.PSK != "aa#bb" {
+		t.Fatalf("quoted hash mishandled: %q %v", h.PSK, err)
+	}
+	if err := parseTOML("carriers = notanumber\n", &Config{}); err == nil {
+		t.Fatal("a bad number should be reported")
+	}
+}
+
+func TestLoadConfigAcceptsBothFormats(t *testing.T) {
+	dir := t.TempDir()
+	j := dir + "/old.json"
+	os.WriteFile(j, []byte(`{"name":"j","role":"edge","mode":"forward","psk":"aa","listen":"0.0.0.0:1"}`), 0600)
+	c, err := loadConfig(j)
+	if err != nil || c.Name != "j" {
+		t.Fatalf("json config: %v %+v", err, c)
+	}
+	c.applyDefaults()
+	if c.Role != "server" {
+		t.Fatalf("the old role name should map to server, got %q", c.Role)
+	}
+
+	t2 := dir + "/new.toml"
+	os.WriteFile(t2, []byte("name = \"t\"\nrole = \"client\"\nmode = \"forward\"\npsk = \"aa\"\nconnect = \"1.2.3.4:9\"\n"), 0600)
+	c2, err := loadConfig(t2)
+	if err != nil || c2.Name != "t" || c2.Role != "client" {
+		t.Fatalf("toml config: %v %+v", err, c2)
 	}
 }

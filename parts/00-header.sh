@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.2.0"
+PINGIFY_VERSION="3.3.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -245,10 +245,23 @@ require_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# These configs are written by this script, one key per line, so a targeted
-# sed is enough and Pingify stays free of a jq dependency.
-json_str() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
-json_num() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
+# Config files are TOML written by this script, one key per line, so a
+# targeted sed reads them back and Pingify needs no parser of its own.
+CFG_EXT="toml"
+
+cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
+
+toml_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
+toml_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
+toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
+
+# Same, but only inside the [tun] table, so "name" there does not collide with
+# the tunnel's own name at the top of the file.
+toml_tun() { [ -f "$1" ] || return 0; sed -n '/^\[tun\]/,$p' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" | head -n1; }
+
+# Only used to convert a config left behind by 3.2 or earlier.
+json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
+json_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
 port_free() {
     local p="$1"
@@ -281,9 +294,9 @@ public_ip() {
 tunnel_names() {
     [ -d "$CFG_DIR" ] || return 0
     local f
-    for f in "$CFG_DIR"/*.json; do
+    for f in "$CFG_DIR"/*."$CFG_EXT"; do
         [ -e "$f" ] || continue
-        basename "$f" .json
+        basename "$f" ".$CFG_EXT"
     done
 }
 

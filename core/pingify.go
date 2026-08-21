@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.2.0"
+const version = "3.3.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -70,9 +70,11 @@ type Config struct {
 	//   tun     — full layer-3 IP tunnel
 	Mode string `json:"mode"`
 
-	// Transport is how the carriers themselves travel. Only "direct" exists
-	// today: the core's own encrypted stream with nothing wrapped around it.
-	// TLS and WebSocket variants slot in here without touching a line above.
+	// Transport is how the carriers themselves travel.
+	//   braid — several parallel TCP connections braided into one encrypted
+	//           stream; what "direct" and "tcp" used to be called
+	// TLS, WebSocket and ICMP variants slot in here without touching a line
+	// above.
 	Transport string `json:"transport,omitempty"`
 
 	// Exactly one of Listen/Connect is set. It is independent of Role, so the
@@ -117,8 +119,9 @@ func (c *Config) applyDefaults() {
 	if c.Mode == "" {
 		c.Mode = "forward"
 	}
-	if c.Transport == "" || c.Transport == "tcp" {
-		c.Transport = "direct"
+	switch c.Transport {
+	case "", "tcp", "direct":
+		c.Transport = "braid"
 	}
 	if c.Carriers <= 0 {
 		c.Carriers = 4
@@ -173,7 +176,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\" or \"tun\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "direct":
+	case "braid":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -240,14 +243,9 @@ func main() {
 		os.Exit(2)
 	}
 
-	raw, err := os.ReadFile(*cfgPath)
+	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read config:", err)
-		os.Exit(1)
-	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "parse config:", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	cfg.applyDefaults()
@@ -264,7 +262,7 @@ func main() {
 	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
 
-	p := newPool(&cfg)
+	p := newPool(cfg)
 	if err := p.start(); err != nil {
 		logError("start: %v", err)
 		os.Exit(1)
@@ -273,7 +271,7 @@ func main() {
 	var top interface{ Close() error }
 	switch cfg.Mode {
 	case "forward":
-		f, err := startForward(&cfg, p)
+		f, err := startForward(cfg, p)
 		if err != nil {
 			logError("forward: %v", err)
 			p.close()
@@ -281,7 +279,7 @@ func main() {
 		}
 		top = f
 	case "tun":
-		t, err := startTUN(&cfg, p)
+		t, err := startTUN(cfg, p)
 		if err != nil {
 			logError("tun: %v", err)
 			p.close()
@@ -291,7 +289,7 @@ func main() {
 	}
 
 	if cfg.StatusAddr != "" {
-		startStatusServer(cfg.StatusAddr, &cfg, p)
+		startStatusServer(cfg.StatusAddr, cfg, p)
 	}
 
 	sig := make(chan os.Signal, 1)
