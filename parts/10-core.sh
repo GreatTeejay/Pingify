@@ -1,6 +1,6 @@
 
 # ---------------------------------------------------------------------------
-# the engine
+# the core
 #
 # Three ways to get it, tried in this order:
 #   1. download the prebuilt binary for this CPU from GitHub Releases - the
@@ -29,17 +29,17 @@ adopt_core() {
     fi
     install -m 0755 "$tmp" "$CORE_BIN" || return 1
     rm -f "$tmp"
-    ok "engine ready: $("$CORE_BIN" -version)"
+    ok "core ready: $("$CORE_BIN" -version)"
     return 0
 }
 
 download_core() {
-    [ -n "$GOARCH" ] || { warn "no prebuilt engine for $ARCH"; return 1; }
+    [ -n "$GOARCH" ] || { warn "no prebuilt core for $ARCH"; return 1; }
     have curl || return 1
     local base tmp="/tmp/pingify-core.dl" sums="/tmp/pingify-core.sums"
     base="$(release_base)"
 
-    if ! spin "downloading the engine for $GOARCH" \
+    if ! spin "downloading the core for $GOARCH" \
          curl -fsSL --retry 2 --max-time 180 -o "$tmp" "$base/$(core_asset)"; then
         rm -f "$tmp"
         return 1
@@ -78,8 +78,8 @@ build_core() {
           CGO_ENABLED=0 "$GO_BIN" build -trimpath -ldflags "-s -w" \
           -o "$SRC_DIR/pingify-core" . ) >"$log" 2>&1
     }
-    if ! spin "compiling the engine (a minute or so on a small VPS)" go_build_now; then
-        fail "the engine did not compile"
+    if ! spin "compiling the core (a minute or so on a small VPS)" go_build_now; then
+        fail "the core did not compile"
         sed 's/^/      /' "$log" | tail -n 20
         return 1
     fi
@@ -110,7 +110,7 @@ import_core_binary() {
 install_core() {
     if download_core; then return 0; fi
     say ""
-    warn "could not fetch the prebuilt engine from GitHub"
+    warn "could not fetch the prebuilt core from GitHub"
     dim "compiling it here instead - this needs Go but downloads nothing"
     say ""
     build_core
