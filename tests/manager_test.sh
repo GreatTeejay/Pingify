@@ -236,5 +236,41 @@ PYEOF
     wait "$IRAN_PID" "$KHAREJ_PID" 2>/dev/null
 fi
 
+
+# ---------------------------------------------------------------------------
+note "forwarders"
+# ---------------------------------------------------------------------------
+cfg_reset
+T_NAME="fw"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="braid"
+T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PSK="$saved_psk"
+T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+f="$(cfg_save)"
+check "pingify is the default"   "$(toml_get "$f" forward forwarder)" "pingify"
+check "mode stays forward"       "$(toml_get "$f" tunnel mode)"       "forward"
+check "forwarder is in the token" "$(cfg_peer_token | base64 -d | sed -n 's/^forwarder = "\(.*\)"/\1/p')" "pingify"
+
+# The far side needs to know the forwarder even though it has no ports.
+cfg_reset
+T_NAME="fw2"; T_ROLE="client"; T_MODE="tun"; T_TRANSPORT="braid"
+T_FORWARDER="iptables"; T_ACCEPTS="server"; T_PEER_IP="203.0.113.9"; T_PORT=9443
+T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"
+T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.2/30"; T_TUNPEER="10.71.1.1"; T_TUNMTU=1380
+g="$(cfg_save)"
+check "far side knows the forwarder" "$(toml_get "$g" forward forwarder)" "iptables"
+check "far side has no ports"        "$(grep -c '^ports' "$g")"           "0"
+cfg_load fw2
+check "cfg_load reads the forwarder" "$T_FORWARDER" "iptables"
+
+# ---------------------------------------------------------------------------
+note "an incomplete tunnel is named, not just rejected"
+# ---------------------------------------------------------------------------
+cfg_reset
+T_NAME="broken"; T_MODE="forward"; T_TRANSPORT="braid"; T_PSK="$saved_psk"
+# T_ROLE deliberately left empty - this is what reached the core before
+out="$(cfg_save 2>&1)"; rc=$?
+check "cfg_save refuses"        "$rc"                                        "1"
+check "and says which field"    "$(printf '%s' "$out" | grep -c 'role')"     "1"
+check "and writes nothing"      "$([ -f "$(cfg_file broken)" ] && echo yes || echo no)" "no"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

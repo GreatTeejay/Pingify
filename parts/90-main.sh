@@ -214,7 +214,7 @@ main() {
         --health-check)
             require_root; run_health_check; exit 0 ;;
         --apply-firewall)
-            require_root; apply_blocking quiet; exit 0 ;;
+            require_root; apply_blocking quiet; apply_nat quiet; exit 0 ;;
         --version | -v)
             echo "Pingify $PINGIFY_VERSION"; exit 0 ;;
         --help | -h)
