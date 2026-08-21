@@ -272,5 +272,22 @@ check "cfg_save refuses"        "$rc"                                        "1"
 check "and says which field"    "$(printf '%s' "$out" | grep -c 'role')"     "1"
 check "and writes nothing"      "$([ -f "$(cfg_file broken)" ] && echo yes || echo no)" "no"
 
+# ---------------------------------------------------------------------------
+note "the core has to match the script"
+# ---------------------------------------------------------------------------
+# A core left behind by an older install reads a sectioned config as if half of
+# it were missing, and the only symptom was the core rejecting a config that is
+# in fact correct.
+if [ -n "${CORE_BIN:-}" ] && [ -x "$CORE_BIN" ]; then
+    check "the shipped core matches" "$("$CORE_BIN" -version | awk '{print $2}')" "$PINGIFY_VERSION"
+    real="$PINGIFY_VERSION"
+    PINGIFY_VERSION="0.0.0-not-this"
+    if core_matches_script; then r=matched; else r=differs; fi
+    check "a mismatch is detected" "$r" "differs"
+    PINGIFY_VERSION="$real"
+    if core_matches_script; then r=matched; else r=differs; fi
+    check "a match is detected"    "$r" "matched"
+fi
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

@@ -339,8 +339,8 @@ new_tunnel() {
 
     # -- forwarder ---------------------------------------------------------
     head2 "Forwarder"
-    item 1 "Pingify" "the core carries it - encrypted end to end, any protocol"
-    item 2 "iptables" "the kernel carries it over a private IP link - fastest"
+    item 1 "PINGIFY" "the core carries it - encrypted end to end, any protocol"
+    item 2 "IPTABLES" "the kernel carries it over a private IP link - fastest"
     say ""
     dim "Pingify never lets a packet out of the tunnel until it is on the far"
     dim "server. iptables sets up a private layer-3 link and lets the kernel"
@@ -453,6 +453,7 @@ new_tunnel() {
     local file; file="$(cfg_save)"
     if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         fail "the core rejected this configuration"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
         "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
         rm -f "$file"
         pause; return 1
@@ -576,6 +577,7 @@ import_tunnel() {
     if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
         "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
         rm -f "$file"
         pause; return 1

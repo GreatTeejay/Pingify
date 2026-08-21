@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.6.0"
+PINGIFY_VERSION="3.7.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -587,6 +587,35 @@ ensure_core() {
     install_core
 }
 
+# The script and the core share the config format, so a core left behind by an
+# older install reads a newer config as if half of it were not there. 3.4 moved
+# configs into sections; a 3.3 core reads one of those and reports every field
+# as empty - which surfaced as "role must be \"server\" or \"client\", got \"\""
+# with nothing to point at the real cause. They are kept in step here instead.
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
+}
+
+ensure_core_current() {
+    [ -x "$CORE_BIN" ] || return 0
+    core_matches_script && return 0
+    banner
+    head2 "Core update"
+    warn "the core is $(core_version), this script is $PINGIFY_VERSION"
+    dim "they have to match - the config format is shared between them"
+    say ""
+    if download_core; then
+        restart_all "the core was updated"
+    else
+        say ""
+        fail "the core could not be updated"
+        dim "until it matches, new tunnels will be rejected"
+        dim "Update core in the menu has the other ways to install it"
+    fi
+    pause
+}
+
 # ---------------------------------------------------------------------------
 # systemd
 # ---------------------------------------------------------------------------
@@ -1004,8 +1033,8 @@ new_tunnel() {
 
     # -- forwarder ---------------------------------------------------------
     head2 "Forwarder"
-    item 1 "Pingify" "the core carries it - encrypted end to end, any protocol"
-    item 2 "iptables" "the kernel carries it over a private IP link - fastest"
+    item 1 "PINGIFY" "the core carries it - encrypted end to end, any protocol"
+    item 2 "IPTABLES" "the kernel carries it over a private IP link - fastest"
     say ""
     dim "Pingify never lets a packet out of the tunnel until it is on the far"
     dim "server. iptables sets up a private layer-3 link and lets the kernel"
@@ -1118,6 +1147,7 @@ new_tunnel() {
     local file; file="$(cfg_save)"
     if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         fail "the core rejected this configuration"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
         "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
         rm -f "$file"
         pause; return 1
@@ -1241,6 +1271,7 @@ import_tunnel() {
     if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
         "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
         rm -f "$file"
         pause; return 1
@@ -1280,8 +1311,8 @@ import_tunnel() {
 
 forwarder_label() {
     case "$1" in
-        iptables) printf 'iptables' ;;
-        *)        printf 'Pingify' ;;
+        iptables) printf 'IPTABLES' ;;
+        *)        printf 'PINGIFY' ;;
     esac
 }
 
@@ -3675,7 +3706,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.6.0"
+const version = "3.7.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -6387,10 +6418,12 @@ info_panel() {
     panel_end
 
     local core_txt tun_txt
-    if [ -x "$CORE_BIN" ]; then
+    if [ ! -x "$CORE_BIN" ]; then
+        core_txt="${C_RED}not installed${C_OFF}"
+    elif core_matches_script; then
         core_txt="$(core_version)"
     else
-        core_txt="${C_RED}not installed${C_OFF}"
+        core_txt="${C_RED}$(core_version) - does not match the script${C_OFF}"
     fi
     if [ "$total" = "0" ]; then
         tun_txt="${C_GRY}${BX_OFF}${C_OFF} none configured"
@@ -6494,6 +6527,7 @@ main() {
     migrate_layout
     server_info
     first_run
+    ensure_core_current
     main_menu
 }
 

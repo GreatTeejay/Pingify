@@ -21,8 +21,8 @@
 
 forwarder_label() {
     case "$1" in
-        iptables) printf 'iptables' ;;
-        *)        printf 'Pingify' ;;
+        iptables) printf 'IPTABLES' ;;
+        *)        printf 'PINGIFY' ;;
     esac
 }
 
