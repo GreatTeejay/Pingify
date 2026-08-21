@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.1.0"
+PINGIFY_VERSION="3.2.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -83,9 +83,42 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
-box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
-box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
-box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
+# A panel carries its title in the top border, so a screen full of them reads
+# as a list of labelled blocks rather than a wall of rules.
+panel() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        return
+    fi
+    # corner + one rule + " title " ; the rest of the line is rule + corner
+    n=$(( ${#t} + 3 ))
+    printf '  %s%s%s %s%s%s %s%s%s\n' \
+        "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF" \
+        "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+}
+
+panel_end() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+
+row() {
+    printf '  %s%s%s %s %s%s%s\n' \
+        "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# field <label> <value> [label2] [value2] - two aligned columns in one row.
+field() {
+    local s
+    s="$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}"
+    if [ -n "${3:-}" ]; then
+        s="$(pad_to "$s" 32)$(pad_to "${C_DIM}$3${C_OFF}" 12)${C_B}$4${C_OFF}"
+    fi
+    row "$s"
+}
+
+# kept so older call sites keep working
+box_top() { panel; }
+box_bot() { panel_end; }
+box_row() { row "$1"; }
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s%s%s %s\n' "$C_CYN" "$BX_ARR" "$C_OFF" "$*"; }
@@ -99,23 +132,37 @@ rule() { printf '  %s%s%s\n' "$C_GRY" "$(repeat "$BX_H" $((UI_W + 2)))" "$C_OFF"
 head2() {
     local t=" $1 " n; n="$(vislen "$t")"
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_B" "$t" "$C_OFF$C_GRY" \
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
         "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
 }
+
+# A label above a run of related menu entries.
+group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 
 # item <key> <label> [hint]
 #
 # The label column grows if a label outruns it, so a long one can never end up
 # glued to its hint.
 item() {
-    local w=28 n
+    local w=24 n
     n="$(vislen "$2")"
     [ "$n" -ge "$w" ] && w=$((n + 2))
     if [ -n "${3:-}" ]; then
-        printf '    %s%s%s  %s%s%s%s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$(pad_to "$2" "$w")" "$C_DIM" "$3" "$C_OFF"
+        printf '    %s%s%s %s%s%s %s%s%s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
+            "$(pad_to "$2" "$w")" "$C_DIM" "$3$C_OFF"
     else
-        printf '    %s%s%s  %s\n' "$C_CYN$C_B" "$1" "$C_OFF" "$2"
+        printf '    %s%s%s %s%s%s %s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$2"
+    fi
+}
+
+# state <on|off> - a coloured on/off badge for toggles.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
     fi
 }
 

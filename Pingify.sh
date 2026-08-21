@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.1.0"
+PINGIFY_VERSION="3.2.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -83,9 +83,42 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
-box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
-box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
-box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
+# A panel carries its title in the top border, so a screen full of them reads
+# as a list of labelled blocks rather than a wall of rules.
+panel() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        return
+    fi
+    # corner + one rule + " title " ; the rest of the line is rule + corner
+    n=$(( ${#t} + 3 ))
+    printf '  %s%s%s %s%s%s %s%s%s\n' \
+        "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF" \
+        "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+}
+
+panel_end() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+
+row() {
+    printf '  %s%s%s %s %s%s%s\n' \
+        "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# field <label> <value> [label2] [value2] - two aligned columns in one row.
+field() {
+    local s
+    s="$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}"
+    if [ -n "${3:-}" ]; then
+        s="$(pad_to "$s" 32)$(pad_to "${C_DIM}$3${C_OFF}" 12)${C_B}$4${C_OFF}"
+    fi
+    row "$s"
+}
+
+# kept so older call sites keep working
+box_top() { panel; }
+box_bot() { panel_end; }
+box_row() { row "$1"; }
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s%s%s %s\n' "$C_CYN" "$BX_ARR" "$C_OFF" "$*"; }
@@ -99,23 +132,37 @@ rule() { printf '  %s%s%s\n' "$C_GRY" "$(repeat "$BX_H" $((UI_W + 2)))" "$C_OFF"
 head2() {
     local t=" $1 " n; n="$(vislen "$t")"
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_B" "$t" "$C_OFF$C_GRY" \
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
         "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
 }
+
+# A label above a run of related menu entries.
+group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 
 # item <key> <label> [hint]
 #
 # The label column grows if a label outruns it, so a long one can never end up
 # glued to its hint.
 item() {
-    local w=28 n
+    local w=24 n
     n="$(vislen "$2")"
     [ "$n" -ge "$w" ] && w=$((n + 2))
     if [ -n "${3:-}" ]; then
-        printf '    %s%s%s  %s%s%s%s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$(pad_to "$2" "$w")" "$C_DIM" "$3" "$C_OFF"
+        printf '    %s%s%s %s%s%s %s%s%s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
+            "$(pad_to "$2" "$w")" "$C_DIM" "$3$C_OFF"
     else
-        printf '    %s%s%s  %s\n' "$C_CYN$C_B" "$1" "$C_OFF" "$2"
+        printf '    %s%s%s %s%s%s %s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$2"
+    fi
+}
+
+# state <on|off> - a coloured on/off badge for toggles.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
     fi
 }
 
@@ -1451,27 +1498,9 @@ apply_tuning() {
         [ -f "$STATE_DIR/sysctl.pre" ] || sysctl -a 2>/dev/null > "$STATE_DIR/sysctl.pre"
     fi
 
-    if ! lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
-        modprobe tcp_bbr 2>/dev/null || true
-    fi
-    if ! grep -q '^tcp_bbr$' /etc/modules-load.d/pingify.conf 2>/dev/null; then
-        echo tcp_bbr > /etc/modules-load.d/pingify.conf
-    fi
-
-    local cc="cubic"
-    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-        cc="bbr"
-    else
-        warn "this kernel has no BBR; staying on cubic"
-    fi
-
     cat > "$SYSCTL_FILE" <<SYSCTL
 # Written by Pingify $PINGIFY_VERSION. Delete this file and run
 # "sysctl --system" to go back to the distribution defaults.
-
-# --- congestion control and queueing ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $cc
 
 # --- room in flight: 64 MB covers a 200 ms / 2.5 Gbit path ---
 net.core.rmem_max = 67108864
@@ -1519,7 +1548,8 @@ SYSCTL
     fi
 
     sysctl --system >/dev/null 2>&1
-    ok "network tuning applied (congestion control: $cc, qdisc: fq)"
+    ok "network tuning applied"
+    dim "congestion control is a separate switch - see Enable BBR"
 
     if ! grep -q 'pingify' /etc/security/limits.d/99-pingify.conf 2>/dev/null; then
         cat > /etc/security/limits.d/99-pingify.conf <<'LIMITS'
@@ -1533,8 +1563,39 @@ LIMITS
     fi
 }
 
+# BBR is its own switch: it is the one change with a visible effect on a slow
+# path, and people want to turn it on or off without touching everything else.
+enable_bbr() {
+    say ""
+    if ! lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        fail "this kernel does not offer BBR"
+        dim "kernel $(uname -r); a 4.9 or newer kernel with tcp_bbr is needed"
+        return 1
+    fi
+    echo tcp_bbr > /etc/modules-load.d/pingify.conf
+    cat > /etc/sysctl.d/98-pingify-bbr.conf <<'SYSCTL'
+# Written by Pingify. Delete this file and run "sysctl --system" to undo it.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+SYSCTL
+    sysctl --system >/dev/null 2>&1
+    ok "BBR enabled with the fq queue discipline"
+    dim "now: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) / $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+}
+
+disable_bbr() {
+    say ""
+    rm -f /etc/sysctl.d/98-pingify-bbr.conf /etc/modules-load.d/pingify.conf
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1
+    ok "back to $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+}
+
 revert_tuning() {
-    rm -f "$SYSCTL_FILE" /etc/security/limits.d/99-pingify.conf /etc/modules-load.d/pingify.conf
+    rm -f "$SYSCTL_FILE" /etc/security/limits.d/99-pingify.conf           /etc/modules-load.d/pingify.conf /etc/sysctl.d/98-pingify-bbr.conf
     sysctl --system >/dev/null 2>&1
     ok "Pingify tuning removed; the distribution defaults are back"
     dim "a reboot makes absolutely sure nothing is left over"
@@ -1591,24 +1652,35 @@ optimize_menu() {
     while :; do
         banner
         head2 "Optimize"
-        item 1 "Apply network tuning" "(BBR + fq + high-BDP buffers)"
-        item 2 "Apply network tuning" "+ enable IP forwarding (full-IP tunnels)"
-        item 3 "Show the current settings"
-        item 4 "Swap file"
-        item 5 "Sync the clock" "(the handshake rejects a skewed clock)"
-        item 6 "Revert every change Pingify made"
+        panel "CURRENT"
+        field "Congestion" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"               "Qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+        field "Tuning" "$([ -f "$SYSCTL_FILE" ] && echo applied || echo default)"               "Open files" "$(ulimit -n)"
+        panel_end
+        say ""
+        item 1 "Apply network optimization" "buffers, backlogs, file limits"
+        item 2 "Enable BBR" "congestion control and fq"
+        item 3 "Disable BBR" "back to the kernel default"
+        say ""
+        item 4 "Enable IP forwarding" "needed for Full IP tunnels"
+        item 5 "Swap file"
+        item 6 "Sync the clock" "the handshake rejects a skewed clock"
+        say ""
+        item 7 "Show all settings"
+        item 8 "Revert everything Pingify changed"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
             1) apply_tuning no; pause ;;
-            2) apply_tuning yes; pause ;;
-            3) show_net_settings; pause ;;
-            4) manage_swap ;;
-            5) sync_clock; pause ;;
-            6) say ""; confirm "revert the sysctl and limits changes?" && revert_tuning; pause ;;
-            0|"") return ;;
+            2) enable_bbr; pause ;;
+            3) disable_bbr; pause ;;
+            4) apply_tuning yes; pause ;;
+            5) manage_swap ;;
+            6) sync_clock; pause ;;
+            7) show_net_settings; pause ;;
+            8) say ""; confirm "revert the sysctl and limits changes?" && revert_tuning; pause ;;
+            0 | "") return ;;
         esac
     done
 }
@@ -1624,6 +1696,221 @@ sync_clock() {
     fi
     dim "Pingify rejects a handshake more than 3 minutes out, so both servers"
     dim "must agree on the time."
+}
+
+# ---------------------------------------------------------------------------
+# blocking
+#
+# Three switches people running a tunnel keep reaching for:
+#
+#   ICMP       stop the server answering pings
+#   speedtest  keep clients from burning the link on benchmark sites
+#   QUIC       force browsers back onto TCP, where the tunnel actually helps
+#
+# Everything goes in Pingify's own iptables chains, so nothing here touches
+# rules you or your panel put in place. State lives in $STATE_DIR and a boot
+# unit re-applies it, because iptables rules do not survive a reboot.
+# ---------------------------------------------------------------------------
+
+SPEEDTEST_HOSTS="speedtest.net ooklaserver.net speedtestcustom.com fast.com \
+nperf.com speedof.me openspeedtest.com speedcheck.org librespeed.org \
+测速 speedtest.cn"
+
+# The hosts file gets a marked block so it can be removed cleanly.
+HOSTS_MARK="# --- pingify speedtest block ---"
+
+block_state() { [ -f "$STATE_DIR/block-$1" ] && printf 'on' || printf 'off'; }
+
+block_summary() {
+    local out=""
+    [ "$(block_state icmp)" = "on" ]      && out="${out}icmp "
+    [ "$(block_state speedtest)" = "on" ] && out="${out}speedtest "
+    [ "$(block_state quic)" = "on" ]      && out="${out}quic "
+    [ -n "$out" ] && printf '%s' "${out% }" || printf 'none'
+}
+
+block_toggle() {
+    local what="$1"
+    if [ -f "$STATE_DIR/block-$what" ]; then
+        rm -f "$STATE_DIR/block-$what"
+    else
+        mkdir -p "$STATE_DIR"
+        : > "$STATE_DIR/block-$what"
+    fi
+    apply_blocking
+}
+
+# ---------------------------------------------------------------------------
+# applying
+# ---------------------------------------------------------------------------
+
+ipt() { iptables "$@" 2>/dev/null; }
+
+# Our chains, hooked once into the built-in ones and rebuilt from scratch each
+# time so the state file is always the single source of truth.
+block_reset_chains() {
+    local c
+    for c in PINGIFY_IN PINGIFY_OUT PINGIFY_FWD; do
+        ipt -N "$c" || ipt -F "$c"
+    done
+    ipt -C INPUT   -j PINGIFY_IN  || ipt -I INPUT 1   -j PINGIFY_IN
+    ipt -C OUTPUT  -j PINGIFY_OUT || ipt -I OUTPUT 1  -j PINGIFY_OUT
+    ipt -C FORWARD -j PINGIFY_FWD || ipt -I FORWARD 1 -j PINGIFY_FWD
+}
+
+block_drop_chains() {
+    ipt -D INPUT   -j PINGIFY_IN
+    ipt -D OUTPUT  -j PINGIFY_OUT
+    ipt -D FORWARD -j PINGIFY_FWD
+    local c
+    for c in PINGIFY_IN PINGIFY_OUT PINGIFY_FWD; do
+        ipt -F "$c"
+        ipt -X "$c"
+    done
+}
+
+hosts_block_off() {
+    if grep -qF "$HOSTS_MARK" /etc/hosts 2>/dev/null; then
+        sed -i "/$(printf '%s' "$HOSTS_MARK" | sed 's/[]\/$*.^[]/\\&/g')/,/# --- end pingify ---/d" /etc/hosts
+    fi
+}
+
+hosts_block_on() {
+    hosts_block_off
+    {
+        printf '%s\n' "$HOSTS_MARK"
+        local h
+        for h in $SPEEDTEST_HOSTS; do
+            case "$h" in *[!a-zA-Z0-9.-]*) continue ;; esac
+            printf '127.0.0.1 %s\n127.0.0.1 www.%s\n' "$h" "$h"
+        done
+        printf '%s\n' "# --- end pingify ---"
+    } >> /etc/hosts
+}
+
+apply_blocking() {
+    local quiet="${1:-}"
+    have iptables || { [ "$quiet" = quiet ] || warn "iptables is not installed; nothing applied"; return 1; }
+    mkdir -p "$STATE_DIR"
+    block_reset_chains
+
+    # --- ICMP -------------------------------------------------------------
+    if [ "$(block_state icmp)" = "on" ]; then
+        printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > /etc/sysctl.d/99-pingify-block.conf
+    else
+        rm -f /etc/sysctl.d/99-pingify-block.conf
+        sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+    fi
+    sysctl --system >/dev/null 2>&1
+
+    # --- speedtest --------------------------------------------------------
+    if [ "$(block_state speedtest)" = "on" ]; then
+        hosts_block_on
+        local h ok_any=0
+        for h in $SPEEDTEST_HOSTS; do
+            case "$h" in *[!a-zA-Z0-9.-]*) continue ;; esac
+            # Matches the hostname in a plaintext TLS ClientHello, so it also
+            # catches traffic that only passes through this server.
+            if ipt -A PINGIFY_OUT -m string --string "$h" --algo bm -j REJECT; then ok_any=1; fi
+            ipt -A PINGIFY_FWD -m string --string "$h" --algo bm -j REJECT
+        done
+        if [ "$ok_any" = "0" ] && [ "$quiet" != quiet ]; then
+            warn "the kernel string match is unavailable; only the hosts file block is active"
+        fi
+    else
+        hosts_block_off
+    fi
+
+    # --- QUIC -------------------------------------------------------------
+    if [ "$(block_state quic)" = "on" ]; then
+        ipt -A PINGIFY_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+        ipt -A PINGIFY_FWD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+        ipt -A PINGIFY_IN  -p udp --dport 443 -j DROP
+    fi
+
+    write_firewall_unit
+    [ "$quiet" = quiet ] || ok "blocking rules applied"
+    return 0
+}
+
+# iptables forgets everything on reboot, so re-apply from the state files.
+write_firewall_unit() {
+    cat > "$UNIT_DIR/pingify-firewall.service" <<UNIT
+[Unit]
+Description=Pingify blocking rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SELF_BIN --apply-firewall
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable pingify-firewall.service >/dev/null 2>&1
+}
+
+remove_blocking() {
+    rm -f "$STATE_DIR"/block-icmp "$STATE_DIR"/block-speedtest "$STATE_DIR"/block-quic
+    rm -f /etc/sysctl.d/99-pingify-block.conf
+    sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+    hosts_block_off
+    have iptables && block_drop_chains
+    systemctl disable --now pingify-firewall.service >/dev/null 2>&1
+    rm -f "$UNIT_DIR/pingify-firewall.service"
+    systemctl daemon-reload
+}
+
+# ---------------------------------------------------------------------------
+# menu
+# ---------------------------------------------------------------------------
+
+blocking_menu() {
+    while :; do
+        banner
+        head2 "Blocking"
+        panel "RULES"
+        row "$(pad_to "${C_DIM}Ping / ICMP${C_OFF}" 22)$(state_badge "$(block_state icmp)")"
+        row "$(pad_to "${C_DIM}Speedtest sites${C_OFF}" 22)$(state_badge "$(block_state speedtest)")"
+        row "$(pad_to "${C_DIM}QUIC on UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
+        panel_end
+        say ""
+        item 1 "Ping / ICMP" "stop this server answering pings"
+        item 2 "Speedtest sites" "block benchmark sites and their CDNs"
+        item 3 "QUIC" "reject UDP 443 so browsers fall back to TCP"
+        say ""
+        item 4 "Show the live rules"
+        item 5 "Clear everything"
+        item 0 "Back"
+        say ""
+        local c=""
+        ask c "select"
+        case "$c" in
+            1) say ""; block_toggle icmp; pause ;;
+            2) say ""
+               dim "This works on traffic leaving in the clear, so it belongs on"
+               dim "the KHAREJ server - that is where the proxy talks to the site."
+               say ""
+               block_toggle speedtest; pause ;;
+            3) say ""; block_toggle quic; pause ;;
+            4) say ""
+               if have iptables; then
+                   iptables -S PINGIFY_IN PINGIFY_OUT PINGIFY_FWD 2>/dev/null | sed 's/^/    /' | head -n 40
+                   printf '    %sicmp_echo_ignore_all = %s%s\n' \
+                       "$C_DIM" "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" "$C_OFF"
+               else
+                   warn "iptables is not installed"
+               fi
+               pause ;;
+            5) say ""
+               confirm "remove every blocking rule?" && { remove_blocking; ok "cleared"; }
+               pause ;;
+            0 | "") return ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -1743,6 +2030,7 @@ full_uninstall() {
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
     systemctl disable --now pingify-health.timer >/dev/null 2>&1
+    remove_blocking
     rm -f "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-health.service \
           "$UNIT_DIR"/pingify-health.timer "$UNIT_DIR"/pingify-recycle@*.service \
           "$UNIT_DIR"/pingify-recycle@*.timer
@@ -1862,44 +2150,6 @@ diag_system() {
 }
 
 # ---------------------------------------------------------------------------
-# backup / restore
-# ---------------------------------------------------------------------------
-
-backup_menu() {
-    banner
-    head2 "Backup & Restore"
-    item 1 "Back up every tunnel"
-    item 2 "Restore from a backup"
-    item 0 "Back"
-    say ""
-    local c=""
-    ask c "select"
-    case "$c" in
-        1)  say ""
-            local out="/root/pingify-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-            if tar -czf "$out" -C / etc/pingify 2>/dev/null; then
-                chmod 600 "$out"
-                ok "written to $out"
-                warn "it contains your shared keys - keep it somewhere safe"
-            else
-                fail "nothing to back up"
-            fi
-            pause ;;
-        2)  say ""
-            local src=""
-            ask src "path to the backup file"
-            [ -f "$src" ] || { fail "no such file"; pause; return; }
-            confirm "this replaces the configs on this server. continue?" || return
-            tar -xzf "$src" -C / || { fail "could not unpack it"; pause; return; }
-            write_units
-            local n
-            for n in $(tunnel_names); do service_enable_start "$n"; ok "started $n"; done
-            pause ;;
-        0|"") return ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
 # embedded core sources
 #
 # build.sh drops the contents of core/*.go in here. Shipping the source rather
@@ -1965,7 +2215,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.1.0"
+const version = "3.2.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -4506,16 +4756,30 @@ PINGIFY_SRC_EOF
 # installation of the manager itself
 # ---------------------------------------------------------------------------
 
+release_script() { printf 'https://github.com/%s/releases/latest/download/Pingify.sh' "$PINGIFY_REPO"; }
+
 install_self() {
     local src="${BASH_SOURCE[0]}"
-    if [ -r "$src" ] && [ "$(readlink -f "$src" 2>/dev/null)" != "$(readlink -f "$SELF_BIN" 2>/dev/null)" ]; then
-        install -m 0755 "$src" "$SELF_BIN" 2>/dev/null || cp -f "$src" "$SELF_BIN"
-        chmod 0755 "$SELF_BIN"
+    if [ -f "$src" ] && [ -r "$src" ]; then
+        if [ "$(readlink -f "$src" 2>/dev/null)" != "$(readlink -f "$SELF_BIN" 2>/dev/null)" ]; then
+            install -m 0755 "$src" "$SELF_BIN" 2>/dev/null || cp -f "$src" "$SELF_BIN"
+            chmod 0755 "$SELF_BIN"
+        fi
+    else
+        # Started straight from a pipe - bash <(wget ...) - so there is no file
+        # on disk to copy. Pull the published script instead.
+        local tmp="/tmp/pingify.self"
+        if spin "installing the pingify command" \
+             curl -fsSL --retry 2 --max-time 120 -o "$tmp" "$(release_script)" \
+           && bash -n "$tmp" 2>/dev/null; then
+            install -m 0755 "$tmp" "$SELF_BIN"
+        else
+            warn "could not fetch the manager; the pingify command is not installed"
+        fi
+        rm -f "$tmp"
     fi
     ensure_deps
     write_units
-    ok "the ${C_B}pingify${C_OFF} command is installed"
-    dim "everything else lives in $BASE_DIR"
 }
 
 # Earlier versions scattered files across /etc, /var/lib and /usr/local. Move
@@ -4548,19 +4812,20 @@ usage() {
     cat <<USAGE
 Pingify $PINGIFY_VERSION - tunnel manager for Iran <-> Kharej server pairs
 
-  pingify                  open the menu
-  pingify --install        install the command and the systemd units
-  pingify --health-check   run the watchdog pass once (used by the timer)
-  pingify --status [name]  print tunnel status and exit
-  pingify --version        print the version
-  pingify --help           this text
+  pingify                    open the menu
+  pingify --install          install the command and the systemd units
+  pingify --health-check     run the watchdog pass once (used by the timer)
+  pingify --apply-firewall   re-apply the blocking rules (used at boot)
+  pingify --status [name]    print tunnel status and exit
+  pingify --version          print the version
+  pingify --help             this text
 
 Files: $BASE_DIR
 USAGE
 }
 
 # ---------------------------------------------------------------------------
-# the panel above the menu
+# front page
 # ---------------------------------------------------------------------------
 
 info_panel() {
@@ -4573,32 +4838,31 @@ info_panel() {
         fi
     done
 
-    local core_line="$C_RED$BX_ON$C_OFF not installed"
-    [ -x "$CORE_BIN" ] && core_line="$C_GRN$BX_ON$C_OFF $(core_version)"
+    panel "SERVER"
+    field "IP" "$SRV_IP" "Location" "$SRV_LOC"
+    field "Provider" "$(printf '%.44s' "$SRV_ORG")"
+    panel_end
 
-    local tun_line
-    if [ "$total" = "0" ]; then
-        tun_line="$C_GRY$BX_OFF$C_OFF none configured"
-    elif [ "$up" = "$total" ]; then
-        tun_line="$C_GRN$BX_ON$C_OFF $up of $total up"
-    elif [ "$up" = "0" ]; then
-        tun_line="$C_RED$BX_ON$C_OFF $up of $total up"
+    local core_txt tun_txt
+    if [ -x "$CORE_BIN" ]; then
+        core_txt="${C_GRN}${BX_ON}${C_OFF} $(core_version)"
     else
-        tun_line="$C_YEL$BX_ON$C_OFF $up of $total up"
+        core_txt="${C_RED}${BX_ON}${C_OFF} missing"
+    fi
+    if [ "$total" = "0" ]; then
+        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none"
+    elif [ "$up" = "$total" ]; then
+        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up/$total up"
+    elif [ "$up" = "0" ]; then
+        tun_txt="${C_RED}${BX_ON}${C_OFF} $up/$total up"
+    else
+        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up/$total up"
     fi
 
-    local wd wd_line
-    wd="$(watchdog_state)"
-    if [ "$wd" = "on" ]; then wd_line="$C_GRN$BX_ON$C_OFF on"; else wd_line="$C_YEL$BX_OFF$C_OFF off"; fi
-
-    box_top
-    box_row "$(pad_to "IP address" 15)${C_B}${SRV_IP}${C_OFF}"
-    box_row "$(pad_to "Location" 15)${SRV_LOC}"
-    box_row "$(pad_to "Provider" 15)$(printf '%.42s' "$SRV_ORG")"
-    box_row "$(pad_to "Core" 15)${core_line}"
-    box_row "$(pad_to "Tunnels" 15)${tun_line}"
-    box_row "$(pad_to "Watchdog" 15)$(pad_to "$wd_line" 16)${C_DIM}tcp $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${C_OFF}"
-    box_bot
+    panel "STATUS"
+    row "$(pad_to "${C_DIM}Core${C_OFF} $core_txt" 24)$(pad_to "${C_DIM}Tunnels${C_OFF} $tun_txt" 22)${C_DIM}Watchdog${C_OFF} $(state_badge "$(watchdog_state)")"
+    row "$(pad_to "${C_DIM}Congestion${C_OFF} ${C_B}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${C_OFF}" 24)$(pad_to "${C_DIM}Blocking${C_OFF} ${C_B}$(block_summary)${C_OFF}" 22)${C_DIM}Script${C_OFF} ${C_B}${PINGIFY_VERSION}${C_OFF}"
+    panel_end
 }
 
 first_run() {
@@ -4614,7 +4878,7 @@ first_run() {
     else
         say ""
         fail "the core could not be installed"
-        dim "the Update core entry has the other ways to get it"
+        dim "Update core has the other ways to get it"
         pause
     fi
 }
@@ -4623,18 +4887,18 @@ main_menu() {
     while :; do
         banner
         info_panel
-        say ""
-        item 1 "New tunnel"        "set this server up"
-        item 2 "Tunnels"           "status, ports, logs, remove"
-        item 3 "Live status"       "dashboard that refreshes itself"
-        say ""
-        item 4 "Update core"       "fetch the latest build"
-        item 5 "Update script"     "fetch the latest Pingify"
-        item 6 "Optimize server"   "kernel and network tuning"
-        say ""
-        item 7 "Diagnostics"       "reach the peer, verify configs"
-        item 8 "Backup"            "save or restore your tunnels"
-        item 9 "Remove"            "uninstall part of it, or all of it"
+        group "TUNNEL"
+        item 1 "New tunnel"      "set this server up"
+        item 2 "Tunnels"         "status, ports, logs, remove"
+        item 3 "Live status"     "dashboard that refreshes itself"
+        group "NETWORK"
+        item 4 "Optimize"        "buffers, limits, swap, clock"
+        item 5 "Blocking"        "ICMP, speedtest, QUIC"
+        item 6 "Diagnostics"     "connectivity and configs"
+        group "MAINTENANCE"
+        item 7 "Update core"     "download, build, import, export"
+        item 8 "Update script"   "fetch the latest Pingify"
+        item 9 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
         say ""
@@ -4644,11 +4908,11 @@ main_menu() {
             1) new_tunnel ;;
             2) manage_tunnels ;;
             3) live_dashboard ;;
-            4) update_menu ;;
-            5) self_update; pause ;;
-            6) optimize_menu ;;
-            7) diagnostics_menu ;;
-            8) backup_menu ;;
+            4) optimize_menu ;;
+            5) blocking_menu ;;
+            6) diagnostics_menu ;;
+            7) update_menu ;;
+            8) self_update; pause ;;
             9) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
@@ -4661,12 +4925,14 @@ main() {
     case "${1:-}" in
         --health-check)
             require_root; run_health_check; exit 0 ;;
+        --apply-firewall)
+            require_root; apply_blocking quiet; exit 0 ;;
         --version | -v)
             echo "Pingify $PINGIFY_VERSION"; exit 0 ;;
         --help | -h)
             usage; exit 0 ;;
         --install)
-            require_root; install_self; exit 0 ;;
+            require_root; install_self; ok "installed"; exit 0 ;;
         --status)
             require_root
             if [ -n "${2:-}" ]; then tunnel_status_block "$2"; else list_tunnels; fi
@@ -4677,6 +4943,9 @@ main() {
 
     require_root
     ensure_deps
+    # Running from bash <(wget ...) leaves nothing behind, so put the command
+    # in place the first time through.
+    [ -x "$SELF_BIN" ] || install_self
     migrate_layout
     server_info
     first_run

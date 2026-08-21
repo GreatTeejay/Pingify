@@ -3,16 +3,30 @@
 # installation of the manager itself
 # ---------------------------------------------------------------------------
 
+release_script() { printf 'https://github.com/%s/releases/latest/download/Pingify.sh' "$PINGIFY_REPO"; }
+
 install_self() {
     local src="${BASH_SOURCE[0]}"
-    if [ -r "$src" ] && [ "$(readlink -f "$src" 2>/dev/null)" != "$(readlink -f "$SELF_BIN" 2>/dev/null)" ]; then
-        install -m 0755 "$src" "$SELF_BIN" 2>/dev/null || cp -f "$src" "$SELF_BIN"
-        chmod 0755 "$SELF_BIN"
+    if [ -f "$src" ] && [ -r "$src" ]; then
+        if [ "$(readlink -f "$src" 2>/dev/null)" != "$(readlink -f "$SELF_BIN" 2>/dev/null)" ]; then
+            install -m 0755 "$src" "$SELF_BIN" 2>/dev/null || cp -f "$src" "$SELF_BIN"
+            chmod 0755 "$SELF_BIN"
+        fi
+    else
+        # Started straight from a pipe - bash <(wget ...) - so there is no file
+        # on disk to copy. Pull the published script instead.
+        local tmp="/tmp/pingify.self"
+        if spin "installing the pingify command" \
+             curl -fsSL --retry 2 --max-time 120 -o "$tmp" "$(release_script)" \
+           && bash -n "$tmp" 2>/dev/null; then
+            install -m 0755 "$tmp" "$SELF_BIN"
+        else
+            warn "could not fetch the manager; the pingify command is not installed"
+        fi
+        rm -f "$tmp"
     fi
     ensure_deps
     write_units
-    ok "the ${C_B}pingify${C_OFF} command is installed"
-    dim "everything else lives in $BASE_DIR"
 }
 
 # Earlier versions scattered files across /etc, /var/lib and /usr/local. Move
@@ -45,19 +59,20 @@ usage() {
     cat <<USAGE
 Pingify $PINGIFY_VERSION - tunnel manager for Iran <-> Kharej server pairs
 
-  pingify                  open the menu
-  pingify --install        install the command and the systemd units
-  pingify --health-check   run the watchdog pass once (used by the timer)
-  pingify --status [name]  print tunnel status and exit
-  pingify --version        print the version
-  pingify --help           this text
+  pingify                    open the menu
+  pingify --install          install the command and the systemd units
+  pingify --health-check     run the watchdog pass once (used by the timer)
+  pingify --apply-firewall   re-apply the blocking rules (used at boot)
+  pingify --status [name]    print tunnel status and exit
+  pingify --version          print the version
+  pingify --help             this text
 
 Files: $BASE_DIR
 USAGE
 }
 
 # ---------------------------------------------------------------------------
-# the panel above the menu
+# front page
 # ---------------------------------------------------------------------------
 
 info_panel() {
@@ -70,32 +85,31 @@ info_panel() {
         fi
     done
 
-    local core_line="$C_RED$BX_ON$C_OFF not installed"
-    [ -x "$CORE_BIN" ] && core_line="$C_GRN$BX_ON$C_OFF $(core_version)"
+    panel "SERVER"
+    field "IP" "$SRV_IP" "Location" "$SRV_LOC"
+    field "Provider" "$(printf '%.44s' "$SRV_ORG")"
+    panel_end
 
-    local tun_line
-    if [ "$total" = "0" ]; then
-        tun_line="$C_GRY$BX_OFF$C_OFF none configured"
-    elif [ "$up" = "$total" ]; then
-        tun_line="$C_GRN$BX_ON$C_OFF $up of $total up"
-    elif [ "$up" = "0" ]; then
-        tun_line="$C_RED$BX_ON$C_OFF $up of $total up"
+    local core_txt tun_txt
+    if [ -x "$CORE_BIN" ]; then
+        core_txt="${C_GRN}${BX_ON}${C_OFF} $(core_version)"
     else
-        tun_line="$C_YEL$BX_ON$C_OFF $up of $total up"
+        core_txt="${C_RED}${BX_ON}${C_OFF} missing"
+    fi
+    if [ "$total" = "0" ]; then
+        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none"
+    elif [ "$up" = "$total" ]; then
+        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up/$total up"
+    elif [ "$up" = "0" ]; then
+        tun_txt="${C_RED}${BX_ON}${C_OFF} $up/$total up"
+    else
+        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up/$total up"
     fi
 
-    local wd wd_line
-    wd="$(watchdog_state)"
-    if [ "$wd" = "on" ]; then wd_line="$C_GRN$BX_ON$C_OFF on"; else wd_line="$C_YEL$BX_OFF$C_OFF off"; fi
-
-    box_top
-    box_row "$(pad_to "IP address" 15)${C_B}${SRV_IP}${C_OFF}"
-    box_row "$(pad_to "Location" 15)${SRV_LOC}"
-    box_row "$(pad_to "Provider" 15)$(printf '%.42s' "$SRV_ORG")"
-    box_row "$(pad_to "Core" 15)${core_line}"
-    box_row "$(pad_to "Tunnels" 15)${tun_line}"
-    box_row "$(pad_to "Watchdog" 15)$(pad_to "$wd_line" 16)${C_DIM}tcp $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${C_OFF}"
-    box_bot
+    panel "STATUS"
+    row "$(pad_to "${C_DIM}Core${C_OFF} $core_txt" 24)$(pad_to "${C_DIM}Tunnels${C_OFF} $tun_txt" 22)${C_DIM}Watchdog${C_OFF} $(state_badge "$(watchdog_state)")"
+    row "$(pad_to "${C_DIM}Congestion${C_OFF} ${C_B}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${C_OFF}" 24)$(pad_to "${C_DIM}Blocking${C_OFF} ${C_B}$(block_summary)${C_OFF}" 22)${C_DIM}Script${C_OFF} ${C_B}${PINGIFY_VERSION}${C_OFF}"
+    panel_end
 }
 
 first_run() {
@@ -111,7 +125,7 @@ first_run() {
     else
         say ""
         fail "the core could not be installed"
-        dim "the Update core entry has the other ways to get it"
+        dim "Update core has the other ways to get it"
         pause
     fi
 }
@@ -120,18 +134,18 @@ main_menu() {
     while :; do
         banner
         info_panel
-        say ""
-        item 1 "New tunnel"        "set this server up"
-        item 2 "Tunnels"           "status, ports, logs, remove"
-        item 3 "Live status"       "dashboard that refreshes itself"
-        say ""
-        item 4 "Update core"       "fetch the latest build"
-        item 5 "Update script"     "fetch the latest Pingify"
-        item 6 "Optimize server"   "kernel and network tuning"
-        say ""
-        item 7 "Diagnostics"       "reach the peer, verify configs"
-        item 8 "Backup"            "save or restore your tunnels"
-        item 9 "Remove"            "uninstall part of it, or all of it"
+        group "TUNNEL"
+        item 1 "New tunnel"      "set this server up"
+        item 2 "Tunnels"         "status, ports, logs, remove"
+        item 3 "Live status"     "dashboard that refreshes itself"
+        group "NETWORK"
+        item 4 "Optimize"        "buffers, limits, swap, clock"
+        item 5 "Blocking"        "ICMP, speedtest, QUIC"
+        item 6 "Diagnostics"     "connectivity and configs"
+        group "MAINTENANCE"
+        item 7 "Update core"     "download, build, import, export"
+        item 8 "Update script"   "fetch the latest Pingify"
+        item 9 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
         say ""
@@ -141,11 +155,11 @@ main_menu() {
             1) new_tunnel ;;
             2) manage_tunnels ;;
             3) live_dashboard ;;
-            4) update_menu ;;
-            5) self_update; pause ;;
-            6) optimize_menu ;;
-            7) diagnostics_menu ;;
-            8) backup_menu ;;
+            4) optimize_menu ;;
+            5) blocking_menu ;;
+            6) diagnostics_menu ;;
+            7) update_menu ;;
+            8) self_update; pause ;;
             9) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
@@ -158,12 +172,14 @@ main() {
     case "${1:-}" in
         --health-check)
             require_root; run_health_check; exit 0 ;;
+        --apply-firewall)
+            require_root; apply_blocking quiet; exit 0 ;;
         --version | -v)
             echo "Pingify $PINGIFY_VERSION"; exit 0 ;;
         --help | -h)
             usage; exit 0 ;;
         --install)
-            require_root; install_self; exit 0 ;;
+            require_root; install_self; ok "installed"; exit 0 ;;
         --status)
             require_root
             if [ -n "${2:-}" ]; then tunnel_status_block "$2"; else list_tunnels; fi
@@ -174,6 +190,9 @@ main() {
 
     require_root
     ensure_deps
+    # Running from bash <(wget ...) leaves nothing behind, so put the command
+    # in place the first time through.
+    [ -x "$SELF_BIN" ] || install_self
     migrate_layout
     server_info
     first_run

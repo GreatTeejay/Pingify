@@ -60,7 +60,7 @@ jobs:
           Install or update on either server:
 
           ```bash
-          sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/OWNER_REPO/main/install.sh)"
+          bash <(wget -qO- https://github.com/OWNER_REPO/releases/latest/download/Pingify.sh)
           ```
 
           Check a download against `SHA256SUMS`.
