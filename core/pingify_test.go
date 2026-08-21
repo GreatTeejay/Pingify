@@ -152,7 +152,7 @@ func TestHandshakeLeaksNoConstantBytes(t *testing.T) {
 		}
 	}()
 
-	cfg := &Config{Role: "server", PSK: testPSK(t), Carriers: 1}
+	cfg := &Config{Role: "server", Token: testPSK(t), Carriers: 1}
 	cfg.applyDefaults()
 	addr := ln.Addr().String()
 
@@ -250,7 +250,7 @@ func bringUp(t *testing.T, forwards []string, carriers int) *pool {
 	originCfg := &Config{
 		Role: "client", Mode: "forward",
 		Listen: fmt.Sprintf("127.0.0.1:%d", carrierPort),
-		PSK:    psk, Carriers: carriers,
+		Token:  psk, Carriers: carriers,
 	}
 	originCfg.applyDefaults()
 	if err := originCfg.validate(); err != nil {
@@ -268,7 +268,7 @@ func bringUp(t *testing.T, forwards []string, carriers int) *pool {
 	edgeCfg := &Config{
 		Role: "server", Mode: "forward",
 		Connect: fmt.Sprintf("127.0.0.1:%d", carrierPort),
-		PSK:     psk, Carriers: carriers, Forwards: forwards,
+		Token:   psk, Carriers: carriers, Forwards: forwards,
 	}
 	edgeCfg.applyDefaults()
 	if err := edgeCfg.validate(); err != nil {
@@ -407,7 +407,7 @@ func TestWrongPSKIsRejectedSilently(t *testing.T) {
 	}
 	defer op.close()
 
-	wrong := &Config{Role: "server", PSK: testPSK(t), Carriers: 1}
+	wrong := &Config{Role: "server", Token: testPSK(t), Carriers: 1}
 	wrong.applyDefaults()
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", carrierPort), 3*time.Second)
 	if err != nil {
@@ -531,7 +531,7 @@ func TestTOMLConfig(t *testing.T) {
 name       = "main"
 role       = "server"
 mode       = "forward"
-transport  = "braid"
+transport  = "tcp"
 listen     = "0.0.0.0:9443"
 psk        = "deadbeef"
 carriers   = 6
@@ -549,7 +549,7 @@ mtu   = 1380
 	if err := parseTOML(doc, &c); err != nil {
 		t.Fatal(err)
 	}
-	if c.Name != "main" || c.Role != "server" || c.Transport != "braid" {
+	if c.Name != "main" || c.Role != "server" || c.Transport != "tcp" {
 		t.Fatalf("scalars wrong: %+v", c)
 	}
 	if c.Listen != "0.0.0.0:9443" || c.Connect != "" {
@@ -582,7 +582,7 @@ mtu   = 1380
 func TestLoadConfigAcceptsBothFormats(t *testing.T) {
 	dir := t.TempDir()
 	j := dir + "/old.json"
-	os.WriteFile(j, []byte(`{"name":"j","role":"edge","mode":"forward","psk":"aa","listen":"0.0.0.0:1"}`), 0600)
+	os.WriteFile(j, []byte(`{"name":"j","role":"edge","mode":"forward","token":"a shared secret","listen":"0.0.0.0:1"}`), 0600)
 	c, err := loadConfig(j)
 	if err != nil || c.Name != "j" {
 		t.Fatalf("json config: %v %+v", err, c)
@@ -610,14 +610,14 @@ role = "server"
 mode = "forward"
 
 [transport]
-type             = "echo"
+type             = "icmp"
 listen           = "0.0.0.0"
 carriers         = 8
 keepalive_sec    = 15
 dial_timeout_sec = 12
 
 [security]
-psk = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+token = "a shared secret phrase"
 
 [forward]
 ports = ["443", "2053=8443", "udp:500"]
@@ -646,12 +646,12 @@ level = "debug"
 	if c.Name != "main" || c.Role != "server" || c.Mode != "forward" {
 		t.Fatalf("[tunnel] wrong: %+v", c)
 	}
-	if c.Transport != "echo" || c.Listen != "0.0.0.0" || c.Carriers != 8 ||
+	if c.Transport != "icmp" || c.Listen != "0.0.0.0" || c.Carriers != 8 ||
 		c.KeepaliveSec != 15 || c.DialTimeout != 12 {
 		t.Fatalf("[transport] wrong: %+v", c)
 	}
-	if len(c.PSK) != 64 {
-		t.Fatalf("[security] wrong: %q", c.PSK)
+	if c.Token != "a shared secret phrase" {
+		t.Fatalf("[security] wrong: %q", c.Token)
 	}
 	if len(c.Forwards) != 3 || c.Forwards[2] != "udp:500" || len(c.Allow) != 1 {
 		t.Fatalf("[forward] wrong: %#v %#v", c.Forwards, c.Allow)
@@ -675,8 +675,8 @@ level = "debug"
 }
 
 func TestEchoTransportIsAccepted(t *testing.T) {
-	c := &Config{Role: "server", Mode: "forward", Transport: "echo",
-		Listen: "0.0.0.0", PSK: "00112233445566778899aabbccddeeff",
+	c := &Config{Role: "server", Mode: "forward", Transport: "icmp",
+		Listen: "0.0.0.0", Token: "00112233445566778899aabbccddeeff",
 		Forwards: []string{"443"}}
 	c.applyDefaults()
 	if err := c.validate(); err != nil {

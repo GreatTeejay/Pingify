@@ -10,24 +10,31 @@ cfg_load() {
     cfg_reset
     T_NAME="$(toml_get "$f" tunnel name)"
     T_ROLE="$(toml_get "$f" tunnel role)"
-    T_MODE="$(toml_get "$f" tunnel mode)"
-    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=braid}"
-    T_LISTEN="$(toml_get "$f" transport listen)"
-    T_CONNECT="$(toml_get "$f" transport connect)"
-    T_PSK="$(toml_get "$f" security psk)"
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=tcp}"
+    T_TOKEN="$(toml_get "$f" security token)"
     T_STATUS="$(toml_get "$f" status addr)"
     T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
-    T_FORWARDER="$(toml_get "$f" forward forwarder)"; : "${T_FORWARDER:=pingify}"
-    if [ "$T_MODE" = "tun" ]; then
-        T_TUNIF="$(toml_get "$f" tun name)"
-        T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
-        T_TUNPEER="$(toml_get "$f" tun remote_addr)"
-        T_TUNMTU="$(toml_get "$f" tun mtu)"
-        : "${T_TUNMTU:=1380}"
+    T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
+    T_TUNIF="$(toml_get "$f" tun name)";                    : "${T_TUNIF:=pfy0}"
+    T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+    T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+    T_TUNMTU="$(toml_get "$f" tun mtu)";                    : "${T_TUNMTU:=1380}"
+
+    # The endpoint is derived, so recover what it was built from.
+    local l c
+    l="$(toml_get "$f" transport listen)"
+    c="$(toml_get "$f" transport connect)"
+    if [ -n "$l" ]; then
+        T_ACCEPTS="$T_ROLE"
+        case "$l" in *:*) T_PORT="${l##*:}" ;; esac
+    else
+        [ "$T_ROLE" = "server" ] && T_ACCEPTS="client" || T_ACCEPTS="server"
+        T_PEER_IP="${c%:*}"
+        case "$c" in *:*) T_PORT="${c##*:}" ;; *) T_PEER_IP="$c" ;; esac
     fi
     return 0
 }
@@ -54,9 +61,10 @@ tunnel_status_block() {
 # One line per tunnel, for the overview table.
 tunnel_row() {
     local name="$1" f="$(cfg_file "$1")"
-    local role mode peer addr state brief up total rtt streams
-    role="$(toml_get "$f" tunnel role)"
-    mode="$(toml_get "$f" tunnel mode)"
+    local role proto fwder addr state brief up total rtt streams
+    role="$(side_label "$(toml_get "$f" tunnel role)")"
+    proto="$(transport_label "$(toml_get "$f" transport type)")"
+    fwder="$(forwarder_label "$(toml_get "$f" forward forwarder)")"
     peer="$(toml_get "$f" transport connect)"
     [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
     addr="$(toml_get "$f" status addr)"
@@ -87,11 +95,12 @@ tunnel_row() {
         disabled) dot="$C_GRY$BX_OFF$C_OFF" ;;
     esac
 
-    printf '  %s %s %s %s %s %s%s%s\n' \
+    printf '  %s %s %s %s %s %s %s%s%s\n' \
         "$dot" \
         "$(pad_to "${C_B}${name}${C_OFF}" 13)" \
-        "$(pad_to "$role" 7)" \
-        "$(pad_to "$mode" 8)" \
+        "$(pad_to "$role" 8)" \
+        "$(pad_to "$proto" 6)" \
+        "$(pad_to "$fwder" 9)" \
         "$(pad_to "$up/$total" 6)" \
         "$C_DIM" "$rtt" "$C_OFF"
 }
@@ -99,14 +108,15 @@ tunnel_row() {
 list_tunnels() {
     local names; names="$(tunnel_names)"
     if [ -z "$names" ]; then
-        dim "no tunnels configured yet - pick Config New Tunnel to make one"
+        dim "no tunnels configured yet - pick New tunnel to make one"
         return 1
     fi
-    printf '    %s%s %s %s %s %s%s\n' \
+    printf '    %s%s %s %s %s %s %s%s\n' \
         "$C_DIM" \
         "$(pad_to "NAME" 13)" \
-        "$(pad_to "ROLE" 7)" \
-        "$(pad_to "MODE" 8)" \
+        "$(pad_to "SIDE" 8)" \
+        "$(pad_to "PROTO" 6)" \
+        "$(pad_to "FORWARDER" 9)" \
         "$(pad_to "LINKS" 6)" \
         "RTT" "$C_OFF"
     local n
@@ -160,7 +170,6 @@ tunnel_menu() {
         item 4 "Live log"
         item 5 "Edit forwarded ports"
         item 6 "Performance settings"
-        item 7 "Show the token again"
         item 8 "Scheduled restart"
         item 9 "Delete this tunnel"
         item 0 "Back"
@@ -175,7 +184,6 @@ tunnel_menu() {
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
             5) edit_forwards "$name" ;;
             6) edit_tuning "$name" ;;
-            7) show_peer_token "$name" ;;
             8) recycle_menu "$name" ;;
             9) delete_tunnel "$name" && return ;;
             0|"") return ;;
@@ -186,10 +194,6 @@ tunnel_menu() {
 edit_forwards() {
     local name="$1" f="$(cfg_file "$1")"
     cfg_load "$name" || return 1
-    if [ "$T_MODE" != "forward" ]; then
-        warn "this is a full-IP tunnel; it has no port list"
-        pause; return
-    fi
     if [ "$T_ROLE" != "server" ]; then
         warn "the port list lives on the IRAN server; this is the KHAREJ end"
         pause; return
@@ -204,14 +208,15 @@ edit_forwards() {
     [ -n "$fwd" ] || { fail "nothing to set"; pause; return; }
 
     cp -f "$f" "$f.bak"
-    if grep -q '^forwards' "$f"; then
-        sed -i "s#^forwards.*#forwards      = [$fwd]#" "$f"
+    if grep -q '^ports' "$f"; then
+        sed -i "s#^ports.*#ports            = [$fwd]#" "$f"
     else
-        sed -i "s#^\(keepalive_sec.*\)#\1\nforwards      = [$fwd]#" "$f"
+        sed -i "s#^\(forwarder.*\)#\1\nports            = [$fwd]#" "$f"
     fi
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
+        apply_nat quiet
         ok "ports updated and the tunnel restarted"
     else
         mv -f "$f.bak" "$f"
@@ -246,20 +251,6 @@ edit_tuning() {
     pause
 }
 
-show_peer_token() {
-    cfg_load "$1" || return 1
-    if [ -z "$T_CONNECT" ]; then
-        T_PUBLIC_IP="$(public_ip)"
-        say ""
-        ask T_PUBLIC_IP "public IP of THIS server" "${T_PUBLIC_IP:-}"
-    fi
-    say ""
-    dim "paste this on the other server: Config New Tunnel -> option 2"
-    say ""
-    say "${C_YEL}$(cfg_peer_token)${C_OFF}"
-    say ""
-    pause
-}
 
 recycle_menu() {
     local name="$1"

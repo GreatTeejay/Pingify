@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.7.0"
+const version = "4.0.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -82,7 +82,11 @@ type Config struct {
 	Listen  string `json:"listen,omitempty"`
 	Connect string `json:"connect,omitempty"`
 
-	PSK      string `json:"psk"`
+	// Token is what both servers are given; it may be any text. The 32-byte
+	// key is derived from it, so a memorable token is still a strong key.
+	// PSK is the older form: 32 bytes of hex, used directly.
+	Token    string `json:"token,omitempty"`
+	PSK      string `json:"psk,omitempty"`
 	Carriers int    `json:"carriers"`
 	WindowKB int    `json:"window_kb"`
 
@@ -120,8 +124,10 @@ func (c *Config) applyDefaults() {
 		c.Mode = "forward"
 	}
 	switch c.Transport {
-	case "", "tcp", "direct":
-		c.Transport = "braid"
+	case "", "braid", "direct":
+		c.Transport = "tcp"
+	case "echo":
+		c.Transport = "icmp"
 	}
 	if c.Carriers <= 0 {
 		c.Carriers = 4
@@ -171,26 +177,33 @@ func (c *Config) validate() error {
 		return fmt.Errorf("role must be \"server\" or \"client\", got %q", c.Role)
 	}
 	switch c.Mode {
-	case "forward", "tun":
+	case "forward", "tun", "both":
 	default:
-		return fmt.Errorf("mode must be \"forward\" or \"tun\", got %q", c.Mode)
+		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "braid", "echo":
+	case "tcp", "icmp":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
 	if (c.Listen == "") == (c.Connect == "") {
 		return fmt.Errorf("set exactly one of \"listen\" or \"connect\"")
 	}
-	key, err := hex.DecodeString(strings.TrimSpace(c.PSK))
-	if err != nil || len(key) < 16 {
-		return fmt.Errorf("psk must be a hex string of at least 16 bytes (use -genpsk)")
+	if c.Token == "" && c.PSK == "" {
+		return fmt.Errorf("a security token is required, and must be the same on both servers")
 	}
-	if c.Mode == "forward" && c.Role == "server" && len(c.Forwards) == 0 {
+	if c.Token != "" && len(strings.TrimSpace(c.Token)) < 8 {
+		return fmt.Errorf("the security token is too short - use at least 8 characters")
+	}
+	if c.Token == "" {
+		if k, err := hex.DecodeString(strings.TrimSpace(c.PSK)); err != nil || len(k) < 16 {
+			return fmt.Errorf("psk must be at least 16 bytes of hex")
+		}
+	}
+	if c.Mode != "tun" && c.Role == "server" && len(c.Forwards) == 0 {
 		return fmt.Errorf("edge side in forward mode needs at least one entry in \"forwards\"")
 	}
-	if c.Mode == "tun" && c.Local() == "" {
+	if (c.Mode == "tun" || c.Mode == "both") && c.Local() == "" {
 		return fmt.Errorf("tun mode needs tun.local (e.g. 10.71.0.1/30)")
 	}
 	return nil
@@ -198,7 +211,13 @@ func (c *Config) validate() error {
 
 func (c *Config) Local() string { return c.TUN.Local }
 
+// key is the 32 bytes everything else is derived from. A token of any length
+// is stretched to it; a legacy hex psk is used as-is.
 func (c *Config) key() []byte {
+	if c.Token != "" {
+		return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
+			[]byte(strings.TrimSpace(c.Token))), []byte("tunnel key"), 32)
+	}
 	k, _ := hex.DecodeString(strings.TrimSpace(c.PSK))
 	return k
 }
@@ -286,6 +305,23 @@ func main() {
 			os.Exit(1)
 		}
 		top = t
+	case "both":
+		f, err := startForward(cfg, p)
+		if err != nil {
+			logError("forward: %v", err)
+			p.close()
+			os.Exit(1)
+		}
+		t, err := startTUN(cfg, p)
+		if err != nil {
+			logError("tun: %v", err)
+			f.Close()
+			p.close()
+			os.Exit(1)
+		}
+		b := &bothHandler{f: f, t: t}
+		p.setHandler(b) // startTUN replaced it; put the pair back
+		top = b
 	}
 
 	if cfg.StatusAddr != "" {
@@ -721,7 +757,7 @@ func (p *pool) handler() recordHandler {
 func (p *pool) start() error {
 	// The echo transport owns a single raw socket for every carrier, so it is
 	// set up once here rather than per connection.
-	if p.cfg.Transport == "echo" {
+	if p.cfg.Transport == "icmp" {
 		t, err := newICMPTransport(p.cfg.key())
 		if err != nil {
 			return err
@@ -2127,8 +2163,20 @@ func configureTUN(c TUNConfig) error {
 		return err
 	}
 	if c.Local != "" {
-		if c.Peer != "" {
-			if err := run("addr", "add", c.Local, "peer", c.Peer, "dev", c.Name); err != nil {
+		// The "peer" form is right for a point-to-point /30 or /32. On a
+		// wider prefix both addresses live in the same subnet and a plain
+		// address is what gives the kernel the route it needs.
+		pfx := ""
+		if i := strings.LastIndex(c.Local, "/"); i >= 0 {
+			pfx = c.Local[i+1:]
+		}
+		ptp := c.Peer != "" && (pfx == "30" || pfx == "31" || pfx == "32")
+		if ptp {
+			peer := c.Peer
+			if i := strings.Index(peer, "/"); i >= 0 {
+				peer = peer[:i]
+			}
+			if err := run("addr", "add", c.Local, "peer", peer, "dev", c.Name); err != nil {
 				return err
 			}
 		} else if err := run("addr", "add", c.Local, "dev", c.Name); err != nil {
@@ -2177,6 +2225,34 @@ func (t *tunnel) onRecord(l *link, cmd byte, id uint32, body []byte) {
 }
 
 func (t *tunnel) onLinkDown(*link) {}
+
+// bothHandler runs a private layer-3 link and port forwarding over the same
+// carriers. Raw IP packets go to the tun device, everything else to the
+// forwarder, so one tunnel can give you a private network between the two
+// servers and forwarded ports at the same time.
+type bothHandler struct {
+	f *forwarder
+	t *tunnel
+}
+
+func (b *bothHandler) onRecord(l *link, cmd byte, id uint32, body []byte) {
+	if cmd == cmdTUN {
+		b.t.onRecord(l, cmd, id, body)
+		return
+	}
+	b.f.onRecord(l, cmd, id, body)
+}
+
+func (b *bothHandler) onLinkDown(l *link) {
+	b.f.onLinkDown(l)
+	b.t.onLinkDown(l)
+}
+
+func (b *bothHandler) Close() error {
+	b.f.Close()
+	b.t.Close()
+	return nil
+}
 
 func (t *tunnel) Close() error {
 	t.once.Do(func() {

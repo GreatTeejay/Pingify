@@ -193,7 +193,10 @@ func assign(c *Config, section, key, val string) error {
 
 	switch section {
 	case "", "security":
-		if key == "psk" {
+		switch key {
+		case "token":
+			c.Token = unquote(val)
+		case "psk":
 			c.PSK = unquote(val)
 		}
 	}
