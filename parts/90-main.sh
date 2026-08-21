@@ -130,10 +130,12 @@ info_panel() {
     panel_end
 
     local core_txt tun_txt
-    if [ -x "$CORE_BIN" ]; then
+    if [ ! -x "$CORE_BIN" ]; then
+        core_txt="${C_RED}not installed${C_OFF}"
+    elif core_matches_script; then
         core_txt="$(core_version)"
     else
-        core_txt="${C_RED}not installed${C_OFF}"
+        core_txt="${C_RED}$(core_version) - does not match the script${C_OFF}"
     fi
     if [ "$total" = "0" ]; then
         tun_txt="${C_GRY}${BX_OFF}${C_OFF} none configured"
@@ -237,6 +239,7 @@ main() {
     migrate_layout
     server_info
     first_run
+    ensure_core_current
     main_menu
 }
 

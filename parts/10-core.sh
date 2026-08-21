@@ -121,6 +121,35 @@ ensure_core() {
     install_core
 }
 
+# The script and the core share the config format, so a core left behind by an
+# older install reads a newer config as if half of it were not there. 3.4 moved
+# configs into sections; a 3.3 core reads one of those and reports every field
+# as empty - which surfaced as "role must be \"server\" or \"client\", got \"\""
+# with nothing to point at the real cause. They are kept in step here instead.
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
+}
+
+ensure_core_current() {
+    [ -x "$CORE_BIN" ] || return 0
+    core_matches_script && return 0
+    banner
+    head2 "Core update"
+    warn "the core is $(core_version), this script is $PINGIFY_VERSION"
+    dim "they have to match - the config format is shared between them"
+    say ""
+    if download_core; then
+        restart_all "the core was updated"
+    else
+        say ""
+        fail "the core could not be updated"
+        dim "until it matches, new tunnels will be rejected"
+        dim "Update core in the menu has the other ways to install it"
+    fi
+    pause
+}
+
 # ---------------------------------------------------------------------------
 # systemd
 # ---------------------------------------------------------------------------
