@@ -45,14 +45,15 @@ check "empty input"       "$(parse_forwards '')"                   ''
 note "config rendering and read-back"
 # ---------------------------------------------------------------------------
 cfg_reset
-T_NAME="t1"; T_ROLE="server"; T_MODE="forward"
-T_CONNECT="203.0.113.9:9443"; T_PSK="$(printf 'ab%.0s' {1..32})"
+T_NAME="t1"; T_ROLE="client"; T_MODE="forward"
+T_ACCEPTS="server"; T_PEER_IP="203.0.113.9"; T_PORT=9443
+T_PSK="$(printf 'ab%.0s' {1..32})"
 T_CARRIERS=6; T_WINDOW=2048; T_KEEPALIVE=15
 T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"
 file="$(cfg_save)"
 
 check "name round-trips"      "$(toml_get "$file" tunnel name)"          "t1"
-check "role round-trips"      "$(toml_get "$file" tunnel role)"          "server"
+check "role round-trips"      "$(toml_get "$file" tunnel role)"          "client"
 check "connect round-trips"   "$(toml_get "$file" transport connect)"       "203.0.113.9:9443"
 check "carriers round-trip"   "$(toml_get "$file" transport carriers)"      "6"
 check "window round-trips"    "$(toml_get "$file" tuning window_kb)"     "2048"
@@ -62,34 +63,60 @@ check "transport written"     "$(toml_get "$file" transport type)"     "braid"
 
 saved_psk="$T_PSK"
 cfg_load t1
-check "cfg_load role"     "$T_ROLE"     "server"
+check "cfg_load role"     "$T_ROLE"     "client"
 check "cfg_load psk"      "$T_PSK"      "$saved_psk"
 check "cfg_load forwards" "$T_FORWARDS" '"443","udp:500"'
 check "cfg_load carriers"  "$T_CARRIERS"  "6"
 check "cfg_load transport" "$T_TRANSPORT" "braid"
 
 # ---------------------------------------------------------------------------
-note "peer token mirrors the tunnel"
+note "the token carries settings, not addresses"
 # ---------------------------------------------------------------------------
-peer="$(cfg_peer_token | base64 -d)"
-printf '%s\n' "$peer" > "$WORK/peer.toml"
-check "role flips"           "$(toml_get "$WORK/peer.toml" tunnel role)"     "client"
-check "dialler becomes host" "$(toml_get "$WORK/peer.toml" transport listen)"   "0.0.0.0:9443"
-check "peer does not dial"   "$(toml_get "$WORK/peer.toml" transport connect)"  ""
-check "key is carried over"  "$(toml_get "$WORK/peer.toml" security psk)"      "$saved_psk"
-check "transport mirrored"   "$(toml_get "$WORK/peer.toml" transport type)" "braid"
-check "ports stay on client" "$(grep -c '^ports' "$WORK/peer.toml")"  "0"
-
-# a tun tunnel must hand the peer the other end of the /30
 cfg_reset
-T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_LISTEN="0.0.0.0:9500"
+T_NAME="t1"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="braid"
+T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PSK="$saved_psk"
+T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"; apply_preset balanced
+
+cfg_peer_token | base64 -d > "$WORK/tok"
+check "token version"        "$(toml_get "$WORK/tok" "" v)"          "2"
+check "role flips"           "$(toml_get "$WORK/tok" "" role)"       "client"
+check "port is agreed"       "$(toml_get "$WORK/tok" "" port)"       "9443"
+check "key is carried over"  "$(toml_get "$WORK/tok" "" psk)"        "$saved_psk"
+check "transport carried"    "$(toml_get "$WORK/tok" "" transport)"  "braid"
+check "address is a hint"    "$(toml_get "$WORK/tok" "" suggest_ip)" "203.0.113.9"
+
+# The two things that must never travel: this server's endpoint, and the ports.
+check "no listen in token"   "$(grep -c '^listen' "$WORK/tok")"      "0"
+check "no connect in token"  "$(grep -c '^connect' "$WORK/tok")"     "0"
+check "no ports in token"    "$(grep -c '^ports' "$WORK/tok")"       "0"
+
+# What the far side ends up with after accepting the suggested address.
+cfg_reset
+T_NAME="t1"; T_ROLE="client"; T_MODE="forward"; T_TRANSPORT="braid"
+T_ACCEPTS="server"; T_PORT=9443; T_PEER_IP="203.0.113.9"; T_PSK="$saved_psk"
+T_STATUS="127.0.0.1:9700"
+cfg_endpoints
+check "far side dials"       "$CFG_CONNECT"  "203.0.113.9:9443"
+check "far side does not listen" "$CFG_LISTEN" ""
+
+# Echo has no port, and used to produce "ip:0.0.0.0" here.
+T_TRANSPORT="echo"
+cfg_endpoints
+check "echo dials without a port" "$CFG_CONNECT" "203.0.113.9"
+T_ROLE="server"
+cfg_endpoints
+check "echo listens without a port" "$CFG_LISTEN" "0.0.0.0"
+
+# a tun tunnel hands the peer the other end of the /30
+cfg_reset
+T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_TRANSPORT="braid"
 T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"; T_PUBLIC_IP="198.51.100.4"
 T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.1/30"; T_TUNPEER="10.71.1.2"; T_TUNMTU=1380
-cfg_peer_token | base64 -d > "$WORK/peer2.toml"
-check "peer dials us"      "$(toml_get "$WORK/peer2.toml" transport connect)" "198.51.100.4:9500"
-check "peer takes .2/30"   "$(toml_get "$WORK/peer2.toml" tun local_addr)" "10.71.1.2/30"
-check "peer points at .1"  "$(toml_get "$WORK/peer2.toml" tun remote_addr)"  "10.71.1.1"
+cfg_peer_token | base64 -d > "$WORK/tok2"
+check "peer takes .2/30"   "$(toml_get "$WORK/tok2" "" tun_local)" "10.71.1.2/30"
+check "peer points at .1"  "$(toml_get "$WORK/tok2" "" tun_peer)"  "10.71.1.1"
 
+# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 note "the engine accepts what the manager writes"
 # ---------------------------------------------------------------------------
@@ -105,21 +132,42 @@ else
     LP=$(( 30000 + RANDOM % 10000 ))   # user-facing port on the edge
     EP=$(( 40000 + RANDOM % 10000 ))   # the "real service"
 
+    # The IRAN side: accepts the link and owns the ports clients connect to.
     cfg_reset
-    T_NAME="live"; T_ROLE="server"; T_MODE="forward"
-    T_CONNECT="127.0.0.1:$TP"
+    T_NAME="live"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="braid"
+    T_ACCEPTS="server"; T_PORT="$TP"; T_PUBLIC_IP="127.0.0.1"
     T_PSK="$("$CORE_BIN" -genpsk)"
     T_CARRIERS=4; T_WINDOW=1024; T_KEEPALIVE=10
     T_FORWARDS="$(parse_forwards "$LP=$EP")"
     T_STATUS="127.0.0.1:$(( 50000 + RANDOM % 5000 ))"
-    edge_cfg="$(cfg_save)"
+    iran_cfg="$(cfg_save)"
+    iran_status="$T_STATUS"
+    cfg_peer_token | base64 -d > "$WORK/tok.live"
 
-    # decode the token exactly as the peer server would
-    cfg_peer_token | base64 -d > "$WORK/origin.toml"
-    sed -i "s#^addr.*#addr             = \"127.0.0.1:$(( 55000 + RANDOM % 5000 ))\"#" "$WORK/origin.toml"
+    # The KHAREJ side, built from nothing but that token plus the address it
+    # suggested - which is exactly what applying it does.
+    cfg_reset
+    T_NAME="$(toml_get "$WORK/tok.live" "" name)"
+    T_ROLE="$(toml_get "$WORK/tok.live" "" role)"
+    T_MODE="$(toml_get "$WORK/tok.live" "" mode)"
+    T_TRANSPORT="$(toml_get "$WORK/tok.live" "" transport)"
+    T_ACCEPTS="$(toml_get "$WORK/tok.live" "" accepts)"
+    T_PORT="$(toml_get "$WORK/tok.live" "" port)"
+    T_PSK="$(toml_get "$WORK/tok.live" "" psk)"
+    T_CARRIERS="$(toml_get "$WORK/tok.live" "" carriers)"
+    T_WINDOW="$(toml_get "$WORK/tok.live" "" window_kb)"
+    T_KEEPALIVE="$(toml_get "$WORK/tok.live" "" keepalive)"
+    T_PEER_IP="$(toml_get "$WORK/tok.live" "" suggest_ip)"
+    T_STATUS="127.0.0.1:$(( 55000 + RANDOM % 5000 ))"
+    CFG_DIR="$WORK/far"; mkdir -p "$CFG_DIR"
+    kharej_cfg="$(cfg_save)"
+    CFG_DIR="$WORK/etc"
 
-    "$CORE_BIN" -c "$edge_cfg"          -check >/dev/null 2>&1; check "edge config validates"   "$?" "0"
-    "$CORE_BIN" -c "$WORK/origin.toml"  -check >/dev/null 2>&1; check "origin config validates" "$?" "0"
+    check "the token alone reaches the peer" "$(toml_get "$kharej_cfg" transport connect)" "127.0.0.1:$TP"
+    check "and carries no ports"             "$(grep -c '^ports' "$kharej_cfg")"           "0"
+
+    "$CORE_BIN" -c "$iran_cfg"   -check >/dev/null 2>&1; check "IRAN config validates"   "$?" "0"
+    "$CORE_BIN" -c "$kharej_cfg" -check >/dev/null 2>&1; check "KHAREJ config validates" "$?" "0"
 
     python - "$EP" "$WORK/echo.ready" <<'PYEOF' &
 import socket, sys, threading
@@ -140,22 +188,26 @@ PYEOF
     ECHO_PID=$!
     for _ in $(seq 1 50); do [ -f "$WORK/echo.ready" ] && break; sleep 0.1; done
 
-    "$CORE_BIN" -c "$WORK/origin.toml" >"$WORK/origin.log" 2>&1 &
-    ORIGIN_PID=$!
-    "$CORE_BIN" -c "$edge_cfg" >"$WORK/edge.log" 2>&1 &
-    EDGE_PID=$!
+    "$CORE_BIN" -c "$kharej_cfg" >"$WORK/kharej.log" 2>&1 &
+    KHAREJ_PID=$!
+    "$CORE_BIN" -c "$iran_cfg" >"$WORK/iran.log" 2>&1 &
+    IRAN_PID=$!
 
     up=1
     for _ in $(seq 1 60); do
-        if "$CORE_BIN" -healthz "$T_STATUS" >/dev/null 2>&1; then up=0; break; fi
+        if "$CORE_BIN" -healthz "$iran_status" >/dev/null 2>&1; then up=0; break; fi
         sleep 0.2
     done
     check "carriers come up" "$up" "0"
 
     if [ "$up" = "0" ]; then
-        brief="$("$CORE_BIN" -status "$T_STATUS" -brief)"
-        set -- $brief
-        check "all 4 carriers connected" "$2" "4"
+        # healthz turns green on the first carrier; give the rest a moment.
+        for _ in $(seq 1 50); do
+            set -- $("$CORE_BIN" -status "$iran_status" -brief)
+            [ "${2:-0}" = "4" ] && break
+            sleep 0.2
+        done
+        check "all 4 carriers connected" "${2:-0}" "4"
 
         python - "$LP" > "$WORK/xfer.out" 2>&1 <<'PYEOF'
 import socket, sys, os, hashlib
@@ -173,15 +225,15 @@ print("match" if got == payload else "mismatch %d/%d" % (len(got), len(payload))
 PYEOF
         check "1 MiB round trip through the tunnel" "$(cat "$WORK/xfer.out")" "match"
 
-        set -- $("$CORE_BIN" -status "$T_STATUS" -brief)
+        set -- $("$CORE_BIN" -status "$iran_status" -brief)
         check "still healthy afterwards" "$1" "up"
     else
         printf '  edge log:\n'; sed 's/^/    /' "$WORK/edge.log" | tail -n 10
         printf '  origin log:\n'; sed 's/^/    /' "$WORK/origin.log" | tail -n 10
     fi
 
-    kill "$EDGE_PID" "$ORIGIN_PID" "$ECHO_PID" 2>/dev/null
-    wait "$EDGE_PID" "$ORIGIN_PID" 2>/dev/null
+    kill "$IRAN_PID" "$KHAREJ_PID" "$ECHO_PID" 2>/dev/null
+    wait "$IRAN_PID" "$KHAREJ_PID" 2>/dev/null
 fi
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
