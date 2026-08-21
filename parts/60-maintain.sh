@@ -16,8 +16,7 @@ update_menu() {
         item 1 "Download the latest core" "prebuilt, from GitHub Releases"
         item 2 "Compile the core here" "from the sources inside this script"
         item 3 "Import a core binary" "path or URL"
-        item 4 "Export this core binary" "to copy to the peer"
-        item 5 "Update Pingify itself" "fetch the newest manager script"
+        item 4 "Export this core binary" "to copy to the other server"
         item 0 "Back"
         say ""
         local c=""
@@ -27,7 +26,6 @@ update_menu() {
             2) say ""; if build_core; then restart_all "the core was rebuilt"; fi; pause ;;
             3) say ""; if import_core_binary; then restart_all "the core was replaced"; fi; pause ;;
             4) export_core; pause ;;
-            5) self_update; pause ;;
             0|"") return ;;
         esac
     done
@@ -67,7 +65,7 @@ export_core() {
     local dest="/root/pingify-core-$(uname -m)"
     cp -f "$CORE_BIN" "$dest"
     ok "copied to $dest"
-    dim "Move it to the other server and use Update Core -> 3 there."
+    dim "Copy it to the other server, then Update core -> 3 there."
     dim "Example, run this on the other server:"
     say ""
     say "    ${C_DIM}scp root@$(public_ip):$dest /root/pingify-core${C_OFF}"

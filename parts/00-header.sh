@@ -8,14 +8,17 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.0.0"
+PINGIFY_VERSION="3.1.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
-CFG_DIR="/etc/pingify"
-STATE_DIR="/var/lib/pingify"
-SRC_DIR="/usr/local/src/pingify"
-CORE_BIN="/usr/local/bin/pingify-core"
-SELF_BIN="/usr/local/bin/pingify"
+# Everything Pingify owns lives in one directory, so it is obvious what is
+# installed and trivial to back up or delete.
+BASE_DIR="/root/Pingify"
+CFG_DIR="$BASE_DIR"
+STATE_DIR="$BASE_DIR/.state"
+SRC_DIR="$BASE_DIR/.build"
+CORE_BIN="$BASE_DIR/pingify-core"
+SELF_BIN="/usr/local/bin/pingify"   # has to be on PATH for the "pingify" command
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
 GO_MIN_MINOR=19          # the core needs Go 1.19 or newer
@@ -237,6 +240,27 @@ tunnel_names() {
     done
 }
 
+# Where this server sits, for the panel on the front page. Best effort: an
+# Iranian box may not reach the lookup service, in which case the local route
+# still gives us the address.
+server_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
+    if have curl; then
+        local j
+        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
+        if [ -n "$j" ]; then
+            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
+            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
+        fi
+    fi
+    [ -n "$SRV_IP" ] || SRV_IP="$(public_ip)"
+    [ -n "$SRV_IP" ] || SRV_IP="unknown"
+    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
+    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
+}
+
 tunnel_count() { tunnel_names | grep -c . ; }
 
 svc_state() {
@@ -291,8 +315,8 @@ ensure_deps() {
             warn "please install manually: ${missing[*]}"
         fi
     fi
-    mkdir -p "$CFG_DIR" "$STATE_DIR"
-    chmod 700 "$CFG_DIR"
+    mkdir -p "$BASE_DIR" "$STATE_DIR"
+    chmod 700 "$BASE_DIR"
 }
 
 # Prints the minor version of a Go toolchain, e.g. 22 for go1.22.2, or 0 when

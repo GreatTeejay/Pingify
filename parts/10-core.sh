@@ -126,7 +126,7 @@ ensure_core() {
 # ---------------------------------------------------------------------------
 
 write_units() {
-    cat > "$UNIT_DIR/pingify@.service" <<'UNIT'
+    cat > "$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
 Documentation=https://github.com/GreatTeejay/Pingify
@@ -136,7 +136,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pingify-core -c /etc/pingify/%i.json
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.json
+WorkingDirectory=$BASE_DIR
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -144,7 +145,8 @@ TasksMax=infinity
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-ProtectHome=yes
+# ProtectHome is deliberately off: the core and its config live under /root.
+ProtectHome=no
 ProtectSystem=full
 StandardOutput=journal
 StandardError=journal

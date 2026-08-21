@@ -45,14 +45,14 @@ check "empty input"       "$(parse_forwards '')"                   ''
 note "config rendering and read-back"
 # ---------------------------------------------------------------------------
 cfg_reset
-T_NAME="t1"; T_ROLE="edge"; T_MODE="forward"
+T_NAME="t1"; T_ROLE="server"; T_MODE="forward"
 T_CONNECT="203.0.113.9:9443"; T_PSK="$(printf 'ab%.0s' {1..32})"
 T_CARRIERS=6; T_WINDOW=2048; T_KEEPALIVE=15
 T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"
 file="$(cfg_save)"
 
 check "name round-trips"      "$(json_str "$file" name)"          "t1"
-check "role round-trips"      "$(json_str "$file" role)"          "edge"
+check "role round-trips"      "$(json_str "$file" role)"          "server"
 check "connect round-trips"   "$(json_str "$file" connect)"       "203.0.113.9:9443"
 check "carriers round-trip"   "$(json_num "$file" carriers)"      "6"
 check "window round-trips"    "$(json_num "$file" window_kb)"     "2048"
@@ -62,7 +62,7 @@ check "transport written"     "$(json_str "$file" transport)"     "direct"
 
 saved_psk="$T_PSK"
 cfg_load t1
-check "cfg_load role"     "$T_ROLE"     "edge"
+check "cfg_load role"     "$T_ROLE"     "server"
 check "cfg_load psk"      "$T_PSK"      "$saved_psk"
 check "cfg_load forwards" "$T_FORWARDS" '"443","udp:500"'
 check "cfg_load carriers"  "$T_CARRIERS"  "6"
@@ -73,7 +73,7 @@ note "peer token mirrors the tunnel"
 # ---------------------------------------------------------------------------
 peer="$(cfg_peer_token | base64 -d)"
 printf '%s\n' "$peer" > "$WORK/peer.json"
-check "role flips"           "$(json_str "$WORK/peer.json" role)"     "origin"
+check "role flips"           "$(json_str "$WORK/peer.json" role)"     "client"
 check "dialler becomes host" "$(json_str "$WORK/peer.json" listen)"   "0.0.0.0:9443"
 check "peer does not dial"   "$(json_str "$WORK/peer.json" connect)"  ""
 check "key is carried over"  "$(json_str "$WORK/peer.json" psk)"      "$saved_psk"
@@ -82,7 +82,7 @@ check "ports stay on edge"   "$(grep -c forwards "$WORK/peer.json")"  "0"
 
 # a tun tunnel must hand the peer the other end of the /30
 cfg_reset
-T_NAME="t2"; T_ROLE="edge"; T_MODE="tun"; T_LISTEN="0.0.0.0:9500"
+T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_LISTEN="0.0.0.0:9500"
 T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"; T_PUBLIC_IP="198.51.100.4"
 T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.1/30"; T_TUNPEER="10.71.1.2"; T_TUNMTU=1380
 cfg_peer_token | base64 -d > "$WORK/peer2.json"
@@ -106,7 +106,7 @@ else
     EP=$(( 40000 + RANDOM % 10000 ))   # the "real service"
 
     cfg_reset
-    T_NAME="live"; T_ROLE="edge"; T_MODE="forward"
+    T_NAME="live"; T_ROLE="server"; T_MODE="forward"
     T_CONNECT="127.0.0.1:$TP"
     T_PSK="$("$CORE_BIN" -genpsk)"
     T_CARRIERS=4; T_WINDOW=1024; T_KEEPALIVE=10
