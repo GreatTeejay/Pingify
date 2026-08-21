@@ -14,22 +14,37 @@
 
 cfg_reset() {
     T_NAME=""; T_ROLE=""; T_MODE="forward"; T_TRANSPORT="braid"
-    T_LISTEN=""; T_CONNECT=""; T_PSK=""; T_PUBLIC_IP=""
+    T_PSK=""
+    T_PORT=9443          # agreed by both ends
+    T_ACCEPTS="server"   # which role accepts the link; the other one dials
+    T_PUBLIC_IP=""       # this server's own address
+    T_PEER_IP=""         # the other server's address
     T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
     T_FORWARDS=""; T_STATUS=""
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
 }
 
-# ---------------------------------------------------------------------------
-# performance presets
-#
-# carriers  how many TCP connections the link is spread over. More of them
-#           absorb packet loss better, because one stalled connection is a
-#           smaller share of the total.
-# window    how much data one forwarded connection may have in flight. Bigger
-#           fills a long path better; it is also the memory ceiling per open
-#           connection.
-# ---------------------------------------------------------------------------
+# This side listens when its role is the one that accepts the link.
+this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
+
+# listen/connect are derived, never stored in the token: they are the one part
+# of a tunnel that is different on each server.
+cfg_endpoints() {
+    CFG_LISTEN=""; CFG_CONNECT=""
+    if this_side_accepts; then
+        if [ "$T_TRANSPORT" = "echo" ]; then
+            CFG_LISTEN="0.0.0.0"
+        else
+            CFG_LISTEN="0.0.0.0:$T_PORT"
+        fi
+    else
+        if [ "$T_TRANSPORT" = "echo" ]; then
+            CFG_CONNECT="$T_PEER_IP"
+        else
+            CFG_CONNECT="$T_PEER_IP:$T_PORT"
+        fi
+    fi
+}
 
 apply_preset() {
     case "$1" in
@@ -101,18 +116,13 @@ cfg_render() {
         printf '\n[forward]\n'
         printf 'ports            = [%s]\n' "$fwd"
     fi
+    # Only ever this server's own file: the token carries the far side's tun
+    # addresses already mirrored, so there is nothing to swap here.
     if [ "$mode" = "tun" ]; then
-        local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
-        if [ "$role" != "$T_ROLE" ]; then
-            local pfx="${T_TUNLOCAL##*/}"
-            [ "$pfx" = "$T_TUNLOCAL" ] && pfx=30
-            lo="$T_TUNPEER/$pfx"
-            pe="${T_TUNLOCAL%%/*}"
-        fi
         printf '\n[tun]\n'
         printf 'name             = "%s"\n' "$T_TUNIF"
-        printf 'local_addr       = "%s"\n' "$lo"
-        printf 'remote_addr      = "%s"\n' "$pe"
+        printf 'local_addr       = "%s"\n' "$T_TUNLOCAL"
+        printf 'remote_addr      = "%s"\n' "$T_TUNPEER"
         printf 'mtu              = %s\n' "$T_TUNMTU"
     fi
     printf '\n[tuning]\n'
@@ -125,24 +135,50 @@ cfg_render() {
 }
 
 cfg_save() {
-    local file="$(cfg_file "$T_NAME")"
-    cfg_render "$T_ROLE" "$T_MODE" "$T_LISTEN" "$T_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
+    local file
+    file="$(cfg_file "$T_NAME")"
+    cfg_endpoints
+    cfg_render "$T_ROLE" "$T_MODE" "$CFG_LISTEN" "$CFG_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
     chmod 600 "$file"
     printf '%s' "$file"
 }
 
-# The peer document is this one mirrored: the roles swap, and whichever end
-# accepts the link becomes the end that dials it.
+# ---------------------------------------------------------------------------
+# the token
+#
+# It carries only what both servers must agree on. No address, because each
+# server has its own; no port list, because those live on the IRAN side alone.
+# The issuing server's address rides along as a suggestion, offered as the
+# default when the other end asks - accept it with enter, or type the real one
+# if this server sits behind a different address than it can see itself.
+# ---------------------------------------------------------------------------
+
 cfg_peer_token() {
-    local prole plisten pconnect pfwd
+    local prole
     if [ "$T_ROLE" = "server" ]; then prole="client"; else prole="server"; fi
-    if [ -n "$T_CONNECT" ]; then
-        plisten="0.0.0.0:${T_CONNECT##*:}"; pconnect=""
-    else
-        plisten=""; pconnect="${T_PUBLIC_IP}:${T_LISTEN##*:}"
-    fi
-    if [ "$prole" = "server" ]; then pfwd="$T_FORWARDS"; else pfwd=""; fi
-    cfg_render "$prole" "$T_MODE" "$plisten" "$pconnect" "$pfwd" "$T_STATUS" | base64 | tr -d '\n'
+    {
+        printf 'v = 2\n'
+        printf 'name = "%s"\n'      "$T_NAME"
+        printf 'role = "%s"\n'      "$prole"
+        printf 'mode = "%s"\n'      "$T_MODE"
+        printf 'transport = "%s"\n' "$T_TRANSPORT"
+        printf 'accepts = "%s"\n'   "$T_ACCEPTS"
+        printf 'port = %s\n'        "$T_PORT"
+        printf 'psk = "%s"\n'       "$T_PSK"
+        printf 'carriers = %s\n'    "$T_CARRIERS"
+        printf 'window_kb = %s\n'   "$T_WINDOW"
+        printf 'keepalive = %s\n'   "$T_KEEPALIVE"
+        printf 'profile = "%s"\n'   "$T_PRESET"
+        printf 'suggest_ip = "%s"\n' "$T_PUBLIC_IP"
+        if [ "$T_MODE" = "tun" ]; then
+            local pfx="${T_TUNLOCAL##*/}"
+            [ "$pfx" = "$T_TUNLOCAL" ] && pfx=30
+            printf 'tun_if = "%s"\n'    "$T_TUNIF"
+            printf 'tun_local = "%s"\n' "$T_TUNPEER/$pfx"
+            printf 'tun_peer = "%s"\n'  "${T_TUNLOCAL%%/*}"
+            printf 'tun_mtu = %s\n'     "$T_TUNMTU"
+        fi
+    } | base64 | tr -d '\n'
 }
 
 parse_forwards() {
@@ -218,38 +254,47 @@ new_tunnel() {
     ask tr "select" "1"
     if [ "$tr" = "2" ]; then T_TRANSPORT="echo"; else T_TRANSPORT="braid"; fi
 
-    # -- endpoint ----------------------------------------------------------
-    local tport=""
-    if [ "$T_ROLE" = "server" ]; then
-        if [ "$T_TRANSPORT" = "echo" ]; then
-            T_LISTEN="0.0.0.0"
-            head2 "Endpoint"
-            dim "Echo needs no port - it answers on this server's address"
-            say ""
-            T_PUBLIC_IP="$SRV_IP"
-            ask T_PUBLIC_IP "address of this server" "${T_PUBLIC_IP:-}"
-        else
-            head2 "Tunnel port"
-            dim "the KHAREJ server connects to this port; open it in your firewall"
-            say ""
-            ask tport "port" "9443"
-            T_LISTEN="0.0.0.0:$tport"
-            port_free "$tport" || warn "something is already listening on $tport"
-            T_PUBLIC_IP="$SRV_IP"
+    # -- addresses ---------------------------------------------------------
+    #
+    # This server's own address is asked for even though it is usually
+    # detected, because the detection needs an outside lookup that an Iranian
+    # server often cannot reach - and the answer is what the other end will be
+    # offered as its default. Getting it wrong here used to produce a token
+    # that pointed at nothing.
+    head2 "Addresses"
+    if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
+        dim "detected on this machine: $SRV_IP"
+        say ""
+        T_PUBLIC_IP="$SRV_IP"
+    else
+        warn "could not detect this server's public address"
+        say ""
+        T_PUBLIC_IP=""
+    fi
+    while :; do
+        ask T_PUBLIC_IP "address of this server" "$T_PUBLIC_IP"
+        case "$T_PUBLIC_IP" in
+            "" | unknown) fail "the other server needs this to reach you" ;;
+            *) break ;;
+        esac
+    done
+
+    if ! this_side_accepts; then
+        say ""
+        ask T_PEER_IP "address of the $(side_label "$T_ACCEPTS") server"
+        [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
+    fi
+
+    if [ "$T_TRANSPORT" != "echo" ]; then
+        say ""
+        ask T_PORT "tunnel port" "$T_PORT"
+        case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
+        if this_side_accepts; then
+            port_free "$T_PORT" || warn "something is already listening on $T_PORT"
+            dim "open $T_PORT in this server's firewall"
         fi
     else
-        head2 "IRAN server"
-        say ""
-        local peer=""
-        ask peer "address of the IRAN server"
-        [ -n "$peer" ] || { fail "an address is required"; pause; return 1; }
-        if [ "$T_TRANSPORT" = "echo" ]; then
-            T_CONNECT="$peer"
-        else
-            ask tport "tunnel port" "9443"
-            T_CONNECT="$peer:$tport"
-        fi
-        T_PUBLIC_IP="$SRV_IP"
+        dim "Echo needs no port - ICMP has none"
     fi
 
     # -- key ---------------------------------------------------------------
@@ -342,11 +387,13 @@ new_tunnel() {
     box_top
     box_row "$(pad_to "Tunnel" 16)${C_B}${T_NAME}${C_OFF}"
     box_row "$(pad_to "This server" 16)$(side_label "$T_ROLE")  ${C_DIM}($(role_label "$T_ROLE"))${C_OFF}"
-    if [ -n "$T_LISTEN" ]; then
-        box_row "$(pad_to "Link" 16)accepts on ${T_LISTEN}"
+    cfg_endpoints
+    if [ -n "$CFG_LISTEN" ]; then
+        box_row "$(pad_to "Link" 16)accepts on ${CFG_LISTEN}"
     else
-        box_row "$(pad_to "Link" 16)connects to ${T_CONNECT}"
+        box_row "$(pad_to "Link" 16)connects to ${CFG_CONNECT}"
     fi
+    box_row "$(pad_to "This address" 16)${T_PUBLIC_IP}"
     box_row "$(pad_to "Protocol" 16)$(transport_label "$T_TRANSPORT")"
     box_row "$(pad_to "Carries" 16)$(mode_label "$T_MODE")"
     if [ "$T_MODE" = "forward" ] && [ -n "$T_FORWARDS" ]; then
@@ -382,6 +429,7 @@ new_tunnel() {
     # -- token -------------------------------------------------------------
     head2 "Token for the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server"
     dim "run Pingify there and choose New tunnel ${BX_ARR} Apply a token"
+    dim "it carries the settings only - that server fills in its own address"
     say ""
     rule
     printf '%s\n' "${C_YEL}$(cfg_peer_token)${C_OFF}"
@@ -402,62 +450,104 @@ import_tunnel() {
     head2 "Apply a token"
     dim "configure the other server first; it prints the token at the end"
     say ""
+    ensure_core || { pause; return 1; }
     local token=""
     ask token "token"
     [ -n "$token" ] || return 1
 
-    local tmp="/tmp/pingify-import.toml"
+    local tmp="/tmp/pingify-token"
     if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
         fail "that is not a Pingify token"
         pause; return 1
     fi
-    local name; name="$(toml_get "$tmp" tunnel name)"
-    if [ -z "$name" ]; then
-        fail "the token is incomplete"
+    if [ "$(toml_get "$tmp" "" v)" != "2" ]; then
+        fail "this token was made by an older Pingify"
+        dim "update both servers, then create the tunnel again"
         rm -f "$tmp"; pause; return 1
     fi
 
-    if [ -f "$(cfg_file "$name")" ]; then
-        say ""
-        warn "a tunnel named $name already exists on this server"
-        confirm "replace it?" || { rm -f "$tmp"; return 1; }
-        systemctl stop "pingify@$name" >/dev/null 2>&1
+    cfg_reset
+    server_info
+    T_NAME="$(toml_get "$tmp" "" name)"
+    T_ROLE="$(toml_get "$tmp" "" role)"
+    T_MODE="$(toml_get "$tmp" "" mode)"
+    T_TRANSPORT="$(toml_get "$tmp" "" transport)"
+    T_ACCEPTS="$(toml_get "$tmp" "" accepts)"
+    T_PORT="$(toml_get "$tmp" "" port)"
+    T_PSK="$(toml_get "$tmp" "" psk)"
+    T_CARRIERS="$(toml_get "$tmp" "" carriers)"
+    T_WINDOW="$(toml_get "$tmp" "" window_kb)"
+    T_KEEPALIVE="$(toml_get "$tmp" "" keepalive)"
+    T_PRESET="$(toml_get "$tmp" "" profile)"
+    local suggested; suggested="$(toml_get "$tmp" "" suggest_ip)"
+    if [ "$T_MODE" = "tun" ]; then
+        T_TUNIF="$(toml_get "$tmp" "" tun_if)"
+        T_TUNLOCAL="$(toml_get "$tmp" "" tun_local)"
+        T_TUNPEER="$(toml_get "$tmp" "" tun_peer)"
+        T_TUNMTU="$(toml_get "$tmp" "" tun_mtu)"
     fi
-
-    # The status port chosen on the other server may be taken here.
-    local sp; sp="$(toml_get "$tmp" status addr)"
-    sed -i "s#^addr.*#addr             = \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
-
-    # A token that dials needs a real address for the server that issued it.
-    local conn; conn="$(toml_get "$tmp" transport connect)"
-    if [ -n "$conn" ]; then
-        case "${conn%%:*}" in
-            "" | "0.0.0.0")
-                say ""
-                local ip=""
-                ask ip "address of the other server"
-                sed -i "s#^connect.*#connect          = \"$ip:${conn##*:}\"#" "$tmp" ;;
-        esac
-    fi
-
-    install -m 600 "$tmp" "$(cfg_file "$name")"
+    T_PUBLIC_IP="$SRV_IP"
     rm -f "$tmp"
 
-    if ! "$CORE_BIN" -c "$(cfg_file "$name")" -check >/dev/null 2>&1; then
+    if [ -z "$T_NAME" ] || [ -z "$T_PSK" ]; then
+        fail "the token is incomplete"
+        pause; return 1
+    fi
+
+    say ""
+    ok "this server will be the $(side_label "$T_ROLE") end"
+    dim "tunnel $T_NAME  ${BX_DOT}  $(transport_label "$T_TRANSPORT")  ${BX_DOT}  $(mode_label "$T_MODE")"
+
+    # The address of the other server is the one thing a token cannot know for
+    # certain, so it is always confirmed here.
+    if ! this_side_accepts; then
+        head2 "The other server"
+        [ -n "$suggested" ] && dim "it reported its address as $suggested"
+        say ""
+        ask T_PEER_IP "address of the $(side_label "$T_ACCEPTS") server" "$suggested"
+        if [ -z "$T_PEER_IP" ] || [ "$T_PEER_IP" = "unknown" ]; then
+            fail "an address is required"
+            pause; return 1
+        fi
+    fi
+
+    # Ports belong to whichever end the clients connect to, and only there.
+    if [ "$T_MODE" = "forward" ] && [ "$T_ROLE" = "server" ]; then
+        head2 "Ports"
+        dim "443            same port on both servers"
+        dim "443=8443       clients hit 443 here, it lands on 8443 there"
+        dim "udp:500        a UDP port"
+        say ""
+        local raw=""
+        ask raw "ports clients will connect to, comma separated" "443"
+        T_FORWARDS="$(parse_forwards "$raw")"
+        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
+    fi
+
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        say ""
+        warn "a tunnel named $T_NAME already exists on this server"
+        confirm "replace it?" || return 1
+        systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
+    fi
+
+    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
+    local file; file="$(cfg_save)"
+    if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
-        "$CORE_BIN" -c "$(cfg_file "$name")" -check 2>&1 | sed 's/^/      /'
-        rm -f "$(cfg_file "$name")"
+        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
+        rm -f "$file"
         pause; return 1
     fi
 
     write_units
-    service_enable_start "$name"
+    service_enable_start "$T_NAME"
     enable_watchdog quiet
     say ""
-    ok "$name is running"
-    dim "config: $(cfg_file "$name")"
+    ok "$T_NAME is running"
+    dim "config: $file"
     say ""
-    tunnel_status_block "$name"
+    tunnel_status_block "$T_NAME"
     pause
 }
