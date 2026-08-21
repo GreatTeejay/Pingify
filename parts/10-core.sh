@@ -136,7 +136,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=$CORE_BIN -c $CFG_DIR/%i.json
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.$CFG_EXT
 WorkingDirectory=$BASE_DIR
 Restart=always
 RestartSec=2

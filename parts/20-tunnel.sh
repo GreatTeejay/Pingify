@@ -13,7 +13,7 @@
 # ---------------------------------------------------------------------------
 
 cfg_reset() {
-    T_NAME=""; T_ROLE=""; T_MODE="forward"; T_TRANSPORT="direct"
+    T_NAME=""; T_ROLE=""; T_MODE="forward"; T_TRANSPORT="braid"
     T_LISTEN=""; T_CONNECT=""; T_PSK=""; T_PUBLIC_IP=""
     T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
     T_FORWARDS=""; T_STATUS=""
@@ -77,23 +77,28 @@ preset_menu() {
 # rendering
 # ---------------------------------------------------------------------------
 
-# cfg_render <role> <mode> <listen> <connect> <forwards-json> <status-addr>
-# Every key sits on its own line, which is what lets the manager read these
-# files back with sed instead of a JSON parser.
+# cfg_render <role> <mode> <listen> <connect> <forwards> <status-addr>
+# TOML, one key per line, which is what lets the manager read it back with a
+# targeted sed instead of carrying a parser.
 cfg_render() {
     local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
-    printf '{\n'
-    printf '  "name": "%s",\n' "$T_NAME"
-    printf '  "role": "%s",\n' "$role"
-    printf '  "mode": "%s",\n' "$mode"
-    printf '  "transport": "%s",\n' "$T_TRANSPORT"
-    [ -n "$listen" ]  && printf '  "listen": "%s",\n' "$listen"
-    [ -n "$connect" ] && printf '  "connect": "%s",\n' "$connect"
-    printf '  "psk": "%s",\n' "$T_PSK"
-    printf '  "carriers": %s,\n' "$T_CARRIERS"
-    printf '  "window_kb": %s,\n' "$T_WINDOW"
-    printf '  "keepalive_sec": %s,\n' "$T_KEEPALIVE"
-    [ -n "$fwd" ] && printf '  "forwards": [%s],\n' "$fwd"
+    printf '# Pingify tunnel - written by the manager, safe to edit by hand\n'
+    printf '\n'
+    printf 'name          = "%s"\n' "$T_NAME"
+    printf 'role          = "%s"\n' "$role"
+    printf 'mode          = "%s"\n' "$mode"
+    printf 'transport     = "%s"\n' "$T_TRANSPORT"
+    [ -n "$listen" ]  && printf 'listen        = "%s"\n' "$listen"
+    [ -n "$connect" ] && printf 'connect       = "%s"\n' "$connect"
+    printf 'psk           = "%s"\n' "$T_PSK"
+    printf '\n'
+    printf 'carriers      = %s\n' "$T_CARRIERS"
+    printf 'window_kb     = %s\n' "$T_WINDOW"
+    printf 'keepalive_sec = %s\n' "$T_KEEPALIVE"
+    [ -n "$fwd" ] && printf 'forwards      = [%s]\n' "$fwd"
+    printf '\n'
+    printf 'status_addr   = "%s"\n' "$status"
+    printf 'log_level     = "info"\n'
     if [ "$mode" = "tun" ]; then
         local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
         if [ "$role" != "$T_ROLE" ]; then
@@ -102,16 +107,16 @@ cfg_render() {
             lo="$T_TUNPEER/$pfx"
             pe="${T_TUNLOCAL%%/*}"
         fi
-        printf '  "tun": { "name": "%s", "local": "%s", "peer": "%s", "mtu": %s },\n' \
-               "$T_TUNIF" "$lo" "$pe" "$T_TUNMTU"
+        printf '\n[tun]\n'
+        printf 'name  = "%s"\n' "$T_TUNIF"
+        printf 'local = "%s"\n' "$lo"
+        printf 'peer  = "%s"\n' "$pe"
+        printf 'mtu   = %s\n' "$T_TUNMTU"
     fi
-    printf '  "status_addr": "%s",\n' "$status"
-    printf '  "log_level": "info"\n'
-    printf '}\n'
 }
 
 cfg_save() {
-    local file="$CFG_DIR/$T_NAME.json"
+    local file="$(cfg_file "$T_NAME")"
     cfg_render "$T_ROLE" "$T_MODE" "$T_LISTEN" "$T_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
     chmod 600 "$file"
     printf '%s' "$file"
@@ -146,7 +151,13 @@ parse_forwards() {
 side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 role_label()      { [ "$1" = "server" ] && printf 'server' || printf 'client'; }
 mode_label()      { [ "$1" = "tun" ] && printf 'Full IP' || printf 'Ports'; }
-transport_label() { case "$1" in direct) printf 'Direct' ;; *) printf '%s' "$1" ;; esac; }
+transport_label() {
+    case "$1" in
+        braid | direct | tcp | "") printf 'Braid' ;;
+        icmp) printf 'Echo' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # new tunnel
@@ -172,13 +183,13 @@ new_tunnel() {
     # -- name --------------------------------------------------------------
     head2 "Name"
     local suggested="main"
-    [ -f "$CFG_DIR/main.json" ] && suggested="tunnel$(( $(tunnel_count) + 1 ))"
+    [ -f "$(cfg_file main)" ] && suggested="tunnel$(( $(tunnel_count) + 1 ))"
     while :; do
         ask T_NAME "tunnel name" "$suggested"
         case "$T_NAME" in
             "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
             *)
-                if [ -f "$CFG_DIR/$T_NAME.json" ]; then
+                if [ -f "$(cfg_file "$T_NAME")" ]; then
                     fail "a tunnel named $T_NAME already exists here"
                 else
                     break
@@ -229,13 +240,13 @@ new_tunnel() {
 
     # -- transport ---------------------------------------------------------
     head2 "Protocol"
-    item 1 "Direct" "encrypted stream, no wrapper - fastest"
+    item 1 "Braid" "several TCP connections woven into one encrypted stream"
     say ""
-    dim "TLS and WebSocket are planned; Direct is the only one in this build"
+    dim "TLS, WebSocket and Echo (ICMP) are planned"
     say ""
     local tr=""
     ask tr "select" "1"
-    T_TRANSPORT="direct"
+    T_TRANSPORT="braid"
 
     # -- payload -----------------------------------------------------------
     head2 "What the tunnel carries"
@@ -371,18 +382,18 @@ import_tunnel() {
     ask token "token"
     [ -n "$token" ] || return 1
 
-    local tmp="/tmp/pingify-import.json"
+    local tmp="/tmp/pingify-import.toml"
     if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
         fail "that is not a Pingify token"
         pause; return 1
     fi
-    local name; name="$(json_str "$tmp" name)"
+    local name; name="$(toml_str "$tmp" name)"
     if [ -z "$name" ]; then
         fail "the token is incomplete"
         rm -f "$tmp"; pause; return 1
     fi
 
-    if [ -f "$CFG_DIR/$name.json" ]; then
+    if [ -f "$(cfg_file "$name")" ]; then
         say ""
         warn "a tunnel named $name already exists on this server"
         confirm "replace it?" || { rm -f "$tmp"; return 1; }
@@ -390,29 +401,29 @@ import_tunnel() {
     fi
 
     # The status port chosen on the other server may be taken here.
-    local sp; sp="$(json_str "$tmp" status_addr)"
-    sed -i "s#\"status_addr\": \"[^\"]*\"#\"status_addr\": \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
+    local sp; sp="$(toml_str "$tmp" status_addr)"
+    sed -i "s#^status_addr.*#status_addr   = \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
 
     # A token that dials needs a real address for the server that issued it.
-    local conn; conn="$(json_str "$tmp" connect)"
+    local conn; conn="$(toml_str "$tmp" connect)"
     if [ -n "$conn" ]; then
         case "${conn%%:*}" in
             "" | "0.0.0.0")
                 say ""
                 local ip=""
                 ask ip "address of the other server"
-                sed -i "s#\"connect\": \"[^\"]*\"#\"connect\": \"$ip:${conn##*:}\"#" "$tmp" ;;
+                sed -i "s#^connect.*#connect       = \"$ip:${conn##*:}\"#" "$tmp" ;;
         esac
     fi
 
-    install -m 600 "$tmp" "$CFG_DIR/$name.json"
+    install -m 600 "$tmp" "$(cfg_file "$name")"
     rm -f "$tmp"
 
-    if ! "$CORE_BIN" -c "$CFG_DIR/$name.json" -check >/dev/null 2>&1; then
+    if ! "$CORE_BIN" -c "$(cfg_file "$name")" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
-        "$CORE_BIN" -c "$CFG_DIR/$name.json" -check 2>&1 | sed 's/^/      /'
-        rm -f "$CFG_DIR/$name.json"
+        "$CORE_BIN" -c "$(cfg_file "$name")" -check 2>&1 | sed 's/^/      /'
+        rm -f "$(cfg_file "$name")"
         pause; return 1
     fi
 
@@ -421,7 +432,7 @@ import_tunnel() {
     enable_watchdog quiet
     say ""
     ok "$name is running"
-    dim "config: $CFG_DIR/$name.json"
+    dim "config: $(cfg_file "$name")"
     say ""
     tunnel_status_block "$name"
     pause

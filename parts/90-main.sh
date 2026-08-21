@@ -47,12 +47,50 @@ migrate_layout() {
     fi
     rm -f /usr/local/bin/pingify-core
     rm -rf /var/lib/pingify /usr/local/src/pingify
+
+    # 3.2 and earlier wrote JSON; tunnel_names only looks for TOML now.
+    for f in "$CFG_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        json_to_toml "$f" && moved=1
+    done
     if [ "$moved" = "1" ]; then
         write_units
         for f in $(tunnel_names); do systemctl restart "pingify@$f" >/dev/null 2>&1; done
         info "moved the existing setup into $BASE_DIR"
         sleep 1
     fi
+}
+
+# Rewrites one 3.2-era JSON config as TOML and removes the original.
+json_to_toml() {
+    local j="$1" name out k v
+    name="$(basename "$j" .json)"
+    out="$(cfg_file "$name")"
+    [ -f "$out" ] && { rm -f "$j"; return 1; }
+    {
+        printf '# Pingify tunnel - converted from %s\n\n' "$(basename "$j")"
+        for k in name role mode transport listen connect psk status_addr log_level; do
+            v="$(json_str "$j" "$k")"
+            [ -n "$v" ] && printf '%s = "%s"\n' "$k" "$v"
+        done
+        for k in carriers window_kb keepalive_sec; do
+            v="$(json_num "$j" "$k")"
+            [ -n "$v" ] && printf '%s = %s\n' "$k" "$v"
+        done
+        v="$(sed -n 's/.*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' "$j" | head -n1)"
+        [ -n "$v" ] && printf 'forwards = [%s]\n' "$v"
+        if grep -q '"tun"' "$j"; then
+            local tl; tl="$(grep -m1 '"tun"' "$j")"
+            printf '\n[tun]\n'
+            printf 'name  = "%s"\n' "$(printf '%s' "$tl" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf 'local = "%s"\n' "$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf 'peer  = "%s"\n' "$(printf '%s' "$tl" | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf 'mtu   = %s\n'   "$(printf '%s' "$tl" | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
+        fi
+    } > "$out"
+    chmod 600 "$out"
+    rm -f "$j"
+    return 0
 }
 
 usage() {
@@ -79,36 +117,39 @@ info_panel() {
     local name addr up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(json_str "$CFG_DIR/$name.json" status_addr)"
+        addr="$(toml_str "$(cfg_file "$name")" status_addr)"
         if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
             up=$((up + 1))
         fi
     done
 
     panel "SERVER"
-    field "IP" "$SRV_IP" "Location" "$SRV_LOC"
-    field "Provider" "$(printf '%.44s' "$SRV_ORG")"
+    field "IP" "$SRV_IP"
+    field "Location" "$SRV_LOC"
+    field "Datacenter" "$(printf '%.44s' "$SRV_ORG")"
     panel_end
 
     local core_txt tun_txt
     if [ -x "$CORE_BIN" ]; then
-        core_txt="${C_GRN}${BX_ON}${C_OFF} $(core_version)"
+        core_txt="$(core_version)"
     else
-        core_txt="${C_RED}${BX_ON}${C_OFF} missing"
+        core_txt="${C_RED}not installed${C_OFF}"
     fi
     if [ "$total" = "0" ]; then
-        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none"
+        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none configured"
     elif [ "$up" = "$total" ]; then
-        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up/$total up"
+        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up of $total up"
     elif [ "$up" = "0" ]; then
-        tun_txt="${C_RED}${BX_ON}${C_OFF} $up/$total up"
+        tun_txt="${C_RED}${BX_ON}${C_OFF} $up of $total up"
     else
-        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up/$total up"
+        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up of $total up"
     fi
 
     panel "STATUS"
-    row "$(pad_to "${C_DIM}Core${C_OFF} $core_txt" 24)$(pad_to "${C_DIM}Tunnels${C_OFF} $tun_txt" 22)${C_DIM}Watchdog${C_OFF} $(state_badge "$(watchdog_state)")"
-    row "$(pad_to "${C_DIM}Congestion${C_OFF} ${C_B}$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)${C_OFF}" 24)$(pad_to "${C_DIM}Blocking${C_OFF} ${C_B}$(block_summary)${C_OFF}" 22)${C_DIM}Script${C_OFF} ${C_B}${PINGIFY_VERSION}${C_OFF}"
+    field "Core ver" "$core_txt"
+    field "Script ver" "$PINGIFY_VERSION"
+    field "Tunnels" "$tun_txt"
+    field "Watchdog" "$(state_badge "$(watchdog_state)")"
     panel_end
 }
 
@@ -134,13 +175,13 @@ main_menu() {
     while :; do
         banner
         info_panel
-        group "TUNNEL"
+        group "TUNNELS"
         item 1 "New tunnel"      "set this server up"
-        item 2 "Tunnels"         "status, ports, logs, remove"
+        item 2 "Manage tunnels"  "status, ports, logs, remove"
         item 3 "Live status"     "dashboard that refreshes itself"
         group "NETWORK"
         item 4 "Optimize"        "buffers, limits, swap, clock"
-        item 5 "Blocking"        "ICMP, speedtest, QUIC"
+        item 5 "Blocking"        "ICMP, speedtest, UDP 443"
         item 6 "Diagnostics"     "connectivity and configs"
         group "MAINTENANCE"
         item 7 "Update core"     "download, build, import, export"
