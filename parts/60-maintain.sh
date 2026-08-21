@@ -116,6 +116,7 @@ full_uninstall() {
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
     systemctl disable --now pingify-health.timer >/dev/null 2>&1
+    remove_blocking
     rm -f "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-health.service \
           "$UNIT_DIR"/pingify-health.timer "$UNIT_DIR"/pingify-recycle@*.service \
           "$UNIT_DIR"/pingify-recycle@*.timer
@@ -232,42 +233,4 @@ diag_system() {
     printf '  %-22s %s\n' "congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
     printf '  %-22s %s\n' "time" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     pause
-}
-
-# ---------------------------------------------------------------------------
-# backup / restore
-# ---------------------------------------------------------------------------
-
-backup_menu() {
-    banner
-    head2 "Backup & Restore"
-    item 1 "Back up every tunnel"
-    item 2 "Restore from a backup"
-    item 0 "Back"
-    say ""
-    local c=""
-    ask c "select"
-    case "$c" in
-        1)  say ""
-            local out="/root/pingify-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-            if tar -czf "$out" -C / etc/pingify 2>/dev/null; then
-                chmod 600 "$out"
-                ok "written to $out"
-                warn "it contains your shared keys - keep it somewhere safe"
-            else
-                fail "nothing to back up"
-            fi
-            pause ;;
-        2)  say ""
-            local src=""
-            ask src "path to the backup file"
-            [ -f "$src" ] || { fail "no such file"; pause; return; }
-            confirm "this replaces the configs on this server. continue?" || return
-            tar -xzf "$src" -C / || { fail "could not unpack it"; pause; return; }
-            write_units
-            local n
-            for n in $(tunnel_names); do service_enable_start "$n"; ok "started $n"; done
-            pause ;;
-        0|"") return ;;
-    esac
 }
