@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="2.1.0"
+PINGIFY_VERSION="2.1.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 CFG_DIR="/etc/pingify"

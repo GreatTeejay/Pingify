@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="2.1.0"
+PINGIFY_VERSION="2.1.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 CFG_DIR="/etc/pingify"
@@ -1484,19 +1484,21 @@ update_menu() {
         printf '  %-22s %s\n' "manager" "$PINGIFY_VERSION"
         printf '  %-22s %s\n' "Go toolchain" "$(find_go >/dev/null 2>&1 && "$GO_BIN" version || echo 'not installed')"
         rule
-        item 1 "Rebuild the engine from the sources in this script"
-        item 2 "Import a prebuilt engine binary" "(path or URL)"
-        item 3 "Update Pingify itself from GitHub"
-        item 4 "Export this server's engine binary" "(to copy to the peer)"
+        item 1 "Download the latest engine" "prebuilt, from GitHub Releases"
+        item 2 "Compile the engine here" "from the sources inside this script"
+        item 3 "Import an engine binary" "path or URL"
+        item 4 "Export this engine binary" "to copy to the peer"
+        item 5 "Update Pingify itself" "fetch the newest manager script"
         item 0 "Back"
         say ""
         local c=""
         ask c "choose"
         case "$c" in
-            1) say ""; if build_core; then restart_all "the engine was rebuilt"; fi; pause ;;
-            2) say ""; if import_core_binary; then restart_all "the engine was replaced"; fi; pause ;;
-            3) self_update; pause ;;
+            1) say ""; if download_core; then restart_all "the engine was updated"; fi; pause ;;
+            2) say ""; if build_core; then restart_all "the engine was rebuilt"; fi; pause ;;
+            3) say ""; if import_core_binary; then restart_all "the engine was replaced"; fi; pause ;;
             4) export_core; pause ;;
+            5) self_update; pause ;;
             0|"") return ;;
         esac
     done
@@ -1527,7 +1529,7 @@ self_update() {
     install -m 0755 "$tmp" "$SELF_BIN"
     rm -f "$tmp"
     ok "Pingify updated to ${newver:-unknown}"
-    dim "run 'pingify' again to pick up the new version, then Update Core -> 1"
+    dim "run 'pingify' again to pick up the new version"
 }
 
 export_core() {
