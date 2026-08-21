@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # health
 #
-# The engine already reconnects a carrier on its own. This watchdog is the
+# The core already reconnects a carrier on its own. This watchdog is the
 # outer layer: it catches a wedged process, a tunnel that lost every carrier,
 # and a service that failed to come back after a reboot.
 # ---------------------------------------------------------------------------
@@ -80,22 +80,22 @@ live_dashboard() {
 health_menu() {
     while :; do
         banner
-        head2 "Health & Monitoring"
+        head2 "Health"
         list_tunnels
         rule
         item 1 "Live status dashboard"
-        item 2 "Run a health check right now"
-        item 3 "Enable the watchdog timer"
-        item 4 "Disable the watchdog timer"
+        item 2 "Run a check now"
+        item 3 "Enable the watchdog"
+        item 4 "Disable the watchdog"
         item 5 "Recent health log"
         item 6 "Restart every tunnel"
         item 0 "Back"
         say ""
         local c=""
-        ask c "choose"
+        ask c "select"
         case "$c" in
             1) live_dashboard ;;
-            2) say ""; run_health_check | sed 's/^/  /'; ok "done"; pause ;;
+            2) say ""; run_health_check | sed 's/^/  /'; ok "check complete"; pause ;;
             3) enable_watchdog; pause ;;
             4) disable_watchdog; pause ;;
             5) say ""; journalctl -u pingify-health.service -n 40 --no-pager | sed 's/^/  /'; pause ;;

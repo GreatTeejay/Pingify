@@ -8,24 +8,24 @@ RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/Pingify/main"
 update_menu() {
     while :; do
         banner
-        head2 "Update Core"
-        printf '  %-22s %s\n' "engine" "$(core_version)"
+        head2 "Core"
+        printf '  %-22s %s\n' "core" "$(core_version)"
         printf '  %-22s %s\n' "manager" "$PINGIFY_VERSION"
         printf '  %-22s %s\n' "Go toolchain" "$(find_go >/dev/null 2>&1 && "$GO_BIN" version || echo 'not installed')"
         rule
-        item 1 "Download the latest engine" "prebuilt, from GitHub Releases"
-        item 2 "Compile the engine here" "from the sources inside this script"
-        item 3 "Import an engine binary" "path or URL"
-        item 4 "Export this engine binary" "to copy to the peer"
+        item 1 "Download the latest core" "prebuilt, from GitHub Releases"
+        item 2 "Compile the core here" "from the sources inside this script"
+        item 3 "Import a core binary" "path or URL"
+        item 4 "Export this core binary" "to copy to the peer"
         item 5 "Update Pingify itself" "fetch the newest manager script"
         item 0 "Back"
         say ""
         local c=""
-        ask c "choose"
+        ask c "select"
         case "$c" in
-            1) say ""; if download_core; then restart_all "the engine was updated"; fi; pause ;;
-            2) say ""; if build_core; then restart_all "the engine was rebuilt"; fi; pause ;;
-            3) say ""; if import_core_binary; then restart_all "the engine was replaced"; fi; pause ;;
+            1) say ""; if download_core; then restart_all "the core was updated"; fi; pause ;;
+            2) say ""; if build_core; then restart_all "the core was rebuilt"; fi; pause ;;
+            3) say ""; if import_core_binary; then restart_all "the core was replaced"; fi; pause ;;
             4) export_core; pause ;;
             5) self_update; pause ;;
             0|"") return ;;
@@ -63,7 +63,7 @@ self_update() {
 
 export_core() {
     say ""
-    [ -x "$CORE_BIN" ] || { fail "no engine is installed here"; return 1; }
+    [ -x "$CORE_BIN" ] || { fail "no core is installed here"; return 1; }
     local dest="/root/pingify-core-$(uname -m)"
     cp -f "$CORE_BIN" "$dest"
     ok "copied to $dest"
@@ -76,13 +76,13 @@ export_core() {
 remove_menu() {
     banner
     head2 "Remove"
-    item 1 "Remove the engine binary only" "(tunnels and configs stay)"
-    item 2 "Remove every tunnel" "(configs and services, engine stays)"
-    item 3 "Full uninstall" "(everything Pingify ever wrote)"
+    item 1 "Remove the core only" "tunnels and configs stay"
+    item 2 "Remove every tunnel" "configs and services, core stays"
+    item 3 "Full uninstall" "everything Pingify ever wrote"
     item 0 "Back"
     say ""
     local c=""
-    ask c "choose"
+    ask c "select"
     case "$c" in
         1)  say ""
             confirm "remove $CORE_BIN?" || return
@@ -90,7 +90,7 @@ remove_menu() {
             for n in $(tunnel_names); do systemctl stop "pingify@$n" >/dev/null 2>&1; done
             rm -f "$CORE_BIN"
             rm -rf "$SRC_DIR"
-            ok "engine removed; rebuild it from Update Core when you need it"
+            ok "core removed; rebuild it from Update Core when you need it"
             pause ;;
         2)  say ""
             confirm "delete every tunnel on this server?" || return
@@ -110,7 +110,7 @@ remove_menu() {
 
 full_uninstall() {
     say ""
-    warn "this removes the engine, every tunnel, the units and the tuning"
+    warn "this removes the core, every tunnel, the units and the tuning"
     confirm "go ahead?" || return
     local n
     for n in $(tunnel_names); do
@@ -144,16 +144,16 @@ diagnostics_menu() {
     while :; do
         banner
         head2 "Diagnostics"
-        item 1 "Reach the peer on the tunnel port"
+        item 1 "Reach the other server"
         item 2 "Ping the peer"
         item 3 "Validate every config"
-        item 4 "What is listening on this server"
+        item 4 "Listening ports"
         item 5 "System summary"
         item 6 "Tail a tunnel log"
         item 0 "Back"
         say ""
         local c=""
-        ask c "choose"
+        ask c "select"
         case "$c" in
             1) diag_reach ;;
             2) diag_ping ;;
@@ -229,7 +229,7 @@ diag_system() {
     printf '  %-22s %s\n' "cpu" "$(nproc) cores"
     printf '  %-22s %s\n' "memory" "$(free -h | awk '/^Mem:/{print $3" used of "$2}')"
     printf '  %-22s %s\n' "public ip" "$(public_ip)"
-    printf '  %-22s %s\n' "engine" "$(core_version)"
+    printf '  %-22s %s\n' "core" "$(core_version)"
     printf '  %-22s %s\n' "watchdog" "$(watchdog_state)"
     printf '  %-22s %s\n' "congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
     printf '  %-22s %s\n' "time" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -243,12 +243,12 @@ diag_system() {
 backup_menu() {
     banner
     head2 "Backup & Restore"
-    item 1 "Back up every tunnel config"
-    item 2 "Restore from a backup file"
+    item 1 "Back up every tunnel"
+    item 2 "Restore from a backup"
     item 0 "Back"
     say ""
     local c=""
-    ask c "choose"
+    ask c "select"
     case "$c" in
         1)  say ""
             local out="/root/pingify-backup-$(date +%Y%m%d-%H%M%S).tar.gz"

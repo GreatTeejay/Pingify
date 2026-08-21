@@ -3,24 +3,25 @@
 # tunnel configuration
 # ---------------------------------------------------------------------------
 
-# All of the T_* variables below describe one tunnel while the wizard runs.
+# The T_* variables below describe one tunnel while the wizard runs.
 cfg_reset() {
-    T_NAME=""; T_ROLE=""; T_MODE="forward"
-    T_LISTEN=""; T_CONNECT=""; T_PSK=""
-    T_CARRIERS=4; T_WINDOW=1024; T_KEEPALIVE=10
+    T_NAME=""; T_ROLE=""; T_MODE="forward"; T_TRANSPORT="direct"
+    T_LISTEN=""; T_CONNECT=""; T_PSK=""; T_PUBLIC_IP=""
+    T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10
     T_FORWARDS=""; T_STATUS=""
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
 }
 
 # cfg_render <role> <mode> <listen> <connect> <forwards-json> <status-addr>
-# Prints one config document. Keeping every key on its own line is what lets
-# the manager read these files back with sed instead of a JSON parser.
+# Prints one config document. Every key sits on its own line, which is what
+# lets the manager read these files back with sed instead of a JSON parser.
 cfg_render() {
     local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
     printf '{\n'
     printf '  "name": "%s",\n' "$T_NAME"
     printf '  "role": "%s",\n' "$role"
     printf '  "mode": "%s",\n' "$mode"
+    printf '  "transport": "%s",\n' "$T_TRANSPORT"
     [ -n "$listen" ]  && printf '  "listen": "%s",\n' "$listen"
     [ -n "$connect" ] && printf '  "connect": "%s",\n' "$connect"
     printf '  "psk": "%s",\n' "$T_PSK"
@@ -51,8 +52,8 @@ cfg_save() {
     printf '%s' "$file"
 }
 
-# The peer document is this one mirrored: roles swap, and whichever side dials
-# becomes the side that listens.
+# The peer document is this one mirrored: the sides swap, and whichever end
+# dials becomes the end that listens.
 cfg_peer_token() {
     local prole plisten pconnect pfwd
     if [ "$T_ROLE" = "edge" ]; then prole="origin"; else prole="edge"; fi
@@ -76,98 +77,129 @@ parse_forwards() {
     printf '%s' "$out"
 }
 
+# Friendly names for the values stored in the config.
+side_label()      { [ "$1" = "edge" ] && printf 'Iran' || printf 'Kharej'; }
+mode_label()      { [ "$1" = "tun" ] && printf 'Full IP' || printf 'Ports'; }
+transport_label() { case "$1" in direct) printf 'Direct' ;; *) printf '%s' "$1" ;; esac; }
+
 # ---------------------------------------------------------------------------
-# new tunnel wizard
+# new tunnel
 # ---------------------------------------------------------------------------
 
 new_tunnel() {
     banner
-    head2 "Config New Tunnel"
+    head2 "New Tunnel"
     ensure_core || { pause; return 1; }
 
-    item 1 "Start from scratch" "set the tunnel up here first"
-    item 2 "Join with a token" "paste what the other server printed"
+    item 1 "Configure this server" "you will get a token for the other one"
+    item 2 "Apply a token" "paste what the other server gave you"
     say ""
     local choice=""
-    ask choice "choose" "1"
-    if [ "$choice" = "2" ]; then import_tunnel; return; fi
+    ask choice "select" "1"
+    [ "$choice" = "2" ] && { import_tunnel; return; }
 
     cfg_reset
 
-    # --- name ------------------------------------------------------------
-    head2 "Step 1 of 7   Name"
+    # -- 1. identity -------------------------------------------------------
+    head2 "1/7   Tunnel name"
+    dim "used for the service name and the config file; letters and digits"
+    say ""
     local suggested="pfy$(( $(tunnel_count) + 1 ))"
     while :; do
-        ask T_NAME "tunnel name" "$suggested"
+        ask T_NAME "name" "$suggested"
         case "$T_NAME" in
-            *[!a-zA-Z0-9_-]*|"") fail "letters, digits, dash and underscore only" ;;
-            *) [ -f "$CFG_DIR/$T_NAME.json" ] && { fail "a tunnel called $T_NAME already exists"; continue; }
-               break ;;
+            "" | *[!a-zA-Z0-9_-]*)
+                fail "letters, digits, dash and underscore only" ;;
+            *)
+                if [ -f "$CFG_DIR/$T_NAME.json" ]; then
+                    fail "a tunnel named $T_NAME already exists"
+                else
+                    break
+                fi ;;
         esac
     done
 
-    # --- which server is this --------------------------------------------
-    head2 "Step 2 of 7   Which server is this?"
-    item 1 "Iran server" "your users connect here"
-    item 2 "Kharej server" "the panel / real services live here"
+    # -- 2. which end is this ----------------------------------------------
+    head2 "2/7   This server"
+    item 1 "Iran" "clients connect to this server"
+    item 2 "Kharej" "the panel and inbounds run on this server"
     say ""
     local side=""
-    ask side "choose" "1"
-    if [ "$side" = "2" ]; then T_ROLE="origin"; else T_ROLE="edge"; fi
+    ask side "select" "1"
+    [ "$side" = "2" ] && T_ROLE="origin" || T_ROLE="edge"
 
-    # --- who dials whom ---------------------------------------------------
-    head2 "Step 3 of 7   Which server opens the connection?"
-    item 1 "This one dials out to the peer" "best when inbound here is filtered"
-    item 2 "This one waits for the peer" "needs an open port on this server"
+    # -- 3. link direction and endpoint ------------------------------------
+    head2 "3/7   Link direction"
+    dim "the tunnel is one link; only one end has to accept connections"
     say ""
-    local dial=""
-    ask dial "choose" "1"
+    item 1 "Outbound" "this server connects to the other one"
+    item 2 "Inbound" "the other one connects in; needs an open port"
+    say ""
+    local dir=""
+    ask dir "select" "1"
 
     local tport=""
-    if [ "$dial" = "2" ]; then
-        ask tport "port to listen on for the tunnel" "9443"
+    say ""
+    if [ "$dir" = "2" ]; then
+        ask tport "listen port" "9443"
         T_LISTEN="0.0.0.0:$tport"
+        port_free "$tport" || warn "port $tport is already in use on this server"
         T_PUBLIC_IP="$(public_ip)"
-        say ""
-        ask T_PUBLIC_IP "public IP of THIS server (the peer will dial it)" "${T_PUBLIC_IP:-}"
-        if ! port_free "$tport"; then warn "something is already listening on port $tport"; fi
+        ask T_PUBLIC_IP "public address of this server" "${T_PUBLIC_IP:-}"
     else
         local peer=""
-        ask peer "IP or hostname of the peer server"
-        [ -n "$peer" ] || { fail "the peer address cannot be empty"; pause; return 1; }
-        ask tport "tunnel port on the peer" "9443"
+        ask peer "address of the other server"
+        [ -n "$peer" ] || { fail "an address is required"; pause; return 1; }
+        ask tport "port on the other server" "9443"
         T_CONNECT="$peer:$tport"
     fi
 
-    # --- shared key -------------------------------------------------------
-    head2 "Step 4 of 7   Shared key"
-    dim "the same key has to end up on both servers"
+    # -- 4. key ------------------------------------------------------------
+    head2 "4/7   Shared key"
+    dim "both servers authenticate with the same key; the token carries it"
+    say ""
+    item 1 "Generate" "recommended"
+    item 2 "Enter an existing key" "if you already have one"
     say ""
     local kmode=""
-    item 1 "Generate a new one"
-    item 2 "Paste the key from the other server"
+    ask kmode "select" "1"
     say ""
-    ask kmode "choose" "1"
     if [ "$kmode" = "2" ]; then
-        ask T_PSK "key (hex)"
+        ask T_PSK "key"
     else
         T_PSK="$("$CORE_BIN" -genpsk)"
+        ok "generated"
     fi
     case "$T_PSK" in
-        *[!0-9a-fA-F]*|"") fail "that is not a hex key"; pause; return 1 ;;
+        "" | *[!0-9a-fA-F]*) fail "a key is 64 hex characters"; pause; return 1 ;;
     esac
 
-    # --- mode -------------------------------------------------------------
-    head2 "Step 5 of 7   What should the tunnel carry?"
-    item 1 "Ports" "forward TCP/UDP ports (panels, inbounds)"
-    item 2 "Full IP" "a layer-3 link between the two servers"
+    # -- 5. transport ------------------------------------------------------
+    head2 "5/7   Protocol"
+    dim "how the link itself travels between the two servers"
+    say ""
+    item 1 "Direct" "encrypted stream, no wrapper - fastest"
+    say ""
+    dim "TLS and WebSocket are planned; Direct is the only one in this build"
+    say ""
+    local tr=""
+    ask tr "select" "1"
+    T_TRANSPORT="direct"
+
+    # -- 6. payload --------------------------------------------------------
+    head2 "6/7   What the tunnel carries"
+    item 1 "Ports" "forward TCP and UDP ports - panels, inbounds"
+    item 2 "Full IP" "a private layer-3 link between the two servers"
     say ""
     local m=""
-    ask m "choose" "1"
+    ask m "select" "1"
+    say ""
+
     if [ "$m" = "2" ]; then
         T_MODE="tun"
         local sub=""
-        ask sub "private /30 subnet index (0-63)" "1"
+        ask sub "subnet index (0-63)" "1"
+        case "$sub" in "" | *[!0-9]*) sub=1 ;; esac
         T_TUNIF="pfy${sub}"
         if [ "$T_ROLE" = "edge" ]; then
             T_TUNLOCAL="10.71.${sub}.1/30"; T_TUNPEER="10.71.${sub}.2"
@@ -175,81 +207,98 @@ new_tunnel() {
             T_TUNLOCAL="10.71.${sub}.2/30"; T_TUNPEER="10.71.${sub}.1"
         fi
         ask T_TUNMTU "MTU" "1380"
+        dim "this server takes ${T_TUNLOCAL}, the other one takes ${T_TUNPEER}"
     else
         T_MODE="forward"
-    fi
-
-    # --- forwarded ports --------------------------------------------------
-    if [ "$T_MODE" = "forward" ]; then
-        head2 "Step 6 of 7   Which ports should users reach?"
-        dim "examples:  443       same port on both sides"
-        dim "           443=8443  arrives on 443, lands on 8443 over there"
-        dim "           udp:500   a UDP port"
-        dim "           8000-8010 a whole range"
+        dim "port           same port on both servers"
+        dim "443=8443       arrives on 443 here, reaches 8443 there"
+        dim "udp:500        a UDP port"
+        dim "8000-8010      a range"
         say ""
         local raw=""
-        ask raw "ports (comma separated)" "443"
+        ask raw "ports on the Iran server, comma separated" "443"
         T_FORWARDS="$(parse_forwards "$raw")"
-        [ -n "$T_FORWARDS" ] || { fail "at least one port is needed"; pause; return 1; }
+        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
     fi
 
-    # --- tuning -----------------------------------------------------------
-    head2 "Step 7 of 7   Tuning"
-    if confirm "tune the advanced settings? (carriers, window, keepalive)"; then
+    # -- 7. performance ----------------------------------------------------
+    head2 "7/7   Performance"
+    dim "carriers are the parallel connections the link runs over; more of"
+    dim "them absorb packet loss better, 4 to 8 suits most paths"
+    say ""
+    if confirm "change the defaults? (carriers ${T_CARRIERS}, window ${T_WINDOW} KB)"; then
         say ""
-        dim "Carriers are the parallel TCP connections the tunnel runs over."
-        dim "More of them ride out packet loss better; 4 to 8 suits most links."
-        ask T_CARRIERS "carriers" "4"
-        dim "The window is how much data may be in flight per connection."
-        ask T_WINDOW "window (KB)" "1024"
-        ask T_KEEPALIVE "keepalive (seconds)" "10"
+        ask T_CARRIERS "carriers" "$T_CARRIERS"
+        ask T_WINDOW "window per stream in KB" "$T_WINDOW"
+        ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE"
     fi
-    case "$T_CARRIERS" in ''|*[!0-9]*) T_CARRIERS=4 ;; esac
+    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=4 ;; esac
+    case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=512 ;; esac
+    case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
     [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1
     [ "$T_CARRIERS" -gt 64 ] && T_CARRIERS=64
 
     T_STATUS="127.0.0.1:$(pick_free_port 9700)"
 
-    # --- write, validate, start -------------------------------------------
+    # -- review ------------------------------------------------------------
+    banner
+    head2 "Review"
+    box_top
+    box_row "$(pad_to "tunnel" 14)${C_B}${T_NAME}${C_OFF}"
+    box_row "$(pad_to "this server" 14)$(side_label "$T_ROLE")"
+    box_row "$(pad_to "link" 14)$([ -n "$T_CONNECT" ] && echo "outbound to $T_CONNECT" || echo "inbound on $T_LISTEN")"
+    box_row "$(pad_to "protocol" 14)$(transport_label "$T_TRANSPORT")"
+    box_row "$(pad_to "carries" 14)$(mode_label "$T_MODE")"
+    if [ "$T_MODE" = "forward" ]; then
+        box_row "$(pad_to "ports" 14)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
+    else
+        box_row "$(pad_to "addresses" 14)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    fi
+    box_row "$(pad_to "carriers" 14)${T_CARRIERS}"
+    box_bot
+    say ""
+    if ! confirm "create it?"; then
+        warn "cancelled, nothing was written"
+        pause
+        return 1
+    fi
+
+    # -- write and start ---------------------------------------------------
+    say ""
     local file; file="$(cfg_save)"
     if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
-        fail "the generated config was rejected:"
-        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/    /'
+        fail "the core rejected this configuration"
+        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
         rm -f "$file"
         pause; return 1
     fi
 
     write_units
     service_enable_start "$T_NAME"
-    ok "tunnel ${C_B}$T_NAME${C_OFF} created and started"
-
     enable_watchdog quiet
+    ok "$T_NAME is configured and running"
 
+    # -- token -------------------------------------------------------------
+    head2 "Token for the other server"
+    dim "on the ${C_OFF}$( [ "$T_ROLE" = "edge" ] && echo Kharej || echo Iran )${C_DIM} server: New Tunnel ${BX_ARR} Apply a token"
     say ""
-    head2 "Now set up the other server"
-    dim "Install Pingify over there, pick Config New Tunnel then \"Join with a"
-    dim "token\", and paste the line below. It carries every matching setting"
-    dim "and the shared key, so there is nothing else to type."
-    say ""
-    # Printed bare rather than inside a box: the token is long enough to wrap,
-    # and a box border would end up copied along with it.
     rule
     printf '%s\n' "${C_YEL}$(cfg_peer_token)${C_OFF}"
     rule
     say ""
-    warn "keep it private - anyone holding it can join your tunnel"
+    warn "treat it like a password - it contains the shared key"
     say ""
     tunnel_status_block "$T_NAME"
     pause
 }
 
 # ---------------------------------------------------------------------------
-# import from a peer token
+# apply a token
 # ---------------------------------------------------------------------------
 
 import_tunnel() {
-    head2 "Join with a token"
-    dim "run Config New Tunnel on the other server first; it prints the token"
+    head2 "Apply a token"
+    dim "configure the other server first; it prints the token at the end"
     say ""
     local token=""
     ask token "token"
@@ -257,30 +306,34 @@ import_tunnel() {
 
     local tmp="/tmp/pingify-import.json"
     if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
-        fail "that does not look like a Pingify token"
+        fail "that is not a Pingify token"
         pause; return 1
     fi
     local name; name="$(json_str "$tmp" name)"
-    [ -n "$name" ] || { fail "the token has no tunnel name in it"; rm -f "$tmp"; pause; return 1; }
+    if [ -z "$name" ]; then
+        fail "the token is incomplete"
+        rm -f "$tmp"; pause; return 1
+    fi
 
     if [ -f "$CFG_DIR/$name.json" ]; then
-        warn "a tunnel called $name already exists here"
-        confirm "overwrite it?" || { rm -f "$tmp"; return 1; }
+        say ""
+        warn "a tunnel named $name already exists on this server"
+        confirm "replace it?" || { rm -f "$tmp"; return 1; }
         systemctl stop "pingify@$name" >/dev/null 2>&1
     fi
 
-    # The status port from the far server may already be taken here.
+    # The status port chosen on the other server may be taken here.
     local sp; sp="$(json_str "$tmp" status_addr)"
-    local newsp="127.0.0.1:$(pick_free_port "${sp##*:}")"
-    sed -i "s#\"status_addr\": \"[^\"]*\"#\"status_addr\": \"$newsp\"#" "$tmp"
+    sed -i "s#\"status_addr\": \"[^\"]*\"#\"status_addr\": \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
 
-    # A dialling side needs the peer address; a listening side does not.
+    # A token that dials needs the address of the server that issued it.
     local conn; conn="$(json_str "$tmp" connect)"
     if [ -n "$conn" ]; then
         case "${conn%%:*}" in
-            ""|"0.0.0.0")
+            "" | "0.0.0.0")
+                say ""
                 local ip=""
-                ask ip "public IP of the OTHER server"
+                ask ip "public address of the other server"
                 sed -i "s#\"connect\": \"[^\"]*\"#\"connect\": \"$ip:${conn##*:}\"#" "$tmp" ;;
         esac
     fi
@@ -289,8 +342,9 @@ import_tunnel() {
     rm -f "$tmp"
 
     if ! "$CORE_BIN" -c "$CFG_DIR/$name.json" -check >/dev/null 2>&1; then
-        fail "the imported config was rejected:"
-        "$CORE_BIN" -c "$CFG_DIR/$name.json" -check 2>&1 | sed 's/^/    /'
+        say ""
+        fail "the core rejected this configuration"
+        "$CORE_BIN" -c "$CFG_DIR/$name.json" -check 2>&1 | sed 's/^/      /'
         rm -f "$CFG_DIR/$name.json"
         pause; return 1
     fi
@@ -298,7 +352,8 @@ import_tunnel() {
     write_units
     service_enable_start "$name"
     enable_watchdog quiet
-    ok "tunnel ${C_B}$name${C_OFF} imported and started"
+    say ""
+    ok "$name is configured and running"
     say ""
     tunnel_status_block "$name"
     pause

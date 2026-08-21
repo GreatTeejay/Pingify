@@ -1,6 +1,6 @@
 
 # ---------------------------------------------------------------------------
-# embedded engine sources
+# embedded core sources
 #
 # build.sh drops the contents of core/*.go in here. Shipping the source rather
 # than a binary means one file works on amd64 and arm64 alike, and there is

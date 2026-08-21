@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "2.0.0"
+const version = "3.0.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -65,9 +65,14 @@ type Config struct {
 	Role string `json:"role"`
 
 	// Mode selects what rides on top of the carrier pool.
-	//   forward — TCP/UDP port forwarding (Backhaul-style)
+	//   forward — TCP/UDP port forwarding
 	//   tun     — full layer-3 IP tunnel
 	Mode string `json:"mode"`
+
+	// Transport is how the carriers themselves travel. Only "direct" exists
+	// today: the core's own encrypted stream with nothing wrapped around it.
+	// TLS and WebSocket variants slot in here without touching a line above.
+	Transport string `json:"transport,omitempty"`
 
 	// Exactly one of Listen/Connect is set. It is independent of Role, so the
 	// dial direction can be chosen to suit whichever side has clean inbound.
@@ -105,6 +110,9 @@ func (c *Config) applyDefaults() {
 	if c.Mode == "" {
 		c.Mode = "forward"
 	}
+	if c.Transport == "" || c.Transport == "tcp" {
+		c.Transport = "direct"
+	}
 	if c.Carriers <= 0 {
 		c.Carriers = 4
 	}
@@ -112,7 +120,10 @@ func (c *Config) applyDefaults() {
 		c.Carriers = 64
 	}
 	if c.WindowKB <= 0 {
-		c.WindowKB = 1024
+		// 512 KiB per stream is roughly 50 Mbit/s on an 80 ms path, and it
+		// bounds what one stalled connection can hold in memory. Raise it for
+		// a very fat link; every open stream can buffer this much.
+		c.WindowKB = 512
 	}
 	if c.WindowKB < 64 {
 		c.WindowKB = 64
@@ -153,6 +164,11 @@ func (c *Config) validate() error {
 	case "forward", "tun":
 	default:
 		return fmt.Errorf("mode must be \"forward\" or \"tun\", got %q", c.Mode)
+	}
+	switch c.Transport {
+	case "direct":
+	default:
+		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
 	if (c.Listen == "") == (c.Connect == "") {
 		return fmt.Errorf("set exactly one of \"listen\" or \"connect\"")
@@ -238,8 +254,8 @@ func main() {
 	}
 
 	setLogLevel(cfg.LogLevel)
-	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s carriers=%d",
-		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Carriers)
+	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
+		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
 
 	p := newPool(&cfg)
 	if err := p.start(); err != nil {
@@ -350,17 +366,58 @@ func hkdfExpand(prk, info []byte, n int) []byte {
 	return out[:n]
 }
 
-// deriveKeys turns the PSK plus both handshake nonces into two independent
-// 32-byte AES keys, one per direction. Every carrier gets its own pair because
-// each carrier runs its own handshake with fresh nonces.
-func deriveKeys(psk, nonceC, nonceS []byte, carrier uint16) (c2s, s2c []byte) {
+// sessionKeys is everything one carrier connection needs: an AEAD per
+// direction, plus a block cipher per direction used to mask the frame length
+// prefix. Masking the length is what stops the stream from looking like clean
+// length-delimited framing to anything watching it go past.
+type sessionKeys struct {
+	tx     cipher.AEAD
+	rx     cipher.AEAD
+	maskTx cipher.Block
+	maskRx cipher.Block
+}
+
+func blockFrom(key []byte) cipher.Block {
+	b, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err) // key length is fixed at 32 by the caller
+	}
+	return b
+}
+
+// deriveSession turns the PSK plus both handshake nonces into four independent
+// keys. Every carrier gets its own set, because every carrier runs its own
+// handshake with fresh nonces - so no two connections, and no two directions,
+// ever share a keystream.
+func deriveSession(psk, nonceC, nonceS []byte, carrier uint16, dialer bool) *sessionKeys {
 	salt := make([]byte, 0, len(nonceC)+len(nonceS)+2)
 	salt = append(salt, nonceC...)
 	salt = append(salt, nonceS...)
 	salt = append(salt, byte(carrier>>8), byte(carrier))
 	prk := hkdfExtract(salt, psk)
-	return hkdfExpand(prk, []byte("pingify/v2 c2s"), 32),
-		hkdfExpand(prk, []byte("pingify/v2 s2c"), 32)
+
+	c2s := hkdfExpand(prk, []byte("pingify/v3 c2s"), 32)
+	s2c := hkdfExpand(prk, []byte("pingify/v3 s2c"), 32)
+	lenC2S := hkdfExpand(prk, []byte("pingify/v3 len c2s"), 32)
+	lenS2C := hkdfExpand(prk, []byte("pingify/v3 len s2c"), 32)
+
+	if dialer {
+		return &sessionKeys{aeadFrom(c2s), aeadFrom(s2c), blockFrom(lenC2S), blockFrom(lenS2C)}
+	}
+	return &sessionKeys{aeadFrom(s2c), aeadFrom(c2s), blockFrom(lenS2C), blockFrom(lenC2S)}
+}
+
+// maskLen XORs the four-byte length prefix with an AES block keyed per
+// direction and indexed by the frame counter. One block cipher call per frame
+// is nothing next to encrypting the payload, and it removes the last piece of
+// visible structure from the stream.
+func maskLen(b cipher.Block, ctr uint64, p []byte) {
+	var in, out [16]byte
+	binary.BigEndian.PutUint64(in[8:], ctr)
+	b.Encrypt(out[:], in[:])
+	for i := 0; i < 4; i++ {
+		p[i] ^= out[i]
+	}
 }
 
 // ==========================================================================
@@ -370,19 +427,32 @@ func deriveKeys(psk, nonceC, nonceS []byte, carrier uint16) (c2s, s2c []byte) {
 // ---------------------------------------------------------------------------
 // handshake
 //
-//	dialer  -> listener : MAGIC(4) VER(1) ROLE(1) CARRIER(2) TIME(8) NONCE(16) TAG(32)
-//	listener -> dialer  : NONCE(16) TAG(32)
+//	dialer  -> listener : NONCE(16) SEALED(16) TAG(32) PAD(0..255)
+//	listener -> dialer  : NONCE(16) TAG(32)     PAD(0..255)
 //
-// Both tags are HMAC-SHA256 over the pre-shared key. A wrong key, a stale
-// timestamp or a replayed nonce all end the same way: the socket is closed
-// without a byte of reply, so a scanner cannot tell the port from a black hole.
+// Not one byte of this is constant. There is no magic number and no plaintext
+// version, role, carrier index or timestamp: those sixteen bytes are XORed
+// with an AES block keyed by the pre-shared key and this connection's nonce,
+// so two handshakes never share a byte. The length varies too, because the
+// amount of trailing padding is read out of the tag - unpredictable to an
+// observer, known to both ends.
+//
+// That matters more than it sounds. The previous revision opened every
+// connection with the four ASCII bytes "PFY2", which is a one-line signature
+// for anything doing deep packet inspection.
+//
+// A wrong key, a stale timestamp or a replayed nonce all end the same way: the
+// socket closes after a random delay without a byte of reply, so a scanner
+// cannot tell the port from a black hole.
 // ---------------------------------------------------------------------------
 
 const (
-	hsMagic     = "PFY2"
-	hsVersion   = 2
-	hsClientLen = 4 + 1 + 1 + 2 + 8 + 16 + 32
-	hsServerLen = 16 + 32
+	hsVersion   = 3
+	hsNonceLen  = 16
+	hsSealedLen = 16
+	hsTagLen    = 32
+	hsClientLen = hsNonceLen + hsSealedLen + hsTagLen
+	hsServerLen = hsNonceLen + hsTagLen
 	hsSkew      = 180 * time.Second
 )
 
@@ -440,90 +510,163 @@ func aeadFrom(key []byte) cipher.AEAD {
 	return a
 }
 
+// headerPad XORs the 16 header bytes with a one-time AES block keyed by the
+// pre-shared key and this connection's nonce. Both ends can compute it; nobody
+// else can, and the result carries no recognisable structure.
+func headerPad(psk, nonce []byte) [16]byte {
+	k := hkdfExpand(hkdfExtract(nonce, psk), []byte("pingify/v3 header"), 32)
+	blk, err := aes.NewCipher(k)
+	if err != nil {
+		panic(err)
+	}
+	var out [16]byte
+	blk.Encrypt(out[:], nonce)
+	return out
+}
+
+// writePadding appends the trailing random bytes. The count comes out of the
+// tag, so the handshake is never the same length twice.
+func writePadding(conn net.Conn, tag []byte) error {
+	n := int(tag[0])
+	if n == 0 {
+		return nil
+	}
+	pad := make([]byte, n)
+	if _, err := rand.Read(pad); err != nil {
+		return err
+	}
+	_, err := conn.Write(pad)
+	return err
+}
+
+func readPadding(conn net.Conn, tag []byte) error {
+	n := int(tag[0])
+	if n == 0 {
+		return nil
+	}
+	_, err := io.CopyN(io.Discard, conn, int64(n))
+	return err
+}
+
 // clientHandshake runs on the side that dials out.
-func clientHandshake(conn net.Conn, cfg *Config, carrier int) (tx, rx cipher.AEAD, err error) {
+func clientHandshake(conn net.Conn, cfg *Config, carrier int) (*sessionKeys, error) {
 	psk := cfg.key()
 	buf := make([]byte, hsClientLen)
-	copy(buf[0:4], hsMagic)
-	buf[4] = hsVersion
-	buf[5] = roleByte(cfg.Role)
-	binary.BigEndian.PutUint16(buf[6:8], uint16(carrier))
-	binary.BigEndian.PutUint64(buf[8:16], uint64(time.Now().Unix()))
-	if _, err = rand.Read(buf[16:32]); err != nil {
-		return nil, nil, err
+	nonceC := buf[:hsNonceLen]
+	sealed := buf[hsNonceLen : hsNonceLen+hsSealedLen]
+	tag := buf[hsNonceLen+hsSealedLen:]
+
+	if _, err := rand.Read(nonceC); err != nil {
+		return nil, err
+	}
+	var hdr [16]byte
+	hdr[0] = hsVersion
+	hdr[1] = roleByte(cfg.Role)
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(carrier))
+	binary.BigEndian.PutUint64(hdr[4:12], uint64(time.Now().Unix()))
+	if _, err := rand.Read(hdr[12:]); err != nil { // filler, never inspected
+		return nil, err
+	}
+	pad := headerPad(psk, nonceC)
+	for i := range hdr {
+		sealed[i] = hdr[i] ^ pad[i]
 	}
 	m := hmac.New(sha256.New, psk)
-	m.Write(buf[:32])
-	copy(buf[32:], m.Sum(nil))
+	m.Write(nonceC)
+	m.Write(sealed)
+	copy(tag, m.Sum(nil))
 
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
-	if _, err = conn.Write(buf); err != nil {
-		return nil, nil, err
+	if _, err := conn.Write(buf); err != nil {
+		return nil, err
 	}
+	if err := writePadding(conn, tag); err != nil {
+		return nil, err
+	}
+
 	resp := make([]byte, hsServerLen)
-	if _, err = io.ReadFull(conn, resp); err != nil {
-		return nil, nil, err
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
 	}
 	m2 := hmac.New(sha256.New, psk)
-	m2.Write([]byte("pingify/v2 srv"))
-	m2.Write(buf[16:32])
-	m2.Write(resp[:16])
-	if !hmac.Equal(m2.Sum(nil), resp[16:]) {
-		return nil, nil, errHandshake
+	m2.Write([]byte("pingify/v3 server"))
+	m2.Write(nonceC)
+	m2.Write(resp[:hsNonceLen])
+	if !hmac.Equal(m2.Sum(nil), resp[hsNonceLen:]) {
+		return nil, errHandshake
+	}
+	if err := readPadding(conn, resp[hsNonceLen:]); err != nil {
+		return nil, err
 	}
 	conn.SetDeadline(time.Time{})
 
-	c2s, s2c := deriveKeys(psk, buf[16:32], resp[:16], uint16(carrier))
-	return aeadFrom(c2s), aeadFrom(s2c), nil
+	return deriveSession(psk, nonceC, resp[:hsNonceLen], uint16(carrier), true), nil
 }
 
 // serverHandshake runs on the side that listens.
-func serverHandshake(conn net.Conn, cfg *Config, g *replayGuard) (tx, rx cipher.AEAD, carrier int, err error) {
+func serverHandshake(conn net.Conn, cfg *Config, g *replayGuard) (*sessionKeys, int, error) {
 	psk := cfg.key()
 	buf := make([]byte, hsClientLen)
 	conn.SetDeadline(time.Now().Add(15 * time.Second))
-	if _, err = io.ReadFull(conn, buf); err != nil {
-		return nil, nil, 0, err
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, 0, err
 	}
-	if string(buf[0:4]) != hsMagic || buf[4] != hsVersion {
-		return nil, nil, 0, errHandshake
-	}
-	if buf[5] == roleByte(cfg.Role) {
-		return nil, nil, 0, errHandshake // both ends configured with the same role
-	}
-	ts := int64(binary.BigEndian.Uint64(buf[8:16]))
-	if d := time.Since(time.Unix(ts, 0)); d > hsSkew || d < -hsSkew {
-		return nil, nil, 0, errHandshake
-	}
+	nonceC := buf[:hsNonceLen]
+	sealed := buf[hsNonceLen : hsNonceLen+hsSealedLen]
+	tag := buf[hsNonceLen+hsSealedLen:]
+
+	// Authenticate before trusting a single field.
 	m := hmac.New(sha256.New, psk)
-	m.Write(buf[:32])
-	if !hmac.Equal(m.Sum(nil), buf[32:]) {
-		return nil, nil, 0, errHandshake
+	m.Write(nonceC)
+	m.Write(sealed)
+	if !hmac.Equal(m.Sum(nil), tag) {
+		return nil, 0, errHandshake
 	}
 	var nc [16]byte
-	copy(nc[:], buf[16:32])
+	copy(nc[:], nonceC)
 	if !g.accept(nc) {
-		return nil, nil, 0, errHandshake
+		return nil, 0, errHandshake
+	}
+
+	pad := headerPad(psk, nonceC)
+	var hdr [16]byte
+	for i := range hdr {
+		hdr[i] = sealed[i] ^ pad[i]
+	}
+	if hdr[0] != hsVersion {
+		return nil, 0, errHandshake
+	}
+	if hdr[1] == roleByte(cfg.Role) {
+		return nil, 0, errHandshake // both ends configured with the same role
+	}
+	ts := int64(binary.BigEndian.Uint64(hdr[4:12]))
+	if d := time.Since(time.Unix(ts, 0)); d > hsSkew || d < -hsSkew {
+		return nil, 0, errHandshake
+	}
+	carrier := int(binary.BigEndian.Uint16(hdr[2:4]))
+
+	if err := readPadding(conn, tag); err != nil {
+		return nil, 0, err
 	}
 
 	resp := make([]byte, hsServerLen)
-	if _, err = rand.Read(resp[:16]); err != nil {
-		return nil, nil, 0, err
+	if _, err := rand.Read(resp[:hsNonceLen]); err != nil {
+		return nil, 0, err
 	}
 	m2 := hmac.New(sha256.New, psk)
-	m2.Write([]byte("pingify/v2 srv"))
-	m2.Write(buf[16:32])
-	m2.Write(resp[:16])
-	copy(resp[16:], m2.Sum(nil))
-	if _, err = conn.Write(resp); err != nil {
-		return nil, nil, 0, err
+	m2.Write([]byte("pingify/v3 server"))
+	m2.Write(nonceC)
+	m2.Write(resp[:hsNonceLen])
+	copy(resp[hsNonceLen:], m2.Sum(nil))
+	if _, err := conn.Write(resp); err != nil {
+		return nil, 0, err
+	}
+	if err := writePadding(conn, resp[hsNonceLen:]); err != nil {
+		return nil, 0, err
 	}
 	conn.SetDeadline(time.Time{})
 
-	carrier = int(binary.BigEndian.Uint16(buf[6:8]))
-	c2s, s2c := deriveKeys(psk, buf[16:32], resp[:16], uint16(carrier))
-	// The dialer is "c2s"; from here it is inbound.
-	return aeadFrom(s2c), aeadFrom(c2s), carrier, nil
+	return deriveSession(psk, nonceC, resp[:hsNonceLen], uint16(carrier), false), carrier, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -606,7 +749,7 @@ func (p *pool) acceptLoop(ln net.Listener) {
 
 func (p *pool) serveInbound(conn net.Conn) {
 	tuneSocket(conn, p.cfg)
-	tx, rx, idx, err := serverHandshake(conn, p.cfg, p.guard)
+	keys, idx, err := serverHandshake(conn, p.cfg, p.guard)
 	if err != nil {
 		// Stay quiet: a probe should learn nothing from timing or content.
 		time.Sleep(time.Duration(200+mrand.Intn(600)) * time.Millisecond)
@@ -618,7 +761,7 @@ func (p *pool) serveInbound(conn net.Conn) {
 		conn.Close()
 		return
 	}
-	l := newLink(idx, p.cfg, conn, tx, rx, p)
+	l := newLink(idx, p.cfg, conn, keys, p)
 	p.install(idx, l)
 	logInfo("carrier %d up from %s", idx, conn.RemoteAddr())
 	l.run()
@@ -639,7 +782,7 @@ func (p *pool) dialLoop(idx int) {
 			continue
 		}
 		tuneSocket(conn, p.cfg)
-		tx, rx, err := clientHandshake(conn, p.cfg, idx)
+		keys, err := clientHandshake(conn, p.cfg, idx)
 		if err != nil {
 			conn.Close()
 			logWarn("carrier %d handshake: %v (check the key on both servers)", idx, err)
@@ -647,7 +790,7 @@ func (p *pool) dialLoop(idx int) {
 			continue
 		}
 		backoff = 500 * time.Millisecond
-		l := newLink(idx, p.cfg, conn, tx, rx, p)
+		l := newLink(idx, p.cfg, conn, keys, p)
 		p.install(idx, l)
 		logInfo("carrier %d up to %s", idx, p.cfg.Connect)
 		l.run() // blocks until the carrier dies
@@ -797,6 +940,16 @@ const (
 	maxRecord = 32 * 1024
 	maxPlain  = 128 * 1024
 	maxFrame  = maxPlain + 64
+
+	// Control records - window credits, keepalives, opens and closes - are a
+	// handful of bytes each and vastly outnumber data records. Giving them
+	// their own small pool keeps a four-byte credit update from borrowing a
+	// 32 KiB buffer, which is where most of the idle memory used to go.
+	smallRecord = 512
+
+	sendQueue      = 128 // records queued per carrier before the writer blocks
+	earlyPadFrames = 8   // pad only the opening frames of a connection
+	earlyPadMax    = 512
 )
 
 const (
@@ -811,6 +964,7 @@ const (
 	cmdUDP  = 9  // one UDP datagram
 	cmdUFIN = 10 // UDP session gone
 	cmdTUN  = 11 // one raw IP packet (tun mode)
+	cmdPad  = 12 // random filler, discarded on arrival
 )
 
 var errLinkClosed = errors.New("carrier closed")
@@ -820,11 +974,12 @@ var errLinkClosed = errors.New("carrier closed")
 // ---------------------------------------------------------------------------
 
 type recBuf struct {
-	a [recHdr + maxRecord]byte
-	n int
+	a   []byte
+	n   int
+	big bool
 }
 
-func (r *recBuf) body() []byte  { return r.a[recHdr : recHdr+maxRecord] }
+func (r *recBuf) body() []byte  { return r.a[recHdr:] }
 func (r *recBuf) bytes() []byte { return r.a[:r.n] }
 
 func (r *recBuf) seal(cmd byte, id uint32, n int) {
@@ -834,16 +989,54 @@ func (r *recBuf) seal(cmd byte, id uint32, n int) {
 	r.n = recHdr + n
 }
 
-var recPool = sync.Pool{New: func() interface{} { return new(recBuf) }}
+var bigPool = sync.Pool{New: func() interface{} {
+	return &recBuf{a: make([]byte, recHdr+maxRecord), big: true}
+}}
 
-func getRec() *recBuf  { return recPool.Get().(*recBuf) }
-func putRec(r *recBuf) { recPool.Put(r) }
+var smallPool = sync.Pool{New: func() interface{} {
+	return &recBuf{a: make([]byte, recHdr+smallRecord)}
+}}
+
+// getRec hands out a full-size buffer, for the data path.
+func getRec() *recBuf { return bigPool.Get().(*recBuf) }
+
+// getCtrl sizes the buffer to the payload, so a keepalive does not cost 32 KiB.
+func getCtrl(payload int) *recBuf {
+	if payload <= smallRecord {
+		return smallPool.Get().(*recBuf)
+	}
+	return bigPool.Get().(*recBuf)
+}
+
+func putRec(r *recBuf) {
+	if r.big {
+		bigPool.Put(r)
+	} else {
+		smallPool.Put(r)
+	}
+}
 
 func ctrlRec(cmd byte, id uint32, payload []byte) *recBuf {
-	r := getRec()
+	r := getCtrl(len(payload))
 	copy(r.a[recHdr:], payload)
 	r.seal(cmd, id, len(payload))
 	return r
+}
+
+// appendPad tacks a random-length filler record onto a frame.
+func appendPad(frame []byte) []byte {
+	n := mrand.Intn(earlyPadMax)
+	if n == 0 {
+		return frame
+	}
+	var hdr [recHdr]byte
+	hdr[0] = cmdPad
+	binary.BigEndian.PutUint32(hdr[5:9], uint32(n))
+	frame = append(frame, hdr[:]...)
+	start := len(frame)
+	frame = append(frame, make([]byte, n)...)
+	rand.Read(frame[start:])
+	return frame
 }
 
 // ---------------------------------------------------------------------------
@@ -1015,7 +1208,7 @@ func (s *stream) pumpOut(local net.Conn) {
 // consumed credit to the far side.
 func (s *stream) pumpIn(local net.Conn) {
 	defer s.halfDone()
-	buf := make([]byte, 64*1024)
+	buf := make([]byte, 32*1024)
 	for {
 		n, err := s.rb.Read(buf)
 		if n > 0 {
@@ -1066,10 +1259,9 @@ type link struct {
 	conn net.Conn
 	pool *pool
 
-	aeadTx cipher.AEAD
-	aeadRx cipher.AEAD
-	txCtr  uint64
-	rxCtr  uint64
+	keys  *sessionKeys
+	txCtr uint64
+	rxCtr uint64
 
 	sendQ     chan *recBuf
 	closed    chan struct{}
@@ -1086,12 +1278,11 @@ type link struct {
 	upSince int64
 }
 
-func newLink(idx int, cfg *Config, conn net.Conn, tx, rx cipher.AEAD, p *pool) *link {
+func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link {
 	l := &link{
 		idx: idx, cfg: cfg, conn: conn, pool: p,
-		aeadTx:  tx,
-		aeadRx:  rx,
-		sendQ:   make(chan *recBuf, 256),
+		keys:    k,
+		sendQ:   make(chan *recBuf, sendQueue),
 		closed:  make(chan struct{}),
 		streams: make(map[uint32]*stream),
 	}
@@ -1172,11 +1363,18 @@ func (l *link) writeLoop() {
 				break drain
 			}
 		}
-		n := nonceFor(l.txCtr)
+		// Only the opening frames are padded. That is where a fingerprint
+		// would be taken, and padding every frame would cost real bandwidth.
+		if ctr := l.txCtr; ctr < earlyPadFrames && len(frame) < maxPlain-recHdr-earlyPadMax {
+			frame = appendPad(frame)
+		}
+		ctr := l.txCtr
 		l.txCtr++
+		n := nonceFor(ctr)
 		out = out[:4]
-		out = l.aeadTx.Seal(out, n[:], frame, nil)
+		out = l.keys.tx.Seal(out, n[:], frame, nil)
 		binary.BigEndian.PutUint32(out[:4], uint32(len(out)-4))
+		maskLen(l.keys.maskTx, ctr, out[:4])
 		l.conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 		if _, err := l.conn.Write(out); err != nil {
 			logDebug("carrier %d write: %v", l.idx, err)
@@ -1198,6 +1396,7 @@ func (l *link) readLoop() {
 			logDebug("carrier %d read: %v", l.idx, err)
 			return
 		}
+		maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
 		n := int(binary.BigEndian.Uint32(hdr[:]))
 		if n < 16 || n > maxFrame {
 			logWarn("carrier %d: bad frame length %d", l.idx, n)
@@ -1212,7 +1411,7 @@ func (l *link) readLoop() {
 		}
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
-		p, err := l.aeadRx.Open(plain[:0], nc[:], ct, nil)
+		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
 		if err != nil {
 			logWarn("carrier %d: authentication failed", l.idx)
 			return
@@ -1259,6 +1458,8 @@ func (l *link) dispatch(p []byte) error {
 			if s := l.getStream(id); s != nil {
 				s.reset()
 			}
+		case cmdPad:
+			// deliberately ignored
 		case cmdPing:
 			// Never block the read loop: if the send queue is momentarily
 			// full, drop the pong rather than risk both ends stalling on
@@ -2126,20 +2327,21 @@ type carrierStatus struct {
 }
 
 type statusDoc struct {
-	Name     string          `json:"name"`
-	Version  string          `json:"version"`
-	Role     string          `json:"role"`
-	Mode     string          `json:"mode"`
-	Peer     string          `json:"peer"`
-	Healthy  bool            `json:"healthy"`
-	Carriers int             `json:"carriers_configured"`
-	Up       int             `json:"carriers_up"`
-	Streams  int             `json:"streams"`
-	TxBytes  uint64          `json:"tx_bytes"`
-	RxBytes  uint64          `json:"rx_bytes"`
-	RTTms    float64         `json:"rtt_ms"`
-	UptimeS  int64           `json:"uptime_s"`
-	Detail   []carrierStatus `json:"detail"`
+	Name      string          `json:"name"`
+	Version   string          `json:"version"`
+	Role      string          `json:"role"`
+	Mode      string          `json:"mode"`
+	Transport string          `json:"transport"`
+	Peer      string          `json:"peer"`
+	Healthy   bool            `json:"healthy"`
+	Carriers  int             `json:"carriers_configured"`
+	Up        int             `json:"carriers_up"`
+	Streams   int             `json:"streams"`
+	TxBytes   uint64          `json:"tx_bytes"`
+	RxBytes   uint64          `json:"rx_bytes"`
+	RTTms     float64         `json:"rtt_ms"`
+	UptimeS   int64           `json:"uptime_s"`
+	Detail    []carrierStatus `json:"detail"`
 }
 
 func startStatusServer(addr string, cfg *Config, p *pool) {
@@ -2169,13 +2371,14 @@ func startStatusServer(addr string, cfg *Config, p *pool) {
 
 func snapshot(cfg *Config, p *pool) statusDoc {
 	d := statusDoc{
-		Name:     cfg.Name,
-		Version:  version,
-		Role:     cfg.Role,
-		Mode:     cfg.Mode,
-		Peer:     cfg.Connect,
-		Carriers: cfg.Carriers,
-		UptimeS:  int64(time.Since(p.startedAt).Seconds()),
+		Name:      cfg.Name,
+		Version:   version,
+		Role:      cfg.Role,
+		Mode:      cfg.Mode,
+		Transport: cfg.Transport,
+		Peer:      cfg.Connect,
+		Carriers:  cfg.Carriers,
+		UptimeS:   int64(time.Since(p.startedAt).Seconds()),
 	}
 	if d.Peer == "" {
 		d.Peer = "listen " + cfg.Listen
@@ -2283,7 +2486,7 @@ func printStatus(addr string, brief bool) int {
 	if d.Healthy {
 		state = "UP"
 	}
-	fmt.Printf("  tunnel     %s (%s, %s)\n", d.Name, d.Role, d.Mode)
+	fmt.Printf("  tunnel     %s  (%s, %s, %s)\n", d.Name, d.Role, d.Mode, d.Transport)
 	fmt.Printf("  state      %s  -  %d of %d carriers\n", state, d.Up, d.Carriers)
 	fmt.Printf("  peer       %s\n", d.Peer)
 	fmt.Printf("  rtt        %.1f ms\n", d.RTTms)

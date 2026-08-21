@@ -10,6 +10,7 @@ cfg_load() {
     T_NAME="$(json_str "$f" name)"
     T_ROLE="$(json_str "$f" role)"
     T_MODE="$(json_str "$f" mode)"
+    T_TRANSPORT="$(json_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
     T_LISTEN="$(json_str "$f" listen)"
     T_CONNECT="$(json_str "$f" connect)"
     T_PSK="$(json_str "$f" psk)"
@@ -127,7 +128,7 @@ pick_tunnel() {
     item 0 "Back"
     say ""
     local sel=""
-    ask sel "tunnel" "1"
+    ask sel "select" "1"
     [ "$sel" = "0" ] && return 1
     case "$sel" in ''|*[!0-9]*) return 1 ;; esac
     PICKED="$(printf '%s\n' $names | sed -n "${sel}p")"
@@ -154,16 +155,16 @@ tunnel_menu() {
         item 1 "Restart"
         item 2 "Stop"
         item 3 "Start"
-        item 4 "Follow the log"
+        item 4 "Live log"
         item 5 "Edit forwarded ports"
-        item 6 "Edit carriers / window / keepalive"
-        item 7 "Show the peer token again"
-        item 8 "Scheduled recycle (periodic restart)"
+        item 6 "Performance settings"
+        item 7 "Show the token again"
+        item 8 "Scheduled restart"
         item 9 "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
-        ask c "choose"
+        ask c "select"
         case "$c" in
             1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
             2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;

@@ -58,13 +58,15 @@ check "carriers round-trip"   "$(json_num "$file" carriers)"      "6"
 check "window round-trips"    "$(json_num "$file" window_kb)"     "2048"
 check "status round-trips"    "$(json_str "$file" status_addr)"   "127.0.0.1:9700"
 check "no listen key written" "$(json_str "$file" listen)"        ""
+check "transport written"     "$(json_str "$file" transport)"     "direct"
 
 saved_psk="$T_PSK"
 cfg_load t1
 check "cfg_load role"     "$T_ROLE"     "edge"
 check "cfg_load psk"      "$T_PSK"      "$saved_psk"
 check "cfg_load forwards" "$T_FORWARDS" '"443","udp:500"'
-check "cfg_load carriers" "$T_CARRIERS" "6"
+check "cfg_load carriers"  "$T_CARRIERS"  "6"
+check "cfg_load transport" "$T_TRANSPORT" "direct"
 
 # ---------------------------------------------------------------------------
 note "peer token mirrors the tunnel"
@@ -75,6 +77,7 @@ check "role flips"           "$(json_str "$WORK/peer.json" role)"     "origin"
 check "dialler becomes host" "$(json_str "$WORK/peer.json" listen)"   "0.0.0.0:9443"
 check "peer does not dial"   "$(json_str "$WORK/peer.json" connect)"  ""
 check "key is carried over"  "$(json_str "$WORK/peer.json" psk)"      "$saved_psk"
+check "transport mirrored"   "$(json_str "$WORK/peer.json" transport)" "direct"
 check "ports stay on edge"   "$(grep -c forwards "$WORK/peer.json")"  "0"
 
 # a tun tunnel must hand the peer the other end of the /30

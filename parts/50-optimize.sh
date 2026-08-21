@@ -157,7 +157,7 @@ manage_swap() {
 optimize_menu() {
     while :; do
         banner
-        head2 "Optimize Server & Network"
+        head2 "Optimize"
         item 1 "Apply network tuning" "(BBR + fq + high-BDP buffers)"
         item 2 "Apply network tuning" "+ enable IP forwarding (full-IP tunnels)"
         item 3 "Show the current settings"
@@ -167,7 +167,7 @@ optimize_menu() {
         item 0 "Back"
         say ""
         local c=""
-        ask c "choose"
+        ask c "select"
         case "$c" in
             1) apply_tuning no; pause ;;
             2) apply_tuning yes; pause ;;

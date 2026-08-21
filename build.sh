@@ -15,7 +15,7 @@ red()  { printf '\033[31m%s\033[0m\n' "$*"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$*"; }
 info() { printf '  %s\n' "$*"; }
 
-# --- 1. the engine has to be healthy before we bundle it -------------------
+# --- 1. the core has to be healthy before we bundle it -------------------
 if command -v "$GO_BIN" >/dev/null 2>&1; then
     info "gofmt"
     unformatted="$("$GO_BIN" fmt ./core/ 2>/dev/null || true)"

@@ -59,7 +59,7 @@ status_panel() {
     local cc; cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
 
     box_top
-    box_row "$edot $(pad_to "engine ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
+    box_row "$edot $(pad_to "core ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
     box_row "$wdot $(pad_to "watchdog ${C_B}${wd}${C_OFF}" 22)${C_GRY}${BX_DOT}${C_OFF} tcp ${C_B}${cc:-unknown}${C_OFF}"
     box_bot
 }
@@ -67,14 +67,17 @@ status_panel() {
 first_run() {
     [ -x "$CORE_BIN" ] && return 0
     banner
-    head2 "Welcome"
-    dim "Pingify needs its engine before it can build a tunnel. It will fetch the"
-    dim "prebuilt binary for this CPU from GitHub, and fall back to compiling the"
-    dim "sources carried inside this script if that is not reachable."
+    head2 "First run"
+    dim "setting up the core for this server"
     say ""
-    if confirm "install the engine now?"; then
+    if install_core; then
         say ""
-        install_core || { say ""; warn "you can retry any time from Update Core"; }
+        ok "ready"
+        sleep 1
+    else
+        say ""
+        fail "the core could not be installed"
+        dim "the Core menu has the other ways to get it"
         pause
     fi
 }
@@ -84,19 +87,19 @@ main_menu() {
         banner
         status_panel
         say ""
-        item 1 "Config New Tunnel"       "create one, or join with a token"
-        item 2 "Manage Tunnels"          "status, ports, logs, remove"
-        item 3 "Health & Monitoring"     "live dashboard and watchdog"
-        item 4 "Optimize Server"         "BBR, buffers, limits, swap"
-        item 5 "Update Core"             "refresh the engine or Pingify"
-        item 6 "Remove"                  "uninstall parts, or everything"
-        item 7 "Diagnostics"             "reach the peer, verify configs"
-        item 8 "Backup & Restore"        "save or reload your tunnels"
+        item 1 "New Tunnel"        "create one, or apply a token"
+        item 2 "Tunnels"           "status, ports, logs, remove"
+        item 3 "Health"            "dashboard, watchdog, restarts"
+        item 4 "Optimize"          "BBR, buffers, limits, swap"
+        item 5 "Core"              "install, update, import, export"
+        item 6 "Remove"            "uninstall parts, or everything"
+        item 7 "Diagnostics"       "reach the peer, verify configs"
+        item 8 "Backup"            "save or restore your tunnels"
         say ""
         item 0 "Exit"
         say ""
         local c=""
-        ask c "choose"
+        ask c "select"
         case "$c" in
             1) new_tunnel ;;
             2) manage_tunnels ;;
@@ -137,6 +140,6 @@ main() {
     main_menu
 }
 
-# build.sh sources this file to verify the embedded engine sources; that must
+# build.sh sources this file to verify the embedded core sources; that must
 # not launch the menu.
 [ -n "${PINGIFY_NO_MAIN:-}" ] || main "$@"

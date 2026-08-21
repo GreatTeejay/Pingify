@@ -67,19 +67,132 @@ func TestParseForward(t *testing.T) {
 	}
 }
 
-func TestDeriveKeysAreDirectionalAndPerCarrier(t *testing.T) {
+func TestSessionKeysAreDirectionalAndPerCarrier(t *testing.T) {
 	psk := []byte("a-shared-secret-value-here-32byte")
 	nc, ns := []byte("0123456789abcdef"), []byte("fedcba9876543210")
-	c2s, s2c := deriveKeys(psk, nc, ns, 0)
-	if len(c2s) != 32 || len(s2c) != 32 {
-		t.Fatal("keys must be 32 bytes")
+
+	dialer := deriveSession(psk, nc, ns, 0, true)
+	listener := deriveSession(psk, nc, ns, 0, false)
+
+	// What one side seals, the other must open - and only that way round.
+	msg := []byte("carrier payload")
+	var nonce [12]byte
+	sealed := dialer.tx.Seal(nil, nonce[:], msg, nil)
+	got, err := listener.rx.Open(nil, nonce[:], sealed, nil)
+	if err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("the listener could not open what the dialer sealed: %v", err)
 	}
-	if bytes.Equal(c2s, s2c) {
+	if _, err := listener.tx.Open(nil, nonce[:], sealed, nil); err == nil {
 		t.Fatal("the two directions must not share a key")
 	}
-	other, _ := deriveKeys(psk, nc, ns, 1)
-	if bytes.Equal(c2s, other) {
-		t.Fatal("carriers must not share a key")
+
+	other := deriveSession(psk, nc, ns, 1, true)
+	if _, err := other.rx.Open(nil, nonce[:], sealed, nil); err == nil {
+		t.Fatal("two carriers must not share a key")
+	}
+}
+
+func TestLengthMaskIsReversibleAndPerFrame(t *testing.T) {
+	k := deriveSession([]byte("psk"), []byte("0123456789abcdef"), []byte("fedcba9876543210"), 0, true)
+	var a, b [4]byte
+	copy(a[:], []byte{0, 1, 0, 0})
+	copy(b[:], a[:])
+
+	maskLen(k.maskTx, 7, a[:])
+	if bytes.Equal(a[:], b[:]) {
+		t.Fatal("masking changed nothing")
+	}
+	maskLen(k.maskTx, 7, a[:]) // XOR is its own inverse
+	if !bytes.Equal(a[:], b[:]) {
+		t.Fatal("unmasking did not restore the length")
+	}
+
+	var c [4]byte
+	copy(c[:], b[:])
+	maskLen(k.maskTx, 8, c[:])
+	maskLen(k.maskTx, 7, b[:])
+	if bytes.Equal(b[:], c[:]) {
+		t.Fatal("consecutive frames must not reuse a mask")
+	}
+}
+
+// The opening bytes of a connection are what a filter fingerprints. Nothing
+// there may repeat: no magic number, no fixed field, not even a fixed length.
+func TestHandshakeLeaksNoConstantBytes(t *testing.T) {
+	setLogLevel("error")
+	const runs = 12
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	captured := make(chan []byte, runs)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				hdr := make([]byte, hsClientLen)
+				if _, err := io.ReadFull(c, hdr); err != nil {
+					return
+				}
+				// The padding length lives in the tag, so read it the way a
+				// real listener would.
+				padLen := int(hdr[hsNonceLen+hsSealedLen])
+				pad := make([]byte, padLen)
+				io.ReadFull(c, pad)
+				captured <- append(append([]byte{}, hdr...), pad...)
+			}(c)
+		}
+	}()
+
+	cfg := &Config{Role: "edge", PSK: testPSK(t), Carriers: 1}
+	cfg.applyDefaults()
+	addr := ln.Addr().String()
+
+	var seen [][]byte
+	for i := 0; i < runs; i++ {
+		c, err := net.DialTimeout("tcp", addr, 3*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clientHandshake(c, cfg, 0) // the listener never answers; that is fine
+		c.Close()
+		select {
+		case b := <-captured:
+			seen = append(seen, b)
+		case <-time.After(3 * time.Second):
+			t.Fatal("the listener never saw the handshake")
+		}
+	}
+
+	// No byte position may hold the same value in every handshake.
+	for pos := 0; pos < hsClientLen; pos++ {
+		same := true
+		for _, b := range seen[1:] {
+			if b[pos] != seen[0][pos] {
+				same = false
+				break
+			}
+		}
+		if same {
+			t.Fatalf("byte %d is identical in all %d handshakes (value %#x) - that is a signature",
+				pos, runs, seen[0][pos])
+		}
+	}
+
+	// And the total length has to vary, or the size alone identifies it.
+	lengths := map[int]bool{}
+	for _, b := range seen {
+		lengths[len(b)] = true
+	}
+	if len(lengths) < 2 {
+		t.Fatalf("every handshake was %d bytes long", len(seen[0]))
 	}
 }
 
@@ -300,7 +413,7 @@ func TestWrongPSKIsRejectedSilently(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if _, _, err := clientHandshake(c, wrong, 0); err == nil {
+	if _, err := clientHandshake(c, wrong, 0); err == nil {
 		t.Fatal("a mismatched key must not produce a session")
 	}
 }
