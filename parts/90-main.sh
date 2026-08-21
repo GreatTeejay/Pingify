@@ -117,7 +117,7 @@ info_panel() {
     local name addr up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(toml_str "$(cfg_file "$name")" status_addr)"
+        addr="$(toml_get "$(cfg_file "$name")" status addr)"
         if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
             up=$((up + 1))
         fi

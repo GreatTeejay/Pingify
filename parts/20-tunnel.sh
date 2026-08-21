@@ -77,28 +77,30 @@ preset_menu() {
 # rendering
 # ---------------------------------------------------------------------------
 
-# cfg_render <role> <mode> <listen> <connect> <forwards> <status-addr>
-# TOML, one key per line, which is what lets the manager read it back with a
-# targeted sed instead of carrying a parser.
+# cfg_render <role> <mode> <listen> <connect> <ports> <status-addr>
+# Sectioned TOML: related settings sit together, and the manager reads it back
+# with a targeted awk rather than carrying a parser.
 cfg_render() {
     local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
     printf '# Pingify tunnel - written by the manager, safe to edit by hand\n'
-    printf '\n'
-    printf 'name          = "%s"\n' "$T_NAME"
-    printf 'role          = "%s"\n' "$role"
-    printf 'mode          = "%s"\n' "$mode"
-    printf 'transport     = "%s"\n' "$T_TRANSPORT"
-    [ -n "$listen" ]  && printf 'listen        = "%s"\n' "$listen"
-    [ -n "$connect" ] && printf 'connect       = "%s"\n' "$connect"
-    printf 'psk           = "%s"\n' "$T_PSK"
-    printf '\n'
-    printf 'carriers      = %s\n' "$T_CARRIERS"
-    printf 'window_kb     = %s\n' "$T_WINDOW"
-    printf 'keepalive_sec = %s\n' "$T_KEEPALIVE"
-    [ -n "$fwd" ] && printf 'forwards      = [%s]\n' "$fwd"
-    printf '\n'
-    printf 'status_addr   = "%s"\n' "$status"
-    printf 'log_level     = "info"\n'
+    printf '\n[tunnel]\n'
+    printf 'name             = "%s"\n' "$T_NAME"
+    printf 'role             = "%s"\n' "$role"
+    printf 'mode             = "%s"\n' "$mode"
+    printf '\n[transport]\n'
+    printf 'type             = "%s"\n' "$T_TRANSPORT"
+    [ -n "$listen" ]  && printf 'listen           = "%s"\n' "$listen"
+    [ -n "$connect" ] && printf 'connect          = "%s"\n' "$connect"
+    printf 'carriers         = %s\n' "$T_CARRIERS"
+    printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
+    printf '\n[security]\n'
+    printf 'psk              = "%s"\n' "$T_PSK"
+    # Only the side that owns the user-facing ports carries the list, so the
+    # peer document does not end up with an empty one.
+    if [ "$mode" = "forward" ] && [ -n "$fwd" ]; then
+        printf '\n[forward]\n'
+        printf 'ports            = [%s]\n' "$fwd"
+    fi
     if [ "$mode" = "tun" ]; then
         local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
         if [ "$role" != "$T_ROLE" ]; then
@@ -108,11 +110,18 @@ cfg_render() {
             pe="${T_TUNLOCAL%%/*}"
         fi
         printf '\n[tun]\n'
-        printf 'name  = "%s"\n' "$T_TUNIF"
-        printf 'local = "%s"\n' "$lo"
-        printf 'peer  = "%s"\n' "$pe"
-        printf 'mtu   = %s\n' "$T_TUNMTU"
+        printf 'name             = "%s"\n' "$T_TUNIF"
+        printf 'local_addr       = "%s"\n' "$lo"
+        printf 'remote_addr      = "%s"\n' "$pe"
+        printf 'mtu              = %s\n' "$T_TUNMTU"
     fi
+    printf '\n[tuning]\n'
+    printf 'profile          = "%s"\n' "$T_PRESET"
+    printf 'window_kb        = %s\n' "$T_WINDOW"
+    printf '\n[status]\n'
+    printf 'addr             = "%s"\n' "$status"
+    printf '\n[logging]\n'
+    printf 'level            = "info"\n'
 }
 
 cfg_save() {
@@ -197,24 +206,49 @@ new_tunnel() {
         esac
     done
 
+    # -- transport ---------------------------------------------------------
+    head2 "Protocol"
+    item 1 "Braid" "several TCP connections woven into one encrypted stream"
+    item 2 "Echo" "the same stream inside ICMP, for when TCP is blocked"
+    say ""
+    dim "Braid is the fast one. Echo is the fallback: every packet is small and"
+    dim "has to be acknowledged, so it moves a fraction of what Braid does."
+    say ""
+    local tr=""
+    ask tr "select" "1"
+    if [ "$tr" = "2" ]; then T_TRANSPORT="echo"; else T_TRANSPORT="braid"; fi
+
     # -- endpoint ----------------------------------------------------------
     local tport=""
     if [ "$T_ROLE" = "server" ]; then
-        head2 "Tunnel port"
-        dim "the KHAREJ server connects to this port; open it in your firewall"
-        say ""
-        ask tport "port" "9443"
-        T_LISTEN="0.0.0.0:$tport"
-        port_free "$tport" || warn "something is already listening on $tport"
-        T_PUBLIC_IP="$SRV_IP"
+        if [ "$T_TRANSPORT" = "echo" ]; then
+            T_LISTEN="0.0.0.0"
+            head2 "Endpoint"
+            dim "Echo needs no port - it answers on this server's address"
+            say ""
+            T_PUBLIC_IP="$SRV_IP"
+            ask T_PUBLIC_IP "address of this server" "${T_PUBLIC_IP:-}"
+        else
+            head2 "Tunnel port"
+            dim "the KHAREJ server connects to this port; open it in your firewall"
+            say ""
+            ask tport "port" "9443"
+            T_LISTEN="0.0.0.0:$tport"
+            port_free "$tport" || warn "something is already listening on $tport"
+            T_PUBLIC_IP="$SRV_IP"
+        fi
     else
         head2 "IRAN server"
         say ""
         local peer=""
         ask peer "address of the IRAN server"
         [ -n "$peer" ] || { fail "an address is required"; pause; return 1; }
-        ask tport "tunnel port" "9443"
-        T_CONNECT="$peer:$tport"
+        if [ "$T_TRANSPORT" = "echo" ]; then
+            T_CONNECT="$peer"
+        else
+            ask tport "tunnel port" "9443"
+            T_CONNECT="$peer:$tport"
+        fi
         T_PUBLIC_IP="$SRV_IP"
     fi
 
@@ -237,16 +271,6 @@ new_tunnel() {
     case "$T_PSK" in
         "" | *[!0-9a-fA-F]*) fail "a key is 64 hex characters"; pause; return 1 ;;
     esac
-
-    # -- transport ---------------------------------------------------------
-    head2 "Protocol"
-    item 1 "Braid" "several TCP connections woven into one encrypted stream"
-    say ""
-    dim "TLS, WebSocket and Echo (ICMP) are planned"
-    say ""
-    local tr=""
-    ask tr "select" "1"
-    T_TRANSPORT="braid"
 
     # -- payload -----------------------------------------------------------
     head2 "What the tunnel carries"
@@ -387,7 +411,7 @@ import_tunnel() {
         fail "that is not a Pingify token"
         pause; return 1
     fi
-    local name; name="$(toml_str "$tmp" name)"
+    local name; name="$(toml_get "$tmp" tunnel name)"
     if [ -z "$name" ]; then
         fail "the token is incomplete"
         rm -f "$tmp"; pause; return 1
@@ -401,18 +425,18 @@ import_tunnel() {
     fi
 
     # The status port chosen on the other server may be taken here.
-    local sp; sp="$(toml_str "$tmp" status_addr)"
-    sed -i "s#^status_addr.*#status_addr   = \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
+    local sp; sp="$(toml_get "$tmp" status addr)"
+    sed -i "s#^addr.*#addr             = \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
 
     # A token that dials needs a real address for the server that issued it.
-    local conn; conn="$(toml_str "$tmp" connect)"
+    local conn; conn="$(toml_get "$tmp" transport connect)"
     if [ -n "$conn" ]; then
         case "${conn%%:*}" in
             "" | "0.0.0.0")
                 say ""
                 local ip=""
                 ask ip "address of the other server"
-                sed -i "s#^connect.*#connect       = \"$ip:${conn##*:}\"#" "$tmp" ;;
+                sed -i "s#^connect.*#connect          = \"$ip:${conn##*:}\"#" "$tmp" ;;
         esac
     fi
 

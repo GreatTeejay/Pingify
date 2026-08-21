@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.3.0"
+PINGIFY_VERSION="3.4.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -254,6 +254,26 @@ cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
 toml_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
 toml_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
+
+# toml_get <file> <section> <key> - reads a value out of one [section].
+# Values keep their quotes off and numeric underscores stripped.
+toml_get() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); cur = s; next }
+        cur == want {
+            line = $0
+            sub(/[[:space:]]*#.*$/, "", line)
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                v = substr(line, RSTART + RLENGTH)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v ~ /^"/) { gsub(/^"|"$/, "", v) }
+                else if (v ~ /^[0-9_]+$/) { gsub(/_/, "", v) }
+                print v
+                exit
+            }
+        }' "$1"
+}
 
 # Same, but only inside the [tun] table, so "name" there does not collide with
 # the tunnel's own name at the top of the file.
@@ -722,28 +742,30 @@ preset_menu() {
 # rendering
 # ---------------------------------------------------------------------------
 
-# cfg_render <role> <mode> <listen> <connect> <forwards> <status-addr>
-# TOML, one key per line, which is what lets the manager read it back with a
-# targeted sed instead of carrying a parser.
+# cfg_render <role> <mode> <listen> <connect> <ports> <status-addr>
+# Sectioned TOML: related settings sit together, and the manager reads it back
+# with a targeted awk rather than carrying a parser.
 cfg_render() {
     local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
     printf '# Pingify tunnel - written by the manager, safe to edit by hand\n'
-    printf '\n'
-    printf 'name          = "%s"\n' "$T_NAME"
-    printf 'role          = "%s"\n' "$role"
-    printf 'mode          = "%s"\n' "$mode"
-    printf 'transport     = "%s"\n' "$T_TRANSPORT"
-    [ -n "$listen" ]  && printf 'listen        = "%s"\n' "$listen"
-    [ -n "$connect" ] && printf 'connect       = "%s"\n' "$connect"
-    printf 'psk           = "%s"\n' "$T_PSK"
-    printf '\n'
-    printf 'carriers      = %s\n' "$T_CARRIERS"
-    printf 'window_kb     = %s\n' "$T_WINDOW"
-    printf 'keepalive_sec = %s\n' "$T_KEEPALIVE"
-    [ -n "$fwd" ] && printf 'forwards      = [%s]\n' "$fwd"
-    printf '\n'
-    printf 'status_addr   = "%s"\n' "$status"
-    printf 'log_level     = "info"\n'
+    printf '\n[tunnel]\n'
+    printf 'name             = "%s"\n' "$T_NAME"
+    printf 'role             = "%s"\n' "$role"
+    printf 'mode             = "%s"\n' "$mode"
+    printf '\n[transport]\n'
+    printf 'type             = "%s"\n' "$T_TRANSPORT"
+    [ -n "$listen" ]  && printf 'listen           = "%s"\n' "$listen"
+    [ -n "$connect" ] && printf 'connect          = "%s"\n' "$connect"
+    printf 'carriers         = %s\n' "$T_CARRIERS"
+    printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
+    printf '\n[security]\n'
+    printf 'psk              = "%s"\n' "$T_PSK"
+    # Only the side that owns the user-facing ports carries the list, so the
+    # peer document does not end up with an empty one.
+    if [ "$mode" = "forward" ] && [ -n "$fwd" ]; then
+        printf '\n[forward]\n'
+        printf 'ports            = [%s]\n' "$fwd"
+    fi
     if [ "$mode" = "tun" ]; then
         local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
         if [ "$role" != "$T_ROLE" ]; then
@@ -753,11 +775,18 @@ cfg_render() {
             pe="${T_TUNLOCAL%%/*}"
         fi
         printf '\n[tun]\n'
-        printf 'name  = "%s"\n' "$T_TUNIF"
-        printf 'local = "%s"\n' "$lo"
-        printf 'peer  = "%s"\n' "$pe"
-        printf 'mtu   = %s\n' "$T_TUNMTU"
+        printf 'name             = "%s"\n' "$T_TUNIF"
+        printf 'local_addr       = "%s"\n' "$lo"
+        printf 'remote_addr      = "%s"\n' "$pe"
+        printf 'mtu              = %s\n' "$T_TUNMTU"
     fi
+    printf '\n[tuning]\n'
+    printf 'profile          = "%s"\n' "$T_PRESET"
+    printf 'window_kb        = %s\n' "$T_WINDOW"
+    printf '\n[status]\n'
+    printf 'addr             = "%s"\n' "$status"
+    printf '\n[logging]\n'
+    printf 'level            = "info"\n'
 }
 
 cfg_save() {
@@ -842,24 +871,49 @@ new_tunnel() {
         esac
     done
 
+    # -- transport ---------------------------------------------------------
+    head2 "Protocol"
+    item 1 "Braid" "several TCP connections woven into one encrypted stream"
+    item 2 "Echo" "the same stream inside ICMP, for when TCP is blocked"
+    say ""
+    dim "Braid is the fast one. Echo is the fallback: every packet is small and"
+    dim "has to be acknowledged, so it moves a fraction of what Braid does."
+    say ""
+    local tr=""
+    ask tr "select" "1"
+    if [ "$tr" = "2" ]; then T_TRANSPORT="echo"; else T_TRANSPORT="braid"; fi
+
     # -- endpoint ----------------------------------------------------------
     local tport=""
     if [ "$T_ROLE" = "server" ]; then
-        head2 "Tunnel port"
-        dim "the KHAREJ server connects to this port; open it in your firewall"
-        say ""
-        ask tport "port" "9443"
-        T_LISTEN="0.0.0.0:$tport"
-        port_free "$tport" || warn "something is already listening on $tport"
-        T_PUBLIC_IP="$SRV_IP"
+        if [ "$T_TRANSPORT" = "echo" ]; then
+            T_LISTEN="0.0.0.0"
+            head2 "Endpoint"
+            dim "Echo needs no port - it answers on this server's address"
+            say ""
+            T_PUBLIC_IP="$SRV_IP"
+            ask T_PUBLIC_IP "address of this server" "${T_PUBLIC_IP:-}"
+        else
+            head2 "Tunnel port"
+            dim "the KHAREJ server connects to this port; open it in your firewall"
+            say ""
+            ask tport "port" "9443"
+            T_LISTEN="0.0.0.0:$tport"
+            port_free "$tport" || warn "something is already listening on $tport"
+            T_PUBLIC_IP="$SRV_IP"
+        fi
     else
         head2 "IRAN server"
         say ""
         local peer=""
         ask peer "address of the IRAN server"
         [ -n "$peer" ] || { fail "an address is required"; pause; return 1; }
-        ask tport "tunnel port" "9443"
-        T_CONNECT="$peer:$tport"
+        if [ "$T_TRANSPORT" = "echo" ]; then
+            T_CONNECT="$peer"
+        else
+            ask tport "tunnel port" "9443"
+            T_CONNECT="$peer:$tport"
+        fi
         T_PUBLIC_IP="$SRV_IP"
     fi
 
@@ -882,16 +936,6 @@ new_tunnel() {
     case "$T_PSK" in
         "" | *[!0-9a-fA-F]*) fail "a key is 64 hex characters"; pause; return 1 ;;
     esac
-
-    # -- transport ---------------------------------------------------------
-    head2 "Protocol"
-    item 1 "Braid" "several TCP connections woven into one encrypted stream"
-    say ""
-    dim "TLS, WebSocket and Echo (ICMP) are planned"
-    say ""
-    local tr=""
-    ask tr "select" "1"
-    T_TRANSPORT="braid"
 
     # -- payload -----------------------------------------------------------
     head2 "What the tunnel carries"
@@ -1032,7 +1076,7 @@ import_tunnel() {
         fail "that is not a Pingify token"
         pause; return 1
     fi
-    local name; name="$(toml_str "$tmp" name)"
+    local name; name="$(toml_get "$tmp" tunnel name)"
     if [ -z "$name" ]; then
         fail "the token is incomplete"
         rm -f "$tmp"; pause; return 1
@@ -1046,18 +1090,18 @@ import_tunnel() {
     fi
 
     # The status port chosen on the other server may be taken here.
-    local sp; sp="$(toml_str "$tmp" status_addr)"
-    sed -i "s#^status_addr.*#status_addr   = \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
+    local sp; sp="$(toml_get "$tmp" status addr)"
+    sed -i "s#^addr.*#addr             = \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
 
     # A token that dials needs a real address for the server that issued it.
-    local conn; conn="$(toml_str "$tmp" connect)"
+    local conn; conn="$(toml_get "$tmp" transport connect)"
     if [ -n "$conn" ]; then
         case "${conn%%:*}" in
             "" | "0.0.0.0")
                 say ""
                 local ip=""
                 ask ip "address of the other server"
-                sed -i "s#^connect.*#connect       = \"$ip:${conn##*:}\"#" "$tmp" ;;
+                sed -i "s#^connect.*#connect          = \"$ip:${conn##*:}\"#" "$tmp" ;;
         esac
     fi
 
@@ -1088,26 +1132,28 @@ import_tunnel() {
 # ---------------------------------------------------------------------------
 
 cfg_load() {
-    local f="$(cfg_file "$1")"
+    local f
+    f="$(cfg_file "$1")"
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME="$(toml_str "$f" name)"
-    T_ROLE="$(toml_str "$f" role)"
-    T_MODE="$(toml_str "$f" mode)"
-    T_TRANSPORT="$(toml_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
-    T_LISTEN="$(toml_str "$f" listen)"
-    T_CONNECT="$(toml_str "$f" connect)"
-    T_PSK="$(toml_str "$f" psk)"
-    T_STATUS="$(toml_str "$f" status_addr)"
-    T_CARRIERS="$(toml_num "$f" carriers)";      : "${T_CARRIERS:=4}"
-    T_WINDOW="$(toml_num "$f" window_kb)";       : "${T_WINDOW:=1024}"
-    T_KEEPALIVE="$(toml_num "$f" keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_FORWARDS="$(toml_arr "$f" forwards)"
+    T_NAME="$(toml_get "$f" tunnel name)"
+    T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)"
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=braid}"
+    T_LISTEN="$(toml_get "$f" transport listen)"
+    T_CONNECT="$(toml_get "$f" transport connect)"
+    T_PSK="$(toml_get "$f" security psk)"
+    T_STATUS="$(toml_get "$f" status addr)"
+    T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
+    T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
+    T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
+    T_FORWARDS="$(toml_arr "$f" ports)"
     if [ "$T_MODE" = "tun" ]; then
-        T_TUNIF="$(toml_tun "$f" name)"
-        T_TUNLOCAL="$(toml_tun "$f" local)"
-        T_TUNPEER="$(toml_tun "$f" peer)"
-        T_TUNMTU="$(toml_tun "$f" mtu)"
+        T_TUNIF="$(toml_get "$f" tun name)"
+        T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+        T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+        T_TUNMTU="$(toml_get "$f" tun mtu)"
         : "${T_TUNMTU:=1380}"
     fi
     return 0
@@ -1120,7 +1166,7 @@ cfg_load() {
 tunnel_status_block() {
     local name="$1" f="$(cfg_file "$1")"
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
-    local addr; addr="$(toml_str "$f" status_addr)"
+    local addr; addr="$(toml_get "$f" status addr)"
     local state; state="$(svc_state "$name")"
 
     local colour="$C_RED"
@@ -1136,14 +1182,14 @@ tunnel_status_block() {
 tunnel_row() {
     local name="$1" f="$(cfg_file "$1")"
     local role mode peer addr state brief up total rtt streams
-    role="$(toml_str "$f" role)"
-    mode="$(toml_str "$f" mode)"
-    peer="$(toml_str "$f" connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_str "$f" listen)"
-    addr="$(toml_str "$f" status_addr)"
+    role="$(toml_get "$f" tunnel role)"
+    mode="$(toml_get "$f" tunnel mode)"
+    peer="$(toml_get "$f" transport connect)"
+    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
+    addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(toml_num "$f" carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
@@ -1312,9 +1358,9 @@ edit_tuning() {
     case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
 
     cp -f "$f" "$f.bak"
-    sed -i "s#^carriers.*#carriers      = $car#" "$f"
-    sed -i "s#^window_kb.*#window_kb     = $win#" "$f"
-    sed -i "s#^keepalive_sec.*#keepalive_sec = $ka#" "$f"
+    sed -i "s#^carriers.*#carriers         = $car#" "$f"
+    sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
+    sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
@@ -1418,7 +1464,7 @@ run_health_check() {
             continue
         fi
 
-        addr="$(toml_str "$f" status_addr)"
+        addr="$(toml_get "$f" status addr)"
         if [ -z "$addr" ] || [ ! -x "$CORE_BIN" ]; then
             continue
         fi
@@ -2280,6 +2326,477 @@ diag_system() {
 write_core_sources() {
     local d="$1"
     mkdir -p "$d" || return 1
+    cat > "$d/arq.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// ARQ - a reliable ordered stream over an unreliable datagram carrier
+//
+// The braid layer above needs what TCP gives it: bytes arriving once, in
+// order. ICMP echo gives none of that, so this sits in between and supplies
+// it - sequence numbers, cumulative acknowledgements, retransmission on a
+// measured timeout, fast retransmit on duplicate acks, and a send window.
+//
+// It deliberately knows nothing about ICMP. It takes a function that puts one
+// datagram on the wire and a stream of datagrams coming back, which is what
+// makes it testable against a link that loses, reorders and duplicates on
+// purpose rather than only against a real network on a good day.
+//
+// Wire layout of one datagram:
+//
+//	[4]  nonce      random, in the clear, keys the mask below
+//	[16] header     masked with AES(k, nonce)
+//	     [4] session
+//	     [1] carrier
+//	     [1] flags
+//	     [4] seq
+//	     [4] ack
+//	     [2] length
+//	[n]  payload    already encrypted by the layer above
+//
+// Masking the header costs one AES block per datagram and leaves nothing
+// constant for a filter to match on.
+// ---------------------------------------------------------------------------
+
+const (
+	arqNonce  = 4
+	arqHdr    = 16
+	arqOver   = arqNonce + arqHdr
+	arqWindow = 64 // segments in flight
+
+	flagData = 1 << 0
+	flagFin  = 1 << 1
+	flagRst  = 1 << 2
+)
+
+var (
+	errARQClosed = errors.New("arq: connection closed")
+	errARQReset  = errors.New("arq: reset by peer")
+)
+
+type arqHeader struct {
+	session uint32
+	carrier uint8
+	flags   uint8
+	seq     uint32
+	ack     uint32
+	length  uint16
+}
+
+func (h *arqHeader) put(dst []byte) {
+	binary.BigEndian.PutUint32(dst[0:4], h.session)
+	dst[4] = h.carrier
+	dst[5] = h.flags
+	binary.BigEndian.PutUint32(dst[6:10], h.seq)
+	binary.BigEndian.PutUint32(dst[10:14], h.ack)
+	binary.BigEndian.PutUint16(dst[14:16], h.length)
+}
+
+func (h *arqHeader) get(src []byte) {
+	h.session = binary.BigEndian.Uint32(src[0:4])
+	h.carrier = src[4]
+	h.flags = src[5]
+	h.seq = binary.BigEndian.Uint32(src[6:10])
+	h.ack = binary.BigEndian.Uint32(src[10:14])
+	h.length = binary.BigEndian.Uint16(src[14:16])
+}
+
+// maskHeader XORs the 16 header bytes with an AES block keyed by the nonce.
+func maskHeader(blk cipher.Block, nonce, hdr []byte) {
+	var in, ks [16]byte
+	copy(in[:], nonce)
+	blk.Encrypt(ks[:], in[:])
+	for i := 0; i < arqHdr; i++ {
+		hdr[i] ^= ks[i]
+	}
+}
+
+// segment is one unacknowledged piece of the outgoing stream.
+type segment struct {
+	seq     uint32
+	data    []byte
+	sentAt  time.Time
+	retries int
+}
+
+// arqConn presents a net.Conn over datagrams.
+type arqConn struct {
+	session uint32
+	carrier uint8
+	mask    cipher.Block
+	maxPay  int
+	send    func([]byte) error
+	remote  net.Addr
+
+	mu   sync.Mutex
+	cond *sync.Cond
+
+	// outbound
+	sndNext uint32
+	sndUna  uint32
+	sndBuf  map[uint32]*segment
+	pending []byte // bytes not yet cut into a segment
+
+	// inbound
+	rcvNext uint32
+	rcvBuf  map[uint32][]byte
+	inbox   []byte
+
+	// round-trip estimate, Jacobson/Karels
+	srtt, rttvar, rto time.Duration
+
+	lastAck  uint32
+	dupAcks  int
+	needAck  bool
+	peerFin  bool
+	sentFin  bool
+	closed   bool
+	err      error
+	done     chan struct{}
+	deadline time.Time
+
+	// How many times one segment is resent before the carrier is declared
+	// dead. With the doubling backoff below, twelve works out at roughly
+	// half a minute - long enough to ride out a blip, short enough that the
+	// pool starts a fresh carrier while anyone is still watching.
+	maxRetries int
+}
+
+func newARQ(session uint32, carrier uint8, psk []byte, maxPayload int, send func([]byte) error) *arqConn {
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), psk), []byte("arq header"), 32)
+	blk, err := aes.NewCipher(k)
+	if err != nil {
+		panic(err)
+	}
+	c := &arqConn{
+		session:    session,
+		carrier:    carrier,
+		mask:       blk,
+		maxPay:     maxPayload,
+		send:       send,
+		sndBuf:     make(map[uint32]*segment),
+		rcvBuf:     make(map[uint32][]byte),
+		rto:        500 * time.Millisecond,
+		done:       make(chan struct{}),
+		maxRetries: 12,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	go c.timerLoop()
+	return c
+}
+
+// ---------------------------------------------------------------------------
+// net.Conn
+// ---------------------------------------------------------------------------
+
+func (c *arqConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.inbox) == 0 {
+		if c.err != nil {
+			return 0, c.err
+		}
+		if c.peerFin {
+			return 0, io.EOF
+		}
+		if c.closed {
+			return 0, errARQClosed
+		}
+		c.cond.Wait()
+	}
+	n := copy(p, c.inbox)
+	c.inbox = c.inbox[n:]
+	return n, nil
+}
+
+func (c *arqConn) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		c.mu.Lock()
+		for len(c.sndBuf) >= arqWindow {
+			if c.closed || c.err != nil {
+				e := c.err
+				if e == nil {
+					e = errARQClosed
+				}
+				c.mu.Unlock()
+				return total, e
+			}
+			c.cond.Wait()
+		}
+		if c.closed || c.err != nil {
+			e := c.err
+			if e == nil {
+				e = errARQClosed
+			}
+			c.mu.Unlock()
+			return total, e
+		}
+		n := len(p)
+		if n > c.maxPay {
+			n = c.maxPay
+		}
+		seg := &segment{seq: c.sndNext, data: append([]byte(nil), p[:n]...)}
+		c.sndBuf[seg.seq] = seg
+		c.sndNext++
+		c.emit(seg, flagData)
+		c.mu.Unlock()
+		p = p[n:]
+		total += n
+	}
+	return total, nil
+}
+
+func (c *arqConn) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	if !c.sentFin {
+		c.sentFin = true
+		c.emit(nil, flagFin)
+	}
+	close(c.done)
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *arqConn) LocalAddr() net.Addr  { return c.remote }
+func (c *arqConn) RemoteAddr() net.Addr { return c.remote }
+
+// The braid layer sets deadlines to detect a wedged carrier. The keepalive and
+// retransmit machinery already covers that, so these are accepted and ignored
+// rather than pretended not to exist.
+func (c *arqConn) SetDeadline(t time.Time) error      { return nil }
+func (c *arqConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *arqConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// ---------------------------------------------------------------------------
+// sending
+// ---------------------------------------------------------------------------
+
+// emit builds and sends one datagram. Caller holds the lock, and the send
+// callback runs under it - fine for a datagram socket, which does not block,
+// but it means the callback must not reach back into this connection.
+func (c *arqConn) emit(seg *segment, flags uint8) {
+	var payload []byte
+	h := arqHeader{session: c.session, carrier: c.carrier, flags: flags, ack: c.rcvNext}
+	if seg != nil {
+		h.seq = seg.seq
+		h.length = uint16(len(seg.data))
+		payload = seg.data
+		seg.sentAt = time.Now()
+	}
+	buf := make([]byte, arqOver+len(payload))
+	if _, err := rand.Read(buf[:arqNonce]); err != nil {
+		return
+	}
+	h.put(buf[arqNonce:arqOver])
+	maskHeader(c.mask, buf[:arqNonce], buf[arqNonce:arqOver])
+	copy(buf[arqOver:], payload)
+	c.needAck = false
+	c.send(buf)
+}
+
+// ackOnly sends a bare acknowledgement. Caller holds the lock.
+func (c *arqConn) ackOnly() { c.emit(nil, 0) }
+
+// ---------------------------------------------------------------------------
+// receiving
+// ---------------------------------------------------------------------------
+
+// onDatagram feeds one received datagram in. It never blocks, so the socket
+// reader is never held up by a slow consumer.
+func (c *arqConn) onDatagram(buf []byte) {
+	if len(buf) < arqOver {
+		return
+	}
+	hdr := make([]byte, arqHdr)
+	copy(hdr, buf[arqNonce:arqOver])
+	maskHeader(c.mask, buf[:arqNonce], hdr)
+	var h arqHeader
+	h.get(hdr)
+	if h.session != c.session || h.carrier != c.carrier {
+		return
+	}
+	if int(h.length) > len(buf)-arqOver {
+		return
+	}
+	payload := buf[arqOver : arqOver+int(h.length)]
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if h.flags&flagRst != 0 {
+		c.fail(errARQReset)
+		return
+	}
+
+	c.processAck(h.ack)
+
+	if h.flags&flagData != 0 && h.length > 0 {
+		c.deliver(h.seq, payload)
+		c.needAck = true
+	}
+	if h.flags&flagFin != 0 {
+		c.peerFin = true
+		c.cond.Broadcast()
+	}
+}
+
+// processAck retires everything the peer has confirmed. Caller holds the lock.
+func (c *arqConn) processAck(ack uint32) {
+	if ack == c.lastAck {
+		c.dupAcks++
+		// Three duplicates mean the segment after the ack is almost certainly
+		// gone; resend it now rather than waiting out the timer.
+		if c.dupAcks == 3 {
+			if seg, ok := c.sndBuf[ack]; ok {
+				c.emit(seg, flagData)
+				seg.retries++
+			}
+		}
+		return
+	}
+	c.dupAcks = 0
+	c.lastAck = ack
+
+	for s := c.sndUna; s < ack; s++ {
+		if seg, ok := c.sndBuf[s]; ok {
+			// Karn's rule: a retransmitted segment says nothing about the RTT.
+			if seg.retries == 0 {
+				c.sampleRTT(time.Since(seg.sentAt))
+			}
+			delete(c.sndBuf, s)
+		}
+	}
+	if ack > c.sndUna {
+		c.sndUna = ack
+	}
+	c.cond.Broadcast()
+}
+
+// deliver puts a segment in order, buffering anything that arrives early.
+// Caller holds the lock.
+func (c *arqConn) deliver(seq uint32, payload []byte) {
+	if seq < c.rcvNext {
+		return // already had it; the ack was lost, not the data
+	}
+	if seq >= c.rcvNext+arqWindow*2 {
+		return // absurdly far ahead, drop rather than grow without bound
+	}
+	if _, dup := c.rcvBuf[seq]; dup {
+		return
+	}
+	c.rcvBuf[seq] = append([]byte(nil), payload...)
+	for {
+		seg, ok := c.rcvBuf[c.rcvNext]
+		if !ok {
+			break
+		}
+		c.inbox = append(c.inbox, seg...)
+		delete(c.rcvBuf, c.rcvNext)
+		c.rcvNext++
+	}
+	c.cond.Broadcast()
+}
+
+func (c *arqConn) fail(err error) {
+	if c.err == nil {
+		c.err = err
+	}
+	c.cond.Broadcast()
+}
+
+// ---------------------------------------------------------------------------
+// timers
+// ---------------------------------------------------------------------------
+
+// sampleRTT folds one measurement into the retransmit timeout, the way TCP
+// does: smoothed average plus four mean deviations. Caller holds the lock.
+func (c *arqConn) sampleRTT(m time.Duration) {
+	if c.srtt == 0 {
+		c.srtt = m
+		c.rttvar = m / 2
+	} else {
+		d := c.srtt - m
+		if d < 0 {
+			d = -d
+		}
+		c.rttvar = (3*c.rttvar + d) / 4
+		c.srtt = (7*c.srtt + m) / 8
+	}
+	c.rto = c.srtt + 4*c.rttvar
+	if c.rto < 200*time.Millisecond {
+		c.rto = 200 * time.Millisecond
+	}
+	if c.rto > 5*time.Second {
+		c.rto = 5 * time.Second
+	}
+}
+
+func (c *arqConn) timerLoop() {
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	idle := time.Now()
+	for {
+		select {
+		case <-c.done:
+			return
+		case now := <-t.C:
+			c.mu.Lock()
+			if c.err != nil {
+				c.mu.Unlock()
+				return
+			}
+			// Anything past its timeout goes again, with the timeout doubled
+			// so a dead path is not hammered.
+			for _, seg := range c.sndBuf {
+				if now.Sub(seg.sentAt) >= c.rto {
+					seg.retries++
+					if seg.retries > c.maxRetries {
+						c.fail(errARQClosed)
+						c.mu.Unlock()
+						return
+					}
+					c.emit(seg, flagData)
+					if c.rto < 5*time.Second {
+						c.rto *= 2
+					}
+				}
+			}
+			if c.needAck {
+				c.ackOnly()
+			}
+			// A quiet link still needs a heartbeat, both to keep any stateful
+			// middlebox interested and to notice the peer going away.
+			if len(c.sndBuf) == 0 && now.Sub(idle) > time.Second {
+				c.ackOnly()
+				idle = now
+			}
+			if len(c.sndBuf) > 0 {
+				idle = now
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+PINGIFY_SRC_EOF
     cat > "$d/config.go" <<'PINGIFY_SRC_EOF'
 package main
 
@@ -2423,13 +2940,17 @@ func splitTop(s string) []string {
 }
 
 func atoi(key, s string) (int, error) {
-	n, err := strconv.Atoi(strings.TrimSpace(s))
+	// TOML allows 10_000 as a readability separator.
+	n, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(s), "_", ""))
 	if err != nil {
 		return 0, fmt.Errorf("%s: %q is not a number", key, s)
 	}
 	return n, nil
 }
 
+// assign maps one key onto the Config. Sections group what belongs together;
+// a key with no section is the flat layout Pingify wrote before 3.4 and is
+// still accepted so an existing file keeps working.
 func assign(c *Config, section, key, val string) error {
 	var err error
 	num := func(dst *int) error {
@@ -2441,7 +2962,7 @@ func assign(c *Config, section, key, val string) error {
 	}
 
 	switch section {
-	case "":
+	case "", "tunnel":
 		switch key {
 		case "name":
 			c.Name = unquote(val)
@@ -2449,51 +2970,391 @@ func assign(c *Config, section, key, val string) error {
 			c.Role = unquote(val)
 		case "mode":
 			c.Mode = unquote(val)
-		case "transport":
+		}
+	}
+
+	switch section {
+	case "", "transport":
+		switch key {
+		case "type", "transport":
 			c.Transport = unquote(val)
 		case "listen":
 			c.Listen = unquote(val)
 		case "connect":
 			c.Connect = unquote(val)
-		case "psk":
-			c.PSK = unquote(val)
-		case "status_addr":
-			c.StatusAddr = unquote(val)
-		case "log_level":
-			c.LogLevel = unquote(val)
 		case "carriers":
 			err = num(&c.Carriers)
-		case "window_kb":
-			err = num(&c.WindowKB)
 		case "keepalive_sec":
 			err = num(&c.KeepaliveSec)
 		case "dial_timeout_sec":
 			err = num(&c.DialTimeout)
+		}
+	}
+
+	switch section {
+	case "", "security":
+		if key == "psk" {
+			c.PSK = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "forward":
+		switch key {
+		case "ports", "forwards":
+			c.Forwards, err = parseArray(val)
+		case "allow":
+			c.Allow, err = parseArray(val)
+		}
+	}
+
+	switch section {
+	case "", "tuning":
+		switch key {
+		case "window_kb":
+			err = num(&c.WindowKB)
 		case "sndbuf_kb":
 			err = num(&c.SndBufKB)
 		case "rcvbuf_kb":
 			err = num(&c.RcvBufKB)
-		case "forwards":
-			c.Forwards, err = parseArray(val)
-		case "allow":
-			c.Allow, err = parseArray(val)
-		default:
-			// Unknown keys are ignored on purpose: a config written by a newer
-			// Pingify should not stop an older core from starting.
 		}
-	case "tun":
+	}
+
+	switch section {
+	case "", "status":
+		if key == "addr" || key == "status_addr" {
+			c.StatusAddr = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "logging":
+		if key == "level" || key == "log_level" {
+			c.LogLevel = unquote(val)
+		}
+	}
+
+	if section == "tun" {
 		switch key {
 		case "name":
 			c.TUN.Name = unquote(val)
-		case "local":
+		case "local", "local_addr":
 			c.TUN.Local = unquote(val)
-		case "peer":
+		case "peer", "remote_addr":
 			c.TUN.Peer = unquote(val)
 		case "mtu":
 			err = num(&c.TUN.MTU)
 		}
 	}
+
+	// Anything unrecognised is ignored on purpose: a config written by a newer
+	// Pingify should not stop an older core from starting.
 	return err
+}
+PINGIFY_SRC_EOF
+    cat > "$d/icmp.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// the echo transport
+//
+// Carries the same braid stream inside ICMP echo packets, for a path where
+// TCP is simply not allowed out. It is the fallback, not the fast option:
+// every datagram is about 1.4 KB and has to be acknowledged, so expect a
+// fraction of what braid does over TCP.
+//
+// Data travels in Echo *Reply* packets (type 0) in both directions rather
+// than requests. Two reasons: the kernel answers an echo request by itself,
+// which would double every packet we send, and a reply needs no matching
+// request to exist on our side. Raw sockets receive both regardless.
+//
+//	ICMP data = [4] tag  [24] arq datagram ...
+//
+// The tag is the first four bytes of HMAC(psk, header), which is what lets
+// the listener tell our traffic apart from the ordinary pings a public server
+// receives all day, before it spends anything on them.
+// ---------------------------------------------------------------------------
+
+const (
+	icmpEchoReply   = 0
+	icmpEchoRequest = 8
+	icmpTagLen      = 4
+	icmpHdrLen      = 8
+	icmpMaxPayload  = 1200 // conservative: fits inside a 1400-byte path MTU
+)
+
+var errICMPClosed = errors.New("icmp: transport closed")
+
+// icmpChecksum is the standard one's-complement sum from RFC 1071.
+func icmpChecksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func buildEcho(typ byte, id, seq uint16, payload []byte) []byte {
+	b := make([]byte, icmpHdrLen+len(payload))
+	b[0] = typ
+	b[1] = 0
+	binary.BigEndian.PutUint16(b[4:6], id)
+	binary.BigEndian.PutUint16(b[6:8], seq)
+	copy(b[icmpHdrLen:], payload)
+	binary.BigEndian.PutUint16(b[2:4], icmpChecksum(b))
+	return b
+}
+
+// stripIP removes an IPv4 header if the kernel handed us one. Raw sockets do
+// this inconsistently across platforms, so look rather than assume.
+func stripIP(b []byte) []byte {
+	if len(b) >= 20 && b[0]>>4 == 4 {
+		ihl := int(b[0]&0x0f) * 4
+		if ihl >= 20 && ihl <= len(b) {
+			return b[ihl:]
+		}
+	}
+	return b
+}
+
+type sessionKey struct {
+	peer    string
+	session uint32
+	carrier uint8
+}
+
+// icmpTransport owns the one raw socket and fans packets out to the ARQ
+// connection they belong to.
+type icmpTransport struct {
+	pc  net.PacketConn
+	psk []byte
+
+	mu       sync.Mutex
+	sessions map[sessionKey]*arqConn
+	inbound  chan net.Conn
+	closed   bool
+	done     chan struct{}
+}
+
+func newICMPTransport(psk []byte) (*icmpTransport, error) {
+	pc, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		return nil, fmt.Errorf("raw ICMP socket: %v (needs CAP_NET_RAW; are you root?)", err)
+	}
+	t := &icmpTransport{
+		pc:       pc,
+		psk:      psk,
+		sessions: make(map[sessionKey]*arqConn),
+		inbound:  make(chan net.Conn, 16),
+		done:     make(chan struct{}),
+	}
+	go t.readLoop()
+	return t, nil
+}
+
+func (t *icmpTransport) tag(hdr []byte) []byte {
+	m := hmac.New(sha256.New, t.psk)
+	m.Write([]byte("pingify/v3 icmp tag"))
+	m.Write(hdr)
+	return m.Sum(nil)[:icmpTagLen]
+}
+
+// sender returns the function one ARQ connection uses to put a datagram on
+// the wire, addressed to its peer.
+func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
+	var seq uint32
+	return func(datagram []byte) error {
+		body := make([]byte, icmpTagLen+len(datagram))
+		copy(body[:icmpTagLen], t.tag(datagram[:min(len(datagram), arqOver)]))
+		copy(body[icmpTagLen:], datagram)
+		s := uint16(atomic.AddUint32(&seq, 1))
+		_, err := t.pc.WriteTo(buildEcho(icmpEchoReply, id, s, body), peer)
+		return err
+	}
+}
+
+func (t *icmpTransport) readLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, addr, err := t.pc.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-t.done:
+				return
+			default:
+			}
+			logDebug("icmp read: %v", err)
+			continue
+		}
+		msg := stripIP(buf[:n])
+		if len(msg) < icmpHdrLen+icmpTagLen+arqOver {
+			continue
+		}
+		if msg[0] != icmpEchoReply && msg[0] != icmpEchoRequest {
+			continue
+		}
+		body := msg[icmpHdrLen:]
+		datagram := body[icmpTagLen:]
+
+		// Reject the ordinary pings a public address collects before doing
+		// any real work on them.
+		if !hmac.Equal(body[:icmpTagLen], t.tag(datagram[:min(len(datagram), arqOver)])) {
+			continue
+		}
+
+		ip, _ := addr.(*net.IPAddr)
+		if ip == nil {
+			continue
+		}
+		t.dispatch(ip, binary.BigEndian.Uint16(msg[4:6]), append([]byte(nil), datagram...))
+	}
+}
+
+// dispatch hands the datagram to its connection, creating one if this is a
+// session the listening side has not seen before.
+func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
+	// The header is masked with a key both ends derive from the PSK, so the
+	// session and carrier can be read out before any connection exists.
+	hdr := make([]byte, arqHdr)
+	copy(hdr, datagram[arqNonce:arqOver])
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), t.psk), []byte("arq header"), 32)
+	maskHeader(blockFrom(k), datagram[:arqNonce], hdr)
+	var h arqHeader
+	h.get(hdr)
+
+	key := sessionKey{peer: peer.String(), session: h.session, carrier: h.carrier}
+
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	conn, known := t.sessions[key]
+	if !known {
+		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.sender(peer, id))
+		conn.remote = peer
+		t.sessions[key] = conn
+		t.mu.Unlock()
+		select {
+		case t.inbound <- conn:
+		case <-t.done:
+			return
+		}
+	} else {
+		t.mu.Unlock()
+	}
+	conn.onDatagram(datagram)
+}
+
+// Dial opens one carrier towards the peer.
+func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
+	ip, err := net.ResolveIPAddr("ip4", peer)
+	if err != nil {
+		return nil, err
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	session := binary.BigEndian.Uint32(b[:])
+	id := uint16(session)
+
+	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.sender(ip, id))
+	conn.remote = ip
+
+	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, errICMPClosed
+	}
+	t.sessions[key] = conn
+	t.mu.Unlock()
+
+	// Nudge the peer so it creates its side before the handshake starts.
+	conn.mu.Lock()
+	conn.ackOnly()
+	conn.mu.Unlock()
+	return conn, nil
+}
+
+func (t *icmpTransport) Accept() (net.Conn, error) {
+	select {
+	case c := <-t.inbound:
+		return c, nil
+	case <-t.done:
+		return nil, errICMPClosed
+	}
+}
+
+func (t *icmpTransport) Close() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	close(t.done)
+	conns := make([]*arqConn, 0, len(t.sessions))
+	for _, c := range t.sessions {
+		conns = append(conns, c)
+	}
+	t.sessions = make(map[sessionKey]*arqConn)
+	t.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+	return t.pc.Close()
+}
+
+// reap drops sessions whose connection has failed, so a long-lived listener
+// does not accumulate them.
+func (t *icmpTransport) reap() {
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tick.C:
+			t.mu.Lock()
+			for k, c := range t.sessions {
+				c.mu.Lock()
+				dead := c.err != nil || c.closed
+				c.mu.Unlock()
+				if dead {
+					delete(t.sessions, k)
+				}
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 PINGIFY_SRC_EOF
     cat > "$d/pingify.go" <<'PINGIFY_SRC_EOF'
@@ -2551,7 +3412,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.3.0"
+const version = "3.4.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -2675,7 +3536,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\" or \"tun\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "braid":
+	case "braid", "echo":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -3192,6 +4053,7 @@ type pool struct {
 	h     recordHandler
 
 	ln        net.Listener
+	icmp      *icmpTransport
 	guard     *replayGuard
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -3217,6 +4079,26 @@ func (p *pool) handler() recordHandler {
 }
 
 func (p *pool) start() error {
+	// The echo transport owns a single raw socket for every carrier, so it is
+	// set up once here rather than per connection.
+	if p.cfg.Transport == "echo" {
+		t, err := newICMPTransport(p.cfg.key())
+		if err != nil {
+			return err
+		}
+		p.icmp = t
+		go t.reap()
+		if p.cfg.Connect != "" {
+			for i := 0; i < p.cfg.Carriers; i++ {
+				go p.dialLoop(i)
+			}
+			logInfo("opening %d echo carriers to %s", p.cfg.Carriers, p.cfg.Connect)
+		} else {
+			go p.acceptEcho()
+			logInfo("waiting for echo carriers")
+		}
+		return nil
+	}
 	if p.cfg.Connect != "" {
 		for i := 0; i < p.cfg.Carriers; i++ {
 			go p.dialLoop(i)
@@ -3232,6 +4114,28 @@ func (p *pool) start() error {
 	go p.acceptLoop(ln)
 	logInfo("waiting for carriers on %s", p.cfg.Listen)
 	return nil
+}
+
+func (p *pool) acceptEcho() {
+	for {
+		c, err := p.icmp.Accept()
+		if err != nil {
+			return
+		}
+		go p.serveInbound(c)
+	}
+}
+
+// dialCarrier opens one carrier with whichever transport is configured.
+func (p *pool) dialCarrier(idx int) (net.Conn, error) {
+	if p.icmp != nil {
+		host := p.cfg.Connect
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		return p.icmp.Dial(host, idx)
+	}
+	return net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
 }
 
 func (p *pool) acceptLoop(ln net.Listener) {
@@ -3279,7 +4183,7 @@ func (p *pool) dialLoop(idx int) {
 			return
 		default:
 		}
-		conn, err := net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
+		conn, err := p.dialCarrier(idx)
 		if err != nil {
 			logWarn("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
 			p.sleepBackoff(&backoff)
@@ -3391,6 +4295,9 @@ func (p *pool) close() {
 		close(p.closed)
 		if p.ln != nil {
 			p.ln.Close()
+		}
+		if p.icmp != nil {
+			p.icmp.Close()
 		}
 		p.mu.Lock()
 		links := p.links
@@ -5204,7 +6111,7 @@ info_panel() {
     local name addr up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(toml_str "$(cfg_file "$name")" status_addr)"
+        addr="$(toml_get "$(cfg_file "$name")" status addr)"
         if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
             up=$((up + 1))
         fi
