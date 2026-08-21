@@ -51,14 +51,14 @@ T_CARRIERS=6; T_WINDOW=2048; T_KEEPALIVE=15
 T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"
 file="$(cfg_save)"
 
-check "name round-trips"      "$(toml_str "$file" name)"          "t1"
-check "role round-trips"      "$(toml_str "$file" role)"          "server"
-check "connect round-trips"   "$(toml_str "$file" connect)"       "203.0.113.9:9443"
-check "carriers round-trip"   "$(toml_num "$file" carriers)"      "6"
-check "window round-trips"    "$(toml_num "$file" window_kb)"     "2048"
-check "status round-trips"    "$(toml_str "$file" status_addr)"   "127.0.0.1:9700"
-check "no listen key written" "$(toml_str "$file" listen)"        ""
-check "transport written"     "$(toml_str "$file" transport)"     "braid"
+check "name round-trips"      "$(toml_get "$file" tunnel name)"          "t1"
+check "role round-trips"      "$(toml_get "$file" tunnel role)"          "server"
+check "connect round-trips"   "$(toml_get "$file" transport connect)"       "203.0.113.9:9443"
+check "carriers round-trip"   "$(toml_get "$file" transport carriers)"      "6"
+check "window round-trips"    "$(toml_get "$file" tuning window_kb)"     "2048"
+check "status round-trips"    "$(toml_get "$file" status addr)"   "127.0.0.1:9700"
+check "no listen key written" "$(toml_get "$file" transport listen)"        ""
+check "transport written"     "$(toml_get "$file" transport type)"     "braid"
 
 saved_psk="$T_PSK"
 cfg_load t1
@@ -73,12 +73,12 @@ note "peer token mirrors the tunnel"
 # ---------------------------------------------------------------------------
 peer="$(cfg_peer_token | base64 -d)"
 printf '%s\n' "$peer" > "$WORK/peer.toml"
-check "role flips"           "$(toml_str "$WORK/peer.toml" role)"     "client"
-check "dialler becomes host" "$(toml_str "$WORK/peer.toml" listen)"   "0.0.0.0:9443"
-check "peer does not dial"   "$(toml_str "$WORK/peer.toml" connect)"  ""
-check "key is carried over"  "$(toml_str "$WORK/peer.toml" psk)"      "$saved_psk"
-check "transport mirrored"   "$(toml_str "$WORK/peer.toml" transport)" "braid"
-check "ports stay on client" "$(grep -c '^forwards' "$WORK/peer.toml")"  "0"
+check "role flips"           "$(toml_get "$WORK/peer.toml" tunnel role)"     "client"
+check "dialler becomes host" "$(toml_get "$WORK/peer.toml" transport listen)"   "0.0.0.0:9443"
+check "peer does not dial"   "$(toml_get "$WORK/peer.toml" transport connect)"  ""
+check "key is carried over"  "$(toml_get "$WORK/peer.toml" security psk)"      "$saved_psk"
+check "transport mirrored"   "$(toml_get "$WORK/peer.toml" transport type)" "braid"
+check "ports stay on client" "$(grep -c '^ports' "$WORK/peer.toml")"  "0"
 
 # a tun tunnel must hand the peer the other end of the /30
 cfg_reset
@@ -86,9 +86,9 @@ T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_LISTEN="0.0.0.0:9500"
 T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"; T_PUBLIC_IP="198.51.100.4"
 T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.1/30"; T_TUNPEER="10.71.1.2"; T_TUNMTU=1380
 cfg_peer_token | base64 -d > "$WORK/peer2.toml"
-check "peer dials us"      "$(toml_str "$WORK/peer2.toml" connect)" "198.51.100.4:9500"
-check "peer takes .2/30"   "$(toml_tun "$WORK/peer2.toml" local)" "10.71.1.2/30"
-check "peer points at .1"  "$(toml_tun "$WORK/peer2.toml" peer)"  "10.71.1.1"
+check "peer dials us"      "$(toml_get "$WORK/peer2.toml" transport connect)" "198.51.100.4:9500"
+check "peer takes .2/30"   "$(toml_get "$WORK/peer2.toml" tun local_addr)" "10.71.1.2/30"
+check "peer points at .1"  "$(toml_get "$WORK/peer2.toml" tun remote_addr)"  "10.71.1.1"
 
 # ---------------------------------------------------------------------------
 note "the engine accepts what the manager writes"
@@ -116,7 +116,7 @@ else
 
     # decode the token exactly as the peer server would
     cfg_peer_token | base64 -d > "$WORK/origin.toml"
-    sed -i "s#^status_addr.*#status_addr   = \"127.0.0.1:$(( 55000 + RANDOM % 5000 ))\"#" "$WORK/origin.toml"
+    sed -i "s#^addr.*#addr             = \"127.0.0.1:$(( 55000 + RANDOM % 5000 ))\"#" "$WORK/origin.toml"
 
     "$CORE_BIN" -c "$edge_cfg"          -check >/dev/null 2>&1; check "edge config validates"   "$?" "0"
     "$CORE_BIN" -c "$WORK/origin.toml"  -check >/dev/null 2>&1; check "origin config validates" "$?" "0"

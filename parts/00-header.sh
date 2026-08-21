@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.3.0"
+PINGIFY_VERSION="3.4.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -254,6 +254,26 @@ cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
 toml_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
 toml_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
+
+# toml_get <file> <section> <key> - reads a value out of one [section].
+# Values keep their quotes off and numeric underscores stripped.
+toml_get() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); cur = s; next }
+        cur == want {
+            line = $0
+            sub(/[[:space:]]*#.*$/, "", line)
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                v = substr(line, RSTART + RLENGTH)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v ~ /^"/) { gsub(/^"|"$/, "", v) }
+                else if (v ~ /^[0-9_]+$/) { gsub(/_/, "", v) }
+                print v
+                exit
+            }
+        }' "$1"
+}
 
 # Same, but only inside the [tun] table, so "name" there does not collide with
 # the tunnel's own name at the top of the file.

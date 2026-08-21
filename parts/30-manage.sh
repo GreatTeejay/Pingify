@@ -4,26 +4,28 @@
 # ---------------------------------------------------------------------------
 
 cfg_load() {
-    local f="$(cfg_file "$1")"
+    local f
+    f="$(cfg_file "$1")"
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME="$(toml_str "$f" name)"
-    T_ROLE="$(toml_str "$f" role)"
-    T_MODE="$(toml_str "$f" mode)"
-    T_TRANSPORT="$(toml_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
-    T_LISTEN="$(toml_str "$f" listen)"
-    T_CONNECT="$(toml_str "$f" connect)"
-    T_PSK="$(toml_str "$f" psk)"
-    T_STATUS="$(toml_str "$f" status_addr)"
-    T_CARRIERS="$(toml_num "$f" carriers)";      : "${T_CARRIERS:=4}"
-    T_WINDOW="$(toml_num "$f" window_kb)";       : "${T_WINDOW:=1024}"
-    T_KEEPALIVE="$(toml_num "$f" keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_FORWARDS="$(toml_arr "$f" forwards)"
+    T_NAME="$(toml_get "$f" tunnel name)"
+    T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)"
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=braid}"
+    T_LISTEN="$(toml_get "$f" transport listen)"
+    T_CONNECT="$(toml_get "$f" transport connect)"
+    T_PSK="$(toml_get "$f" security psk)"
+    T_STATUS="$(toml_get "$f" status addr)"
+    T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
+    T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
+    T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
+    T_FORWARDS="$(toml_arr "$f" ports)"
     if [ "$T_MODE" = "tun" ]; then
-        T_TUNIF="$(toml_tun "$f" name)"
-        T_TUNLOCAL="$(toml_tun "$f" local)"
-        T_TUNPEER="$(toml_tun "$f" peer)"
-        T_TUNMTU="$(toml_tun "$f" mtu)"
+        T_TUNIF="$(toml_get "$f" tun name)"
+        T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+        T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+        T_TUNMTU="$(toml_get "$f" tun mtu)"
         : "${T_TUNMTU:=1380}"
     fi
     return 0
@@ -36,7 +38,7 @@ cfg_load() {
 tunnel_status_block() {
     local name="$1" f="$(cfg_file "$1")"
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
-    local addr; addr="$(toml_str "$f" status_addr)"
+    local addr; addr="$(toml_get "$f" status addr)"
     local state; state="$(svc_state "$name")"
 
     local colour="$C_RED"
@@ -52,14 +54,14 @@ tunnel_status_block() {
 tunnel_row() {
     local name="$1" f="$(cfg_file "$1")"
     local role mode peer addr state brief up total rtt streams
-    role="$(toml_str "$f" role)"
-    mode="$(toml_str "$f" mode)"
-    peer="$(toml_str "$f" connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_str "$f" listen)"
-    addr="$(toml_str "$f" status_addr)"
+    role="$(toml_get "$f" tunnel role)"
+    mode="$(toml_get "$f" tunnel mode)"
+    peer="$(toml_get "$f" transport connect)"
+    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
+    addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(toml_num "$f" carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
@@ -228,9 +230,9 @@ edit_tuning() {
     case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
 
     cp -f "$f" "$f.bak"
-    sed -i "s#^carriers.*#carriers      = $car#" "$f"
-    sed -i "s#^window_kb.*#window_kb     = $win#" "$f"
-    sed -i "s#^keepalive_sec.*#keepalive_sec = $ka#" "$f"
+    sed -i "s#^carriers.*#carriers         = $car#" "$f"
+    sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
+    sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"

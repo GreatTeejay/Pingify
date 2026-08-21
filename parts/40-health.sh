@@ -23,7 +23,7 @@ run_health_check() {
             continue
         fi
 
-        addr="$(toml_str "$f" status_addr)"
+        addr="$(toml_get "$f" status addr)"
         if [ -z "$addr" ] || [ ! -x "$CORE_BIN" ]; then
             continue
         fi

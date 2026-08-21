@@ -140,13 +140,17 @@ func splitTop(s string) []string {
 }
 
 func atoi(key, s string) (int, error) {
-	n, err := strconv.Atoi(strings.TrimSpace(s))
+	// TOML allows 10_000 as a readability separator.
+	n, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(s), "_", ""))
 	if err != nil {
 		return 0, fmt.Errorf("%s: %q is not a number", key, s)
 	}
 	return n, nil
 }
 
+// assign maps one key onto the Config. Sections group what belongs together;
+// a key with no section is the flat layout Pingify wrote before 3.4 and is
+// still accepted so an existing file keeps working.
 func assign(c *Config, section, key, val string) error {
 	var err error
 	num := func(dst *int) error {
@@ -158,7 +162,7 @@ func assign(c *Config, section, key, val string) error {
 	}
 
 	switch section {
-	case "":
+	case "", "tunnel":
 		switch key {
 		case "name":
 			c.Name = unquote(val)
@@ -166,49 +170,84 @@ func assign(c *Config, section, key, val string) error {
 			c.Role = unquote(val)
 		case "mode":
 			c.Mode = unquote(val)
-		case "transport":
+		}
+	}
+
+	switch section {
+	case "", "transport":
+		switch key {
+		case "type", "transport":
 			c.Transport = unquote(val)
 		case "listen":
 			c.Listen = unquote(val)
 		case "connect":
 			c.Connect = unquote(val)
-		case "psk":
-			c.PSK = unquote(val)
-		case "status_addr":
-			c.StatusAddr = unquote(val)
-		case "log_level":
-			c.LogLevel = unquote(val)
 		case "carriers":
 			err = num(&c.Carriers)
-		case "window_kb":
-			err = num(&c.WindowKB)
 		case "keepalive_sec":
 			err = num(&c.KeepaliveSec)
 		case "dial_timeout_sec":
 			err = num(&c.DialTimeout)
+		}
+	}
+
+	switch section {
+	case "", "security":
+		if key == "psk" {
+			c.PSK = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "forward":
+		switch key {
+		case "ports", "forwards":
+			c.Forwards, err = parseArray(val)
+		case "allow":
+			c.Allow, err = parseArray(val)
+		}
+	}
+
+	switch section {
+	case "", "tuning":
+		switch key {
+		case "window_kb":
+			err = num(&c.WindowKB)
 		case "sndbuf_kb":
 			err = num(&c.SndBufKB)
 		case "rcvbuf_kb":
 			err = num(&c.RcvBufKB)
-		case "forwards":
-			c.Forwards, err = parseArray(val)
-		case "allow":
-			c.Allow, err = parseArray(val)
-		default:
-			// Unknown keys are ignored on purpose: a config written by a newer
-			// Pingify should not stop an older core from starting.
 		}
-	case "tun":
+	}
+
+	switch section {
+	case "", "status":
+		if key == "addr" || key == "status_addr" {
+			c.StatusAddr = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "logging":
+		if key == "level" || key == "log_level" {
+			c.LogLevel = unquote(val)
+		}
+	}
+
+	if section == "tun" {
 		switch key {
 		case "name":
 			c.TUN.Name = unquote(val)
-		case "local":
+		case "local", "local_addr":
 			c.TUN.Local = unquote(val)
-		case "peer":
+		case "peer", "remote_addr":
 			c.TUN.Peer = unquote(val)
 		case "mtu":
 			err = num(&c.TUN.MTU)
 		}
 	}
+
+	// Anything unrecognised is ignored on purpose: a config written by a newer
+	// Pingify should not stop an older core from starting.
 	return err
 }

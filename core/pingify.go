@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.3.0"
+const version = "3.4.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -176,7 +176,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\" or \"tun\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "braid":
+	case "braid", "echo":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -693,6 +693,7 @@ type pool struct {
 	h     recordHandler
 
 	ln        net.Listener
+	icmp      *icmpTransport
 	guard     *replayGuard
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -718,6 +719,26 @@ func (p *pool) handler() recordHandler {
 }
 
 func (p *pool) start() error {
+	// The echo transport owns a single raw socket for every carrier, so it is
+	// set up once here rather than per connection.
+	if p.cfg.Transport == "echo" {
+		t, err := newICMPTransport(p.cfg.key())
+		if err != nil {
+			return err
+		}
+		p.icmp = t
+		go t.reap()
+		if p.cfg.Connect != "" {
+			for i := 0; i < p.cfg.Carriers; i++ {
+				go p.dialLoop(i)
+			}
+			logInfo("opening %d echo carriers to %s", p.cfg.Carriers, p.cfg.Connect)
+		} else {
+			go p.acceptEcho()
+			logInfo("waiting for echo carriers")
+		}
+		return nil
+	}
 	if p.cfg.Connect != "" {
 		for i := 0; i < p.cfg.Carriers; i++ {
 			go p.dialLoop(i)
@@ -733,6 +754,28 @@ func (p *pool) start() error {
 	go p.acceptLoop(ln)
 	logInfo("waiting for carriers on %s", p.cfg.Listen)
 	return nil
+}
+
+func (p *pool) acceptEcho() {
+	for {
+		c, err := p.icmp.Accept()
+		if err != nil {
+			return
+		}
+		go p.serveInbound(c)
+	}
+}
+
+// dialCarrier opens one carrier with whichever transport is configured.
+func (p *pool) dialCarrier(idx int) (net.Conn, error) {
+	if p.icmp != nil {
+		host := p.cfg.Connect
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		return p.icmp.Dial(host, idx)
+	}
+	return net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
 }
 
 func (p *pool) acceptLoop(ln net.Listener) {
@@ -780,7 +823,7 @@ func (p *pool) dialLoop(idx int) {
 			return
 		default:
 		}
-		conn, err := net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
+		conn, err := p.dialCarrier(idx)
 		if err != nil {
 			logWarn("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
 			p.sleepBackoff(&backoff)
@@ -892,6 +935,9 @@ func (p *pool) close() {
 		close(p.closed)
 		if p.ln != nil {
 			p.ln.Close()
+		}
+		if p.icmp != nil {
+			p.icmp.Close()
 		}
 		p.mu.Lock()
 		links := p.links

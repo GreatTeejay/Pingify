@@ -599,3 +599,91 @@ func TestLoadConfigAcceptsBothFormats(t *testing.T) {
 		t.Fatalf("toml config: %v %+v", err, c2)
 	}
 }
+
+func TestSectionedTOMLConfig(t *testing.T) {
+	doc := `
+# Pingify tunnel
+
+[tunnel]
+name = "main"
+role = "server"
+mode = "forward"
+
+[transport]
+type             = "echo"
+listen           = "0.0.0.0"
+carriers         = 8
+keepalive_sec    = 15
+dial_timeout_sec = 12
+
+[security]
+psk = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+
+[forward]
+ports = ["443", "2053=8443", "udp:500"]
+allow = ["127.0.0.1:8443"]
+
+[tun]
+name        = "pfy2"
+local_addr  = "10.10.10.2/24"
+remote_addr = "10.10.10.1/24"
+mtu         = 1320
+
+[tuning]
+window_kb = 10_000
+sndbuf_kb = 2048
+
+[status]
+addr = "127.0.0.1:9701"
+
+[logging]
+level = "debug"
+`
+	var c Config
+	if err := parseTOML(doc, &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.Name != "main" || c.Role != "server" || c.Mode != "forward" {
+		t.Fatalf("[tunnel] wrong: %+v", c)
+	}
+	if c.Transport != "echo" || c.Listen != "0.0.0.0" || c.Carriers != 8 ||
+		c.KeepaliveSec != 15 || c.DialTimeout != 12 {
+		t.Fatalf("[transport] wrong: %+v", c)
+	}
+	if len(c.PSK) != 64 {
+		t.Fatalf("[security] wrong: %q", c.PSK)
+	}
+	if len(c.Forwards) != 3 || c.Forwards[2] != "udp:500" || len(c.Allow) != 1 {
+		t.Fatalf("[forward] wrong: %#v %#v", c.Forwards, c.Allow)
+	}
+	// local_addr / remote_addr are the names the reference config uses.
+	if c.TUN.Name != "pfy2" || c.TUN.Local != "10.10.10.2/24" ||
+		c.TUN.Peer != "10.10.10.1/24" || c.TUN.MTU != 1320 {
+		t.Fatalf("[tun] wrong: %+v", c.TUN)
+	}
+	if c.WindowKB != 10000 || c.SndBufKB != 2048 {
+		t.Fatalf("[tuning] wrong: %d %d", c.WindowKB, c.SndBufKB)
+	}
+	if c.StatusAddr != "127.0.0.1:9701" || c.LogLevel != "debug" {
+		t.Fatalf("[status]/[logging] wrong: %q %q", c.StatusAddr, c.LogLevel)
+	}
+
+	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		t.Fatalf("a complete sectioned config should validate: %v", err)
+	}
+}
+
+func TestEchoTransportIsAccepted(t *testing.T) {
+	c := &Config{Role: "server", Mode: "forward", Transport: "echo",
+		Listen: "0.0.0.0", PSK: "00112233445566778899aabbccddeeff",
+		Forwards: []string{"443"}}
+	c.applyDefaults()
+	if err := c.validate(); err != nil {
+		t.Fatalf("echo should be a valid transport: %v", err)
+	}
+	c.Transport = "smoke-signals"
+	if err := c.validate(); err == nil {
+		t.Fatal("an unknown transport must be rejected")
+	}
+}
