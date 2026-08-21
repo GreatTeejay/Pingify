@@ -2,25 +2,28 @@
 # ---------------------------------------------------------------------------
 # tunnel configuration
 #
-# The model, in one paragraph. A tunnel gives the two servers a private
-# network of their own - a small subnet reachable from both. On top of that,
-# the IRAN server exposes ports: a client connects there and comes out on
-# KHAREJ. So the questions split cleanly by which server you are standing on:
+# There are two kinds of tunnel, and everything else follows from which one
+# you pick.
 #
-#   both ends   which server this is, the protocol, the private addresses,
-#               and the security token, which has to be typed the same on both
-#   IRAN only   how ports are forwarded, and which ports
-#   KHAREJ only where the IRAN server is
+#   TCP   The two servers talk over their own public addresses. Ports are
+#         forwarded by the core: it accepts the connection on IRAN, carries it
+#         over the parallel connections, and opens the far side on KHAREJ.
+#         Nothing else exists - no extra interface, no routing.
 #
-# There is no token to copy between servers. Everything either end needs is
-# either asked for or has an obvious default, and the one shared secret is
-# typed by hand on both.
+#   TUN   The two servers get a private layer-3 link with an address range of
+#         their own, and ports are forwarded onto it by the kernel. The link
+#         itself can be carried in different ways; ICMP is the one that exists
+#         today, GRE and others slot in beside it.
+#
+# The questions then divide by which server you are standing on: IRAN owns the
+# ports clients reach, KHAREJ knows where IRAN is, and both are told the same
+# security token by hand.
 # ---------------------------------------------------------------------------
 
 cfg_reset() {
-    T_NAME=""; T_ROLE=""; T_TRANSPORT="tcp"; T_FORWARDER="pingify"
-    # Every tunnel brings up the private link and can forward ports over it.
-    T_MODE="both"
+    T_NAME=""; T_ROLE=""
+    # kind is TCP or TUN; the transport, mode and forwarder all follow from it.
+    T_KIND="tcp"; T_TRANSPORT="tcp"; T_MODE="forward"; T_FORWARDER="pingify"
     T_TOKEN=""
     T_PORT=9443          # the tunnel's own port, TCP only
     T_ACCEPTS="server"   # IRAN accepts the link, KHAREJ dials it
@@ -208,17 +211,38 @@ new_tunnel() {
     server_info
     if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
 
-    # -- protocol ----------------------------------------------------------
-    head2 "Protocol"
-    item 1 "TCP" "parallel encrypted connections - the fast one"
-    item 2 "ICMP" "the same stream inside ping packets - no port at all"
+    # -- kind --------------------------------------------------------------
+    head2 "Tunnel type"
+    item 1 "TCP" "straight over the public addresses - the fast one"
+    item 2 "TUN" "a private layer-3 link between the two servers"
     say ""
-    dim "ICMP is the fallback for a path that will not pass TCP. Every packet"
-    dim "is small and has to be acknowledged, so it moves a fraction as much."
+    dim "TCP forwards ports through the core and adds nothing to the machine."
+    dim "TUN gives the servers a private network and lets the kernel forward"
+    dim "onto it - use it when TCP will not pass, or when you want the servers"
+    dim "to reach each other directly."
     say ""
-    local pr=""
-    ask pr "select" "1"
-    if [ "$pr" = "2" ]; then T_TRANSPORT="icmp"; else T_TRANSPORT="tcp"; fi
+    local kind=""
+    ask kind "select" "1"
+
+    if [ "$kind" = "2" ]; then
+        T_KIND="tun"; T_MODE="tun"; T_FORWARDER="iptables"
+        head2 "How the link is carried"
+        item 1 "ICMP" "inside ping packets - needs no port at all"
+        say ""
+        dim "GRE and others will appear here; ICMP is what this build carries."
+        say ""
+        local sub=""
+        ask sub "select" "1"
+        T_TRANSPORT="icmp"
+        if ! have iptables; then
+            warn "iptables is not installed - a TUN tunnel forwards with it"
+            dim "install iptables, or choose TCP instead"
+            pause
+            return 1
+        fi
+    else
+        T_KIND="tcp"; T_MODE="forward"; T_TRANSPORT="tcp"; T_FORWARDER="pingify"
+    fi
 
     # -- name --------------------------------------------------------------
     head2 "Name"
@@ -259,26 +283,26 @@ new_tunnel() {
         this_side_accepts && dim "open $T_PORT in this server's firewall"
     fi
 
-    # -- the private link --------------------------------------------------
-    #
-    # Both servers get an address on a small private network. It is what the
-    # iptables forwarder NATs onto, and it gives you a direct address for the
-    # other machine whichever forwarder is in use.
-    head2 "Private link"
-    local sub=""
-    ask sub "private range (third octet)" "10"
-    case "$sub" in "" | *[!0-9]*) sub=10 ;; esac
-    if [ "$T_ROLE" = "server" ]; then
-        T_TUNLOCAL="10.${sub}.10.1/24"; T_TUNPEER="10.${sub}.10.2/24"
-    else
-        T_TUNLOCAL="10.${sub}.10.2/24"; T_TUNPEER="10.${sub}.10.1/24"
+    # -- the private link, TUN only ----------------------------------------
+    if [ "$T_MODE" = "tun" ]; then
+        head2 "Private link"
+        dim "both servers get an address on a small network of their own"
+        say ""
+        local octet=""
+        ask octet "private range 10.x.10.0/24, pick x" "10"
+        case "$octet" in "" | *[!0-9]*) octet=10 ;; esac
+        if [ "$T_ROLE" = "server" ]; then
+            T_TUNLOCAL="10.${octet}.10.1/24"; T_TUNPEER="10.${octet}.10.2/24"
+        else
+            T_TUNLOCAL="10.${octet}.10.2/24"; T_TUNPEER="10.${octet}.10.1/24"
+        fi
+        say ""
+        ask T_TUNLOCAL "this server's private address" "$T_TUNLOCAL"
+        ask T_TUNPEER  "the other server's private address" "$T_TUNPEER"
+        ask T_TUNIF    "device name" "$T_TUNIF"
+        ask T_TUNMTU   "MTU" "$T_TUNMTU"
+        case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
     fi
-    say ""
-    ask T_TUNLOCAL "this server's private address" "$T_TUNLOCAL"
-    ask T_TUNPEER  "the other server's private address" "$T_TUNPEER"
-    ask T_TUNIF    "device name" "$T_TUNIF"
-    ask T_TUNMTU   "MTU" "$T_TUNMTU"
-    case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
 
     # -- security ----------------------------------------------------------
     head2 "Security token"
@@ -294,30 +318,15 @@ new_tunnel() {
         fi
     done
 
-    # -- forwarder and ports: the IRAN side owns both ----------------------
+    # -- ports: the IRAN side owns them ------------------------------------
     if [ "$T_ROLE" = "server" ]; then
-        head2 "Forwarder"
-        item 1 "PINGIFY" "the core carries each connection - encrypted end to end"
-        item 2 "IPTABLES" "the kernel NATs onto the private link - least CPU"
-        say ""
-        dim "PINGIFY never lets a packet out of the tunnel until it is on the"
-        dim "far server. IPTABLES hands it to the kernel, so nothing is copied"
-        dim "into user space - lighter on a busy tunnel, and it writes NAT rules."
-        say ""
-        local fw=""
-        ask fw "select" "1"
-        if [ "$fw" = "2" ]; then
-            if ! have iptables; then
-                warn "iptables is not installed here - using PINGIFY instead"
-                T_FORWARDER="pingify"
-            else
-                T_FORWARDER="iptables"
-            fi
-        else
-            T_FORWARDER="pingify"
-        fi
-
         head2 "Ports"
+        if [ "$T_FORWARDER" = "iptables" ]; then
+            dim "forwarded by the kernel onto the private link"
+        else
+            dim "forwarded by the core, over the tunnel's own connections"
+        fi
+        say ""
         dim "443            same port on both servers"
         dim "443=8443       clients hit 443 here, it lands on 8443 there"
         dim "udp:500        a UDP port"
@@ -328,7 +337,7 @@ new_tunnel() {
         T_FORWARDS="$(parse_forwards "$raw")"
         [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
     else
-        dim "ports and forwarding are configured on the IRAN server"
+        dim "ports are configured on the IRAN server"
     fi
 
     # -- performance -------------------------------------------------------
@@ -344,13 +353,17 @@ new_tunnel() {
     box_top
     box_row "$(pad_to "Tunnel" 16)${C_B}${T_NAME}${C_OFF}"
     box_row "$(pad_to "This server" 16)$(side_label "$T_ROLE")  ${C_DIM}$T_PUBLIC_IP${C_OFF}"
-    box_row "$(pad_to "Protocol" 16)$(transport_label "$T_TRANSPORT")"
+    if [ "$T_KIND" = "tun" ]; then
+        box_row "$(pad_to "Type" 16)TUN  ${C_DIM}carried over $(transport_label "$T_TRANSPORT")${C_OFF}"
+    else
+        box_row "$(pad_to "Type" 16)TCP"
+    fi
     if [ -n "$CFG_LISTEN" ]; then
         box_row "$(pad_to "Link" 16)accepts on ${CFG_LISTEN}"
     else
         box_row "$(pad_to "Link" 16)connects to ${CFG_CONNECT}"
     fi
-    box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    [ "$T_MODE" = "tun" ] && box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
     if [ "$T_ROLE" = "server" ]; then
         box_row "$(pad_to "Forwarder" 16)$(forwarder_label "$T_FORWARDER")"
         box_row "$(pad_to "Ports" 16)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
@@ -389,11 +402,17 @@ new_tunnel() {
     say ""
     box_top
     box_row "$(pad_to "This server" 18)$( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN )"
-    box_row "$(pad_to "Protocol" 18)$(transport_label "$T_TRANSPORT")"
+    if [ "$T_KIND" = "tun" ]; then
+        box_row "$(pad_to "Type" 18)TUN, over $(transport_label "$T_TRANSPORT")"
+    else
+        box_row "$(pad_to "Type" 18)TCP"
+    fi
     [ "$T_TRANSPORT" = "tcp" ] && box_row "$(pad_to "Tunnel port" 18)${T_PORT}"
     box_row "$(pad_to "IRAN address" 18)$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
-    box_row "$(pad_to "Its private addr" 18)${T_TUNPEER}"
-    box_row "$(pad_to "Peer private addr" 18)${T_TUNLOCAL}"
+    if [ "$T_MODE" = "tun" ]; then
+        box_row "$(pad_to "Its private addr" 18)${T_TUNPEER}"
+        box_row "$(pad_to "Peer private addr" 18)${T_TUNLOCAL}"
+    fi
     box_row "$(pad_to "Security token" 18)${C_YEL}the same one${C_OFF}"
     box_bot
     say ""
