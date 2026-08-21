@@ -151,7 +151,7 @@ func TestHandshakeLeaksNoConstantBytes(t *testing.T) {
 		}
 	}()
 
-	cfg := &Config{Role: "edge", PSK: testPSK(t), Carriers: 1}
+	cfg := &Config{Role: "server", PSK: testPSK(t), Carriers: 1}
 	cfg.applyDefaults()
 	addr := ln.Addr().String()
 
@@ -247,7 +247,7 @@ func bringUp(t *testing.T, forwards []string, carriers int) *pool {
 	carrierPort := freePort(t)
 
 	originCfg := &Config{
-		Role: "origin", Mode: "forward",
+		Role: "client", Mode: "forward",
 		Listen: fmt.Sprintf("127.0.0.1:%d", carrierPort),
 		PSK:    psk, Carriers: carriers,
 	}
@@ -265,7 +265,7 @@ func bringUp(t *testing.T, forwards []string, carriers int) *pool {
 	}
 
 	edgeCfg := &Config{
-		Role: "edge", Mode: "forward",
+		Role: "server", Mode: "forward",
 		Connect: fmt.Sprintf("127.0.0.1:%d", carrierPort),
 		PSK:     psk, Carriers: carriers, Forwards: forwards,
 	}
@@ -395,7 +395,7 @@ func TestWrongPSKIsRejectedSilently(t *testing.T) {
 	setLogLevel("error")
 	carrierPort := freePort(t)
 	originCfg := &Config{
-		Role: "origin", Mode: "forward",
+		Role: "client", Mode: "forward",
 		Listen: fmt.Sprintf("127.0.0.1:%d", carrierPort),
 		PSK:    testPSK(t), Carriers: 1,
 	}
@@ -406,7 +406,7 @@ func TestWrongPSKIsRejectedSilently(t *testing.T) {
 	}
 	defer op.close()
 
-	wrong := &Config{Role: "edge", PSK: testPSK(t), Carriers: 1}
+	wrong := &Config{Role: "server", PSK: testPSK(t), Carriers: 1}
 	wrong.applyDefaults()
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", carrierPort), 3*time.Second)
 	if err != nil {

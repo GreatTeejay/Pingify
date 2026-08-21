@@ -188,8 +188,8 @@ edit_forwards() {
         warn "this is a full-IP tunnel; it has no port list"
         pause; return
     fi
-    if [ "$T_ROLE" != "edge" ]; then
-        warn "ports are configured on the Iran side; this server is the Kharej end"
+    if [ "$T_ROLE" != "server" ]; then
+        warn "the port list lives on the IRAN server; this is the KHAREJ end"
         pause; return
     fi
     say ""

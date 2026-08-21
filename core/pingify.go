@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.0.0"
+const version = "3.1.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -60,8 +60,9 @@ type Config struct {
 	Name string `json:"name"`
 
 	// Role decides who owns the user-facing ports.
-	//   edge   — users connect here (normally the Iran server)
-	//   origin — the real services live here (normally the Kharej server)
+	//   server — users connect here; normally the Iran box
+	//   client — the real services live here; normally the Kharej box
+	// "edge" and "origin" are accepted as the old names for these.
 	Role string `json:"role"`
 
 	// Mode selects what rides on top of the carrier pool.
@@ -107,6 +108,12 @@ type TUNConfig struct {
 }
 
 func (c *Config) applyDefaults() {
+	switch c.Role {
+	case "edge":
+		c.Role = "server"
+	case "origin":
+		c.Role = "client"
+	}
 	if c.Mode == "" {
 		c.Mode = "forward"
 	}
@@ -156,9 +163,9 @@ func (c *Config) applyDefaults() {
 
 func (c *Config) validate() error {
 	switch c.Role {
-	case "edge", "origin":
+	case "server", "client":
 	default:
-		return fmt.Errorf("role must be \"edge\" or \"origin\", got %q", c.Role)
+		return fmt.Errorf("role must be \"server\" or \"client\", got %q", c.Role)
 	}
 	switch c.Mode {
 	case "forward", "tun":
@@ -177,7 +184,7 @@ func (c *Config) validate() error {
 	if err != nil || len(key) < 16 {
 		return fmt.Errorf("psk must be a hex string of at least 16 bytes (use -genpsk)")
 	}
-	if c.Mode == "forward" && c.Role == "edge" && len(c.Forwards) == 0 {
+	if c.Mode == "forward" && c.Role == "server" && len(c.Forwards) == 0 {
 		return fmt.Errorf("edge side in forward mode needs at least one entry in \"forwards\"")
 	}
 	if c.Mode == "tun" && c.Local() == "" {
@@ -459,7 +466,7 @@ const (
 var errHandshake = errors.New("handshake rejected")
 
 func roleByte(role string) byte {
-	if role == "edge" {
+	if role == "server" {
 		return 0
 	}
 	return 1
@@ -1288,7 +1295,7 @@ func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link
 	}
 	// Odd ids from the edge, even from the origin. Ids are per-carrier, so this
 	// is only belt and braces against a future origin-initiated stream.
-	if cfg.Role == "edge" {
+	if cfg.Role == "server" {
 		l.nextID = 1
 	} else {
 		l.nextID = 2
@@ -1693,7 +1700,7 @@ func startForward(cfg *Config, p *pool) (*forwarder, error) {
 	}
 	p.setHandler(f)
 
-	if cfg.Role == "edge" {
+	if cfg.Role == "server" {
 		for _, spec := range cfg.Forwards {
 			rules, err := parseForward(spec)
 			if err != nil {
