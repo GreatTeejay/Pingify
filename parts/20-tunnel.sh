@@ -14,6 +14,7 @@
 
 cfg_reset() {
     T_NAME=""; T_ROLE=""; T_MODE="forward"; T_TRANSPORT="braid"
+    T_FORWARDER="pingify"
     T_PSK=""
     T_PORT=9443          # agreed by both ends
     T_ACCEPTS="server"   # which role accepts the link; the other one dials
@@ -110,12 +111,12 @@ cfg_render() {
     printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
     printf '\n[security]\n'
     printf 'psk              = "%s"\n' "$T_PSK"
-    # Only the side that owns the user-facing ports carries the list, so the
-    # peer document does not end up with an empty one.
-    if [ "$mode" = "forward" ] && [ -n "$fwd" ]; then
-        printf '\n[forward]\n'
-        printf 'ports            = [%s]\n' "$fwd"
-    fi
+    # Both ends need to know which forwarder is in use - the KHAREJ side has
+    # rules of its own to write. Only the side clients reach carries the port
+    # list, so the other document does not end up with an empty one.
+    printf '\n[forward]\n'
+    printf 'forwarder        = "%s"\n' "$T_FORWARDER"
+    [ -n "$fwd" ] && printf 'ports            = [%s]\n' "$fwd"
     # Only ever this server's own file: the token carries the far side's tun
     # addresses already mirrored, so there is nothing to swap here.
     if [ "$mode" = "tun" ]; then
@@ -134,8 +135,26 @@ cfg_render() {
     printf 'level            = "info"\n'
 }
 
+# A missing field used to reach the core and come back as a flat rejection
+# with no hint which one it was. Name it here instead.
+cfg_check_complete() {
+    local missing=""
+    [ -n "$T_NAME" ]      || missing="$missing name"
+    [ -n "$T_ROLE" ]      || missing="$missing role"
+    [ -n "$T_MODE" ]      || missing="$missing mode"
+    [ -n "$T_TRANSPORT" ] || missing="$missing transport"
+    [ -n "$T_PSK" ]       || missing="$missing key"
+    if [ -n "$missing" ]; then
+        fail "the wizard did not collect:$missing"
+        dim "nothing was written - please report this, it is a bug in Pingify"
+        return 1
+    fi
+    return 0
+}
+
 cfg_save() {
     local file
+    cfg_check_complete || return 1
     file="$(cfg_file "$T_NAME")"
     cfg_endpoints
     cfg_render "$T_ROLE" "$T_MODE" "$CFG_LISTEN" "$CFG_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
@@ -169,6 +188,7 @@ cfg_peer_token() {
         printf 'window_kb = %s\n'   "$T_WINDOW"
         printf 'keepalive = %s\n'   "$T_KEEPALIVE"
         printf 'profile = "%s"\n'   "$T_PRESET"
+        printf 'forwarder = "%s"\n' "$T_FORWARDER"
         printf 'suggest_ip = "%s"\n' "$T_PUBLIC_IP"
         if [ "$T_MODE" = "tun" ]; then
             local pfx="${T_TUNLOCAL##*/}"
@@ -317,19 +337,30 @@ new_tunnel() {
         "" | *[!0-9a-fA-F]*) fail "a key is 64 hex characters"; pause; return 1 ;;
     esac
 
-    # -- payload -----------------------------------------------------------
-    head2 "What the tunnel carries"
-    item 1 "Ports" "forward TCP and UDP - panels, inbounds"
-    item 2 "Full IP" "a private layer-3 link between the servers"
+    # -- forwarder ---------------------------------------------------------
+    head2 "Forwarder"
+    item 1 "Pingify" "the core carries it - encrypted end to end, any protocol"
+    item 2 "iptables" "the kernel carries it over a private IP link - fastest"
     say ""
-    local m=""
-    ask m "select" "1"
+    dim "Pingify never lets a packet out of the tunnel until it is on the far"
+    dim "server. iptables sets up a private layer-3 link and lets the kernel"
+    dim "NAT onto it, so nothing is copied into user space - less CPU on a busy"
+    dim "tunnel, but it needs a full-IP link and it writes NAT rules."
     say ""
-
-    if [ "$m" = "2" ]; then
+    local fw=""
+    ask fw "select" "1"
+    if [ "$fw" = "2" ]; then
+        T_FORWARDER="iptables"
         T_MODE="tun"
+        if ! have iptables; then
+            warn "iptables is not installed on this server"
+            dim "install it, or choose Pingify instead"
+            pause
+            return 1
+        fi
         local sub=""
-        ask sub "subnet index (0-63)" "1"
+        say ""
+        ask sub "private subnet index (0-63)" "1"
         case "$sub" in "" | *[!0-9]*) sub=1 ;; esac
         T_TUNIF="pfy${sub}"
         if [ "$T_ROLE" = "server" ]; then
@@ -337,22 +368,27 @@ new_tunnel() {
         else
             T_TUNLOCAL="10.71.${sub}.2/30"; T_TUNPEER="10.71.${sub}.1"
         fi
-        ask T_TUNMTU "MTU" "1380"
+        T_TUNMTU=1380
+        dim "this server takes ${T_TUNLOCAL}, the other one ${T_TUNPEER}"
     else
+        T_FORWARDER="pingify"
         T_MODE="forward"
-        if [ "$T_ROLE" = "server" ]; then
-            dim "443            same port on both servers"
-            dim "443=8443       clients hit 443 here, it lands on 8443 there"
-            dim "udp:500        a UDP port"
-            dim "8000-8010      a range"
-            say ""
-            local raw=""
-            ask raw "ports clients will connect to, comma separated" "443"
-            T_FORWARDS="$(parse_forwards "$raw")"
-            [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
-        else
-            dim "the port list lives on the IRAN server, nothing to set here"
-        fi
+    fi
+
+    # -- ports -------------------------------------------------------------
+    #
+    # Only the side clients connect to has any use for these.
+    if [ "$T_ROLE" = "server" ]; then
+        head2 "Ports"
+        dim "443            same port on both servers"
+        dim "443=8443       clients hit 443 here, it lands on 8443 there"
+        dim "udp:500        a UDP port"
+        dim "8000-8010      a range"
+        say ""
+        local raw=""
+        ask raw "ports clients will connect to, comma separated" "443"
+        T_FORWARDS="$(parse_forwards "$raw")"
+        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
     fi
 
     # -- performance -------------------------------------------------------
@@ -369,15 +405,16 @@ new_tunnel() {
         dim "Reverse it when inbound to the IRAN server is filtered."
         say ""
         if confirm "reverse which end accepts the link?"; then
-            if [ -n "$T_LISTEN" ]; then
-                local a=""
-                ask a "address of the other server"
-                [ -n "$a" ] && { T_CONNECT="$a:${T_LISTEN##*:}"; T_LISTEN=""; }
-            else
-                T_LISTEN="0.0.0.0:${T_CONNECT##*:}"
-                T_CONNECT=""
+            if [ "$T_ACCEPTS" = "server" ]; then T_ACCEPTS="client"; else T_ACCEPTS="server"; fi
+            if ! this_side_accepts && [ -z "$T_PEER_IP" ]; then
+                say ""
+                ask T_PEER_IP "address of the other server"
             fi
-            ok "this server will $( [ -n "$T_LISTEN" ] && echo accept || echo open ) the link"
+            if this_side_accepts; then
+                ok "this server now accepts the link"
+            else
+                ok "this server now opens the link"
+            fi
         fi
     fi
 
@@ -395,11 +432,12 @@ new_tunnel() {
     fi
     box_row "$(pad_to "This address" 16)${T_PUBLIC_IP}"
     box_row "$(pad_to "Protocol" 16)$(transport_label "$T_TRANSPORT")"
-    box_row "$(pad_to "Carries" 16)$(mode_label "$T_MODE")"
-    if [ "$T_MODE" = "forward" ] && [ -n "$T_FORWARDS" ]; then
+    box_row "$(pad_to "Forwarder" 16)$(forwarder_label "$T_FORWARDER")"
+    if [ -n "$T_FORWARDS" ]; then
         box_row "$(pad_to "Ports" 16)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
-    elif [ "$T_MODE" = "tun" ]; then
-        box_row "$(pad_to "Addresses" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    fi
+    if [ "$T_MODE" = "tun" ]; then
+        box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
     fi
     box_row "$(pad_to "Performance" 16)${T_PRESET}  ${C_DIM}${T_CARRIERS} connections, ${T_WINDOW} KB window${C_OFF}"
     box_bot
@@ -423,6 +461,7 @@ new_tunnel() {
     write_units
     service_enable_start "$T_NAME"
     enable_watchdog quiet
+    [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
     ok "$T_NAME is running"
     dim "config: $file"
 
@@ -479,6 +518,7 @@ import_tunnel() {
     T_WINDOW="$(toml_get "$tmp" "" window_kb)"
     T_KEEPALIVE="$(toml_get "$tmp" "" keepalive)"
     T_PRESET="$(toml_get "$tmp" "" profile)"
+    T_FORWARDER="$(toml_get "$tmp" "" forwarder)"; : "${T_FORWARDER:=pingify}"
     local suggested; suggested="$(toml_get "$tmp" "" suggest_ip)"
     if [ "$T_MODE" = "tun" ]; then
         T_TUNIF="$(toml_get "$tmp" "" tun_if)"
@@ -544,6 +584,7 @@ import_tunnel() {
     write_units
     service_enable_start "$T_NAME"
     enable_watchdog quiet
+    [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
     say ""
     ok "$T_NAME is running"
     dim "config: $file"

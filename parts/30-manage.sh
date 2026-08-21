@@ -21,6 +21,7 @@ cfg_load() {
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
+    T_FORWARDER="$(toml_get "$f" forward forwarder)"; : "${T_FORWARDER:=pingify}"
     if [ "$T_MODE" = "tun" ]; then
         T_TUNIF="$(toml_get "$f" tun name)"
         T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
