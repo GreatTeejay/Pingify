@@ -43,54 +43,75 @@ check "ranges kept"      "$(parse_forwards '8000-8010=9000')"      '"8000-8010=9
 check "empty input"      "$(parse_forwards '')"                    ''
 
 # ---------------------------------------------------------------------------
-note "the IRAN side"
+note "a TCP tunnel - IRAN side"
 # ---------------------------------------------------------------------------
+# A TCP tunnel adds nothing to the machine: no private link, no extra
+# interface, ports carried by the core over its own connections.
 cfg_reset
-T_NAME="ir"; T_ROLE="server"; T_TRANSPORT="tcp"; T_FORWARDER="iptables"
+T_NAME="ir"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"
+T_MODE="forward"; T_FORWARDER="pingify"
 T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_TOKEN="$TOKEN"
-T_TUNLOCAL="10.10.10.1/24"; T_TUNPEER="10.10.10.2/24"
 T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"
 apply_preset throughput
 iran="$(cfg_save)"
 
-check "name"                 "$(toml_get "$iran" tunnel name)"           "ir"
-check "role"                 "$(toml_get "$iran" tunnel role)"           "server"
-check "mode carries both"    "$(toml_get "$iran" tunnel mode)"           "both"
-check "protocol"             "$(toml_get "$iran" transport type)"        "tcp"
-check "IRAN accepts the link" "$(toml_get "$iran" transport listen)"     "0.0.0.0:9443"
-check "and does not dial"    "$(toml_get "$iran" transport connect)"     ""
-check "token, not a key"     "$(toml_get "$iran" security token)"        "$TOKEN"
-check "no psk is written"    "$(grep -c '^psk' "$iran")"                 "0"
-check "forwarder"            "$(toml_get "$iran" forward forwarder)"     "iptables"
-check "ports"                "$(toml_arr "$iran" ports)"                 '"443","udp:500"'
-check "private address"      "$(toml_get "$iran" tun local_addr)"        "10.10.10.1/24"
-check "peer private address" "$(toml_get "$iran" tun remote_addr)"       "10.10.10.2/24"
-check "preset carried"       "$(toml_get "$iran" tuning profile)"        "throughput"
-check "window from preset"   "$(toml_get "$iran" tuning window_kb)"      "2048"
+check "name"                  "$(toml_get "$iran" tunnel name)"       "ir"
+check "role"                  "$(toml_get "$iran" tunnel role)"       "server"
+check "no private link"       "$(toml_get "$iran" tunnel mode)"       "forward"
+check "and no [tun] section"  "$(grep -c '^\[tun\]' "$iran")"         "0"
+check "protocol"              "$(toml_get "$iran" transport type)"    "tcp"
+check "IRAN accepts the link" "$(toml_get "$iran" transport listen)"  "0.0.0.0:9443"
+check "and does not dial"     "$(toml_get "$iran" transport connect)" ""
+check "token, not a key"      "$(toml_get "$iran" security token)"    "$TOKEN"
+check "no psk is written"     "$(grep -c '^psk' "$iran")"             "0"
+check "forwarded by the core" "$(toml_get "$iran" forward forwarder)" "pingify"
+check "ports"                 "$(toml_arr "$iran" ports)"             '"443","udp:500"'
+check "preset carried"        "$(toml_get "$iran" tuning profile)"    "throughput"
+check "window from preset"    "$(toml_get "$iran" tuning window_kb)"  "2048"
 
 cfg_load ir
 check "cfg_load role"      "$T_ROLE"      "server"
 check "cfg_load token"     "$T_TOKEN"     "$TOKEN"
-check "cfg_load forwarder" "$T_FORWARDER" "iptables"
+check "cfg_load forwarder" "$T_FORWARDER" "pingify"
 check "cfg_load ports"     "$T_FORWARDS"  '"443","udp:500"'
 check "cfg_load port"      "$T_PORT"      "9443"
 check "cfg_load accepts"   "$T_ACCEPTS"   "server"
 
 # ---------------------------------------------------------------------------
+note "a TUN tunnel - the private link"
+# ---------------------------------------------------------------------------
+cfg_reset
+T_NAME="tn"; T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"
+T_MODE="tun"; T_FORWARDER="iptables"
+T_PUBLIC_IP="203.0.113.9"; T_TOKEN="$TOKEN"
+T_TUNLOCAL="10.10.10.1/24"; T_TUNPEER="10.10.10.2/24"
+T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9702"
+tun="$(cfg_save)"
+
+check "mode is tun"           "$(toml_get "$tun" tunnel mode)"        "tun"
+check "carried over ICMP"     "$(toml_get "$tun" transport type)"     "icmp"
+check "listens without a port" "$(toml_get "$tun" transport listen)"  "0.0.0.0"
+check "private address"       "$(toml_get "$tun" tun local_addr)"     "10.10.10.1/24"
+check "peer private address"  "$(toml_get "$tun" tun remote_addr)"    "10.10.10.2/24"
+check "forwarded by iptables" "$(toml_get "$tun" forward forwarder)"  "iptables"
+
+cfg_load tn
+check "cfg_load private addr" "$T_TUNLOCAL"  "10.10.10.1/24"
+check "cfg_load transport"    "$T_TRANSPORT" "icmp"
+
+# ---------------------------------------------------------------------------
 note "the KHAREJ side"
 # ---------------------------------------------------------------------------
 cfg_reset
-T_NAME="kh"; T_ROLE="client"; T_TRANSPORT="tcp"
+T_NAME="kh"; T_ROLE="client"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_MODE="forward"
 T_PORT=9443; T_PEER_IP="203.0.113.9"; T_PUBLIC_IP="198.51.100.4"; T_TOKEN="$TOKEN"
-T_TUNLOCAL="10.10.10.2/24"; T_TUNPEER="10.10.10.1/24"
 T_STATUS="127.0.0.1:9701"
 kharej="$(cfg_save)"
 
-check "KHAREJ dials IRAN"    "$(toml_get "$kharej" transport connect)" "203.0.113.9:9443"
-check "and does not listen"  "$(toml_get "$kharej" transport listen)"  ""
-check "same token"           "$(toml_get "$kharej" security token)"    "$TOKEN"
-check "no ports on KHAREJ"   "$(grep -c '^ports' "$kharej")"           "0"
-check "its own address"      "$(toml_get "$kharej" tun local_addr)"    "10.10.10.2/24"
+check "KHAREJ dials IRAN"   "$(toml_get "$kharej" transport connect)" "203.0.113.9:9443"
+check "and does not listen" "$(toml_get "$kharej" transport listen)"  ""
+check "same token"          "$(toml_get "$kharej" security token)"    "$TOKEN"
+check "no ports on KHAREJ"  "$(grep -c '^ports' "$kharej")"           "0"
 
 cfg_load kh
 check "cfg_load peer"    "$T_PEER_IP" "203.0.113.9"
