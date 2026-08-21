@@ -2,8 +2,7 @@
 # End-to-end check of the manager's config pipeline.
 #
 # It sources the generated Pingify.sh, drives the same functions the wizard
-# uses, and then runs two real engines against the documents they produce -
-# including the peer token, decoded exactly as the far server would decode it.
+# uses, and then runs two real cores against the documents they produce.
 # Runs anywhere bash and the Go toolchain do; no root and no Linux needed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -32,148 +31,157 @@ CFG_DIR="$WORK/etc"
 STATE_DIR="$WORK/state"
 mkdir -p "$CFG_DIR" "$STATE_DIR"
 
+TOKEN="a shared secret phrase"
+
 # ---------------------------------------------------------------------------
 note "forward spec parsing"
 # ---------------------------------------------------------------------------
-check "single port"       "$(parse_forwards '443')"                '"443"'
-check "comma separated"   "$(parse_forwards '443,2053')"           '"443","2053"'
-check "spaces tolerated"  "$(parse_forwards '443, 2053 , udp:500')" '"443","2053","udp:500"'
-check "ranges kept"       "$(parse_forwards '8000-8010=9000')"     '"8000-8010=9000"'
-check "empty input"       "$(parse_forwards '')"                   ''
+check "single port"      "$(parse_forwards '443')"                 '"443"'
+check "comma separated"  "$(parse_forwards '443,2053')"            '"443","2053"'
+check "spaces tolerated" "$(parse_forwards '443, 2053 , udp:500')" '"443","2053","udp:500"'
+check "ranges kept"      "$(parse_forwards '8000-8010=9000')"      '"8000-8010=9000"'
+check "empty input"      "$(parse_forwards '')"                    ''
 
 # ---------------------------------------------------------------------------
-note "config rendering and read-back"
+note "the IRAN side"
 # ---------------------------------------------------------------------------
 cfg_reset
-T_NAME="t1"; T_ROLE="client"; T_MODE="forward"
-T_ACCEPTS="server"; T_PEER_IP="203.0.113.9"; T_PORT=9443
-T_PSK="$(printf 'ab%.0s' {1..32})"
-T_CARRIERS=6; T_WINDOW=2048; T_KEEPALIVE=15
+T_NAME="ir"; T_ROLE="server"; T_TRANSPORT="tcp"; T_FORWARDER="iptables"
+T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_TOKEN="$TOKEN"
+T_TUNLOCAL="10.10.10.1/24"; T_TUNPEER="10.10.10.2/24"
 T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"
-file="$(cfg_save)"
+apply_preset throughput
+iran="$(cfg_save)"
 
-check "name round-trips"      "$(toml_get "$file" tunnel name)"          "t1"
-check "role round-trips"      "$(toml_get "$file" tunnel role)"          "client"
-check "connect round-trips"   "$(toml_get "$file" transport connect)"       "203.0.113.9:9443"
-check "carriers round-trip"   "$(toml_get "$file" transport carriers)"      "6"
-check "window round-trips"    "$(toml_get "$file" tuning window_kb)"     "2048"
-check "status round-trips"    "$(toml_get "$file" status addr)"   "127.0.0.1:9700"
-check "no listen key written" "$(toml_get "$file" transport listen)"        ""
-check "transport written"     "$(toml_get "$file" transport type)"     "braid"
+check "name"                 "$(toml_get "$iran" tunnel name)"           "ir"
+check "role"                 "$(toml_get "$iran" tunnel role)"           "server"
+check "mode carries both"    "$(toml_get "$iran" tunnel mode)"           "both"
+check "protocol"             "$(toml_get "$iran" transport type)"        "tcp"
+check "IRAN accepts the link" "$(toml_get "$iran" transport listen)"     "0.0.0.0:9443"
+check "and does not dial"    "$(toml_get "$iran" transport connect)"     ""
+check "token, not a key"     "$(toml_get "$iran" security token)"        "$TOKEN"
+check "no psk is written"    "$(grep -c '^psk' "$iran")"                 "0"
+check "forwarder"            "$(toml_get "$iran" forward forwarder)"     "iptables"
+check "ports"                "$(toml_arr "$iran" ports)"                 '"443","udp:500"'
+check "private address"      "$(toml_get "$iran" tun local_addr)"        "10.10.10.1/24"
+check "peer private address" "$(toml_get "$iran" tun remote_addr)"       "10.10.10.2/24"
+check "preset carried"       "$(toml_get "$iran" tuning profile)"        "throughput"
+check "window from preset"   "$(toml_get "$iran" tuning window_kb)"      "2048"
 
-saved_psk="$T_PSK"
-cfg_load t1
-check "cfg_load role"     "$T_ROLE"     "client"
-check "cfg_load psk"      "$T_PSK"      "$saved_psk"
-check "cfg_load forwards" "$T_FORWARDS" '"443","udp:500"'
-check "cfg_load carriers"  "$T_CARRIERS"  "6"
-check "cfg_load transport" "$T_TRANSPORT" "braid"
+cfg_load ir
+check "cfg_load role"      "$T_ROLE"      "server"
+check "cfg_load token"     "$T_TOKEN"     "$TOKEN"
+check "cfg_load forwarder" "$T_FORWARDER" "iptables"
+check "cfg_load ports"     "$T_FORWARDS"  '"443","udp:500"'
+check "cfg_load port"      "$T_PORT"      "9443"
+check "cfg_load accepts"   "$T_ACCEPTS"   "server"
 
 # ---------------------------------------------------------------------------
-note "the token carries settings, not addresses"
+note "the KHAREJ side"
 # ---------------------------------------------------------------------------
 cfg_reset
-T_NAME="t1"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="braid"
-T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PSK="$saved_psk"
-T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"; apply_preset balanced
+T_NAME="kh"; T_ROLE="client"; T_TRANSPORT="tcp"
+T_PORT=9443; T_PEER_IP="203.0.113.9"; T_PUBLIC_IP="198.51.100.4"; T_TOKEN="$TOKEN"
+T_TUNLOCAL="10.10.10.2/24"; T_TUNPEER="10.10.10.1/24"
+T_STATUS="127.0.0.1:9701"
+kharej="$(cfg_save)"
 
-cfg_peer_token | base64 -d > "$WORK/tok"
-check "token version"        "$(toml_get "$WORK/tok" "" v)"          "2"
-check "role flips"           "$(toml_get "$WORK/tok" "" role)"       "client"
-check "port is agreed"       "$(toml_get "$WORK/tok" "" port)"       "9443"
-check "key is carried over"  "$(toml_get "$WORK/tok" "" psk)"        "$saved_psk"
-check "transport carried"    "$(toml_get "$WORK/tok" "" transport)"  "braid"
-check "address is a hint"    "$(toml_get "$WORK/tok" "" suggest_ip)" "203.0.113.9"
+check "KHAREJ dials IRAN"    "$(toml_get "$kharej" transport connect)" "203.0.113.9:9443"
+check "and does not listen"  "$(toml_get "$kharej" transport listen)"  ""
+check "same token"           "$(toml_get "$kharej" security token)"    "$TOKEN"
+check "no ports on KHAREJ"   "$(grep -c '^ports' "$kharej")"           "0"
+check "its own address"      "$(toml_get "$kharej" tun local_addr)"    "10.10.10.2/24"
 
-# The two things that must never travel: this server's endpoint, and the ports.
-check "no listen in token"   "$(grep -c '^listen' "$WORK/tok")"      "0"
-check "no connect in token"  "$(grep -c '^connect' "$WORK/tok")"     "0"
-check "no ports in token"    "$(grep -c '^ports' "$WORK/tok")"       "0"
-
-# What the far side ends up with after accepting the suggested address.
-cfg_reset
-T_NAME="t1"; T_ROLE="client"; T_MODE="forward"; T_TRANSPORT="braid"
-T_ACCEPTS="server"; T_PORT=9443; T_PEER_IP="203.0.113.9"; T_PSK="$saved_psk"
-T_STATUS="127.0.0.1:9700"
-cfg_endpoints
-check "far side dials"       "$CFG_CONNECT"  "203.0.113.9:9443"
-check "far side does not listen" "$CFG_LISTEN" ""
-
-# Echo has no port, and used to produce "ip:0.0.0.0" here.
-T_TRANSPORT="echo"
-cfg_endpoints
-check "echo dials without a port" "$CFG_CONNECT" "203.0.113.9"
-T_ROLE="server"
-cfg_endpoints
-check "echo listens without a port" "$CFG_LISTEN" "0.0.0.0"
-
-# a tun tunnel hands the peer the other end of the /30
-cfg_reset
-T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_TRANSPORT="braid"
-T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"; T_PUBLIC_IP="198.51.100.4"
-T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.1/30"; T_TUNPEER="10.71.1.2"; T_TUNMTU=1380
-cfg_peer_token | base64 -d > "$WORK/tok2"
-check "peer takes .2/30"   "$(toml_get "$WORK/tok2" "" tun_local)" "10.71.1.2/30"
-check "peer points at .1"  "$(toml_get "$WORK/tok2" "" tun_peer)"  "10.71.1.1"
+cfg_load kh
+check "cfg_load peer"    "$T_PEER_IP" "203.0.113.9"
+check "cfg_load accepts" "$T_ACCEPTS" "server"
 
 # ---------------------------------------------------------------------------
+note "ICMP needs no port"
 # ---------------------------------------------------------------------------
-note "the engine accepts what the manager writes"
+cfg_reset
+T_NAME="ic"; T_ROLE="server"; T_TRANSPORT="icmp"; T_TOKEN="$TOKEN"
+T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"
+T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9702"
+cfg_endpoints
+check "IRAN listens without a port" "$CFG_LISTEN" "0.0.0.0"
+
+T_ROLE="client"; T_PEER_IP="203.0.113.9"
+cfg_endpoints
+check "KHAREJ dials without a port" "$CFG_CONNECT" "203.0.113.9"
+check "and nothing is appended"     "$CFG_LISTEN"  ""
+
+# ---------------------------------------------------------------------------
+note "an incomplete tunnel names what is missing"
+# ---------------------------------------------------------------------------
+cfg_reset
+T_NAME="broken"; T_ROLE="server"; T_TRANSPORT="tcp"
+T_TUNLOCAL="10.10.10.1/24"; T_FORWARDS='"443"'
+out="$(cfg_save 2>&1)"; rc=$?
+check "refuses without a token" "$rc"                                  "1"
+check "and says so"             "$(printf '%s' "$out" | grep -c token)" "1"
+check "and writes nothing"      "$([ -f "$(cfg_file broken)" ] && echo yes || echo no)" "no"
+
+cfg_reset
+T_NAME="broken2"; T_ROLE="server"; T_TRANSPORT="tcp"; T_TOKEN="$TOKEN"
+T_TUNLOCAL="10.10.10.1/24"
+out="$(cfg_save 2>&1)"; rc=$?
+check "IRAN needs ports"        "$rc"                                   "1"
+check "and says which"          "$(printf '%s' "$out" | grep -c ports)" "1"
+
+# ---------------------------------------------------------------------------
+note "the core has to match the script"
 # ---------------------------------------------------------------------------
 GO_BIN="${GO_BIN:-go}"
 if ! command -v "$GO_BIN" >/dev/null 2>&1; then
-    printf '  \033[33mskip\033[0m live engine checks: no Go toolchain\n'
+    printf '  \033[33mskip\033[0m live core checks: no Go toolchain\n'
 else
     EXT=""; [ "${OS:-}" = "Windows_NT" ] && EXT=".exe"
     CORE_BIN="$WORK/pingify-core$EXT"
     ( cd core && CGO_ENABLED=0 "$GO_BIN" build -o "$CORE_BIN" . ) || { echo "core build failed"; exit 1; }
 
-    TP=$(( 20000 + RANDOM % 10000 ))   # tunnel carrier port
-    LP=$(( 30000 + RANDOM % 10000 ))   # user-facing port on the edge
-    EP=$(( 40000 + RANDOM % 10000 ))   # the "real service"
+    check "the shipped core matches" "$("$CORE_BIN" -version | awk '{print $2}')" "$PINGIFY_VERSION"
+    real="$PINGIFY_VERSION"
+    PINGIFY_VERSION="0.0.0-not-this"
+    if core_matches_script; then r=matched; else r=differs; fi
+    check "a mismatch is detected" "$r" "differs"
+    PINGIFY_VERSION="$real"
 
-    # The IRAN side: accepts the link and owns the ports clients connect to.
+    # ---------------------------------------------------------------------
+    note "two cores, one token, real traffic"
+    # ---------------------------------------------------------------------
+    # forward mode rather than both: a private link needs /dev/net/tun, which
+    # a developer machine does not necessarily have.
+    TP=$(( 20000 + RANDOM % 10000 ))
+    LP=$(( 30000 + RANDOM % 10000 ))
+    EP=$(( 40000 + RANDOM % 10000 ))
+    LIVE_TOKEN="a token typed on both servers"
+
     cfg_reset
-    T_NAME="live"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="braid"
+    T_MODE="forward"
+    T_NAME="live-ir"; T_ROLE="server"; T_TRANSPORT="tcp"
     T_ACCEPTS="server"; T_PORT="$TP"; T_PUBLIC_IP="127.0.0.1"
-    T_PSK="$("$CORE_BIN" -genpsk)"
-    T_CARRIERS=4; T_WINDOW=1024; T_KEEPALIVE=10
+    T_TOKEN="$LIVE_TOKEN"; T_CARRIERS=4; T_WINDOW=1024
     T_FORWARDS="$(parse_forwards "$LP=$EP")"
-    T_STATUS="127.0.0.1:$(( 50000 + RANDOM % 5000 ))"
+    iran_status="127.0.0.1:$(( 50000 + RANDOM % 5000 ))"
+    T_STATUS="$iran_status"
     iran_cfg="$(cfg_save)"
-    iran_status="$T_STATUS"
-    cfg_peer_token | base64 -d > "$WORK/tok.live"
 
-    # The KHAREJ side, built from nothing but that token plus the address it
-    # suggested - which is exactly what applying it does.
     cfg_reset
-    T_NAME="$(toml_get "$WORK/tok.live" "" name)"
-    T_ROLE="$(toml_get "$WORK/tok.live" "" role)"
-    T_MODE="$(toml_get "$WORK/tok.live" "" mode)"
-    T_TRANSPORT="$(toml_get "$WORK/tok.live" "" transport)"
-    T_ACCEPTS="$(toml_get "$WORK/tok.live" "" accepts)"
-    T_PORT="$(toml_get "$WORK/tok.live" "" port)"
-    T_PSK="$(toml_get "$WORK/tok.live" "" psk)"
-    T_CARRIERS="$(toml_get "$WORK/tok.live" "" carriers)"
-    T_WINDOW="$(toml_get "$WORK/tok.live" "" window_kb)"
-    T_KEEPALIVE="$(toml_get "$WORK/tok.live" "" keepalive)"
-    T_PEER_IP="$(toml_get "$WORK/tok.live" "" suggest_ip)"
+    T_MODE="forward"
+    T_NAME="live-kh"; T_ROLE="client"; T_TRANSPORT="tcp"
+    T_ACCEPTS="server"; T_PORT="$TP"; T_PEER_IP="127.0.0.1"
+    T_TOKEN="$LIVE_TOKEN"; T_CARRIERS=4; T_WINDOW=1024
     T_STATUS="127.0.0.1:$(( 55000 + RANDOM % 5000 ))"
-    CFG_DIR="$WORK/far"; mkdir -p "$CFG_DIR"
     kharej_cfg="$(cfg_save)"
-    CFG_DIR="$WORK/etc"
-
-    check "the token alone reaches the peer" "$(toml_get "$kharej_cfg" transport connect)" "127.0.0.1:$TP"
-    check "and carries no ports"             "$(grep -c '^ports' "$kharej_cfg")"           "0"
 
     "$CORE_BIN" -c "$iran_cfg"   -check >/dev/null 2>&1; check "IRAN config validates"   "$?" "0"
     "$CORE_BIN" -c "$kharej_cfg" -check >/dev/null 2>&1; check "KHAREJ config validates" "$?" "0"
 
-    python - "$EP" "$WORK/echo.ready" <<'PYEOF' &
+    cat > "$WORK/echo.py" <<'PYEOF'
 import socket, sys, threading
-port = int(sys.argv[1])
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("127.0.0.1", port)); s.listen(16)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(16)
 open(sys.argv[2], "w").close()
 def serve(c):
     with c:
@@ -182,11 +190,11 @@ def serve(c):
             if not b: return
             c.sendall(b)
 while True:
-    c, _ = s.accept()
-    threading.Thread(target=serve, args=(c,), daemon=True).start()
+    c, _ = s.accept(); threading.Thread(target=serve, args=(c,), daemon=True).start()
 PYEOF
-    ECHO_PID=$!
-    for _ in $(seq 1 50); do [ -f "$WORK/echo.ready" ] && break; sleep 0.1; done
+    rm -f "$WORK/ready"
+    python "$WORK/echo.py" "$EP" "$WORK/ready" &
+    for _ in $(seq 1 50); do [ -f "$WORK/ready" ] && break; sleep 0.1; done
 
     "$CORE_BIN" -c "$kharej_cfg" >"$WORK/kharej.log" 2>&1 &
     KHAREJ_PID=$!
@@ -198,95 +206,52 @@ PYEOF
         if "$CORE_BIN" -healthz "$iran_status" >/dev/null 2>&1; then up=0; break; fi
         sleep 0.2
     done
-    check "carriers come up" "$up" "0"
+    check "the link comes up on a typed token" "$up" "0"
 
     if [ "$up" = "0" ]; then
-        # healthz turns green on the first carrier; give the rest a moment.
         for _ in $(seq 1 50); do
             set -- $("$CORE_BIN" -status "$iran_status" -brief)
             [ "${2:-0}" = "4" ] && break
             sleep 0.2
         done
-        check "all 4 carriers connected" "${2:-0}" "4"
+        check "all 4 connections" "${2:-0}" "4"
 
-        python - "$LP" > "$WORK/xfer.out" 2>&1 <<'PYEOF'
-import socket, sys, os, hashlib
-port = int(sys.argv[1])
+        cat > "$WORK/xfer.py" <<'PYEOF'
+import socket, sys, os
+s = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=15); s.settimeout(20)
 payload = os.urandom(1 << 20)
-s = socket.create_connection(("127.0.0.1", port), timeout=15)
-s.settimeout(20)
 s.sendall(payload); s.shutdown(socket.SHUT_WR)
 got = b""
 while len(got) < len(payload):
     b = s.recv(65536)
     if not b: break
     got += b
-print("match" if got == payload else "mismatch %d/%d" % (len(got), len(payload)))
+print("match" if got == payload else "mismatch")
 PYEOF
-        check "1 MiB round trip through the tunnel" "$(cat "$WORK/xfer.out")" "match"
+        check "1 MiB round trip" "$(python "$WORK/xfer.py" "$LP")" "match"
 
-        set -- $("$CORE_BIN" -status "$iran_status" -brief)
-        check "still healthy afterwards" "$1" "up"
+        # A different token must not get in.
+        cfg_reset
+        T_MODE="forward"
+        T_NAME="live-bad"; T_ROLE="client"; T_TRANSPORT="tcp"
+        T_ACCEPTS="server"; T_PORT="$TP"; T_PEER_IP="127.0.0.1"
+        T_TOKEN="a completely different token"; T_CARRIERS=1
+        T_STATUS="127.0.0.1:$(( 58000 + RANDOM % 1000 ))"
+        bad_status="$T_STATUS"
+        bad_cfg="$(cfg_save)"
+        "$CORE_BIN" -c "$bad_cfg" >"$WORK/bad.log" 2>&1 &
+        BAD_PID=$!
+        sleep 3
+        "$CORE_BIN" -healthz "$bad_status" >/dev/null 2>&1 && r=up || r=refused
+        check "a wrong token is refused" "$r" "refused"
+        kill "$BAD_PID" 2>/dev/null
     else
-        printf '  edge log:\n'; sed 's/^/    /' "$WORK/edge.log" | tail -n 10
-        printf '  origin log:\n'; sed 's/^/    /' "$WORK/origin.log" | tail -n 10
+        printf '  iran log:\n';   sed 's/^/    /' "$WORK/iran.log"   | tail -n 8
+        printf '  kharej log:\n'; sed 's/^/    /' "$WORK/kharej.log" | tail -n 8
     fi
 
-    kill "$IRAN_PID" "$KHAREJ_PID" "$ECHO_PID" 2>/dev/null
+    kill "$IRAN_PID" "$KHAREJ_PID" 2>/dev/null
     wait "$IRAN_PID" "$KHAREJ_PID" 2>/dev/null
-fi
-
-
-# ---------------------------------------------------------------------------
-note "forwarders"
-# ---------------------------------------------------------------------------
-cfg_reset
-T_NAME="fw"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="braid"
-T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PSK="$saved_psk"
-T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
-f="$(cfg_save)"
-check "pingify is the default"   "$(toml_get "$f" forward forwarder)" "pingify"
-check "mode stays forward"       "$(toml_get "$f" tunnel mode)"       "forward"
-check "forwarder is in the token" "$(cfg_peer_token | base64 -d | sed -n 's/^forwarder = "\(.*\)"/\1/p')" "pingify"
-
-# The far side needs to know the forwarder even though it has no ports.
-cfg_reset
-T_NAME="fw2"; T_ROLE="client"; T_MODE="tun"; T_TRANSPORT="braid"
-T_FORWARDER="iptables"; T_ACCEPTS="server"; T_PEER_IP="203.0.113.9"; T_PORT=9443
-T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"
-T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.2/30"; T_TUNPEER="10.71.1.1"; T_TUNMTU=1380
-g="$(cfg_save)"
-check "far side knows the forwarder" "$(toml_get "$g" forward forwarder)" "iptables"
-check "far side has no ports"        "$(grep -c '^ports' "$g")"           "0"
-cfg_load fw2
-check "cfg_load reads the forwarder" "$T_FORWARDER" "iptables"
-
-# ---------------------------------------------------------------------------
-note "an incomplete tunnel is named, not just rejected"
-# ---------------------------------------------------------------------------
-cfg_reset
-T_NAME="broken"; T_MODE="forward"; T_TRANSPORT="braid"; T_PSK="$saved_psk"
-# T_ROLE deliberately left empty - this is what reached the core before
-out="$(cfg_save 2>&1)"; rc=$?
-check "cfg_save refuses"        "$rc"                                        "1"
-check "and says which field"    "$(printf '%s' "$out" | grep -c 'role')"     "1"
-check "and writes nothing"      "$([ -f "$(cfg_file broken)" ] && echo yes || echo no)" "no"
-
-# ---------------------------------------------------------------------------
-note "the core has to match the script"
-# ---------------------------------------------------------------------------
-# A core left behind by an older install reads a sectioned config as if half of
-# it were missing, and the only symptom was the core rejecting a config that is
-# in fact correct.
-if [ -n "${CORE_BIN:-}" ] && [ -x "$CORE_BIN" ]; then
-    check "the shipped core matches" "$("$CORE_BIN" -version | awk '{print $2}')" "$PINGIFY_VERSION"
-    real="$PINGIFY_VERSION"
-    PINGIFY_VERSION="0.0.0-not-this"
-    if core_matches_script; then r=matched; else r=differs; fi
-    check "a mismatch is detected" "$r" "differs"
-    PINGIFY_VERSION="$real"
-    if core_matches_script; then r=matched; else r=differs; fi
-    check "a match is detected"    "$r" "matched"
 fi
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
