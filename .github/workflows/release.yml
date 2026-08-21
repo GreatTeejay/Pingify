@@ -48,22 +48,42 @@ jobs:
           cd dist && sha256sum pingify-core-linux-* > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Write the release notes
+        env:
+          REPO: ${{ github.repository }}
+        run: |
+          # Built with a quoted heredoc so nothing here has to survive both YAML
+          # and shell quoting - the previous inline version broke the workflow.
+          cat > notes.md <<'NOTES'
+          Prebuilt engine for `linux/amd64` and `linux/arm64`, plus the manager script.
+
+          Install or update on either server:
+
+          ```bash
+          sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/OWNER_REPO/main/install.sh)"
+          ```
+
+          Check a download against `SHA256SUMS`.
+          NOTES
+          sed -i "s#OWNER_REPO#${REPO}#" notes.md
+          sed -i 's/^          //' notes.md
+          cat notes.md
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          [ "$tag" = "main" ] && tag="v$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
-          gh release view "$tag" >/dev/null 2>&1 \
-            && gh release upload "$tag" dist/* Pingify.sh --clobber \
-            || gh release create "$tag" dist/* Pingify.sh \
-                 --title "Pingify $tag" \
-                 --notes "Prebuilt engine for linux/amd64 and linux/arm64, plus the manager script.
-
-Install or update on either server:
-
-\`\`\`bash
-sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh)\"
-\`\`\`
-
-Verify a download against \`SHA256SUMS\`."
+          if [ "$tag" = "main" ]; then
+            tag="v$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/pingify-core-linux-amd64 \
+                                     dist/pingify-core-linux-arm64 \
+                                     dist/SHA256SUMS Pingify.sh --clobber
+          else
+            gh release create "$tag" dist/pingify-core-linux-amd64 \
+                                     dist/pingify-core-linux-arm64 \
+                                     dist/SHA256SUMS Pingify.sh \
+              --title "Pingify $tag" --notes-file notes.md
+          fi
