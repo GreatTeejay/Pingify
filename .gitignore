@@ -1,0 +1,5 @@
+core/pingify-core
+core/pingify-core.exe
+*.test
+*.test.exe
+/tmp/
