@@ -1,0 +1,69 @@
+name: release
+
+# Publishes the prebuilt engine so servers never have to compile it. Pingify.sh
+# falls back to building from its embedded sources, but that path only exists
+# for a server that cannot reach these files at all.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false          # the engine has no dependencies to cache
+
+      # The race detector needs cgo, which is why this runs here rather than on
+      # the developer machine.
+      - name: Test the engine
+        working-directory: core
+        run: go test -count=1 -race -timeout 300s ./...
+
+      - name: Check the bundled script is up to date
+        run: |
+          bash build.sh
+          if ! git diff --quiet -- Pingify.sh; then
+            echo "::error::Pingify.sh is stale - run build.sh and commit the result"
+            git --no-pager diff --stat -- Pingify.sh
+            exit 1
+          fi
+
+      - name: Build the engine
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            (cd core && GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w" -o "../dist/pingify-core-linux-$arch" .)
+          done
+          cd dist && sha256sum pingify-core-linux-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          [ "$tag" = "main" ] && tag="v$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
+          gh release view "$tag" >/dev/null 2>&1 \
+            && gh release upload "$tag" dist/* Pingify.sh --clobber \
+            || gh release create "$tag" dist/* Pingify.sh \
+                 --title "Pingify $tag" \
+                 --notes "Prebuilt engine for linux/amd64 and linux/arm64, plus the manager script.
+
+Install or update on either server:
+
+\`\`\`bash
+sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/install.sh)\"
+\`\`\`
+
+Verify a download against \`SHA256SUMS\`."
