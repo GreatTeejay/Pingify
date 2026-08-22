@@ -180,7 +180,7 @@ main_menu() {
         group "TUNNELS"
         item 1 "New tunnel"      "set this server up"
         item 2 "Manage tunnels"  "status, ports, logs, remove"
-        item 3 "Live status"     "dashboard that refreshes itself"
+        item 3 "Health"          "live status, watchdog, health log"
         group "NETWORK"
         item 4 "Optimize"        "buffers, limits, swap, clock"
         item 5 "Blocking"        "ICMP, speedtest, UDP 443"
@@ -197,7 +197,7 @@ main_menu() {
         case "$c" in
             1) new_tunnel ;;
             2) manage_tunnels ;;
-            3) live_dashboard ;;
+            3) health_menu ;;
             4) optimize_menu ;;
             5) blocking_menu ;;
             6) diagnostics_menu ;;

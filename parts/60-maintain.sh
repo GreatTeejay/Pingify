@@ -185,8 +185,19 @@ diag_tunnel() {
     fi
 
     # 4. the path, so a down link points at a cause
-    if [ -n "$T_CONNECT" ]; then
-        local host="${T_CONNECT%:*}" port="${T_CONNECT##*:}"
+    cfg_endpoints
+    if [ -n "$CFG_CONNECT" ]; then
+        local host="${CFG_CONNECT%:*}" port="${CFG_CONNECT##*:}"
+        if [ "$T_TRANSPORT" = "icmp" ]; then
+            host="$CFG_CONNECT"
+            if have ping && ping -c 2 -W 2 "$host" >/dev/null 2>&1; then
+                check_pass "$host answers a ping - the ICMP path is open"
+            else
+                check_fail "$host does not answer a ping"
+                check_note "an ICMP tunnel cannot work if ping does not get through"
+            fi
+            return
+        fi
         if tcp_probe "$host" "$port"; then
             check_pass "port $port on $host accepts connections"
         else
@@ -194,7 +205,11 @@ diag_tunnel() {
             check_note "is the other server running, and is the port open there?"
         fi
     else
-        local port="${T_LISTEN##*:}"
+        local port="${CFG_LISTEN##*:}"
+        if [ "$T_TRANSPORT" = "icmp" ]; then
+            check_pass "ICMP needs no port to be open here"
+            return
+        fi
         if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
             check_pass "listening on port $port"
             [ "$state" = "up" ] || check_note "open $port in your firewall and check the other server"
@@ -268,6 +283,7 @@ diagnostics_menu() {
         item 2 "Ping the other server" "plain ICMP, to see the raw latency"
         item 3 "Live log" "follow a tunnel as it runs"
         item 4 "System summary"
+        item 5 "Forwarding rules" "what iptables is doing for Pingify"
         item 0 "Back"
         say ""
         local c=""
@@ -280,6 +296,7 @@ diagnostics_menu() {
                    journalctl -u "pingify@$PICKED" -n 40 -f --no-pager || true
                fi ;;
             4) diag_system ;;
+            5) show_nat; pause ;;
             0 | "") return ;;
         esac
     done
@@ -289,7 +306,8 @@ diag_ping() {
     pick_tunnel || return
     cfg_load "$PICKED" || return
     local host=""
-    [ -n "$T_CONNECT" ] && host="${T_CONNECT%:*}"
+    cfg_endpoints
+    [ -n "$CFG_CONNECT" ] && host="${CFG_CONNECT%:*}"
     say ""
     if [ -z "$host" ]; then
         dim "this server waits for the other one, so it does not know its address"

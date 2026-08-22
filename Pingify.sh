@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.1.0"
+PINGIFY_VERSION="4.2.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -251,8 +251,6 @@ CFG_EXT="toml"
 
 cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
 
-toml_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
-toml_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
 
 # toml_get <file> <section> <key> - reads a value out of one [section].
@@ -275,9 +273,6 @@ toml_get() {
         }' "$1"
 }
 
-# Same, but only inside the [tun] table, so "name" there does not collide with
-# the tunnel's own name at the top of the file.
-toml_tun() { [ -f "$1" ] || return 0; sed -n '/^\[tun\]/,$p' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" | head -n1; }
 
 # Only used to convert a config left behind by 3.2 or earlier.
 json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
@@ -696,22 +691,21 @@ service_enable_start() {
 # ---------------------------------------------------------------------------
 # tunnel configuration
 #
-# There are two kinds of tunnel, and everything else follows from which one
-# you pick.
+# Two things decide the shape of a tunnel, and both are asked on both servers
+# because both ends have to agree.
 #
-#   TCP   The two servers talk over their own public addresses. Ports are
-#         forwarded by the core: it accepts the connection on IRAN, carries it
-#         over the parallel connections, and opens the far side on KHAREJ.
-#         Nothing else exists - no extra interface, no routing.
+#   kind        TCP  - the servers talk over their own public addresses
+#               TUN  - a private layer-3 link, carried over ICMP today
 #
-#   TUN   The two servers get a private layer-3 link with an address range of
-#         their own, and ports are forwarded onto it by the kernel. The link
-#         itself can be carried in different ways; ICMP is the one that exists
-#         today, GRE and others slot in beside it.
+#   forwarder   only meaningful under TUN, where a local tunnel exists:
+#               PINGIFY  - the core carries each connection itself
+#               IPTABLES - the kernel NATs onto the local tunnel
 #
-# The questions then divide by which server you are standing on: IRAN owns the
-# ports clients reach, KHAREJ knows where IRAN is, and both are told the same
-# security token by hand.
+# A TCP tunnel has no local tunnel and adds no interface, so the core is the
+# only thing that can forward on it and there is nothing to ask.
+#
+# Ports are asked for on the IRAN server alone - that is the end clients
+# reach. The security token is typed by hand on both.
 # ---------------------------------------------------------------------------
 
 cfg_reset() {
@@ -728,6 +722,22 @@ cfg_reset() {
 }
 
 this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
+
+# A local tunnel belongs to the TUN kind and nowhere else. A TCP tunnel runs
+# over the two public addresses and leaves the machine as it found it, so the
+# core is the only thing that can forward on it.
+cfg_mode() {
+    if [ "$T_KIND" = "tun" ]; then
+        # both forwarders work here: the kernel can NAT onto the local tunnel,
+        # or the core can carry the ports over the same carriers.
+        [ "$T_FORWARDER" = "iptables" ] && T_MODE="tun" || T_MODE="both"
+    else
+        T_FORWARDER="pingify"
+        T_MODE="forward"
+    fi
+}
+
+cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 
 # listen and connect are derived, never stored anywhere shared: they are the
 # one part of a tunnel that differs between the two servers.
@@ -804,6 +814,7 @@ cfg_render() {
     printf '\n[tunnel]\n'
     printf 'name             = "%s"\n' "$T_NAME"
     printf 'role             = "%s"\n' "$T_ROLE"
+    printf 'kind             = "%s"\n' "$T_KIND"
     printf 'mode             = "%s"\n' "$T_MODE"
     printf '\n[transport]\n'
     printf 'type             = "%s"\n' "$T_TRANSPORT"
@@ -878,7 +889,6 @@ parse_forwards() {
 }
 
 side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
-role_label()      { [ "$1" = "server" ] && printf 'server' || printf 'client'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'ICMP' ;;
@@ -910,16 +920,15 @@ new_tunnel() {
     item 1 "TCP" "straight over the public addresses - the fast one"
     item 2 "TUN" "a private layer-3 link between the two servers"
     say ""
-    dim "TCP forwards ports through the core and adds nothing to the machine."
-    dim "TUN gives the servers a private network and lets the kernel forward"
-    dim "onto it - use it when TCP will not pass, or when you want the servers"
-    dim "to reach each other directly."
+    dim "TCP carries the tunnel over ordinary connections between the two"
+    dim "public addresses. TUN gives the servers a private network instead,"
+    dim "carried inside something that is not TCP."
     say ""
     local kind=""
     ask kind "select" "1"
 
     if [ "$kind" = "2" ]; then
-        T_KIND="tun"; T_MODE="tun"; T_FORWARDER="iptables"
+        T_KIND="tun"
         head2 "How the link is carried"
         item 1 "ICMP" "inside ping packets - needs no port at all"
         say ""
@@ -928,15 +937,31 @@ new_tunnel() {
         local sub=""
         ask sub "select" "1"
         T_TRANSPORT="icmp"
-        if ! have iptables; then
-            warn "iptables is not installed - a TUN tunnel forwards with it"
-            dim "install iptables, or choose TCP instead"
-            pause
-            return 1
+
+        # Both forwarders are available here, because a local tunnel exists
+        # for the kernel to route onto.
+        head2 "Forwarder"
+        item 1 "PINGIFY" "the core carries each connection - TCP and UDP"
+        item 2 "IPTABLES" "the kernel NATs onto the local tunnel - least CPU"
+        say ""
+        dim "PINGIFY needs nothing from the kernel and keeps every byte inside"
+        dim "the tunnel. IPTABLES is lighter on a busy link, but the service on"
+        dim "KHAREJ must listen on 0.0.0.0 rather than only on 127.0.0.1."
+        say ""
+        local fw=""
+        ask fw "select" "1"
+        if [ "$fw" = "2" ] && have iptables; then
+            T_FORWARDER="iptables"
+        else
+            [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
+            T_FORWARDER="pingify"
         fi
     else
-        T_KIND="tcp"; T_MODE="forward"; T_TRANSPORT="tcp"; T_FORWARDER="pingify"
+        T_KIND="tcp"; T_TRANSPORT="tcp"
+        # Nothing to choose: with no local tunnel the core is what forwards.
+        T_FORWARDER="pingify"
     fi
+    cfg_mode
 
     # -- name --------------------------------------------------------------
     head2 "Name"
@@ -977,8 +1002,8 @@ new_tunnel() {
         this_side_accepts && dim "open $T_PORT in this server's firewall"
     fi
 
-    # -- the private link, TUN only ----------------------------------------
-    if [ "$T_MODE" = "tun" ]; then
+    # -- the private link, whenever one is needed --------------------------
+    if cfg_needs_link; then
         head2 "Private link"
         dim "both servers get an address on a small network of their own"
         say ""
@@ -1057,11 +1082,9 @@ new_tunnel() {
     else
         box_row "$(pad_to "Link" 16)connects to ${CFG_CONNECT}"
     fi
-    [ "$T_MODE" = "tun" ] && box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
-    if [ "$T_ROLE" = "server" ]; then
-        box_row "$(pad_to "Forwarder" 16)$(forwarder_label "$T_FORWARDER")"
-        box_row "$(pad_to "Ports" 16)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
-    fi
+    cfg_needs_link && box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    box_row "$(pad_to "Forwarder" 16)$(forwarder_label "$T_FORWARDER")"
+    [ -n "$T_FORWARDS" ] && box_row "$(pad_to "Ports" 16)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     box_row "$(pad_to "Performance" 16)${T_PRESET}  ${C_DIM}${T_CARRIERS} connections, ${T_WINDOW} KB window${C_OFF}"
     box_bot
     say ""
@@ -1103,7 +1126,8 @@ new_tunnel() {
     fi
     [ "$T_TRANSPORT" = "tcp" ] && box_row "$(pad_to "Tunnel port" 18)${T_PORT}"
     box_row "$(pad_to "IRAN address" 18)$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
-    if [ "$T_MODE" = "tun" ]; then
+    box_row "$(pad_to "Forwarder" 18)$(forwarder_label "$T_FORWARDER")"
+    if cfg_needs_link; then
         box_row "$(pad_to "Its private addr" 18)${T_TUNPEER}"
         box_row "$(pad_to "Peer private addr" 18)${T_TUNLOCAL}"
     fi
@@ -1170,7 +1194,8 @@ nat_rules_for() {
     local name="$1"
     cfg_load "$name" || return 1
     [ "$T_FORWARDER" = "iptables" ] || return 0
-    [ "$T_MODE" = "tun" ] || return 0
+    # a private link is what the rules route onto; forward-only has none
+    [ "$T_MODE" != "forward" ] || return 0
 
     local peer_ip local_ip
     peer_ip="${T_TUNPEER%%/*}"
@@ -1193,21 +1218,18 @@ nat_rules_for() {
         [ "$rport" = "$spec" ] && rport="$lport"
         case "$lport$rport" in *[!0-9-]*) continue ;; esac
 
+        # Only the IRAN side has rules: it sends the traffic straight to the
+        # other server's private address. Nothing is needed over there, as
+        # long as the service listens on 0.0.0.0 rather than loopback alone.
         if [ "$T_ROLE" = "server" ]; then
-            # Arriving from a client: send it down the private link.
             target="$peer_ip:$rport"
             iptables -t nat -A PINGIFY_NAT -p "$proto" --dport "$lport" \
                      ! -s "$peer_ip" -j DNAT --to-destination "$target" 2>/dev/null
-        else
-            # Arriving over the private link: hand it to the local service.
-            iptables -t nat -A PINGIFY_NAT -p "$proto" -d "$local_ip" --dport "$rport" \
-                     -j DNAT --to-destination "127.0.0.1:$rport" 2>/dev/null
         fi
     done
 
     # Replies have to come back the way they came.
     iptables -t nat -A PINGIFY_POST -o "$T_TUNIF" -j MASQUERADE 2>/dev/null
-    iptables -t nat -A PINGIFY_POST -s 127.0.0.0/8 -d "$local_ip" -j MASQUERADE 2>/dev/null
     return 0
 }
 
@@ -1256,6 +1278,12 @@ cfg_load() {
     cfg_reset
     T_NAME="$(toml_get "$f" tunnel name)"
     T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)";                  : "${T_MODE:=forward}"
+    T_KIND="$(toml_get "$f" tunnel kind)"
+    if [ -z "$T_KIND" ]; then
+        # written before the kind was recorded
+        [ "$(toml_get "$f" transport type)" = "icmp" ] && T_KIND="tun" || T_KIND="tcp"
+    fi
     T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=tcp}"
     T_TOKEN="$(toml_get "$f" security token)"
     T_STATUS="$(toml_get "$f" status addr)"
@@ -2278,8 +2306,19 @@ diag_tunnel() {
     fi
 
     # 4. the path, so a down link points at a cause
-    if [ -n "$T_CONNECT" ]; then
-        local host="${T_CONNECT%:*}" port="${T_CONNECT##*:}"
+    cfg_endpoints
+    if [ -n "$CFG_CONNECT" ]; then
+        local host="${CFG_CONNECT%:*}" port="${CFG_CONNECT##*:}"
+        if [ "$T_TRANSPORT" = "icmp" ]; then
+            host="$CFG_CONNECT"
+            if have ping && ping -c 2 -W 2 "$host" >/dev/null 2>&1; then
+                check_pass "$host answers a ping - the ICMP path is open"
+            else
+                check_fail "$host does not answer a ping"
+                check_note "an ICMP tunnel cannot work if ping does not get through"
+            fi
+            return
+        fi
         if tcp_probe "$host" "$port"; then
             check_pass "port $port on $host accepts connections"
         else
@@ -2287,7 +2326,11 @@ diag_tunnel() {
             check_note "is the other server running, and is the port open there?"
         fi
     else
-        local port="${T_LISTEN##*:}"
+        local port="${CFG_LISTEN##*:}"
+        if [ "$T_TRANSPORT" = "icmp" ]; then
+            check_pass "ICMP needs no port to be open here"
+            return
+        fi
         if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
             check_pass "listening on port $port"
             [ "$state" = "up" ] || check_note "open $port in your firewall and check the other server"
@@ -2361,6 +2404,7 @@ diagnostics_menu() {
         item 2 "Ping the other server" "plain ICMP, to see the raw latency"
         item 3 "Live log" "follow a tunnel as it runs"
         item 4 "System summary"
+        item 5 "Forwarding rules" "what iptables is doing for Pingify"
         item 0 "Back"
         say ""
         local c=""
@@ -2373,6 +2417,7 @@ diagnostics_menu() {
                    journalctl -u "pingify@$PICKED" -n 40 -f --no-pager || true
                fi ;;
             4) diag_system ;;
+            5) show_nat; pause ;;
             0 | "") return ;;
         esac
     done
@@ -2382,7 +2427,8 @@ diag_ping() {
     pick_tunnel || return
     cfg_load "$PICKED" || return
     local host=""
-    [ -n "$T_CONNECT" ] && host="${T_CONNECT%:*}"
+    cfg_endpoints
+    [ -n "$CFG_CONNECT" ] && host="${CFG_CONNECT%:*}"
     say ""
     if [ -z "$host" ]; then
         dim "this server waits for the other one, so it does not know its address"
@@ -3525,7 +3571,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.1.0"
+const version = "4.2.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -6363,7 +6409,7 @@ main_menu() {
         group "TUNNELS"
         item 1 "New tunnel"      "set this server up"
         item 2 "Manage tunnels"  "status, ports, logs, remove"
-        item 3 "Live status"     "dashboard that refreshes itself"
+        item 3 "Health"          "live status, watchdog, health log"
         group "NETWORK"
         item 4 "Optimize"        "buffers, limits, swap, clock"
         item 5 "Blocking"        "ICMP, speedtest, UDP 443"
@@ -6380,7 +6426,7 @@ main_menu() {
         case "$c" in
             1) new_tunnel ;;
             2) manage_tunnels ;;
-            3) live_dashboard ;;
+            3) health_menu ;;
             4) optimize_menu ;;
             5) blocking_menu ;;
             6) diagnostics_menu ;;
