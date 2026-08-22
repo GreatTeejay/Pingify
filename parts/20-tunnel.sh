@@ -168,27 +168,8 @@ new_tunnel() {
 
     cfg_reset
 
-    # -- 1. identity -------------------------------------------------------
-    head2 "1/7   Tunnel name"
-    dim "used for the service name and the config file; letters and digits"
-    say ""
-    local suggested="pfy$(( $(tunnel_count) + 1 ))"
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*)
-                fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$(cfg_file "$T_NAME")" ]; then
-                    fail "a tunnel named $T_NAME already exists"
-                else
-                    break
-                fi ;;
-        esac
-    done
-
-    # -- 2. which end is this ----------------------------------------------
-    head2 "2/7   This server"
+    # -- 1. which end is this ----------------------------------------------
+    head2 "1/6   This server"
     item 1 "Iran" "clients connect to this server"
     item 2 "Kharej" "the panel and inbounds run on this server"
     say ""
@@ -196,8 +177,8 @@ new_tunnel() {
     ask side "select" "1"
     [ "$side" = "2" ] && T_ROLE="client" || T_ROLE="server"
 
-    # -- 3. link direction and endpoint ------------------------------------
-    head2 "3/7   Link direction"
+    # -- 2. link direction and endpoint ------------------------------------
+    head2 "2/6   Link direction"
     dim "the tunnel is one link; only one end has to accept connections"
     say ""
     item 1 "Outbound" "this server connects to the other one"
@@ -222,8 +203,20 @@ new_tunnel() {
         T_CONNECT="$peer:$tport"
     fi
 
-    # -- 4. key ------------------------------------------------------------
-    head2 "4/7   Shared key"
+    # -- the name, derived --------------------------------------------------
+    # iran-9443 here, kharej-9443 on the other server. Two machines side by
+    # side then say what they are without either config being opened.
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')-${tport}"
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+    fi
+    say ""
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
+
+    # -- 3. key ------------------------------------------------------------
+    head2 "3/6   Shared key"
     dim "both servers authenticate with the same key; the token carries it"
     say ""
     item 1 "Generate" "recommended"
@@ -243,7 +236,7 @@ new_tunnel() {
     esac
 
     # -- 5. transport ------------------------------------------------------
-    head2 "5/7   Protocol"
+    head2 "4/6   Protocol"
     dim "how the link itself travels between the two servers"
     say ""
     item 1 "Direct" "encrypted stream, no wrapper - fastest"
@@ -255,7 +248,7 @@ new_tunnel() {
     T_TRANSPORT="direct"
 
     # -- 6. payload --------------------------------------------------------
-    head2 "6/7   What the tunnel carries"
+    head2 "5/6   What the tunnel carries"
     item 1 "Ports" "forward TCP and UDP ports - panels, inbounds"
     item 2 "Full IP" "a private layer-3 link between the two servers"
     say ""
@@ -290,7 +283,7 @@ new_tunnel() {
     fi
 
     # -- 7. performance ----------------------------------------------------
-    head2 "7/7   Performance"
+    head2 "6/6   Performance"
     dim "carriers are the parallel connections the link runs over; more of"
     dim "them absorb packet loss better, 4 to 8 suits most paths"
     say ""

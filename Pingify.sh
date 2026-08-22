@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.13.0"
+PINGIFY_VERSION="3.13.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 BASE_DIR="/root/Pingify"
@@ -81,6 +81,43 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
+# A panel carries its title in the top border, so a page of them reads as a
+# list of labelled blocks rather than a wall of rules.
+panel() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        printf '  %s%s%s%s%s
+' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        return
+    fi
+    n=$(( ${#t} + 3 ))
+    printf '  %s%s%s %s%s%s %s%s%s
+'         "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF"         "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+}
+
+panel_end() { printf '  %s%s%s%s%s
+' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+
+# field <label> <value> - one labelled line inside a panel, values aligned.
+field() {
+    printf '  %s%s%s %s %s%s%s
+'         "$C_GRY" "$BX_V" "$C_OFF"         "$(pad_to "$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}" $((UI_W - 2)))"         "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# A label above a run of related menu entries.
+group() { printf '
+  %s%s%s
+' "$C_DIM$C_B" "$1" "$C_OFF"; }
+
+# state <on|off> - a coloured badge for a toggle.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
+    fi
+}
+
 box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
 box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
 box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
@@ -120,31 +157,53 @@ item() {
 banner() {
     clear 2>/dev/null || true
     printf '\n'
-    local l
+    local l w pad
     if [ "$PINGIFY_UTF8" = "1" ]; then
-        for l in \
+        set -- \
             '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
             '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
             '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
             '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
             '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
             '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
     else
-        for l in \
-            ' ___  _                 _   __       ' \
-            '| _ \(_)_ _   __ _   (_) / _|_  _  ' \
-            '|  _/| |  \ \ / _` |  | ||  _| || | ' \
-            '|_|  |_|_||_|\__, |  |_||_|   \_, | ' \
-            '             |___/           |__/  '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
+        set -- \
+            ' ___  _                 _   __     ' \
+            '| _ \(_)_ _  __ _ (_) / _|_  _     ' \
+            '|  _/| | | \| | (_| | | ||  _| || |' \
+            '|_|  |_|_||_|\__, | |_||_|   \_, |ذ' \
+            '             |___/          |__/   '
     fi
-    printf '  %s%sby Teejay%s   %sIran %s Kharej tunnel   %s   v%s%s\n\n' \
-        "$C_CYN" "$C_DIM" "$C_OFF" "$C_DIM" "$BX_ARR" "$BX_DOT" "$PINGIFY_VERSION" "$C_OFF"
+
+    # The name sits in its own frame, centred, so the page opens with one
+    # object rather than six lines floating above a rule.
+    w=0
+    for l in "$@"; do
+        [ "$(vislen "$l")" -gt "$w" ] && w="$(vislen "$l")"
+    done
+    local inner=$((UI_W))
+    pad=$(( (inner - w) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+
+    printf '  %s%s%s%s%s\n' "$C_CYN$C_DIM" "$BX_TL" "$(repeat "$BX_H" "$inner")" "$BX_TR" "$C_OFF"
+    for l in "$@"; do
+        printf '  %s%s%s%s%s%s%s%s\n' \
+            "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+            "$(repeat ' ' "$pad")" "$C_CYN$C_B$l$C_OFF" \
+            "$(repeat ' ' $((inner - pad - $(vislen "$l"))))" \
+            "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    done
+
+    # and the one line that says what it is, centred under it
+    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel   ${BX_DOT}   v${PINGIFY_VERSION}"
+    pad=$(( (inner - ${#sub}) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '  %s%s%s%s%s%s%s%s\n' \
+        "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+        "$(repeat ' ' "$pad")" "$C_DIM$sub$C_OFF" \
+        "$(repeat ' ' $((inner - pad - ${#sub})))" \
+        "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    printf '  %s%s%s%s%s\n\n' "$C_CYN$C_DIM" "$BX_BL" "$(repeat "$BX_H" "$inner")" "$BX_BR" "$C_OFF"
 }
 
 pause() { printf '\n'; read -rsp "  ${C_DIM}press enter${C_OFF}" _; printf '\n'; }
@@ -255,6 +314,27 @@ pick_free_port() {
         p=$((p + 1))
     done
     printf '%s' "$1"
+}
+
+# Where this server is, for the front page. Looked up once per run: the
+# answer does not change while the menu is open, and a small VPS should not
+# spend a round trip redrawing it.
+server_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
+    if have curl; then
+        local j
+        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
+        if [ -n "$j" ]; then
+            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*//p')"
+            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*//p')"
+            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*//p')"
+        fi
+    fi
+    [ -n "$SRV_IP" ]  || SRV_IP="$(public_ip)"
+    [ -n "$SRV_IP" ]  || SRV_IP="unknown"
+    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
+    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
 }
 
 public_ip() {
@@ -523,6 +603,37 @@ ensure_core() {
     install_core
 }
 
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
+}
+
+# The core and the script share the config format, so a mismatch is not a
+# cosmetic thing: a script that writes TOML beside a core that still parses
+# JSON produces "invalid character" the moment you build a tunnel. Updating
+# one without the other has to be impossible rather than merely discouraged.
+ensure_core_current() {
+    [ -x "$CORE_BIN" ] || return 0
+    core_matches_script && return 0
+    banner
+    head2 "Core update"
+    warn "the core is $(core_version) and this script is $PINGIFY_VERSION"
+    dim "they read the same config file, so they have to be the same version"
+    say ""
+    if install_core; then
+        local n
+        for n in $(tunnel_names); do systemctl restart "pingify@$n" >/dev/null 2>&1; done
+        say ""
+        ok "the core is now $(core_version)"
+    else
+        say ""
+        fail "the core could not be updated"
+        dim "until it matches, new tunnels will be rejected"
+        dim "Core has the other ways to install it"
+    fi
+    pause
+}
+
 # ---------------------------------------------------------------------------
 # systemd
 # ---------------------------------------------------------------------------
@@ -768,27 +879,8 @@ new_tunnel() {
 
     cfg_reset
 
-    # -- 1. identity -------------------------------------------------------
-    head2 "1/7   Tunnel name"
-    dim "used for the service name and the config file; letters and digits"
-    say ""
-    local suggested="pfy$(( $(tunnel_count) + 1 ))"
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*)
-                fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$(cfg_file "$T_NAME")" ]; then
-                    fail "a tunnel named $T_NAME already exists"
-                else
-                    break
-                fi ;;
-        esac
-    done
-
-    # -- 2. which end is this ----------------------------------------------
-    head2 "2/7   This server"
+    # -- 1. which end is this ----------------------------------------------
+    head2 "1/6   This server"
     item 1 "Iran" "clients connect to this server"
     item 2 "Kharej" "the panel and inbounds run on this server"
     say ""
@@ -796,8 +888,8 @@ new_tunnel() {
     ask side "select" "1"
     [ "$side" = "2" ] && T_ROLE="client" || T_ROLE="server"
 
-    # -- 3. link direction and endpoint ------------------------------------
-    head2 "3/7   Link direction"
+    # -- 2. link direction and endpoint ------------------------------------
+    head2 "2/6   Link direction"
     dim "the tunnel is one link; only one end has to accept connections"
     say ""
     item 1 "Outbound" "this server connects to the other one"
@@ -822,8 +914,20 @@ new_tunnel() {
         T_CONNECT="$peer:$tport"
     fi
 
-    # -- 4. key ------------------------------------------------------------
-    head2 "4/7   Shared key"
+    # -- the name, derived --------------------------------------------------
+    # iran-9443 here, kharej-9443 on the other server. Two machines side by
+    # side then say what they are without either config being opened.
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')-${tport}"
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+    fi
+    say ""
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
+
+    # -- 3. key ------------------------------------------------------------
+    head2 "3/6   Shared key"
     dim "both servers authenticate with the same key; the token carries it"
     say ""
     item 1 "Generate" "recommended"
@@ -843,7 +947,7 @@ new_tunnel() {
     esac
 
     # -- 5. transport ------------------------------------------------------
-    head2 "5/7   Protocol"
+    head2 "4/6   Protocol"
     dim "how the link itself travels between the two servers"
     say ""
     item 1 "Direct" "encrypted stream, no wrapper - fastest"
@@ -855,7 +959,7 @@ new_tunnel() {
     T_TRANSPORT="direct"
 
     # -- 6. payload --------------------------------------------------------
-    head2 "6/7   What the tunnel carries"
+    head2 "5/6   What the tunnel carries"
     item 1 "Ports" "forward TCP and UDP ports - panels, inbounds"
     item 2 "Full IP" "a private layer-3 link between the two servers"
     say ""
@@ -890,7 +994,7 @@ new_tunnel() {
     fi
 
     # -- 7. performance ----------------------------------------------------
-    head2 "7/7   Performance"
+    head2 "6/6   Performance"
     dim "carriers are the parallel connections the link runs over; more of"
     dim "them absorb packet loss better, 4 to 8 suits most paths"
     say ""
@@ -2248,7 +2352,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.13.0"
+const version = "3.13.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -4815,27 +4919,39 @@ status_panel() {
         fi
     done
 
-    local edot="$C_RED$BX_OFF$C_OFF" ever
-    ever="$(core_version)"
-    [ -x "$CORE_BIN" ] && edot="$C_GRN$BX_ON$C_OFF"
+    server_info
+    panel "SERVER"
+    field "IP" "$SRV_IP"
+    field "Location" "$SRV_LOC"
+    field "Datacenter" "$(printf '%.44s' "$SRV_ORG")"
+    panel_end
 
-    local tdot="$C_GRY$BX_OFF$C_OFF"
-    if [ "$total" != "0" ]; then
-        if [ "$up" = "$total" ]; then tdot="$C_GRN$BX_ON$C_OFF"
-        elif [ "$up" = "0" ]; then    tdot="$C_RED$BX_ON$C_OFF"
-        else                          tdot="$C_YEL$BX_ON$C_OFF"; fi
+    local core_txt
+    if [ ! -x "$CORE_BIN" ]; then
+        core_txt="${C_RED}not installed${C_OFF}"
+    elif core_matches_script; then
+        core_txt="$(core_version)"
+    else
+        core_txt="${C_RED}$(core_version) - does not match the script${C_OFF}"
     fi
 
-    local wd wdot="$C_YEL$BX_OFF$C_OFF"
-    wd="$(watchdog_state)"
-    [ "$wd" = "on" ] && wdot="$C_GRN$BX_ON$C_OFF"
+    local tun_txt
+    if [ "$total" = "0" ]; then
+        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none configured"
+    elif [ "$up" = "$total" ]; then
+        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up of $total up"
+    elif [ "$up" = "0" ]; then
+        tun_txt="${C_RED}${BX_ON}${C_OFF} $up of $total up"
+    else
+        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up of $total up"
+    fi
 
-    local cc; cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-
-    box_top
-    box_row "$edot $(pad_to "core ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
-    box_row "$wdot $(pad_to "watchdog ${C_B}${wd}${C_OFF}" 22)${C_GRY}${BX_DOT}${C_OFF} tcp ${C_B}${cc:-unknown}${C_OFF}"
-    box_bot
+    panel "STATUS"
+    field "Core ver" "$core_txt"
+    field "Script ver" "$PINGIFY_VERSION"
+    field "Tunnels" "$tun_txt"
+    field "Watchdog" "$(state_badge "$(watchdog_state)")"
+    panel_end
 }
 
 # ---------------------------------------------------------------------------
@@ -4966,14 +5082,17 @@ main_menu() {
         banner
         status_panel
         say ""
-        item 1 "New Tunnel"        "create one, or apply a token"
-        item 2 "Tunnels"           "status, ports, logs, remove"
+        group "TUNNELS"
+        item 1 "New tunnel"        "set this server up"
+        item 2 "Manage tunnels"    "status, ports, logs, remove"
         item 3 "Health"            "dashboard, watchdog, restarts"
+        group "NETWORK"
         item 4 "Optimize"          "BBR, buffers, limits, swap"
-        item 5 "Core"              "install, update, import, export"
-        item 6 "Remove"            "uninstall parts, or everything"
         item 7 "Diagnostics"       "reach the peer, verify configs"
+        group "MAINTENANCE"
+        item 5 "Core"              "install, update, import, export"
         item 8 "Backup"            "save or restore your tunnels"
+        item 6 "Remove"            "uninstall parts, or everything"
         say ""
         item 0 "Exit"
         say ""
@@ -5017,6 +5136,7 @@ main() {
     ensure_deps
     migrate_layout
     first_run
+    ensure_core_current
     main_menu
 }
 
