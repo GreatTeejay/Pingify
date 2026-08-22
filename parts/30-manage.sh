@@ -4,28 +4,43 @@
 # ---------------------------------------------------------------------------
 
 cfg_load() {
-    local f="$CFG_DIR/$1.json"
+    local f
+    f="$(cfg_file "$1")"
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME="$(json_str "$f" name)"
-    T_ROLE="$(json_str "$f" role)"
-    T_MODE="$(json_str "$f" mode)"
-    T_TRANSPORT="$(json_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
-    T_LISTEN="$(json_str "$f" listen)"
-    T_CONNECT="$(json_str "$f" connect)"
-    T_PSK="$(json_str "$f" psk)"
-    T_STATUS="$(json_str "$f" status_addr)"
-    T_CARRIERS="$(json_num "$f" carriers)";      : "${T_CARRIERS:=4}"
-    T_WINDOW="$(json_num "$f" window_kb)";       : "${T_WINDOW:=1024}"
-    T_KEEPALIVE="$(json_num "$f" keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_FORWARDS="$(sed -n 's/^[[:space:]]*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\],*[[:space:]]*$/\1/p' "$f" | head -n1)"
-    if [ "$T_MODE" = "tun" ]; then
-        local tl; tl="$(grep -m1 '"tun"' "$f")"
-        T_TUNIF="$(printf '%s' "$tl"    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNLOCAL="$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNPEER="$(printf '%s' "$tl"  | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNMTU="$(printf '%s' "$tl"   | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
-        : "${T_TUNMTU:=1380}"
+    T_NAME="$(toml_get "$f" tunnel name)"
+    T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)";                  : "${T_MODE:=forward}"
+    T_KIND="$(toml_get "$f" tunnel kind)"
+    if [ -z "$T_KIND" ]; then
+        # written before the kind was recorded
+        [ "$(toml_get "$f" transport type)" = "icmp" ] && T_KIND="tun" || T_KIND="tcp"
+    fi
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=tcp}"
+    T_TOKEN="$(toml_get "$f" security token)"
+    T_STATUS="$(toml_get "$f" status addr)"
+    T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
+    T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
+    T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
+    T_FORWARDS="$(toml_arr "$f" ports)"
+    T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
+    T_TUNIF="$(toml_get "$f" tun name)";                    : "${T_TUNIF:=pfy0}"
+    T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+    T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+    T_TUNMTU="$(toml_get "$f" tun mtu)";                    : "${T_TUNMTU:=1380}"
+
+    # The endpoint is derived, so recover what it was built from.
+    local l c
+    l="$(toml_get "$f" transport listen)"
+    c="$(toml_get "$f" transport connect)"
+    if [ -n "$l" ]; then
+        T_ACCEPTS="$T_ROLE"
+        case "$l" in *:*) T_PORT="${l##*:}" ;; esac
+    else
+        [ "$T_ROLE" = "server" ] && T_ACCEPTS="client" || T_ACCEPTS="server"
+        T_PEER_IP="${c%:*}"
+        case "$c" in *:*) T_PORT="${c##*:}" ;; *) T_PEER_IP="$c" ;; esac
     fi
     return 0
 }
@@ -35,32 +50,47 @@ cfg_load() {
 # ---------------------------------------------------------------------------
 
 tunnel_status_block() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
-    local addr; addr="$(json_str "$f" status_addr)"
+    local addr; addr="$(toml_get "$f" status addr)"
     local state; state="$(svc_state "$name")"
 
     local colour="$C_RED"
     [ "$state" = "active" ] && colour="$C_GRN"
-    printf '  %s%s%s  service %s%s%s\n' \
-        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF"
-    if [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
-        "$CORE_BIN" -status "$addr" 2>/dev/null || true
+    printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
+        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
+
+    # A stopped tunnel has no status endpoint to ask, and printing the raw
+    # "connection refused" from trying anyway reads like a fault when it is
+    # only the consequence of the line above.
+    if [ "$state" != "active" ]; then
+        dim "not running - nothing to report"
+        return 0
     fi
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 0
+    if ! "$CORE_BIN" -status "$addr" 2>/dev/null; then
+        # Either it is still coming up, or no carrier has arrived. The status
+        # server answers within a second of starting, so a refusal this soon
+        # after a start is the former.
+        dim "starting up, or the other server has not connected yet"
+    fi
+    return 0
 }
 
 # One line per tunnel, for the overview table.
 tunnel_row() {
-    local name="$1" f="$CFG_DIR/$1.json"
-    local role mode peer addr state brief up total rtt streams
-    role="$(json_str "$f" role)"
-    mode="$(json_str "$f" mode)"
-    peer="$(json_str "$f" connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(json_str "$f" listen)"
-    addr="$(json_str "$f" status_addr)"
+    local name="$1" f="$(cfg_file "$1")"
+    local role proto fwder addr state brief up total rtt streams
+    role="$(side_label "$(toml_get "$f" tunnel role)")"
+    proto="$(transport_label "$(toml_get "$f" transport type)")"
+    fwder="$(forwarder_label "$(toml_get "$f" forward forwarder)")"
+    peer="$(toml_get "$f" transport connect)"
+    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
+    addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(json_num "$f" carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
@@ -85,11 +115,12 @@ tunnel_row() {
         disabled) dot="$C_GRY$BX_OFF$C_OFF" ;;
     esac
 
-    printf '  %s %s %s %s %s %s%s%s\n' \
+    printf '  %s %s %s %s %s %s %s%s%s\n' \
         "$dot" \
         "$(pad_to "${C_B}${name}${C_OFF}" 13)" \
-        "$(pad_to "$role" 7)" \
-        "$(pad_to "$mode" 8)" \
+        "$(pad_to "$role" 8)" \
+        "$(pad_to "$proto" 10)" \
+        "$(pad_to "$fwder" 9)" \
         "$(pad_to "$up/$total" 6)" \
         "$C_DIM" "$rtt" "$C_OFF"
 }
@@ -97,14 +128,15 @@ tunnel_row() {
 list_tunnels() {
     local names; names="$(tunnel_names)"
     if [ -z "$names" ]; then
-        dim "no tunnels configured yet - pick Config New Tunnel to make one"
+        dim "no tunnels configured yet - pick New tunnel to make one"
         return 1
     fi
-    printf '    %s%s %s %s %s %s%s\n' \
+    printf '    %s%s %s %s %s %s %s%s\n' \
         "$C_DIM" \
         "$(pad_to "NAME" 13)" \
-        "$(pad_to "ROLE" 7)" \
-        "$(pad_to "MODE" 8)" \
+        "$(pad_to "SIDE" 8)" \
+        "$(pad_to "PROTO" 10)" \
+        "$(pad_to "FORWARDER" 9)" \
         "$(pad_to "LINKS" 6)" \
         "RTT" "$C_OFF"
     local n
@@ -152,44 +184,112 @@ tunnel_menu() {
         head2 "Tunnel: $name"
         tunnel_status_block "$name"
         rule
-        item 1 "Restart"
-        item 2 "Stop"
-        item 3 "Start"
-        item 4 "Live log"
-        item 5 "Edit forwarded ports"
-        item 6 "Performance settings"
-        item 7 "Show the token again"
-        item 8 "Scheduled restart"
-        item 9 "Delete this tunnel"
+        group "Check"
+        item 1 "Test the path" "go through the tunnel and say where it stops"
+        item 2 "Live log"
+        group "Settings"
+        item 3 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
+        item 4 "Tuning" "carriers, window, keepalive, logging"
+        item 5 "Scheduled restart"
+        group "Service"
+        item 6 "Restart"
+        item 7 "Stop"
+        item 8 "Start"
+        say ""
+        item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
-            2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
-            3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            4) say ""; dim "ctrl-c to stop following"; say ""
+            1) probe_path "$name" ;;
+            2) say ""; dim "ctrl-c to stop following"; say ""
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            5) edit_forwards "$name" ;;
-            6) edit_tuning "$name" ;;
-            7) show_peer_token "$name" ;;
-            8) recycle_menu "$name" ;;
-            9) delete_tunnel "$name" && return ;;
+            3) edit_forwards "$name" ;;
+            4) tuning_menu "$name" ;;
+            5) recycle_menu "$name" ;;
+            6) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
+            7) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
+            8) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
+            d|D) delete_tunnel "$name" && return ;;
             0|"") return ;;
         esac
     done
 }
 
-edit_forwards() {
-    local name="$1" f="$CFG_DIR/$1.json"
+# Connecting to a forwarded port proves nothing on its own: this server accepts
+# before it has said a word to the tunnel. The core's probe goes the whole way
+# and reports where it stopped.
+probe_path() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
     cfg_load "$name" || return 1
-    if [ "$T_MODE" != "forward" ]; then
-        warn "this is a full-IP tunnel; it has no port list"
+    banner
+    head2 "Testing the path for: $name"
+    say ""
+    if [ "$T_ROLE" != "server" ]; then
+        warn "this is the KHAREJ end - the ports live on the IRAN server"
+        dim "run this from the menu over there instead"
         pause; return
     fi
-    if [ "$T_ROLE" != "edge" ]; then
-        warn "ports are configured on the Iran side; this server is the Kharej end"
+    if ! systemctl is-active --quiet "pingify@$name"; then
+        fail "the tunnel is not running; start it first"
+        pause; return
+    fi
+    "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
+    say ""
+    dim "A port that fails is one the other server could not reach. The service"
+    dim "there must be listening on the address after the arrow."
+    pause
+}
+
+edit_logging() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    banner
+    head2 "Logging: $name"
+    say ""
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    say ""
+    dim "This is local. The two servers may log at different levels."
+    say ""
+    local c="" lvl
+    ask c "select" "3"
+    case "$c" in
+        1) lvl="error" ;; 2) lvl="warn" ;;
+        4) lvl="debug" ;; 5) lvl="trace" ;;
+        3|"") lvl="info" ;;
+        *) fail "pick 1 to 5"; pause; return ;;
+    esac
+    cp -f "$f" "$f.bak"
+    if grep -q '^level' "$f"; then
+        sed -i "s#^level.*#level            = \"$lvl\"#" "$f"
+    else
+        printf '
+[logging]
+level            = "%s"
+' "$lvl" >> "$f"
+    fi
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "logging at $lvl"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
+}
+
+edit_forwards() {
+    local name="$1" f="$(cfg_file "$1")"
+    cfg_load "$name" || return 1
+    if [ "$T_ROLE" != "server" ]; then
+        warn "the port list lives on the IRAN server; this is the KHAREJ end"
         pause; return
     fi
     say ""
@@ -202,14 +302,15 @@ edit_forwards() {
     [ -n "$fwd" ] || { fail "nothing to set"; pause; return; }
 
     cp -f "$f" "$f.bak"
-    if grep -q '"forwards"' "$f"; then
-        sed -i "s#^\([[:space:]]*\"forwards\"[[:space:]]*:[[:space:]]*\).*#\1[$fwd],#" "$f"
+    if grep -q '^ports' "$f"; then
+        sed -i "s#^ports.*#ports            = [$fwd]#" "$f"
     else
-        sed -i "s#^\([[:space:]]*\"psk\".*\)#\1\n  \"forwards\": [$fwd],#" "$f"
+        sed -i "s#^\(forwarder.*\)#\1\nports            = [$fwd]#" "$f"
     fi
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
+        apply_nat quiet
         ok "ports updated and the tunnel restarted"
     else
         mv -f "$f.bak" "$f"
@@ -218,46 +319,79 @@ edit_forwards() {
     pause
 }
 
-edit_tuning() {
-    local name="$1" f="$CFG_DIR/$1.json"
-    cfg_load "$name" || return 1
-    say ""
-    local car win ka
-    ask car "carriers" "$T_CARRIERS"
-    ask win "window (KB)" "$T_WINDOW"
-    ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
-    case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
+# Every number that shapes a tunnel, on one screen, split by the only
+# distinction that matters when two servers disagree: the settings that have to
+# match, and the ones that are nobody's business but this machine's.
+tuning_menu() {
+    local name="$1" f v
+    f="$(cfg_file "$name")"
+    while :; do
+        cfg_load "$name" || return 1
+        banner
+        head2 "Tuning: $name"
+
+        panel "both servers must agree"
+        field "Token" "$(token_print "$T_TOKEN")"
+        field "Type" "$(transport_label "$T_TRANSPORT")" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        panel_end
+        say ""
+        panel "local to this server"
+        field "Profile" "$T_PRESET"
+        field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
+        field "Keepalive" "${T_KEEPALIVE} s"
+        panel_end
+        say ""
+        dim "Read the top box on the other server and make it read the same."
+        dim "The bottom box may differ; it will not break the link."
+
+        rule
+        item 1 "Profile" "pick a preset and set all three at once"
+        item 2 "Carriers" "$T_CARRIERS - parallel connections"
+        item 3 "Window" "$T_WINDOW KB per connection"
+        item 4 "Keepalive" "$T_KEEPALIVE seconds"
+        item 5 "Logging" "$T_LOG"
+        item 0 "Back"
+        say ""
+        local c=""
+        ask c "select"
+        case "$c" in
+            1) say ""; preset_menu
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" ;;
+            2) say ""; ask v "parallel connections" "$T_CARRIERS"
+               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" ;;
+            3) say ""; ask v "window per connection, KB" "$T_WINDOW"
+               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" ;;
+            4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
+            5) edit_logging "$name" ;;
+            0|"") return ;;
+        esac
+    done
+}
+
+# tuning_write <name> <carriers> <window> <keepalive>
+tuning_write() {
+    local name="$1" car="$2" win="$3" ka="$4" f
+    f="$(cfg_file "$name")"
+    case "$car$win$ka" in *[!0-9]*|"") fail "numbers only"; pause; return ;; esac
+    [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
 
     cp -f "$f" "$f.bak"
-    sed -i "s#^\([[:space:]]*\"carriers\"[[:space:]]*:[[:space:]]*\).*#\1$car,#" "$f"
-    sed -i "s#^\([[:space:]]*\"window_kb\"[[:space:]]*:[[:space:]]*\).*#\1$win,#" "$f"
-    sed -i "s#^\([[:space:]]*\"keepalive_sec\"[[:space:]]*:[[:space:]]*\).*#\1$ka,#" "$f"
+    sed -i "s#^carriers.*#carriers         = $car#" "$f"
+    sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
+    sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
-        ok "updated and restarted"
-        warn "set the same carrier count on the other server too"
+        ok "saved and restarted"
     else
         mv -f "$f.bak" "$f"
-        fail "rejected, nothing changed"
+        fail "the core rejected that; nothing was changed"
     fi
-    pause
+    sleep 1
 }
 
-show_peer_token() {
-    cfg_load "$1" || return 1
-    if [ -z "$T_CONNECT" ]; then
-        T_PUBLIC_IP="$(public_ip)"
-        say ""
-        ask T_PUBLIC_IP "public IP of THIS server" "${T_PUBLIC_IP:-}"
-    fi
-    say ""
-    dim "paste this on the other server: Config New Tunnel -> option 2"
-    say ""
-    say "${C_YEL}$(cfg_peer_token)${C_OFF}"
-    say ""
-    pause
-}
+
 
 recycle_menu() {
     local name="$1"
@@ -304,8 +438,12 @@ delete_tunnel() {
     systemctl disable --now "pingify@$name" >/dev/null 2>&1
     systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
-    rm -f "$CFG_DIR/$name.json" "$CFG_DIR/$name.json.bak" "$STATE_DIR/$name.fail"
+    rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
+    # Its forwarding rules outlive the config unless something removes them,
+    # and a DNAT rule pointing at an address that no longer exists swallows
+    # every packet for that port - which looks exactly like a broken tunnel.
+    apply_nat quiet
     ok "tunnel $name removed"
     sleep 1
     return 0

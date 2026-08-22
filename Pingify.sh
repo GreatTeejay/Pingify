@@ -8,14 +8,17 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.8.0"
+PINGIFY_VERSION="3.9.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
-CFG_DIR="/etc/pingify"
-STATE_DIR="/var/lib/pingify"
-SRC_DIR="/usr/local/src/pingify"
-CORE_BIN="/usr/local/bin/pingify-core"
-SELF_BIN="/usr/local/bin/pingify"
+# Everything Pingify owns lives in one directory, so it is obvious what is
+# installed and trivial to back up or delete.
+BASE_DIR="/root/Pingify"
+CFG_DIR="$BASE_DIR"
+STATE_DIR="$BASE_DIR/.state"
+SRC_DIR="$BASE_DIR/.build"
+CORE_BIN="$BASE_DIR/pingify-core"
+SELF_BIN="/usr/local/bin/pingify"   # has to be on PATH for the "pingify" command
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
 GO_MIN_MINOR=19          # the core needs Go 1.19 or newer
@@ -80,9 +83,42 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
-box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
-box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
-box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
+# A panel carries its title in the top border, so a screen full of them reads
+# as a list of labelled blocks rather than a wall of rules.
+panel() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        return
+    fi
+    # corner + one rule + " title " ; the rest of the line is rule + corner
+    n=$(( ${#t} + 3 ))
+    printf '  %s%s%s %s%s%s %s%s%s\n' \
+        "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF" \
+        "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+}
+
+panel_end() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+
+row() {
+    printf '  %s%s%s %s %s%s%s\n' \
+        "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# field <label> <value> [label2] [value2] - two aligned columns in one row.
+field() {
+    local s
+    s="$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}"
+    if [ -n "${3:-}" ]; then
+        s="$(pad_to "$s" 32)$(pad_to "${C_DIM}$3${C_OFF}" 12)${C_B}$4${C_OFF}"
+    fi
+    row "$s"
+}
+
+# kept so older call sites keep working
+box_top() { panel; }
+box_bot() { panel_end; }
+box_row() { row "$1"; }
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s%s%s %s\n' "$C_CYN" "$BX_ARR" "$C_OFF" "$*"; }
@@ -96,23 +132,78 @@ rule() { printf '  %s%s%s\n' "$C_GRY" "$(repeat "$BX_H" $((UI_W + 2)))" "$C_OFF"
 head2() {
     local t=" $1 " n; n="$(vislen "$t")"
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_B" "$t" "$C_OFF$C_GRY" \
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
         "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
 }
+
+# A label above a run of related menu entries.
+group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 
 # item <key> <label> [hint]
 #
 # The label column grows if a label outruns it, so a long one can never end up
 # glued to its hint.
 item() {
-    local w=28 n
+    local w=24 n
     n="$(vislen "$2")"
     [ "$n" -ge "$w" ] && w=$((n + 2))
     if [ -n "${3:-}" ]; then
-        printf '    %s%s%s  %s%s%s%s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$(pad_to "$2" "$w")" "$C_DIM" "$3" "$C_OFF"
+        printf '    %s%s%s %s%s%s %s%s%s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
+            "$(pad_to "$2" "$w")" "$C_DIM" "$3$C_OFF"
     else
-        printf '    %s%s%s  %s\n' "$C_CYN$C_B" "$1" "$C_OFF" "$2"
+        printf '    %s%s%s %s%s%s %s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$2"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# the wizard
+#
+# The steps run down one page. Nothing is cleared between them, so the answers
+# already given stay on screen above the question being asked - which is what
+# you want when you are copying the same numbers onto a second server.
+# ---------------------------------------------------------------------------
+
+WIZ_STEP=0
+
+wiz_reset() { WIZ_STEP=0; }
+
+# Kept so the wizard can note a decision without the page having to redraw.
+wiz_add() { :; }
+
+# wiz <title> [subtitle] - open a step.
+wiz() {
+    WIZ_STEP=$((WIZ_STEP + 1))
+    local t="$WIZ_STEP $BX_DOT $1 " n; n="$(vislen " $t")"
+    printf '\n  %s%s%s%s%s%s%s\n\n' \
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
+        "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
+    [ -n "${2:-}" ] && { dim "$2"; say ""; }
+    return 0
+}
+
+# choice <key> <name> <hint> - one option, name and reason on the same line.
+#
+# CHOICE_DEF marks the one enter picks, on the line itself. Having to read the
+# prompt underneath to work out which number that is, is a step nobody should
+# have to take.
+CHOICE_DEF=""
+choice() {
+    local mark="  "
+    [ "$1" = "$CHOICE_DEF" ] && mark="${C_GRN}${BX_ARR}${C_OFF} "
+    printf '   %s%s%s%s  %s  %s%s%s\n' \
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
+        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
+        "$C_DIM" "${3:-}" "$C_OFF"
+}
+
+# state <on|off> - a coloured on/off badge for toggles.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
     fi
 }
 
@@ -195,10 +286,62 @@ require_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# These configs are written by this script, one key per line, so a targeted
-# sed is enough and Pingify stays free of a jq dependency.
-json_str() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
-json_num() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
+# fetch <url> <dest> [timeout] - download one file with whatever this machine
+# has. The install line is written with wget, so wget is the tool most likely
+# to be present and curl the one most likely to be missing; assuming curl left
+# servers quietly running an old script while the core updated around them.
+fetch() {
+    local url="$1" dest="$2" t="${3:-120}"
+    if have curl; then
+        curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
+    fi
+    if have wget; then
+        wget -q --tries=2 --timeout="$t" -O "$dest" "$url" && return 0
+    fi
+    return 1
+}
+
+# Config files are TOML written by this script, one key per line, so a
+# targeted sed reads them back and Pingify needs no parser of its own.
+CFG_EXT="toml"
+
+cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
+
+toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
+
+# toml_get <file> <section> <key> - reads a value out of one [section].
+# Values keep their quotes off and numeric underscores stripped.
+# The public name of a security token: eight characters derived from it, safe
+# to read aloud. Both servers print the same one when the token matches, which
+# is the only way to tell a wrong token apart from a broken network.
+token_print() {
+    local t
+    t="$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$t" ] && printf '%s' "$t" | sha256sum | cut -c1-8 || printf 'none'
+}
+
+toml_get() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); cur = s; next }
+        cur == want {
+            line = $0
+            sub(/[[:space:]]*#.*$/, "", line)
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                v = substr(line, RSTART + RLENGTH)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v ~ /^"/) { gsub(/^"|"$/, "", v) }
+                else if (v ~ /^[0-9_]+$/) { gsub(/_/, "", v) }
+                print v
+                exit
+            }
+        }' "$1"
+}
+
+
+# Only used to convert a config left behind by 3.2 or earlier.
+json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
+json_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
 port_free() {
     local p="$1"
@@ -231,10 +374,31 @@ public_ip() {
 tunnel_names() {
     [ -d "$CFG_DIR" ] || return 0
     local f
-    for f in "$CFG_DIR"/*.json; do
+    for f in "$CFG_DIR"/*."$CFG_EXT"; do
         [ -e "$f" ] || continue
-        basename "$f" .json
+        basename "$f" ".$CFG_EXT"
     done
+}
+
+# Where this server sits, for the panel on the front page. Best effort: an
+# Iranian box may not reach the lookup service, in which case the local route
+# still gives us the address.
+server_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
+    if have curl; then
+        local j
+        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
+        if [ -n "$j" ]; then
+            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
+            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
+        fi
+    fi
+    [ -n "$SRV_IP" ] || SRV_IP="$(public_ip)"
+    [ -n "$SRV_IP" ] || SRV_IP="unknown"
+    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
+    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
 }
 
 tunnel_count() { tunnel_names | grep -c . ; }
@@ -291,8 +455,8 @@ ensure_deps() {
             warn "please install manually: ${missing[*]}"
         fi
     fi
-    mkdir -p "$CFG_DIR" "$STATE_DIR"
-    chmod 700 "$CFG_DIR"
+    mkdir -p "$BASE_DIR" "$STATE_DIR"
+    chmod 700 "$BASE_DIR"
 }
 
 # Prints the minor version of a Go toolchain, e.g. 22 for go1.22.2, or 0 when
@@ -402,14 +566,14 @@ download_core() {
     base="$(release_base)"
 
     if ! spin "downloading the core for $GOARCH" \
-         curl -fsSL --retry 2 --max-time 180 -o "$tmp" "$base/$(core_asset)"; then
+         fetch "$base/$(core_asset)" "$tmp" 180; then
         rm -f "$tmp"
         return 1
     fi
 
     # The checksum file is published alongside the binaries. A missing one is
     # not fatal, a wrong one is.
-    if curl -fsSL --max-time 30 -o "$sums" "$base/SHA256SUMS" 2>/dev/null; then
+    if fetch "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
         want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
@@ -459,7 +623,7 @@ import_core_binary() {
     local tmp="/tmp/pingify-core.import"
     case "$src" in
         http://* | https://*)
-            spin "downloading" curl -fsSL --max-time 300 -o "$tmp" "$src" \
+            spin "downloading" fetch "$src" "$tmp" 300 \
                 || { fail "download failed"; return 1; } ;;
         *)
             [ -f "$src" ] || { fail "no such file: $src"; return 1; }
@@ -483,12 +647,41 @@ ensure_core() {
     install_core
 }
 
+# The script and the core share the config format, so a core left behind by an
+# older install reads a newer config as if half of it were not there. 3.4 moved
+# configs into sections; a 3.3 core reads one of those and reports every field
+# as empty - which surfaced as "role must be \"server\" or \"client\", got \"\""
+# with nothing to point at the real cause. They are kept in step here instead.
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
+}
+
+ensure_core_current() {
+    [ -x "$CORE_BIN" ] || return 0
+    core_matches_script && return 0
+    banner
+    head2 "Core update"
+    warn "the core is $(core_version), this script is $PINGIFY_VERSION"
+    dim "they have to match - the config format is shared between them"
+    say ""
+    if download_core; then
+        restart_all "the core was updated"
+    else
+        say ""
+        fail "the core could not be updated"
+        dim "until it matches, new tunnels will be rejected"
+        dim "Update core in the menu has the other ways to install it"
+    fi
+    pause
+}
+
 # ---------------------------------------------------------------------------
 # systemd
 # ---------------------------------------------------------------------------
 
 write_units() {
-    cat > "$UNIT_DIR/pingify@.service" <<'UNIT'
+    cat > "$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
 Documentation=https://github.com/GreatTeejay/Pingify
@@ -498,7 +691,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pingify-core -c /etc/pingify/%i.json
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.$CFG_EXT
+WorkingDirectory=$BASE_DIR
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -506,7 +700,8 @@ TasksMax=infinity
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-ProtectHome=yes
+# ProtectHome is deliberately off: the core and its config live under /root.
+ProtectHome=no
 ProtectSystem=full
 StandardOutput=journal
 StandardError=journal
@@ -560,69 +755,193 @@ service_enable_start() {
 
 # ---------------------------------------------------------------------------
 # tunnel configuration
+#
+# Two things decide the shape of a tunnel, and both are asked on both servers
+# because both ends have to agree.
+#
+#   kind        TCP  - the servers talk over their own public addresses
+#               TUN  - a private layer-3 link, carried over ICMP today
+#
+#   forwarder   only meaningful under TUN, where a local tunnel exists:
+#               PINGIFY  - the core carries each connection itself
+#               IPTABLES - the kernel NATs onto the local tunnel
+#
+# A TCP tunnel has no local tunnel and adds no interface, so the core is the
+# only thing that can forward on it and there is nothing to ask.
+#
+# Ports are asked for on the IRAN server alone - that is the end clients
+# reach. The security token is typed by hand on both.
 # ---------------------------------------------------------------------------
 
-# The T_* variables below describe one tunnel while the wizard runs.
 cfg_reset() {
-    T_NAME=""; T_ROLE=""; T_MODE="forward"; T_TRANSPORT="direct"
-    T_LISTEN=""; T_CONNECT=""; T_PSK=""; T_PUBLIC_IP=""
-    T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10
-    T_FORWARDS=""; T_STATUS=""
+    T_NAME=""; T_ROLE=""
+    # kind is TCP or TUN; the transport, mode and forwarder all follow from it.
+    T_KIND="tcp"; T_TRANSPORT="tcp"; T_MODE="forward"; T_FORWARDER="pingify"
+    T_TOKEN=""
+    T_PORT=9443          # the tunnel's own port, TCP only
+    T_ACCEPTS="server"   # IRAN accepts the link, KHAREJ dials it
+    T_PUBLIC_IP=""; T_PEER_IP=""
+    T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
+    T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
 }
 
-# cfg_render <role> <mode> <listen> <connect> <forwards-json> <status-addr>
-# Prints one config document. Every key sits on its own line, which is what
-# lets the manager read these files back with sed instead of a JSON parser.
-cfg_render() {
-    local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
-    printf '{\n'
-    printf '  "name": "%s",\n' "$T_NAME"
-    printf '  "role": "%s",\n' "$role"
-    printf '  "mode": "%s",\n' "$mode"
-    printf '  "transport": "%s",\n' "$T_TRANSPORT"
-    [ -n "$listen" ]  && printf '  "listen": "%s",\n' "$listen"
-    [ -n "$connect" ] && printf '  "connect": "%s",\n' "$connect"
-    printf '  "psk": "%s",\n' "$T_PSK"
-    printf '  "carriers": %s,\n' "$T_CARRIERS"
-    printf '  "window_kb": %s,\n' "$T_WINDOW"
-    printf '  "keepalive_sec": %s,\n' "$T_KEEPALIVE"
-    [ -n "$fwd" ] && printf '  "forwards": [%s],\n' "$fwd"
-    if [ "$mode" = "tun" ]; then
-        local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
-        if [ "$role" != "$T_ROLE" ]; then
-            local pfx="${T_TUNLOCAL##*/}"
-            [ "$pfx" = "$T_TUNLOCAL" ] && pfx=30
-            lo="$T_TUNPEER/$pfx"
-            pe="${T_TUNLOCAL%%/*}"
-        fi
-        printf '  "tun": { "name": "%s", "local": "%s", "peer": "%s", "mtu": %s },\n' \
-               "$T_TUNIF" "$lo" "$pe" "$T_TUNMTU"
+this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
+
+# A local tunnel belongs to the TUN kind and nowhere else. A TCP tunnel runs
+# over the two public addresses and leaves the machine as it found it, so the
+# core is the only thing that can forward on it.
+cfg_mode() {
+    if [ "$T_KIND" = "tun" ]; then
+        # both forwarders work here: the kernel can NAT onto the local tunnel,
+        # or the core can carry the ports over the same carriers.
+        [ "$T_FORWARDER" = "iptables" ] && T_MODE="tun" || T_MODE="both"
+    else
+        T_FORWARDER="pingify"
+        T_MODE="forward"
     fi
-    printf '  "status_addr": "%s",\n' "$status"
-    printf '  "log_level": "info"\n'
-    printf '}\n'
+}
+
+cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
+
+# listen and connect are derived, never stored anywhere shared: they are the
+# one part of a tunnel that differs between the two servers.
+cfg_endpoints() {
+    CFG_LISTEN=""; CFG_CONNECT=""
+    if this_side_accepts; then
+        if [ "$T_TRANSPORT" = "icmp" ]; then CFG_LISTEN="0.0.0.0"
+        else CFG_LISTEN="0.0.0.0:$T_PORT"; fi
+    else
+        if [ "$T_TRANSPORT" = "icmp" ]; then CFG_CONNECT="$T_PEER_IP"
+        else CFG_CONNECT="$T_PEER_IP:$T_PORT"; fi
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# performance presets
+#
+# carriers  how many connections the link is spread over; more of them absorb
+#           packet loss better, because one stalled connection is a smaller
+#           share of the whole
+# window    how much one forwarded connection may have in flight; bigger fills
+#           a long path better and is the memory ceiling per open connection
+# ---------------------------------------------------------------------------
+
+apply_preset() {
+    case "$1" in
+        gaming)     T_CARRIERS=8;  T_WINDOW=128;  T_KEEPALIVE=5 ;;
+        latency)    T_CARRIERS=6;  T_WINDOW=256;  T_KEEPALIVE=5 ;;
+        balanced)   T_CARRIERS=4;  T_WINDOW=512;  T_KEEPALIVE=10 ;;
+        throughput) T_CARRIERS=8;  T_WINDOW=2048; T_KEEPALIVE=15 ;;
+        extreme)    T_CARRIERS=16; T_WINDOW=4096; T_KEEPALIVE=15 ;;
+        *)          return 1 ;;
+    esac
+    T_PRESET="$1"
+    return 0
+}
+
+preset_menu() {
+    CHOICE_DEF="3"
+    choice 1 "Gaming" "lowest ping, small bursts"
+    choice 2 "Latency" "browsing, calls, anything interactive"
+    choice 3 "Balanced" "a good default"
+    choice 4 "Download" "large files"
+    choice 5 "Extreme" "fastest, uses the most memory"
+    choice 6 "Custom" "set the numbers yourself"
+    CHOICE_DEF=""
+    say ""
+    local p=""
+    ask p "select" "3"
+    case "$p" in
+        1) apply_preset gaming ;;
+        2) apply_preset latency ;;
+        4) apply_preset throughput ;;
+        5) apply_preset extreme ;;
+        6) T_PRESET="custom"
+           say ""
+           ask T_CARRIERS "parallel connections" "$T_CARRIERS"
+           ask T_WINDOW "window per connection, KB" "$T_WINDOW"
+           ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE" ;;
+        *) apply_preset balanced ;;
+    esac
+    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=4 ;; esac
+    case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=512 ;; esac
+    case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
+    [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1
+    [ "$T_CARRIERS" -gt 64 ] && T_CARRIERS=64
+}
+
+# ---------------------------------------------------------------------------
+# rendering
+# ---------------------------------------------------------------------------
+
+cfg_render() {
+    local listen="$1" connect="$2" status="$3"
+    printf '# Pingify tunnel - written by the manager, safe to edit by hand\n'
+    printf '\n[tunnel]\n'
+    printf 'name             = "%s"\n' "$T_NAME"
+    printf 'role             = "%s"\n' "$T_ROLE"
+    printf 'kind             = "%s"\n' "$T_KIND"
+    printf 'mode             = "%s"\n' "$T_MODE"
+    printf '\n[transport]\n'
+    printf 'type             = "%s"\n' "$T_TRANSPORT"
+    [ -n "$listen" ]  && printf 'listen           = "%s"\n' "$listen"
+    [ -n "$connect" ] && printf 'connect          = "%s"\n' "$connect"
+    printf 'carriers         = %s\n' "$T_CARRIERS"
+    printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
+    printf '\n[security]\n'
+    printf 'token            = "%s"\n' "$T_TOKEN"
+    printf '\n[forward]\n'
+    printf 'forwarder        = "%s"\n' "$T_FORWARDER"
+    [ -n "$T_FORWARDS" ] && printf 'ports            = [%s]\n' "$T_FORWARDS"
+    if [ "$T_MODE" = "tun" ] || [ "$T_MODE" = "both" ]; then
+        printf '\n[tun]\n'
+        printf 'name             = "%s"\n' "$T_TUNIF"
+        printf 'local_addr       = "%s"\n' "$T_TUNLOCAL"
+        printf 'remote_addr      = "%s"\n' "$T_TUNPEER"
+        printf 'mtu              = %s\n' "$T_TUNMTU"
+    fi
+    printf '\n[tuning]\n'
+    printf 'profile          = "%s"\n' "$T_PRESET"
+    printf 'window_kb        = %s\n' "$T_WINDOW"
+    printf '\n[status]\n'
+    printf 'addr             = "%s"\n' "$status"
+    printf '\n[logging]\n'
+    printf 'level            = "%s"\n' "$T_LOG"
+}
+
+# Name the missing field rather than letting the core report it as a flat
+# rejection with nothing to point at.
+cfg_check_complete() {
+    local missing=""
+    [ -n "$T_NAME" ]      || missing="$missing name"
+    [ -n "$T_ROLE" ]      || missing="$missing side"
+    [ -n "$T_TRANSPORT" ] || missing="$missing protocol"
+    [ -n "$T_TOKEN" ]     || missing="$missing token"
+    case "$T_MODE" in
+        tun | both) [ -n "$T_TUNLOCAL" ] || missing="$missing private-address" ;;
+    esac
+    if [ "$T_ROLE" = "server" ] && [ -z "$T_FORWARDS" ]; then
+        missing="$missing ports"
+    fi
+    if ! this_side_accepts && [ -z "$T_PEER_IP" ]; then
+        missing="$missing peer-address"
+    fi
+    if [ -n "$missing" ]; then
+        fail "these are still missing:$missing"
+        return 1
+    fi
+    return 0
 }
 
 cfg_save() {
-    local file="$CFG_DIR/$T_NAME.json"
-    cfg_render "$T_ROLE" "$T_MODE" "$T_LISTEN" "$T_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
+    local file
+    cfg_check_complete || return 1
+    file="$(cfg_file "$T_NAME")"
+    cfg_endpoints
+    cfg_render "$CFG_LISTEN" "$CFG_CONNECT" "$T_STATUS" > "$file"
     chmod 600 "$file"
     printf '%s' "$file"
-}
-
-# The peer document is this one mirrored: the sides swap, and whichever end
-# dials becomes the end that listens.
-cfg_peer_token() {
-    local prole plisten pconnect pfwd
-    if [ "$T_ROLE" = "edge" ]; then prole="origin"; else prole="edge"; fi
-    if [ -n "$T_CONNECT" ]; then
-        plisten="0.0.0.0:${T_CONNECT##*:}"; pconnect=""
-    else
-        plisten=""; pconnect="${T_PUBLIC_IP}:${T_LISTEN##*:}"
-    fi
-    if [ "$prole" = "edge" ]; then pfwd="$T_FORWARDS"; else pfwd=""; fi
-    cfg_render "$prole" "$T_MODE" "$plisten" "$pconnect" "$pfwd" "$T_STATUS" | base64 | tr -d '\n'
 }
 
 parse_forwards() {
@@ -636,10 +955,16 @@ parse_forwards() {
     printf '%s' "$out"
 }
 
-# Friendly names for the values stored in the config.
-side_label()      { [ "$1" = "edge" ] && printf 'Iran' || printf 'Kharej'; }
-mode_label()      { [ "$1" = "tun" ] && printf 'Full IP' || printf 'Ports'; }
-transport_label() { case "$1" in direct) printf 'Direct' ;; *) printf '%s' "$1" ;; esac; }
+side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
+# BRAID is what the TCP transport does: several carriers woven together, each
+# flow pinned to one strand so nothing arrives out of order. The protocol is
+# still plain TCP - the name describes the weave, not a new protocol.
+transport_label() {
+    case "$1" in
+        icmp | echo) printf 'TUN-ICMP' ;;
+        *)           printf 'TCP' ;;
+    esac
+}
 
 # ---------------------------------------------------------------------------
 # new tunnel
@@ -647,174 +972,195 @@ transport_label() { case "$1" in direct) printf 'Direct' ;; *) printf '%s' "$1" 
 
 new_tunnel() {
     banner
-    head2 "New Tunnel"
+    head2 "New tunnel"
     ensure_core || { pause; return 1; }
-
-    item 1 "Configure this server" "you will get a token for the other one"
-    item 2 "Apply a token" "paste what the other server gave you"
-    say ""
-    local choice=""
-    ask choice "select" "1"
-    [ "$choice" = "2" ] && { import_tunnel; return; }
-
     cfg_reset
+    wiz_reset
+    server_info
 
-    # -- 1. identity -------------------------------------------------------
-    head2 "1/7   Tunnel name"
-    dim "used for the service name and the config file; letters and digits"
-    say ""
-    local suggested="pfy$(( $(tunnel_count) + 1 ))"
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*)
-                fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$CFG_DIR/$T_NAME.json" ]; then
-                    fail "a tunnel named $T_NAME already exists"
-                else
-                    break
-                fi ;;
-        esac
-    done
-
-    # -- 2. which end is this ----------------------------------------------
-    head2 "2/7   This server"
-    item 1 "Iran" "clients connect to this server"
-    item 2 "Kharej" "the panel and inbounds run on this server"
+    # -- which server is this ----------------------------------------------
+    wiz "Which server is this?"
+    CHOICE_DEF="1"
+    choice 1 "IRAN" "clients connect here"
+    choice 2 "KHAREJ" "your panel and inbounds run here"
+    CHOICE_DEF=""
     say ""
     local side=""
     ask side "select" "1"
-    [ "$side" = "2" ] && T_ROLE="origin" || T_ROLE="edge"
+    if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
+    wiz_add "$(side_label "$T_ROLE")"
 
-    # -- 3. link direction and endpoint ------------------------------------
-    head2 "3/7   Link direction"
-    dim "the tunnel is one link; only one end has to accept connections"
+    # -- protocol -----------------------------------------------------------
+    # One flat list. TUN-ICMP is not a category with something inside it; it is
+    # a protocol you pick, and picking it is what brings up the local tunnel.
+    wiz "Protocol"
+    CHOICE_DEF="1"
+    choice 1 "TCP" "over the two public addresses - several connections at once"
+    choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port needed"
+    CHOICE_DEF=""
     say ""
-    item 1 "Outbound" "this server connects to the other one"
-    item 2 "Inbound" "the other one connects in; needs an open port"
-    say ""
-    local dir=""
-    ask dir "select" "1"
+    local proto=""
+    ask proto "select" "1"
 
-    local tport=""
-    say ""
-    if [ "$dir" = "2" ]; then
-        ask tport "listen port" "9443"
-        T_LISTEN="0.0.0.0:$tport"
-        port_free "$tport" || warn "port $tport is already in use on this server"
-        T_PUBLIC_IP="$(public_ip)"
-        ask T_PUBLIC_IP "public address of this server" "${T_PUBLIC_IP:-}"
-    else
-        local peer=""
-        ask peer "address of the other server"
-        [ -n "$peer" ] || { fail "an address is required"; pause; return 1; }
-        ask tport "port on the other server" "9443"
-        T_CONNECT="$peer:$tport"
-    fi
+    if [ "$proto" = "2" ]; then
+        T_KIND="tun"; T_TRANSPORT="icmp"
 
-    # -- 4. key ------------------------------------------------------------
-    head2 "4/7   Shared key"
-    dim "both servers authenticate with the same key; the token carries it"
-    say ""
-    item 1 "Generate" "recommended"
-    item 2 "Enter an existing key" "if you already have one"
-    say ""
-    local kmode=""
-    ask kmode "select" "1"
-    say ""
-    if [ "$kmode" = "2" ]; then
-        ask T_PSK "key"
-    else
-        T_PSK="$("$CORE_BIN" -genpsk)"
-        ok "generated"
-    fi
-    case "$T_PSK" in
-        "" | *[!0-9a-fA-F]*) fail "a key is 64 hex characters"; pause; return 1 ;;
-    esac
-
-    # -- 5. transport ------------------------------------------------------
-    head2 "5/7   Protocol"
-    dim "how the link itself travels between the two servers"
-    say ""
-    item 1 "Direct" "encrypted stream, no wrapper - fastest"
-    say ""
-    dim "TLS and WebSocket are planned; Direct is the only one in this build"
-    say ""
-    local tr=""
-    ask tr "select" "1"
-    T_TRANSPORT="direct"
-
-    # -- 6. payload --------------------------------------------------------
-    head2 "6/7   What the tunnel carries"
-    item 1 "Ports" "forward TCP and UDP ports - panels, inbounds"
-    item 2 "Full IP" "a private layer-3 link between the two servers"
-    say ""
-    local m=""
-    ask m "select" "1"
-    say ""
-
-    if [ "$m" = "2" ]; then
-        T_MODE="tun"
-        local sub=""
-        ask sub "subnet index (0-63)" "1"
-        case "$sub" in "" | *[!0-9]*) sub=1 ;; esac
-        T_TUNIF="pfy${sub}"
-        if [ "$T_ROLE" = "edge" ]; then
-            T_TUNLOCAL="10.71.${sub}.1/30"; T_TUNPEER="10.71.${sub}.2"
+        wiz "Who forwards the ports?"
+        CHOICE_DEF="1"
+        choice 1 "PINGIFY" "the core carries every connection itself"
+        choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
+        CHOICE_DEF=""
+        say ""
+        dim "With IPTABLES the service on KHAREJ has to listen on 0.0.0.0,"
+        dim "not only on 127.0.0.1."
+        say ""
+        local fw=""
+        ask fw "select" "1"
+        if [ "$fw" = "2" ] && have iptables; then
+            T_FORWARDER="iptables"
         else
-            T_TUNLOCAL="10.71.${sub}.2/30"; T_TUNPEER="10.71.${sub}.1"
+            [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
+            T_FORWARDER="pingify"
         fi
-        ask T_TUNMTU "MTU" "1380"
-        dim "this server takes ${T_TUNLOCAL}, the other one takes ${T_TUNPEER}"
     else
-        T_MODE="forward"
-        dim "port           same port on both servers"
-        dim "443=8443       arrives on 443 here, reaches 8443 there"
-        dim "udp:500        a UDP port"
-        dim "8000-8010      a range"
+        T_KIND="tcp"; T_TRANSPORT="tcp"
+        T_FORWARDER="pingify"
+    fi
+    cfg_mode
+
+    # -- where the servers are ---------------------------------------------
+    wiz "Addresses"
+    if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
+        T_PUBLIC_IP="$SRV_IP"
+        dim "this machine reports $SRV_IP"
+        say ""
+    fi
+    ask T_PUBLIC_IP "this server" "$T_PUBLIC_IP"
+
+    if ! this_side_accepts; then
+        say ""
+        ask T_PEER_IP "the IRAN server"
+        [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
+    fi
+
+    if [ "$T_TRANSPORT" = "tcp" ]; then
+        say ""
+        ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
+        case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
+        this_side_accepts && dim "leave $T_PORT open in this server's firewall"
+    fi
+
+    # -- name, derived ------------------------------------------------------
+    # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
+    # tunnel. Two servers side by side say what they are without either file
+    # being opened, and there is nothing to answer.
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    if [ "$T_TRANSPORT" = "icmp" ]; then
+        T_NAME="${T_NAME}-icmp"
+    else
+        T_NAME="${T_NAME}-${T_PORT}"
+    fi
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+    fi
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
+
+    # -- the private link, whenever one is needed --------------------------
+    if cfg_needs_link; then
+        wiz "Private link" "Both servers get an address on a small network of their own."
+        local octet=""
+        ask octet "range 10.x.10.0/24 - pick x" "10"
+        case "$octet" in "" | *[!0-9]*) octet=10 ;; esac
+        if [ "$T_ROLE" = "server" ]; then
+            T_TUNLOCAL="10.${octet}.10.1/24"; T_TUNPEER="10.${octet}.10.2/24"
+        else
+            T_TUNLOCAL="10.${octet}.10.2/24"; T_TUNPEER="10.${octet}.10.1/24"
+        fi
+        say ""
+        ask T_TUNLOCAL "this server" "$T_TUNLOCAL"
+        ask T_TUNPEER  "the other server" "$T_TUNPEER"
+        say ""
+        ask T_TUNIF    "device name" "$T_TUNIF"
+        ask T_TUNMTU   "MTU" "$T_TUNMTU"
+        case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
+    fi
+
+    # -- security ----------------------------------------------------------
+    wiz "Security token" "One secret, typed the same on BOTH servers. Any length."
+    while :; do
+        ask T_TOKEN "token"
+        T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -n "$T_TOKEN" ] && break
+        fail "a token is required"
+    done
+    say ""
+    ok "fingerprint  ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
+    dim "the other server must show these same eight characters"
+
+    # -- ports: the IRAN side owns them ------------------------------------
+    if [ "$T_ROLE" = "server" ]; then
+        wiz "Ports" "The ports your clients will connect to, here on IRAN."
+        dim "443           the same port on both servers"
+        dim "443=8443      clients hit 443 here, it lands on 8443 there"
+        dim "udp:500       a UDP port"
+        dim "8000-8010     a range"
         say ""
         local raw=""
-        ask raw "ports on the Iran server, comma separated" "443"
+        ask raw "ports, comma separated" "443"
         T_FORWARDS="$(parse_forwards "$raw")"
         [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
     fi
 
-    # -- 7. performance ----------------------------------------------------
-    head2 "7/7   Performance"
-    dim "carriers are the parallel connections the link runs over; more of"
-    dim "them absorb packet loss better, 4 to 8 suits most paths"
+    # -- performance -------------------------------------------------------
+    wiz "Performance" "Pick the shape of your traffic; you can change it later."
+    preset_menu
+
+    # -- logging -----------------------------------------------------------
+    wiz "How much to log" "Each level includes the ones above it."
+    CHOICE_DEF="3"
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    CHOICE_DEF=""
     say ""
-    if confirm "change the defaults? (carriers ${T_CARRIERS}, window ${T_WINDOW} KB)"; then
-        say ""
-        ask T_CARRIERS "carriers" "$T_CARRIERS"
-        ask T_WINDOW "window per stream in KB" "$T_WINDOW"
-        ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE"
-    fi
-    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=4 ;; esac
-    case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=512 ;; esac
-    case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
-    [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1
-    [ "$T_CARRIERS" -gt 64 ] && T_CARRIERS=64
+    local lg=""
+    ask lg "select" "3"
+    case "$lg" in
+        1) T_LOG="error" ;; 2) T_LOG="warn" ;;
+        4) T_LOG="debug" ;; 5) T_LOG="trace" ;;
+        *) T_LOG="info" ;;
+    esac
 
     T_STATUS="127.0.0.1:$(pick_free_port 9700)"
 
     # -- review ------------------------------------------------------------
     banner
-    head2 "Review"
-    box_top
-    box_row "$(pad_to "tunnel" 14)${C_B}${T_NAME}${C_OFF}"
-    box_row "$(pad_to "this server" 14)$(side_label "$T_ROLE")"
-    box_row "$(pad_to "link" 14)$([ -n "$T_CONNECT" ] && echo "outbound to $T_CONNECT" || echo "inbound on $T_LISTEN")"
-    box_row "$(pad_to "protocol" 14)$(transport_label "$T_TRANSPORT")"
-    box_row "$(pad_to "carries" 14)$(mode_label "$T_MODE")"
-    if [ "$T_MODE" = "forward" ]; then
-        box_row "$(pad_to "ports" 14)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
+    cfg_endpoints
+    head2 "Ready to create"
+    panel "$T_NAME"
+    field "This server" "$(side_label "$T_ROLE")"
+    field "Address" "$T_PUBLIC_IP"
+    if [ "$T_KIND" = "tun" ]; then
+        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
-        box_row "$(pad_to "addresses" 14)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+        field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
-    box_row "$(pad_to "carriers" 14)${T_CARRIERS}"
-    box_bot
+    field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+    if [ -n "$CFG_LISTEN" ]; then
+        field "Link" "accepts on $CFG_LISTEN"
+    else
+        field "Link" "connects to $CFG_CONNECT"
+    fi
+    cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
+    field "Token" "$(token_print "$T_TOKEN")"
+    field "Tuning" "$T_PRESET"
+    field "Logging" "$T_LOG"
+    panel_end
     say ""
     if ! confirm "create it?"; then
         warn "cancelled, nothing was written"
@@ -824,9 +1170,11 @@ new_tunnel() {
 
     # -- write and start ---------------------------------------------------
     say ""
-    local file; file="$(cfg_save)"
+    local file
+    file="$(cfg_save)" || { pause; return 1; }
     if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         fail "the core rejected this configuration"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
         "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
         rm -f "$file"
         pause; return 1
@@ -835,87 +1183,169 @@ new_tunnel() {
     write_units
     service_enable_start "$T_NAME"
     enable_watchdog quiet
-    ok "$T_NAME is configured and running"
+    # Unconditional: apply_nat tears the chains down when no tunnel needs
+    # them, so this is also what cleans up after a forwarder that changed.
+    apply_nat quiet
+    ok "$T_NAME is running"
+    dim "$file"
 
-    # -- token -------------------------------------------------------------
-    head2 "Token for the other server"
-    dim "on the ${C_OFF}$( [ "$T_ROLE" = "edge" ] && echo Kharej || echo Iran )${C_DIM} server: New Tunnel ${BX_ARR} Apply a token"
+    # -- what to do on the other server ------------------------------------
+    local other
+    other="$( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN )"
+    head2 "Now do the other side"
+    dim "Run Pingify on the $other server, choose New tunnel, and answer:"
     say ""
-    rule
-    printf '%s\n' "${C_YEL}$(cfg_peer_token)${C_OFF}"
-    rule
+    panel "on $other"
+    field "This server" "$other"
+    if [ "$T_KIND" = "tun" ]; then
+        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
+    else
+        field "Type" "$(transport_label "$T_TRANSPORT")"
+    fi
+    [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
+    field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
+    field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+    if cfg_needs_link; then
+        field "Its address" "$T_TUNPEER"
+        field "Peer address" "$T_TUNLOCAL"
+    fi
+    field "Token" "the same one"
+    field "Fingerprint" "$(token_print "$T_TOKEN")"
+    panel_end
     say ""
-    warn "treat it like a password - it contains the shared key"
+    dim "The fingerprint there must read $(token_print "$T_TOKEN") too."
     say ""
     tunnel_status_block "$T_NAME"
     pause
 }
 
 # ---------------------------------------------------------------------------
-# apply a token
+# forwarders
+#
+# Two ways to get a client on the IRAN server through to a service on KHAREJ.
+#
+#   pingify   The core does it. It accepts the connection, multiplexes it over
+#             the carriers and opens the far side itself. Every byte is
+#             encrypted end to end by the core, it works over any transport,
+#             and it needs nothing from the kernel.
+#
+#   iptables  The kernel does it. A private layer-3 link is brought up between
+#             the two servers and the traffic is NATed onto it, so a packet is
+#             never copied into user space at all. Less CPU and more headroom
+#             on a busy tunnel - at the cost of only working over a full-IP
+#             link, and of touching the NAT table.
+#
+# Rules live in Pingify's own chains, so nothing your panel installed is
+# disturbed, and a boot unit puts them back after a restart.
 # ---------------------------------------------------------------------------
 
-import_tunnel() {
-    head2 "Apply a token"
-    dim "configure the other server first; it prints the token at the end"
-    say ""
-    local token=""
-    ask token "token"
-    [ -n "$token" ] || return 1
+forwarder_label() {
+    case "$1" in
+        iptables) printf 'IPTABLES' ;;
+        *)        printf 'PINGIFY' ;;
+    esac
+}
 
-    local tmp="/tmp/pingify-import.json"
-    if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
-        fail "that is not a Pingify token"
-        pause; return 1
-    fi
-    local name; name="$(json_str "$tmp" name)"
-    if [ -z "$name" ]; then
-        fail "the token is incomplete"
-        rm -f "$tmp"; pause; return 1
-    fi
+# nat_chains prepares the two chains and hooks them in once.
+nat_chains() {
+    local c
+    for c in PINGIFY_NAT PINGIFY_POST; do
+        iptables -t nat -N "$c" 2>/dev/null || iptables -t nat -F "$c" 2>/dev/null
+    done
+    iptables -t nat -C PREROUTING  -j PINGIFY_NAT  2>/dev/null || iptables -t nat -I PREROUTING 1  -j PINGIFY_NAT
+    iptables -t nat -C OUTPUT      -j PINGIFY_NAT  2>/dev/null || iptables -t nat -I OUTPUT 1      -j PINGIFY_NAT
+    iptables -t nat -C POSTROUTING -j PINGIFY_POST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j PINGIFY_POST
+}
 
-    if [ -f "$CFG_DIR/$name.json" ]; then
-        say ""
-        warn "a tunnel named $name already exists on this server"
-        confirm "replace it?" || { rm -f "$tmp"; return 1; }
-        systemctl stop "pingify@$name" >/dev/null 2>&1
-    fi
+nat_drop_chains() {
+    iptables -t nat -D PREROUTING  -j PINGIFY_NAT  2>/dev/null
+    iptables -t nat -D OUTPUT      -j PINGIFY_NAT  2>/dev/null
+    iptables -t nat -D POSTROUTING -j PINGIFY_POST 2>/dev/null
+    local c
+    for c in PINGIFY_NAT PINGIFY_POST; do
+        iptables -t nat -F "$c" 2>/dev/null
+        iptables -t nat -X "$c" 2>/dev/null
+    done
+}
 
-    # The status port chosen on the other server may be taken here.
-    local sp; sp="$(json_str "$tmp" status_addr)"
-    sed -i "s#\"status_addr\": \"[^\"]*\"#\"status_addr\": \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
+# nat_rules_for writes the rules one tunnel needs. Both ends need a rule: the
+# IRAN side sends the traffic across the private link, and the KHAREJ side
+# turns it back towards whatever is listening on loopback.
+nat_rules_for() {
+    local name="$1"
+    cfg_load "$name" || return 1
+    [ "$T_FORWARDER" = "iptables" ] || return 0
+    # a private link is what the rules route onto; forward-only has none
+    [ "$T_MODE" != "forward" ] || return 0
 
-    # A token that dials needs the address of the server that issued it.
-    local conn; conn="$(json_str "$tmp" connect)"
-    if [ -n "$conn" ]; then
-        case "${conn%%:*}" in
-            "" | "0.0.0.0")
-                say ""
-                local ip=""
-                ask ip "public address of the other server"
-                sed -i "s#\"connect\": \"[^\"]*\"#\"connect\": \"$ip:${conn##*:}\"#" "$tmp" ;;
+    local peer_ip local_ip
+    peer_ip="${T_TUNPEER%%/*}"
+    local_ip="${T_TUNLOCAL%%/*}"
+    [ -n "$peer_ip" ] && [ -n "$local_ip" ] || return 1
+
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    # DNAT to a loopback address is refused unless this is on.
+    sysctl -w net.ipv4.conf.all.route_localnet=1 >/dev/null 2>&1
+
+    local spec proto lport rport target
+    for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
+        proto=tcp
+        case "$spec" in
+            udp:*) proto=udp; spec="${spec#udp:}" ;;
+            tcp:*) spec="${spec#tcp:}" ;;
         esac
+        lport="${spec%%=*}"
+        rport="${spec#*=}"
+        [ "$rport" = "$spec" ] && rport="$lport"
+        case "$lport$rport" in *[!0-9-]*) continue ;; esac
+
+        # Only the IRAN side has rules: it sends the traffic straight to the
+        # other server's private address. Nothing is needed over there, as
+        # long as the service listens on 0.0.0.0 rather than loopback alone.
+        if [ "$T_ROLE" = "server" ]; then
+            target="$peer_ip:$rport"
+            iptables -t nat -A PINGIFY_NAT -p "$proto" --dport "$lport" \
+                     ! -s "$peer_ip" -j DNAT --to-destination "$target" 2>/dev/null
+        fi
+    done
+
+    # Replies have to come back the way they came.
+    iptables -t nat -A PINGIFY_POST -o "$T_TUNIF" -j MASQUERADE 2>/dev/null
+    return 0
+}
+
+# apply_nat rebuilds every tunnel's rules from its config.
+apply_nat() {
+    local quiet="${1:-}"
+    have iptables || { [ "$quiet" = quiet ] || warn "iptables is not installed"; return 1; }
+    local any=0 n
+    for n in $(tunnel_names); do
+        if [ "$(toml_get "$(cfg_file "$n")" forward forwarder)" = "iptables" ]; then
+            any=1
+        fi
+    done
+    if [ "$any" = "0" ]; then
+        nat_drop_chains
+        return 0
     fi
+    nat_chains
+    for n in $(tunnel_names); do nat_rules_for "$n"; done
+    [ "$quiet" = quiet ] || ok "forwarding rules applied"
+    return 0
+}
 
-    install -m 600 "$tmp" "$CFG_DIR/$name.json"
-    rm -f "$tmp"
-
-    if ! "$CORE_BIN" -c "$CFG_DIR/$name.json" -check >/dev/null 2>&1; then
-        say ""
-        fail "the core rejected this configuration"
-        "$CORE_BIN" -c "$CFG_DIR/$name.json" -check 2>&1 | sed 's/^/      /'
-        rm -f "$CFG_DIR/$name.json"
-        pause; return 1
+show_nat() {
+    say ""
+    if ! have iptables; then
+        warn "iptables is not installed"
+        return
     fi
-
-    write_units
-    service_enable_start "$name"
-    enable_watchdog quiet
-    say ""
-    ok "$name is configured and running"
-    say ""
-    tunnel_status_block "$name"
-    pause
+    if iptables -t nat -S PINGIFY_NAT >/dev/null 2>&1; then
+        iptables -t nat -S PINGIFY_NAT  2>/dev/null | sed 's/^/    /'
+        iptables -t nat -S PINGIFY_POST 2>/dev/null | sed 's/^/    /'
+    else
+        dim "no iptables forwarding is set up"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -923,28 +1353,43 @@ import_tunnel() {
 # ---------------------------------------------------------------------------
 
 cfg_load() {
-    local f="$CFG_DIR/$1.json"
+    local f
+    f="$(cfg_file "$1")"
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME="$(json_str "$f" name)"
-    T_ROLE="$(json_str "$f" role)"
-    T_MODE="$(json_str "$f" mode)"
-    T_TRANSPORT="$(json_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
-    T_LISTEN="$(json_str "$f" listen)"
-    T_CONNECT="$(json_str "$f" connect)"
-    T_PSK="$(json_str "$f" psk)"
-    T_STATUS="$(json_str "$f" status_addr)"
-    T_CARRIERS="$(json_num "$f" carriers)";      : "${T_CARRIERS:=4}"
-    T_WINDOW="$(json_num "$f" window_kb)";       : "${T_WINDOW:=1024}"
-    T_KEEPALIVE="$(json_num "$f" keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_FORWARDS="$(sed -n 's/^[[:space:]]*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\],*[[:space:]]*$/\1/p' "$f" | head -n1)"
-    if [ "$T_MODE" = "tun" ]; then
-        local tl; tl="$(grep -m1 '"tun"' "$f")"
-        T_TUNIF="$(printf '%s' "$tl"    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNLOCAL="$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNPEER="$(printf '%s' "$tl"  | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNMTU="$(printf '%s' "$tl"   | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
-        : "${T_TUNMTU:=1380}"
+    T_NAME="$(toml_get "$f" tunnel name)"
+    T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)";                  : "${T_MODE:=forward}"
+    T_KIND="$(toml_get "$f" tunnel kind)"
+    if [ -z "$T_KIND" ]; then
+        # written before the kind was recorded
+        [ "$(toml_get "$f" transport type)" = "icmp" ] && T_KIND="tun" || T_KIND="tcp"
+    fi
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=tcp}"
+    T_TOKEN="$(toml_get "$f" security token)"
+    T_STATUS="$(toml_get "$f" status addr)"
+    T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
+    T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
+    T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
+    T_FORWARDS="$(toml_arr "$f" ports)"
+    T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
+    T_TUNIF="$(toml_get "$f" tun name)";                    : "${T_TUNIF:=pfy0}"
+    T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+    T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+    T_TUNMTU="$(toml_get "$f" tun mtu)";                    : "${T_TUNMTU:=1380}"
+
+    # The endpoint is derived, so recover what it was built from.
+    local l c
+    l="$(toml_get "$f" transport listen)"
+    c="$(toml_get "$f" transport connect)"
+    if [ -n "$l" ]; then
+        T_ACCEPTS="$T_ROLE"
+        case "$l" in *:*) T_PORT="${l##*:}" ;; esac
+    else
+        [ "$T_ROLE" = "server" ] && T_ACCEPTS="client" || T_ACCEPTS="server"
+        T_PEER_IP="${c%:*}"
+        case "$c" in *:*) T_PORT="${c##*:}" ;; *) T_PEER_IP="$c" ;; esac
     fi
     return 0
 }
@@ -954,32 +1399,47 @@ cfg_load() {
 # ---------------------------------------------------------------------------
 
 tunnel_status_block() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
-    local addr; addr="$(json_str "$f" status_addr)"
+    local addr; addr="$(toml_get "$f" status addr)"
     local state; state="$(svc_state "$name")"
 
     local colour="$C_RED"
     [ "$state" = "active" ] && colour="$C_GRN"
-    printf '  %s%s%s  service %s%s%s\n' \
-        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF"
-    if [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
-        "$CORE_BIN" -status "$addr" 2>/dev/null || true
+    printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
+        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
+
+    # A stopped tunnel has no status endpoint to ask, and printing the raw
+    # "connection refused" from trying anyway reads like a fault when it is
+    # only the consequence of the line above.
+    if [ "$state" != "active" ]; then
+        dim "not running - nothing to report"
+        return 0
     fi
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 0
+    if ! "$CORE_BIN" -status "$addr" 2>/dev/null; then
+        # Either it is still coming up, or no carrier has arrived. The status
+        # server answers within a second of starting, so a refusal this soon
+        # after a start is the former.
+        dim "starting up, or the other server has not connected yet"
+    fi
+    return 0
 }
 
 # One line per tunnel, for the overview table.
 tunnel_row() {
-    local name="$1" f="$CFG_DIR/$1.json"
-    local role mode peer addr state brief up total rtt streams
-    role="$(json_str "$f" role)"
-    mode="$(json_str "$f" mode)"
-    peer="$(json_str "$f" connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(json_str "$f" listen)"
-    addr="$(json_str "$f" status_addr)"
+    local name="$1" f="$(cfg_file "$1")"
+    local role proto fwder addr state brief up total rtt streams
+    role="$(side_label "$(toml_get "$f" tunnel role)")"
+    proto="$(transport_label "$(toml_get "$f" transport type)")"
+    fwder="$(forwarder_label "$(toml_get "$f" forward forwarder)")"
+    peer="$(toml_get "$f" transport connect)"
+    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
+    addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(json_num "$f" carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
@@ -1004,11 +1464,12 @@ tunnel_row() {
         disabled) dot="$C_GRY$BX_OFF$C_OFF" ;;
     esac
 
-    printf '  %s %s %s %s %s %s%s%s\n' \
+    printf '  %s %s %s %s %s %s %s%s%s\n' \
         "$dot" \
         "$(pad_to "${C_B}${name}${C_OFF}" 13)" \
-        "$(pad_to "$role" 7)" \
-        "$(pad_to "$mode" 8)" \
+        "$(pad_to "$role" 8)" \
+        "$(pad_to "$proto" 10)" \
+        "$(pad_to "$fwder" 9)" \
         "$(pad_to "$up/$total" 6)" \
         "$C_DIM" "$rtt" "$C_OFF"
 }
@@ -1016,14 +1477,15 @@ tunnel_row() {
 list_tunnels() {
     local names; names="$(tunnel_names)"
     if [ -z "$names" ]; then
-        dim "no tunnels configured yet - pick Config New Tunnel to make one"
+        dim "no tunnels configured yet - pick New tunnel to make one"
         return 1
     fi
-    printf '    %s%s %s %s %s %s%s\n' \
+    printf '    %s%s %s %s %s %s %s%s\n' \
         "$C_DIM" \
         "$(pad_to "NAME" 13)" \
-        "$(pad_to "ROLE" 7)" \
-        "$(pad_to "MODE" 8)" \
+        "$(pad_to "SIDE" 8)" \
+        "$(pad_to "PROTO" 10)" \
+        "$(pad_to "FORWARDER" 9)" \
         "$(pad_to "LINKS" 6)" \
         "RTT" "$C_OFF"
     local n
@@ -1071,44 +1533,112 @@ tunnel_menu() {
         head2 "Tunnel: $name"
         tunnel_status_block "$name"
         rule
-        item 1 "Restart"
-        item 2 "Stop"
-        item 3 "Start"
-        item 4 "Live log"
-        item 5 "Edit forwarded ports"
-        item 6 "Performance settings"
-        item 7 "Show the token again"
-        item 8 "Scheduled restart"
-        item 9 "Delete this tunnel"
+        group "Check"
+        item 1 "Test the path" "go through the tunnel and say where it stops"
+        item 2 "Live log"
+        group "Settings"
+        item 3 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
+        item 4 "Tuning" "carriers, window, keepalive, logging"
+        item 5 "Scheduled restart"
+        group "Service"
+        item 6 "Restart"
+        item 7 "Stop"
+        item 8 "Start"
+        say ""
+        item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
-            2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
-            3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            4) say ""; dim "ctrl-c to stop following"; say ""
+            1) probe_path "$name" ;;
+            2) say ""; dim "ctrl-c to stop following"; say ""
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            5) edit_forwards "$name" ;;
-            6) edit_tuning "$name" ;;
-            7) show_peer_token "$name" ;;
-            8) recycle_menu "$name" ;;
-            9) delete_tunnel "$name" && return ;;
+            3) edit_forwards "$name" ;;
+            4) tuning_menu "$name" ;;
+            5) recycle_menu "$name" ;;
+            6) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
+            7) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
+            8) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
+            d|D) delete_tunnel "$name" && return ;;
             0|"") return ;;
         esac
     done
 }
 
-edit_forwards() {
-    local name="$1" f="$CFG_DIR/$1.json"
+# Connecting to a forwarded port proves nothing on its own: this server accepts
+# before it has said a word to the tunnel. The core's probe goes the whole way
+# and reports where it stopped.
+probe_path() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
     cfg_load "$name" || return 1
-    if [ "$T_MODE" != "forward" ]; then
-        warn "this is a full-IP tunnel; it has no port list"
+    banner
+    head2 "Testing the path for: $name"
+    say ""
+    if [ "$T_ROLE" != "server" ]; then
+        warn "this is the KHAREJ end - the ports live on the IRAN server"
+        dim "run this from the menu over there instead"
         pause; return
     fi
-    if [ "$T_ROLE" != "edge" ]; then
-        warn "ports are configured on the Iran side; this server is the Kharej end"
+    if ! systemctl is-active --quiet "pingify@$name"; then
+        fail "the tunnel is not running; start it first"
+        pause; return
+    fi
+    "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
+    say ""
+    dim "A port that fails is one the other server could not reach. The service"
+    dim "there must be listening on the address after the arrow."
+    pause
+}
+
+edit_logging() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    banner
+    head2 "Logging: $name"
+    say ""
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    say ""
+    dim "This is local. The two servers may log at different levels."
+    say ""
+    local c="" lvl
+    ask c "select" "3"
+    case "$c" in
+        1) lvl="error" ;; 2) lvl="warn" ;;
+        4) lvl="debug" ;; 5) lvl="trace" ;;
+        3|"") lvl="info" ;;
+        *) fail "pick 1 to 5"; pause; return ;;
+    esac
+    cp -f "$f" "$f.bak"
+    if grep -q '^level' "$f"; then
+        sed -i "s#^level.*#level            = \"$lvl\"#" "$f"
+    else
+        printf '
+[logging]
+level            = "%s"
+' "$lvl" >> "$f"
+    fi
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "logging at $lvl"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
+}
+
+edit_forwards() {
+    local name="$1" f="$(cfg_file "$1")"
+    cfg_load "$name" || return 1
+    if [ "$T_ROLE" != "server" ]; then
+        warn "the port list lives on the IRAN server; this is the KHAREJ end"
         pause; return
     fi
     say ""
@@ -1121,14 +1651,15 @@ edit_forwards() {
     [ -n "$fwd" ] || { fail "nothing to set"; pause; return; }
 
     cp -f "$f" "$f.bak"
-    if grep -q '"forwards"' "$f"; then
-        sed -i "s#^\([[:space:]]*\"forwards\"[[:space:]]*:[[:space:]]*\).*#\1[$fwd],#" "$f"
+    if grep -q '^ports' "$f"; then
+        sed -i "s#^ports.*#ports            = [$fwd]#" "$f"
     else
-        sed -i "s#^\([[:space:]]*\"psk\".*\)#\1\n  \"forwards\": [$fwd],#" "$f"
+        sed -i "s#^\(forwarder.*\)#\1\nports            = [$fwd]#" "$f"
     fi
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
+        apply_nat quiet
         ok "ports updated and the tunnel restarted"
     else
         mv -f "$f.bak" "$f"
@@ -1137,46 +1668,79 @@ edit_forwards() {
     pause
 }
 
-edit_tuning() {
-    local name="$1" f="$CFG_DIR/$1.json"
-    cfg_load "$name" || return 1
-    say ""
-    local car win ka
-    ask car "carriers" "$T_CARRIERS"
-    ask win "window (KB)" "$T_WINDOW"
-    ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
-    case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
+# Every number that shapes a tunnel, on one screen, split by the only
+# distinction that matters when two servers disagree: the settings that have to
+# match, and the ones that are nobody's business but this machine's.
+tuning_menu() {
+    local name="$1" f v
+    f="$(cfg_file "$name")"
+    while :; do
+        cfg_load "$name" || return 1
+        banner
+        head2 "Tuning: $name"
+
+        panel "both servers must agree"
+        field "Token" "$(token_print "$T_TOKEN")"
+        field "Type" "$(transport_label "$T_TRANSPORT")" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        panel_end
+        say ""
+        panel "local to this server"
+        field "Profile" "$T_PRESET"
+        field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
+        field "Keepalive" "${T_KEEPALIVE} s"
+        panel_end
+        say ""
+        dim "Read the top box on the other server and make it read the same."
+        dim "The bottom box may differ; it will not break the link."
+
+        rule
+        item 1 "Profile" "pick a preset and set all three at once"
+        item 2 "Carriers" "$T_CARRIERS - parallel connections"
+        item 3 "Window" "$T_WINDOW KB per connection"
+        item 4 "Keepalive" "$T_KEEPALIVE seconds"
+        item 5 "Logging" "$T_LOG"
+        item 0 "Back"
+        say ""
+        local c=""
+        ask c "select"
+        case "$c" in
+            1) say ""; preset_menu
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" ;;
+            2) say ""; ask v "parallel connections" "$T_CARRIERS"
+               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" ;;
+            3) say ""; ask v "window per connection, KB" "$T_WINDOW"
+               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" ;;
+            4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
+            5) edit_logging "$name" ;;
+            0|"") return ;;
+        esac
+    done
+}
+
+# tuning_write <name> <carriers> <window> <keepalive>
+tuning_write() {
+    local name="$1" car="$2" win="$3" ka="$4" f
+    f="$(cfg_file "$name")"
+    case "$car$win$ka" in *[!0-9]*|"") fail "numbers only"; pause; return ;; esac
+    [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
 
     cp -f "$f" "$f.bak"
-    sed -i "s#^\([[:space:]]*\"carriers\"[[:space:]]*:[[:space:]]*\).*#\1$car,#" "$f"
-    sed -i "s#^\([[:space:]]*\"window_kb\"[[:space:]]*:[[:space:]]*\).*#\1$win,#" "$f"
-    sed -i "s#^\([[:space:]]*\"keepalive_sec\"[[:space:]]*:[[:space:]]*\).*#\1$ka,#" "$f"
+    sed -i "s#^carriers.*#carriers         = $car#" "$f"
+    sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
+    sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
-        ok "updated and restarted"
-        warn "set the same carrier count on the other server too"
+        ok "saved and restarted"
     else
         mv -f "$f.bak" "$f"
-        fail "rejected, nothing changed"
+        fail "the core rejected that; nothing was changed"
     fi
-    pause
+    sleep 1
 }
 
-show_peer_token() {
-    cfg_load "$1" || return 1
-    if [ -z "$T_CONNECT" ]; then
-        T_PUBLIC_IP="$(public_ip)"
-        say ""
-        ask T_PUBLIC_IP "public IP of THIS server" "${T_PUBLIC_IP:-}"
-    fi
-    say ""
-    dim "paste this on the other server: Config New Tunnel -> option 2"
-    say ""
-    say "${C_YEL}$(cfg_peer_token)${C_OFF}"
-    say ""
-    pause
-}
+
 
 recycle_menu() {
     local name="$1"
@@ -1223,8 +1787,12 @@ delete_tunnel() {
     systemctl disable --now "pingify@$name" >/dev/null 2>&1
     systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
-    rm -f "$CFG_DIR/$name.json" "$CFG_DIR/$name.json.bak" "$STATE_DIR/$name.fail"
+    rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
+    # Its forwarding rules outlive the config unless something removes them,
+    # and a DNAT rule pointing at an address that no longer exists swallows
+    # every packet for that port - which looks exactly like a broken tunnel.
+    apply_nat quiet
     ok "tunnel $name removed"
     sleep 1
     return 0
@@ -1245,7 +1813,7 @@ run_health_check() {
     local n f addr fails
     for n in $(tunnel_names); do
         systemctl is-enabled --quiet "pingify@$n" 2>/dev/null || continue
-        f="$CFG_DIR/$n.json"
+        f="$(cfg_file "$n")"
 
         if ! systemctl is-active --quiet "pingify@$n"; then
             echo "pingify: $n is not running, starting it"
@@ -1254,7 +1822,7 @@ run_health_check() {
             continue
         fi
 
-        addr="$(json_str "$f" status_addr)"
+        addr="$(toml_get "$f" status addr)"
         if [ -z "$addr" ] || [ ! -x "$CORE_BIN" ]; then
             continue
         fi
@@ -1357,27 +1925,9 @@ apply_tuning() {
         [ -f "$STATE_DIR/sysctl.pre" ] || sysctl -a 2>/dev/null > "$STATE_DIR/sysctl.pre"
     fi
 
-    if ! lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
-        modprobe tcp_bbr 2>/dev/null || true
-    fi
-    if ! grep -q '^tcp_bbr$' /etc/modules-load.d/pingify.conf 2>/dev/null; then
-        echo tcp_bbr > /etc/modules-load.d/pingify.conf
-    fi
-
-    local cc="cubic"
-    if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-        cc="bbr"
-    else
-        warn "this kernel has no BBR; staying on cubic"
-    fi
-
     cat > "$SYSCTL_FILE" <<SYSCTL
 # Written by Pingify $PINGIFY_VERSION. Delete this file and run
 # "sysctl --system" to go back to the distribution defaults.
-
-# --- congestion control and queueing ---
-net.core.default_qdisc = fq
-net.ipv4.tcp_congestion_control = $cc
 
 # --- room in flight: 64 MB covers a 200 ms / 2.5 Gbit path ---
 net.core.rmem_max = 67108864
@@ -1425,7 +1975,8 @@ SYSCTL
     fi
 
     sysctl --system >/dev/null 2>&1
-    ok "network tuning applied (congestion control: $cc, qdisc: fq)"
+    ok "network tuning applied"
+    dim "congestion control is a separate switch - see Enable BBR"
 
     if ! grep -q 'pingify' /etc/security/limits.d/99-pingify.conf 2>/dev/null; then
         cat > /etc/security/limits.d/99-pingify.conf <<'LIMITS'
@@ -1439,8 +1990,39 @@ LIMITS
     fi
 }
 
+# BBR is its own switch: it is the one change with a visible effect on a slow
+# path, and people want to turn it on or off without touching everything else.
+enable_bbr() {
+    say ""
+    if ! lsmod 2>/dev/null | grep -q '^tcp_bbr'; then
+        modprobe tcp_bbr 2>/dev/null || true
+    fi
+    if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+        fail "this kernel does not offer BBR"
+        dim "kernel $(uname -r); a 4.9 or newer kernel with tcp_bbr is needed"
+        return 1
+    fi
+    echo tcp_bbr > /etc/modules-load.d/pingify.conf
+    cat > /etc/sysctl.d/98-pingify-bbr.conf <<'SYSCTL'
+# Written by Pingify. Delete this file and run "sysctl --system" to undo it.
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+SYSCTL
+    sysctl --system >/dev/null 2>&1
+    ok "BBR enabled with the fq queue discipline"
+    dim "now: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) / $(sysctl -n net.core.default_qdisc 2>/dev/null)"
+}
+
+disable_bbr() {
+    say ""
+    rm -f /etc/sysctl.d/98-pingify-bbr.conf /etc/modules-load.d/pingify.conf
+    sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1
+    sysctl --system >/dev/null 2>&1
+    ok "back to $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+}
+
 revert_tuning() {
-    rm -f "$SYSCTL_FILE" /etc/security/limits.d/99-pingify.conf /etc/modules-load.d/pingify.conf
+    rm -f "$SYSCTL_FILE" /etc/security/limits.d/99-pingify.conf           /etc/modules-load.d/pingify.conf /etc/sysctl.d/98-pingify-bbr.conf
     sysctl --system >/dev/null 2>&1
     ok "Pingify tuning removed; the distribution defaults are back"
     dim "a reboot makes absolutely sure nothing is left over"
@@ -1497,24 +2079,35 @@ optimize_menu() {
     while :; do
         banner
         head2 "Optimize"
-        item 1 "Apply network tuning" "(BBR + fq + high-BDP buffers)"
-        item 2 "Apply network tuning" "+ enable IP forwarding (full-IP tunnels)"
-        item 3 "Show the current settings"
-        item 4 "Swap file"
-        item 5 "Sync the clock" "(the handshake rejects a skewed clock)"
-        item 6 "Revert every change Pingify made"
+        panel "CURRENT"
+        field "Congestion" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"               "Qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+        field "Tuning" "$([ -f "$SYSCTL_FILE" ] && echo applied || echo default)"               "Open files" "$(ulimit -n)"
+        panel_end
+        say ""
+        item 1 "Apply network optimization" "buffers, backlogs, file limits"
+        item 2 "Enable BBR" "congestion control and fq"
+        item 3 "Disable BBR" "back to the kernel default"
+        say ""
+        item 4 "Enable IP forwarding" "needed for Full IP tunnels"
+        item 5 "Swap file"
+        item 6 "Sync the clock" "the handshake rejects a skewed clock"
+        say ""
+        item 7 "Show all settings"
+        item 8 "Revert everything Pingify changed"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
             1) apply_tuning no; pause ;;
-            2) apply_tuning yes; pause ;;
-            3) show_net_settings; pause ;;
-            4) manage_swap ;;
-            5) sync_clock; pause ;;
-            6) say ""; confirm "revert the sysctl and limits changes?" && revert_tuning; pause ;;
-            0|"") return ;;
+            2) enable_bbr; pause ;;
+            3) disable_bbr; pause ;;
+            4) apply_tuning yes; pause ;;
+            5) manage_swap ;;
+            6) sync_clock; pause ;;
+            7) show_net_settings; pause ;;
+            8) say ""; confirm "revert the sysctl and limits changes?" && revert_tuning; pause ;;
+            0 | "") return ;;
         esac
     done
 }
@@ -1530,6 +2123,221 @@ sync_clock() {
     fi
     dim "Pingify rejects a handshake more than 3 minutes out, so both servers"
     dim "must agree on the time."
+}
+
+# ---------------------------------------------------------------------------
+# blocking
+#
+# Three switches people running a tunnel keep reaching for:
+#
+#   ICMP       stop the server answering pings
+#   speedtest  keep clients from burning the link on benchmark sites
+#   UDP 443    reject QUIC, so browsers fall back to TCP where the tunnel
+#
+# Everything goes in Pingify's own iptables chains, so nothing here touches
+# rules you or your panel put in place. State lives in $STATE_DIR and a boot
+# unit re-applies it, because iptables rules do not survive a reboot.
+# ---------------------------------------------------------------------------
+
+SPEEDTEST_HOSTS="speedtest.net ooklaserver.net speedtestcustom.com fast.com \
+nperf.com speedof.me openspeedtest.com speedcheck.org librespeed.org \
+测速 speedtest.cn"
+
+# The hosts file gets a marked block so it can be removed cleanly.
+HOSTS_MARK="# --- pingify speedtest block ---"
+
+block_state() { [ -f "$STATE_DIR/block-$1" ] && printf 'on' || printf 'off'; }
+
+block_summary() {
+    local out=""
+    [ "$(block_state icmp)" = "on" ]      && out="${out}icmp "
+    [ "$(block_state speedtest)" = "on" ] && out="${out}speedtest "
+    [ "$(block_state quic)" = "on" ]      && out="${out}quic "
+    [ -n "$out" ] && printf '%s' "${out% }" || printf 'none'
+}
+
+block_toggle() {
+    local what="$1"
+    if [ -f "$STATE_DIR/block-$what" ]; then
+        rm -f "$STATE_DIR/block-$what"
+    else
+        mkdir -p "$STATE_DIR"
+        : > "$STATE_DIR/block-$what"
+    fi
+    apply_blocking
+}
+
+# ---------------------------------------------------------------------------
+# applying
+# ---------------------------------------------------------------------------
+
+ipt() { iptables "$@" 2>/dev/null; }
+
+# Our chains, hooked once into the built-in ones and rebuilt from scratch each
+# time so the state file is always the single source of truth.
+block_reset_chains() {
+    local c
+    for c in PINGIFY_IN PINGIFY_OUT PINGIFY_FWD; do
+        ipt -N "$c" || ipt -F "$c"
+    done
+    ipt -C INPUT   -j PINGIFY_IN  || ipt -I INPUT 1   -j PINGIFY_IN
+    ipt -C OUTPUT  -j PINGIFY_OUT || ipt -I OUTPUT 1  -j PINGIFY_OUT
+    ipt -C FORWARD -j PINGIFY_FWD || ipt -I FORWARD 1 -j PINGIFY_FWD
+}
+
+block_drop_chains() {
+    ipt -D INPUT   -j PINGIFY_IN
+    ipt -D OUTPUT  -j PINGIFY_OUT
+    ipt -D FORWARD -j PINGIFY_FWD
+    local c
+    for c in PINGIFY_IN PINGIFY_OUT PINGIFY_FWD; do
+        ipt -F "$c"
+        ipt -X "$c"
+    done
+}
+
+hosts_block_off() {
+    if grep -qF "$HOSTS_MARK" /etc/hosts 2>/dev/null; then
+        sed -i "/$(printf '%s' "$HOSTS_MARK" | sed 's/[]\/$*.^[]/\\&/g')/,/# --- end pingify ---/d" /etc/hosts
+    fi
+}
+
+hosts_block_on() {
+    hosts_block_off
+    {
+        printf '%s\n' "$HOSTS_MARK"
+        local h
+        for h in $SPEEDTEST_HOSTS; do
+            case "$h" in *[!a-zA-Z0-9.-]*) continue ;; esac
+            printf '127.0.0.1 %s\n127.0.0.1 www.%s\n' "$h" "$h"
+        done
+        printf '%s\n' "# --- end pingify ---"
+    } >> /etc/hosts
+}
+
+apply_blocking() {
+    local quiet="${1:-}"
+    have iptables || { [ "$quiet" = quiet ] || warn "iptables is not installed; nothing applied"; return 1; }
+    mkdir -p "$STATE_DIR"
+    block_reset_chains
+
+    # --- ICMP -------------------------------------------------------------
+    if [ "$(block_state icmp)" = "on" ]; then
+        printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > /etc/sysctl.d/99-pingify-block.conf
+    else
+        rm -f /etc/sysctl.d/99-pingify-block.conf
+        sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+    fi
+    sysctl --system >/dev/null 2>&1
+
+    # --- speedtest --------------------------------------------------------
+    if [ "$(block_state speedtest)" = "on" ]; then
+        hosts_block_on
+        local h ok_any=0
+        for h in $SPEEDTEST_HOSTS; do
+            case "$h" in *[!a-zA-Z0-9.-]*) continue ;; esac
+            # Matches the hostname in a plaintext TLS ClientHello, so it also
+            # catches traffic that only passes through this server.
+            if ipt -A PINGIFY_OUT -m string --string "$h" --algo bm -j REJECT; then ok_any=1; fi
+            ipt -A PINGIFY_FWD -m string --string "$h" --algo bm -j REJECT
+        done
+        if [ "$ok_any" = "0" ] && [ "$quiet" != quiet ]; then
+            warn "the kernel string match is unavailable; only the hosts file block is active"
+        fi
+    else
+        hosts_block_off
+    fi
+
+    # --- QUIC -------------------------------------------------------------
+    if [ "$(block_state quic)" = "on" ]; then
+        ipt -A PINGIFY_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+        ipt -A PINGIFY_FWD -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
+        ipt -A PINGIFY_IN  -p udp --dport 443 -j DROP
+    fi
+
+    write_firewall_unit
+    [ "$quiet" = quiet ] || ok "blocking rules applied"
+    return 0
+}
+
+# iptables forgets everything on reboot, so re-apply from the state files.
+write_firewall_unit() {
+    cat > "$UNIT_DIR/pingify-firewall.service" <<UNIT
+[Unit]
+Description=Pingify blocking rules
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SELF_BIN --apply-firewall
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload
+    systemctl enable pingify-firewall.service >/dev/null 2>&1
+}
+
+remove_blocking() {
+    rm -f "$STATE_DIR"/block-icmp "$STATE_DIR"/block-speedtest "$STATE_DIR"/block-quic
+    rm -f /etc/sysctl.d/99-pingify-block.conf
+    sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+    hosts_block_off
+    have iptables && block_drop_chains
+    systemctl disable --now pingify-firewall.service >/dev/null 2>&1
+    rm -f "$UNIT_DIR/pingify-firewall.service"
+    systemctl daemon-reload
+}
+
+# ---------------------------------------------------------------------------
+# menu
+# ---------------------------------------------------------------------------
+
+blocking_menu() {
+    while :; do
+        banner
+        head2 "Blocking"
+        panel "RULES"
+        row "$(pad_to "${C_DIM}Ping / ICMP${C_OFF}" 22)$(state_badge "$(block_state icmp)")"
+        row "$(pad_to "${C_DIM}Speedtest sites${C_OFF}" 22)$(state_badge "$(block_state speedtest)")"
+        row "$(pad_to "${C_DIM}UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
+        panel_end
+        say ""
+        item 1 "Ping / ICMP" "stop this server answering pings"
+        item 2 "Speedtest sites" "block benchmark sites and their CDNs"
+        item 3 "Block UDP 443" "rejects QUIC, so browsers fall back to TCP"
+        say ""
+        item 4 "Show the live rules"
+        item 5 "Clear everything"
+        item 0 "Back"
+        say ""
+        local c=""
+        ask c "select"
+        case "$c" in
+            1) say ""; block_toggle icmp; pause ;;
+            2) say ""
+               dim "This works on traffic leaving in the clear, so it belongs on"
+               dim "the KHAREJ server - that is where the proxy talks to the site."
+               say ""
+               block_toggle speedtest; pause ;;
+            3) say ""; block_toggle quic; pause ;;
+            4) say ""
+               if have iptables; then
+                   iptables -S PINGIFY_IN PINGIFY_OUT PINGIFY_FWD 2>/dev/null | sed 's/^/    /' | head -n 40
+                   printf '    %sicmp_echo_ignore_all = %s%s\n' \
+                       "$C_DIM" "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" "$C_OFF"
+               else
+                   warn "iptables is not installed"
+               fi
+               pause ;;
+            5) say ""
+               confirm "remove every blocking rule?" && { remove_blocking; ok "cleared"; }
+               pause ;;
+            0 | "") return ;;
+        esac
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -1549,8 +2357,7 @@ update_menu() {
         item 1 "Download the latest core" "prebuilt, from GitHub Releases"
         item 2 "Compile the core here" "from the sources inside this script"
         item 3 "Import a core binary" "path or URL"
-        item 4 "Export this core binary" "to copy to the peer"
-        item 5 "Update Pingify itself" "fetch the newest manager script"
+        item 4 "Export this core binary" "to copy to the other server"
         item 0 "Back"
         say ""
         local c=""
@@ -1560,7 +2367,6 @@ update_menu() {
             2) say ""; if build_core; then restart_all "the core was rebuilt"; fi; pause ;;
             3) say ""; if import_core_binary; then restart_all "the core was replaced"; fi; pause ;;
             4) export_core; pause ;;
-            5) self_update; pause ;;
             0|"") return ;;
         esac
     done
@@ -1572,12 +2378,24 @@ restart_all() {
     [ "$any" = "1" ] && ok "$1; every tunnel was restarted" || ok "$1"
 }
 
+# The script and the core share a config format, so they have to move
+# together. Updating one alone is how a machine ends up with two versions of
+# Pingify on it that refuse to work with each other.
+update_pingify() {
+    banner
+    head2 "Update Pingify"
+    if ! self_update; then pause; return 1; fi
+    say ""
+    info "restarting with the new version to bring the core along"
+    sleep 1
+    exec "$SELF_BIN"
+}
+
 self_update() {
     say ""
-    have curl || { fail "curl is needed for this"; return 1; }
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! curl -fsSL --max-time 60 "$RAW_BASE/Pingify.sh" -o "$tmp"; then
+    if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
         fail "could not reach GitHub"
         dim "on an Iranian server this often fails; update from the Kharej box"
         dim "and copy the file across instead."
@@ -1591,7 +2409,6 @@ self_update() {
     install -m 0755 "$tmp" "$SELF_BIN"
     rm -f "$tmp"
     ok "Pingify updated to ${newver:-unknown}"
-    dim "run 'pingify' again to pick up the new version"
 }
 
 export_core() {
@@ -1600,7 +2417,7 @@ export_core() {
     local dest="/root/pingify-core-$(uname -m)"
     cp -f "$CORE_BIN" "$dest"
     ok "copied to $dest"
-    dim "Move it to the other server and use Update Core -> 3 there."
+    dim "Copy it to the other server, then Update core -> 3 there."
     dim "Example, run this on the other server:"
     say ""
     say "    ${C_DIM}scp root@$(public_ip):$dest /root/pingify-core${C_OFF}"
@@ -1631,7 +2448,7 @@ remove_menu() {
             for n in $(tunnel_names); do
                 systemctl disable --now "pingify@$n" >/dev/null 2>&1
                 systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
-                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$CFG_DIR/$n.json"
+                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$(cfg_file "$n")"
             done
             systemctl daemon-reload
             ok "all tunnels removed"
@@ -1651,6 +2468,7 @@ full_uninstall() {
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
     systemctl disable --now pingify-health.timer >/dev/null 2>&1
+    remove_blocking
     rm -f "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-health.service \
           "$UNIT_DIR"/pingify-health.timer "$UNIT_DIR"/pingify-recycle@*.service \
           "$UNIT_DIR"/pingify-recycle@*.timer
@@ -1666,145 +2484,222 @@ full_uninstall() {
 
 # ---------------------------------------------------------------------------
 # diagnostics
+#
+# One command that answers "is this thing working, and if not, which part is
+# broken" - in the order the failures actually happen, so the first red line
+# is the one to fix.
 # ---------------------------------------------------------------------------
 
+DIAG_BAD=0
+
+check_pass() { printf '  %s%s%s %s\n' "$C_GRN" "$MK_OK" "$C_OFF" "$1"; }
+check_fail() { printf '  %s%s%s %s\n' "$C_RED" "$MK_NO" "$C_OFF" "$1"; DIAG_BAD=$((DIAG_BAD + 1)); }
+check_warn() { printf '  %s%s%s %s\n' "$C_YEL" "$MK_WARN" "$C_OFF" "$1"; }
+check_note() { printf '      %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
+
 tcp_probe() {
-    local host="$1" port="$2"
-    timeout 5 bash -c ": < /dev/tcp/$host/$port" 2>/dev/null
+    timeout 5 bash -c ": < /dev/tcp/$1/$2" 2>/dev/null
+}
+
+diag_tunnel() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    cfg_load "$name" || { check_fail "$name: no config"; return; }
+
+    printf '\n  %s%s%s\n' "$C_B" "$name" "$C_OFF"
+
+    # 1. the config the core will actually read
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        check_pass "config is valid"
+    else
+        check_fail "the core rejects this config"
+        "$CORE_BIN" -c "$f" -check 2>&1 | sed 's/^/      /'
+        return
+    fi
+
+    # 2. the service
+    case "$(svc_state "$name")" in
+        active)   check_pass "service is running" ;;
+        stopped)  check_fail "service is stopped"; check_note "start it from Manage tunnels"; return ;;
+        *)        check_fail "service is not enabled"; return ;;
+    esac
+
+    # 3. the link itself, straight from the core
+    local brief state up total rtt
+    brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    set -- $brief
+    state="${1:-down}"; up="${2:-0}"; total="${3:-0}"; rtt="${4:-0}"
+    if [ "$state" = "up" ]; then
+        check_pass "link is up - $up of $total connections, ${rtt}ms"
+        [ "$up" != "$total" ] && check_warn "some connections are still down"
+    else
+        check_fail "no connection to the other server"
+    fi
+
+    # 4. the path, so a down link points at a cause
+    cfg_endpoints
+    if [ -n "$CFG_CONNECT" ]; then
+        local host="${CFG_CONNECT%:*}" port="${CFG_CONNECT##*:}"
+        if [ "$T_TRANSPORT" = "icmp" ]; then
+            host="$CFG_CONNECT"
+            if have ping && ping -c 2 -W 2 "$host" >/dev/null 2>&1; then
+                check_pass "$host answers a ping - the ICMP path is open"
+            else
+                check_fail "$host does not answer a ping"
+                check_note "an ICMP tunnel cannot work if ping does not get through"
+            fi
+            return
+        fi
+        if tcp_probe "$host" "$port"; then
+            check_pass "port $port on $host accepts connections"
+        else
+            check_fail "cannot reach $host:$port"
+            check_note "is the other server running, and is the port open there?"
+        fi
+    else
+        local port="${CFG_LISTEN##*:}"
+        if [ "$T_TRANSPORT" = "icmp" ]; then
+            check_pass "ICMP needs no port to be open here"
+            return
+        fi
+        if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+            check_pass "listening on port $port"
+            [ "$state" = "up" ] || check_note "open $port in your firewall and check the other server"
+        else
+            check_fail "nothing is listening on port $port"
+        fi
+    fi
+
+    # 5. the ports clients are told to use
+    if [ "$T_MODE" = "forward" ] && [ -n "$T_FORWARDS" ]; then
+        local spec p missing=""
+        for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
+            p="${spec%%=*}"; p="${p##*:}"; p="${p%%-*}"
+            case "$p" in "" | *[!0-9]*) continue ;; esac
+            ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || missing="$missing $p"
+        done
+        if [ -n "$missing" ]; then
+            check_fail "not listening on:$missing"
+        else
+            check_pass "all forwarded ports are open"
+        fi
+    fi
+}
+
+diag_full() {
+    banner
+    head2 "Full check"
+    DIAG_BAD=0
+
+    # --- the machine ------------------------------------------------------
+    printf '  %s%s%s\n' "$C_B" "This server" "$C_OFF"
+    [ -x "$CORE_BIN" ] && check_pass "core $(core_version)" || check_fail "the core is not installed"
+
+    if have timedatectl && timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
+        check_pass "clock is synchronised"
+    else
+        check_warn "clock may be off"
+        check_note "the handshake rejects a difference over 3 minutes - see Optimize"
+    fi
+
+    if [ "$(watchdog_state)" = "on" ]; then
+        check_pass "watchdog is on"
+    else
+        check_warn "watchdog is off - a dead tunnel will not be restarted"
+    fi
+
+    # --- each tunnel ------------------------------------------------------
+    local names; names="$(tunnel_names)"
+    if [ -z "$names" ]; then
+        printf '\n'
+        check_warn "no tunnels configured"
+    else
+        local n
+        for n in $names; do diag_tunnel "$n"; done
+    fi
+
+    printf '\n'
+    if [ "$DIAG_BAD" = "0" ]; then
+        ok "everything checks out"
+    else
+        fail "$DIAG_BAD problem(s) above"
+    fi
+    pause
 }
 
 diagnostics_menu() {
     while :; do
         banner
         head2 "Diagnostics"
-        item 1 "Reach the other server"
-        item 2 "Ping the peer"
-        item 3 "Validate every config"
-        item 4 "Listening ports"
-        item 5 "System summary"
-        item 6 "Tail a tunnel log"
+        item 1 "Full check" "config, service, link, path, ports"
+        item 2 "Ping the other server" "plain ICMP, to see the raw latency"
+        item 3 "Live log" "follow a tunnel as it runs"
+        item 4 "System summary"
+        item 5 "Forwarding rules" "what iptables is doing for Pingify"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) diag_reach ;;
+            1) diag_full ;;
             2) diag_ping ;;
-            3) diag_configs ;;
-            4) say ""; ss -Hltnp 2>/dev/null | sed 's/^/  /' | head -n 40; pause ;;
-            5) diag_system ;;
-            6) if pick_tunnel; then journalctl -u "pingify@$PICKED" -n 80 --no-pager | sed 's/^/  /'; pause; fi ;;
-            0|"") return ;;
+            3) if pick_tunnel; then
+                   say ""; dim "ctrl-c to stop"; say ""
+                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager || true
+               fi ;;
+            4) diag_system ;;
+            5) show_nat; pause ;;
+            0 | "") return ;;
         esac
     done
-}
-
-diag_reach() {
-    pick_tunnel || return
-    cfg_load "$PICKED" || return
-    say ""
-    if [ -n "$T_CONNECT" ]; then
-        local host="${T_CONNECT%:*}" port="${T_CONNECT##*:}"
-        info "opening a TCP connection to $host:$port"
-        if tcp_probe "$host" "$port"; then
-            ok "the peer accepted the connection - the path is clear"
-        else
-            fail "no answer from $host:$port"
-            dim "check that the peer's tunnel is running, that its firewall allows"
-            dim "the port, and that the provider is not blocking it"
-        fi
-    else
-        local port="${T_LISTEN##*:}"
-        info "this server listens on port $port; checking it is bound"
-        if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
-            ok "port $port is open and listening"
-            dim "run this same check from the other server to test the path"
-        else
-            fail "nothing is listening on $port - is the tunnel running?"
-        fi
-    fi
-    pause
 }
 
 diag_ping() {
     pick_tunnel || return
     cfg_load "$PICKED" || return
     local host=""
-    if [ -n "$T_CONNECT" ]; then host="${T_CONNECT%:*}"; fi
-    [ -n "$host" ] || ask host "peer IP"
+    cfg_endpoints
+    [ -n "$CFG_CONNECT" ] && host="${CFG_CONNECT%:*}"
+    say ""
+    if [ -z "$host" ]; then
+        dim "this server waits for the other one, so it does not know its address"
+        say ""
+        ask host "address to ping"
+    fi
     [ -n "$host" ] || return
     say ""
-    ping -c 5 -W 2 "$host" 2>&1 | sed 's/^/  /'
-    pause
-}
-
-diag_configs() {
-    say ""
-    local n bad=0
-    for n in $(tunnel_names); do
-        if "$CORE_BIN" -c "$CFG_DIR/$n.json" -check >/dev/null 2>&1; then
-            ok "$n"
-        else
-            bad=1
-            fail "$n"
-            "$CORE_BIN" -c "$CFG_DIR/$n.json" -check 2>&1 | sed 's/^/      /'
-        fi
-    done
-    [ "$bad" = "0" ] && dim "every config is valid"
+    if have ping; then
+        ping -c 5 -W 2 "$host" 2>&1 | sed 's/^/    /'
+    else
+        warn "ping is not installed"
+    fi
     pause
 }
 
 diag_system() {
-    say ""
-    printf '  %-22s %s\n' "os" "$OS_PRETTY"
-    printf '  %-22s %s\n' "kernel" "$(uname -r)"
-    printf '  %-22s %s\n' "arch" "$ARCH"
-    printf '  %-22s %s\n' "cpu" "$(nproc) cores"
-    printf '  %-22s %s\n' "memory" "$(free -h | awk '/^Mem:/{print $3" used of "$2}')"
-    printf '  %-22s %s\n' "public ip" "$(public_ip)"
-    printf '  %-22s %s\n' "core" "$(core_version)"
-    printf '  %-22s %s\n' "watchdog" "$(watchdog_state)"
-    printf '  %-22s %s\n' "congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-    printf '  %-22s %s\n' "time" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-    pause
-}
-
-# ---------------------------------------------------------------------------
-# backup / restore
-# ---------------------------------------------------------------------------
-
-backup_menu() {
     banner
-    head2 "Backup & Restore"
-    item 1 "Back up every tunnel"
-    item 2 "Restore from a backup"
-    item 0 "Back"
-    say ""
-    local c=""
-    ask c "select"
-    case "$c" in
-        1)  say ""
-            local out="/root/pingify-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
-            if tar -czf "$out" -C / etc/pingify 2>/dev/null; then
-                chmod 600 "$out"
-                ok "written to $out"
-                warn "it contains your shared keys - keep it somewhere safe"
-            else
-                fail "nothing to back up"
-            fi
-            pause ;;
-        2)  say ""
-            local src=""
-            ask src "path to the backup file"
-            [ -f "$src" ] || { fail "no such file"; pause; return; }
-            confirm "this replaces the configs on this server. continue?" || return
-            tar -xzf "$src" -C / || { fail "could not unpack it"; pause; return; }
-            write_units
-            local n
-            for n in $(tunnel_names); do service_enable_start "$n"; ok "started $n"; done
-            pause ;;
-        0|"") return ;;
-    esac
+    head2 "System"
+    panel "MACHINE"
+    field "OS" "$OS_PRETTY"
+    field "Kernel" "$(uname -r)"
+    field "Arch" "$ARCH"
+    field "CPU" "$(nproc) cores"
+    field "Memory" "$(free -h 2>/dev/null | awk '/^Mem:/{print $3" of "$2}')"
+    panel_end
+    panel "NETWORK"
+    field "Public IP" "$SRV_IP"
+    field "Congestion" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    field "Qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+    field "Blocking" "$(block_summary)"
+    field "Open files" "$(ulimit -n)"
+    panel_end
+    panel "PINGIFY"
+    field "Script" "$PINGIFY_VERSION"
+    field "Core" "$(core_version)"
+    field "Directory" "$BASE_DIR"
+    field "Time" "$(date -u '+%Y-%m-%d %H:%M UTC')"
+    panel_end
+    pause
 }
 
 # ---------------------------------------------------------------------------
@@ -1818,6 +2713,1170 @@ backup_menu() {
 write_core_sources() {
     local d="$1"
     mkdir -p "$d" || return 1
+    cat > "$d/arq.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"encoding/binary"
+	"errors"
+	"io"
+	"net"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// ARQ - a reliable ordered stream over an unreliable datagram carrier
+//
+// The braid layer above needs what TCP gives it: bytes arriving once, in
+// order. ICMP echo gives none of that, so this sits in between and supplies
+// it - sequence numbers, cumulative acknowledgements, retransmission on a
+// measured timeout, fast retransmit on duplicate acks, and a send window.
+//
+// It deliberately knows nothing about ICMP. It takes a function that puts one
+// datagram on the wire and a stream of datagrams coming back, which is what
+// makes it testable against a link that loses, reorders and duplicates on
+// purpose rather than only against a real network on a good day.
+//
+// Wire layout of one datagram:
+//
+//	[4]  nonce      random, in the clear, keys the mask below
+//	[16] header     masked with AES(k, nonce)
+//	     [4] session
+//	     [1] carrier
+//	     [1] flags
+//	     [4] seq
+//	     [4] ack
+//	     [2] length
+//	[n]  payload    already encrypted by the layer above
+//
+// Masking the header costs one AES block per datagram and leaves nothing
+// constant for a filter to match on.
+// ---------------------------------------------------------------------------
+
+const (
+	arqNonce  = 4
+	arqHdr    = 16
+	arqOver   = arqNonce + arqHdr
+	arqWindow = 64 // segments in flight
+
+	flagData = 1 << 0
+	flagFin  = 1 << 1
+	flagRst  = 1 << 2
+)
+
+var (
+	errARQClosed = errors.New("arq: connection closed")
+	errARQReset  = errors.New("arq: reset by peer")
+)
+
+type arqHeader struct {
+	session uint32
+	carrier uint8
+	flags   uint8
+	seq     uint32
+	ack     uint32
+	length  uint16
+}
+
+func (h *arqHeader) put(dst []byte) {
+	binary.BigEndian.PutUint32(dst[0:4], h.session)
+	dst[4] = h.carrier
+	dst[5] = h.flags
+	binary.BigEndian.PutUint32(dst[6:10], h.seq)
+	binary.BigEndian.PutUint32(dst[10:14], h.ack)
+	binary.BigEndian.PutUint16(dst[14:16], h.length)
+}
+
+func (h *arqHeader) get(src []byte) {
+	h.session = binary.BigEndian.Uint32(src[0:4])
+	h.carrier = src[4]
+	h.flags = src[5]
+	h.seq = binary.BigEndian.Uint32(src[6:10])
+	h.ack = binary.BigEndian.Uint32(src[10:14])
+	h.length = binary.BigEndian.Uint16(src[14:16])
+}
+
+// maskHeader XORs the 16 header bytes with an AES block keyed by the nonce.
+func maskHeader(blk cipher.Block, nonce, hdr []byte) {
+	var in, ks [16]byte
+	copy(in[:], nonce)
+	blk.Encrypt(ks[:], in[:])
+	for i := 0; i < arqHdr; i++ {
+		hdr[i] ^= ks[i]
+	}
+}
+
+// segment is one unacknowledged piece of the outgoing stream.
+type segment struct {
+	seq     uint32
+	data    []byte
+	sentAt  time.Time
+	retries int
+}
+
+// arqConn presents a net.Conn over datagrams.
+type arqConn struct {
+	session uint32
+	carrier uint8
+	mask    cipher.Block
+	maxPay  int
+	send    func([]byte) error
+	remote  net.Addr
+
+	mu   sync.Mutex
+	cond *sync.Cond
+
+	// outbound
+	sndNext uint32
+	sndUna  uint32
+	sndBuf  map[uint32]*segment
+	pending []byte // bytes not yet cut into a segment
+
+	// inbound
+	rcvNext uint32
+	rcvBuf  map[uint32][]byte
+	inbox   []byte
+
+	// round-trip estimate, Jacobson/Karels
+	srtt, rttvar, rto time.Duration
+
+	lastAck  uint32
+	dupAcks  int
+	needAck  bool
+	peerFin  bool
+	sentFin  bool
+	closed   bool
+	err      error
+	done     chan struct{}
+	deadline time.Time
+
+	// How many times one segment is resent before the carrier is declared
+	// dead. With the doubling backoff below, twelve works out at roughly
+	// half a minute - long enough to ride out a blip, short enough that the
+	// pool starts a fresh carrier while anyone is still watching.
+	maxRetries int
+}
+
+func newARQ(session uint32, carrier uint8, psk []byte, maxPayload int, send func([]byte) error) *arqConn {
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), psk), []byte("arq header"), 32)
+	blk, err := aes.NewCipher(k)
+	if err != nil {
+		panic(err)
+	}
+	c := &arqConn{
+		session:    session,
+		carrier:    carrier,
+		mask:       blk,
+		maxPay:     maxPayload,
+		send:       send,
+		sndBuf:     make(map[uint32]*segment),
+		rcvBuf:     make(map[uint32][]byte),
+		rto:        500 * time.Millisecond,
+		done:       make(chan struct{}),
+		maxRetries: 12,
+	}
+	c.cond = sync.NewCond(&c.mu)
+	go c.timerLoop()
+	return c
+}
+
+// ---------------------------------------------------------------------------
+// net.Conn
+// ---------------------------------------------------------------------------
+
+func (c *arqConn) Read(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.inbox) == 0 {
+		if c.err != nil {
+			return 0, c.err
+		}
+		if c.peerFin {
+			return 0, io.EOF
+		}
+		if c.closed {
+			return 0, errARQClosed
+		}
+		c.cond.Wait()
+	}
+	n := copy(p, c.inbox)
+	c.inbox = c.inbox[n:]
+	return n, nil
+}
+
+func (c *arqConn) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		c.mu.Lock()
+		for len(c.sndBuf) >= arqWindow {
+			if c.closed || c.err != nil {
+				e := c.err
+				if e == nil {
+					e = errARQClosed
+				}
+				c.mu.Unlock()
+				return total, e
+			}
+			c.cond.Wait()
+		}
+		if c.closed || c.err != nil {
+			e := c.err
+			if e == nil {
+				e = errARQClosed
+			}
+			c.mu.Unlock()
+			return total, e
+		}
+		n := len(p)
+		if n > c.maxPay {
+			n = c.maxPay
+		}
+		seg := &segment{seq: c.sndNext, data: append([]byte(nil), p[:n]...)}
+		c.sndBuf[seg.seq] = seg
+		c.sndNext++
+		c.emit(seg, flagData)
+		c.mu.Unlock()
+		p = p[n:]
+		total += n
+	}
+	return total, nil
+}
+
+func (c *arqConn) Close() error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	c.closed = true
+	if !c.sentFin {
+		c.sentFin = true
+		c.emit(nil, flagFin)
+	}
+	close(c.done)
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *arqConn) LocalAddr() net.Addr  { return c.remote }
+func (c *arqConn) RemoteAddr() net.Addr { return c.remote }
+
+// The braid layer sets deadlines to detect a wedged carrier. The keepalive and
+// retransmit machinery already covers that, so these are accepted and ignored
+// rather than pretended not to exist.
+func (c *arqConn) SetDeadline(t time.Time) error      { return nil }
+func (c *arqConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *arqConn) SetWriteDeadline(t time.Time) error { return nil }
+
+// ---------------------------------------------------------------------------
+// sending
+// ---------------------------------------------------------------------------
+
+// emit builds and sends one datagram. Caller holds the lock, and the send
+// callback runs under it - fine for a datagram socket, which does not block,
+// but it means the callback must not reach back into this connection.
+func (c *arqConn) emit(seg *segment, flags uint8) {
+	var payload []byte
+	h := arqHeader{session: c.session, carrier: c.carrier, flags: flags, ack: c.rcvNext}
+	if seg != nil {
+		h.seq = seg.seq
+		h.length = uint16(len(seg.data))
+		payload = seg.data
+		seg.sentAt = time.Now()
+	}
+	buf := make([]byte, arqOver+len(payload))
+	if _, err := rand.Read(buf[:arqNonce]); err != nil {
+		return
+	}
+	h.put(buf[arqNonce:arqOver])
+	maskHeader(c.mask, buf[:arqNonce], buf[arqNonce:arqOver])
+	copy(buf[arqOver:], payload)
+	c.needAck = false
+	c.send(buf)
+}
+
+// ackOnly sends a bare acknowledgement. Caller holds the lock.
+func (c *arqConn) ackOnly() { c.emit(nil, 0) }
+
+// ---------------------------------------------------------------------------
+// receiving
+// ---------------------------------------------------------------------------
+
+// onDatagram feeds one received datagram in. It never blocks, so the socket
+// reader is never held up by a slow consumer.
+func (c *arqConn) onDatagram(buf []byte) {
+	if len(buf) < arqOver {
+		return
+	}
+	hdr := make([]byte, arqHdr)
+	copy(hdr, buf[arqNonce:arqOver])
+	maskHeader(c.mask, buf[:arqNonce], hdr)
+	var h arqHeader
+	h.get(hdr)
+	if h.session != c.session || h.carrier != c.carrier {
+		return
+	}
+	if int(h.length) > len(buf)-arqOver {
+		return
+	}
+	payload := buf[arqOver : arqOver+int(h.length)]
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if h.flags&flagRst != 0 {
+		c.fail(errARQReset)
+		return
+	}
+
+	c.processAck(h.ack)
+
+	if h.flags&flagData != 0 && h.length > 0 {
+		c.deliver(h.seq, payload)
+		c.needAck = true
+	}
+	if h.flags&flagFin != 0 {
+		c.peerFin = true
+		c.cond.Broadcast()
+	}
+}
+
+// processAck retires everything the peer has confirmed. Caller holds the lock.
+func (c *arqConn) processAck(ack uint32) {
+	if ack == c.lastAck {
+		c.dupAcks++
+		// Three duplicates mean the segment after the ack is almost certainly
+		// gone; resend it now rather than waiting out the timer.
+		if c.dupAcks == 3 {
+			if seg, ok := c.sndBuf[ack]; ok {
+				c.emit(seg, flagData)
+				seg.retries++
+			}
+		}
+		return
+	}
+	c.dupAcks = 0
+	c.lastAck = ack
+
+	for s := c.sndUna; s < ack; s++ {
+		if seg, ok := c.sndBuf[s]; ok {
+			// Karn's rule: a retransmitted segment says nothing about the RTT.
+			if seg.retries == 0 {
+				c.sampleRTT(time.Since(seg.sentAt))
+			}
+			delete(c.sndBuf, s)
+		}
+	}
+	if ack > c.sndUna {
+		c.sndUna = ack
+	}
+	c.cond.Broadcast()
+}
+
+// deliver puts a segment in order, buffering anything that arrives early.
+// Caller holds the lock.
+func (c *arqConn) deliver(seq uint32, payload []byte) {
+	if seq < c.rcvNext {
+		return // already had it; the ack was lost, not the data
+	}
+	if seq >= c.rcvNext+arqWindow*2 {
+		return // absurdly far ahead, drop rather than grow without bound
+	}
+	if _, dup := c.rcvBuf[seq]; dup {
+		return
+	}
+	c.rcvBuf[seq] = append([]byte(nil), payload...)
+	for {
+		seg, ok := c.rcvBuf[c.rcvNext]
+		if !ok {
+			break
+		}
+		c.inbox = append(c.inbox, seg...)
+		delete(c.rcvBuf, c.rcvNext)
+		c.rcvNext++
+	}
+	c.cond.Broadcast()
+}
+
+func (c *arqConn) fail(err error) {
+	if c.err == nil {
+		c.err = err
+	}
+	c.cond.Broadcast()
+}
+
+// ---------------------------------------------------------------------------
+// timers
+// ---------------------------------------------------------------------------
+
+// sampleRTT folds one measurement into the retransmit timeout, the way TCP
+// does: smoothed average plus four mean deviations. Caller holds the lock.
+func (c *arqConn) sampleRTT(m time.Duration) {
+	if c.srtt == 0 {
+		c.srtt = m
+		c.rttvar = m / 2
+	} else {
+		d := c.srtt - m
+		if d < 0 {
+			d = -d
+		}
+		c.rttvar = (3*c.rttvar + d) / 4
+		c.srtt = (7*c.srtt + m) / 8
+	}
+	c.rto = c.srtt + 4*c.rttvar
+	if c.rto < 200*time.Millisecond {
+		c.rto = 200 * time.Millisecond
+	}
+	if c.rto > 5*time.Second {
+		c.rto = 5 * time.Second
+	}
+}
+
+func (c *arqConn) timerLoop() {
+	t := time.NewTicker(20 * time.Millisecond)
+	defer t.Stop()
+	idle := time.Now()
+	for {
+		select {
+		case <-c.done:
+			return
+		case now := <-t.C:
+			c.mu.Lock()
+			if c.err != nil {
+				c.mu.Unlock()
+				return
+			}
+			// Anything past its timeout goes again, with the timeout doubled
+			// so a dead path is not hammered.
+			for _, seg := range c.sndBuf {
+				if now.Sub(seg.sentAt) >= c.rto {
+					seg.retries++
+					if seg.retries > c.maxRetries {
+						c.fail(errARQClosed)
+						c.mu.Unlock()
+						return
+					}
+					c.emit(seg, flagData)
+					if c.rto < 5*time.Second {
+						c.rto *= 2
+					}
+				}
+			}
+			if c.needAck {
+				c.ackOnly()
+			}
+			// A quiet link still needs a heartbeat, both to keep any stateful
+			// middlebox interested and to notice the peer going away.
+			if len(c.sndBuf) == 0 && now.Sub(idle) > time.Second {
+				c.ackOnly()
+				idle = now
+			}
+			if len(c.sndBuf) > 0 {
+				idle = now
+			}
+			c.mu.Unlock()
+		}
+	}
+}
+PINGIFY_SRC_EOF
+    cat > "$d/config.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// ---------------------------------------------------------------------------
+// configuration files
+//
+// TOML is what people expect for this kind of tool, so that is what Pingify
+// writes. What it reads back is a deliberately small subset: bare `key = value`
+// at the top level, one `[tun]` table, string arrays, integers and strings.
+// Pingify generates these files, so a full TOML implementation would be a
+// dependency bought for nothing - and a dependency is exactly what the offline
+// build path cannot afford.
+//
+// JSON is still accepted so that configs written by 3.2 and earlier keep
+// working without anyone having to convert them.
+// ---------------------------------------------------------------------------
+
+func loadConfig(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %v", err)
+	}
+	var cfg Config
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, fmt.Errorf("parse config: %v", err)
+		}
+		return &cfg, nil
+	}
+	if err := parseTOML(string(raw), &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %v", err)
+	}
+	return &cfg, nil
+}
+
+func parseTOML(text string, c *Config) error {
+	sc := bufio.NewScanner(strings.NewReader(text))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	section := ""
+	line := 0
+
+	for sc.Scan() {
+		line++
+		s := stripComment(sc.Text())
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, "[") {
+			if !strings.HasSuffix(s, "]") {
+				return fmt.Errorf("line %d: unterminated table header", line)
+			}
+			section = strings.Trim(s[1:len(s)-1], " \t\"")
+			continue
+		}
+		eq := strings.Index(s, "=")
+		if eq < 0 {
+			return fmt.Errorf("line %d: expected key = value", line)
+		}
+		key := strings.TrimSpace(s[:eq])
+		val := strings.TrimSpace(s[eq+1:])
+		if err := assign(c, section, key, val); err != nil {
+			return fmt.Errorf("line %d: %v", line, err)
+		}
+	}
+	return sc.Err()
+}
+
+// stripComment removes a trailing # comment, leaving anything inside quotes
+// alone so a value may contain a hash.
+func stripComment(s string) string {
+	inQ := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			inQ = !inQ
+		case '#':
+			if !inQ {
+				return strings.TrimSpace(s[:i])
+			}
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
+func unquote(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		if out, err := strconv.Unquote(s); err == nil {
+			return out
+		}
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// parseArray reads ["a", "b"] into its elements.
+func parseArray(s string) ([]string, error) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return nil, fmt.Errorf("expected a [...] array")
+	}
+	body := strings.TrimSpace(s[1 : len(s)-1])
+	if body == "" {
+		return nil, nil
+	}
+	var out []string
+	for _, part := range splitTop(body) {
+		part = unquote(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out, nil
+}
+
+// splitTop splits on commas that are not inside quotes.
+func splitTop(s string) []string {
+	var out []string
+	inQ, start := false, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			inQ = !inQ
+		case ',':
+			if !inQ {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+func atoi(key, s string) (int, error) {
+	// TOML allows 10_000 as a readability separator.
+	n, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(s), "_", ""))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a number", key, s)
+	}
+	return n, nil
+}
+
+// assign maps one key onto the Config. Sections group what belongs together;
+// a key with no section is the flat layout Pingify wrote before 3.4 and is
+// still accepted so an existing file keeps working.
+func assign(c *Config, section, key, val string) error {
+	var err error
+	num := func(dst *int) error {
+		n, e := atoi(key, val)
+		if e == nil {
+			*dst = n
+		}
+		return e
+	}
+
+	switch section {
+	case "", "tunnel":
+		switch key {
+		case "name":
+			c.Name = unquote(val)
+		case "role":
+			c.Role = unquote(val)
+		case "mode":
+			c.Mode = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "transport":
+		switch key {
+		case "type", "transport":
+			c.Transport = unquote(val)
+		case "listen":
+			c.Listen = unquote(val)
+		case "connect":
+			c.Connect = unquote(val)
+		case "carriers":
+			err = num(&c.Carriers)
+		case "keepalive_sec":
+			err = num(&c.KeepaliveSec)
+		case "dial_timeout_sec":
+			err = num(&c.DialTimeout)
+		}
+	}
+
+	switch section {
+	case "", "security":
+		switch key {
+		case "token":
+			c.Token = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "forward":
+		switch key {
+		case "ports", "forwards":
+			c.Forwards, err = parseArray(val)
+		case "bind_addr":
+			c.BindAddr = unquote(val)
+		case "allow":
+			c.Allow, err = parseArray(val)
+		}
+	}
+
+	switch section {
+	case "", "tuning":
+		switch key {
+		case "window_kb":
+			err = num(&c.WindowKB)
+		case "sndbuf_kb":
+			err = num(&c.SndBufKB)
+		case "rcvbuf_kb":
+			err = num(&c.RcvBufKB)
+		}
+	}
+
+	switch section {
+	case "", "status":
+		if key == "addr" || key == "status_addr" {
+			c.StatusAddr = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "logging":
+		if key == "level" || key == "log_level" {
+			c.LogLevel = unquote(val)
+		}
+	}
+
+	if section == "tun" {
+		switch key {
+		case "name":
+			c.TUN.Name = unquote(val)
+		case "local", "local_addr":
+			c.TUN.Local = unquote(val)
+		case "peer", "remote_addr":
+			c.TUN.Peer = unquote(val)
+		case "mtu":
+			err = num(&c.TUN.MTU)
+		}
+	}
+
+	// Anything unrecognised is ignored on purpose: a config written by a newer
+	// Pingify should not stop an older core from starting.
+	return err
+}
+PINGIFY_SRC_EOF
+    cat > "$d/handshake_v2.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"io"
+	"net"
+	"time"
+)
+
+// The plain handshake, byte for byte as v2.1.1 shipped it.
+//
+// v3 removed every constant from the wire so nothing could be fingerprinted:
+// no magic, no version, a header XORed with a key-derived block, a variable
+// amount of trailing padding, and masked frame lengths. On a real Iran<->Europe
+// path that stream stopped carrying anything a few seconds after each carrier
+// came up, in both directions, every time - while this one, with a four-byte
+// magic in the clear, worked on the same two servers.
+//
+// Both are kept. Which one a tunnel speaks is [transport] obfuscate, and it has
+// to match on the two ends. Off - this one - is the default, because a tunnel
+// that carries no traffic protects nothing.
+const (
+	hs2Magic     = "PFY2"
+	hs2Version   = 2
+	hs2ClientLen = 4 + 1 + 1 + 2 + 8 + 16 + 32
+	hs2ServerLen = 16 + 32
+)
+
+func deriveSessionV2(psk, nonceC, nonceS []byte, carrier uint16, dialer bool) *sessionKeys {
+	salt := make([]byte, 0, len(nonceC)+len(nonceS)+2)
+	salt = append(salt, nonceC...)
+	salt = append(salt, nonceS...)
+	salt = append(salt, byte(carrier>>8), byte(carrier))
+	prk := hkdfExtract(salt, psk)
+	c2s := hkdfExpand(prk, []byte("pingify/v2 c2s"), 32)
+	s2c := hkdfExpand(prk, []byte("pingify/v2 s2c"), 32)
+
+	// The length masks are never used in this mode; they are filled in so the
+	// struct is always whole and nothing has to check before reading it.
+	if dialer {
+		return &sessionKeys{aeadFrom(c2s), aeadFrom(s2c), blockFrom(c2s), blockFrom(s2c)}
+	}
+	return &sessionKeys{aeadFrom(s2c), aeadFrom(c2s), blockFrom(s2c), blockFrom(c2s)}
+}
+
+func clientHandshakeV2(conn net.Conn, cfg *Config, carrier int) (*sessionKeys, error) {
+	psk := cfg.key()
+	buf := make([]byte, hs2ClientLen)
+	copy(buf[0:4], hs2Magic)
+	buf[4] = hs2Version
+	buf[5] = roleByte(cfg.Role)
+	binary.BigEndian.PutUint16(buf[6:8], uint16(carrier))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(time.Now().Unix()))
+	if _, err := rand.Read(buf[16:32]); err != nil {
+		return nil, err
+	}
+	m := hmac.New(sha256.New, psk)
+	m.Write(buf[:32])
+	copy(buf[32:], m.Sum(nil))
+
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if _, err := conn.Write(buf); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, hs2ServerLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+	m2 := hmac.New(sha256.New, psk)
+	m2.Write([]byte("pingify/v2 srv"))
+	m2.Write(buf[16:32])
+	m2.Write(resp[:16])
+	if !hmac.Equal(m2.Sum(nil), resp[16:]) {
+		return nil, errHandshake
+	}
+	conn.SetDeadline(time.Time{})
+
+	return deriveSessionV2(psk, buf[16:32], resp[:16], uint16(carrier), true), nil
+}
+
+func serverHandshakeV2(conn net.Conn, cfg *Config, g *replayGuard) (*sessionKeys, int, error) {
+	psk := cfg.key()
+	buf := make([]byte, hs2ClientLen)
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, 0, err
+	}
+	if string(buf[0:4]) != hs2Magic || buf[4] != hs2Version {
+		return nil, 0, errHandshake
+	}
+	if buf[5] == roleByte(cfg.Role) {
+		return nil, 0, errHandshake // both ends configured with the same role
+	}
+	ts := int64(binary.BigEndian.Uint64(buf[8:16]))
+	if d := time.Since(time.Unix(ts, 0)); d > hsSkew || d < -hsSkew {
+		return nil, 0, errHandshake
+	}
+	m := hmac.New(sha256.New, psk)
+	m.Write(buf[:32])
+	if !hmac.Equal(m.Sum(nil), buf[32:]) {
+		return nil, 0, errHandshake
+	}
+	var nc [16]byte
+	copy(nc[:], buf[16:32])
+	if !g.accept(nc) {
+		return nil, 0, errHandshake
+	}
+
+	resp := make([]byte, hs2ServerLen)
+	if _, err := rand.Read(resp[:16]); err != nil {
+		return nil, 0, err
+	}
+	m2 := hmac.New(sha256.New, psk)
+	m2.Write([]byte("pingify/v2 srv"))
+	m2.Write(buf[16:32])
+	m2.Write(resp[:16])
+	copy(resp[16:], m2.Sum(nil))
+	if _, err := conn.Write(resp); err != nil {
+		return nil, 0, err
+	}
+	conn.SetDeadline(time.Time{})
+
+	carrier := int(binary.BigEndian.Uint16(buf[6:8]))
+	return deriveSessionV2(psk, buf[16:32], resp[:16], uint16(carrier), false), carrier, nil
+}
+PINGIFY_SRC_EOF
+    cat > "$d/icmp.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// the echo transport
+//
+// Carries the same braid stream inside ICMP echo packets, for a path where
+// TCP is simply not allowed out. It is the fallback, not the fast option:
+// every datagram is about 1.4 KB and has to be acknowledged, so expect a
+// fraction of what braid does over TCP.
+//
+// Data travels in Echo *Reply* packets (type 0) in both directions rather
+// than requests. Two reasons: the kernel answers an echo request by itself,
+// which would double every packet we send, and a reply needs no matching
+// request to exist on our side. Raw sockets receive both regardless.
+//
+//	ICMP data = [4] tag  [24] arq datagram ...
+//
+// The tag is the first four bytes of HMAC(psk, header), which is what lets
+// the listener tell our traffic apart from the ordinary pings a public server
+// receives all day, before it spends anything on them.
+// ---------------------------------------------------------------------------
+
+const (
+	icmpEchoReply   = 0
+	icmpEchoRequest = 8
+	icmpTagLen      = 4
+	icmpHdrLen      = 8
+	icmpMaxPayload  = 1200 // conservative: fits inside a 1400-byte path MTU
+)
+
+var errICMPClosed = errors.New("icmp: transport closed")
+
+// icmpChecksum is the standard one's-complement sum from RFC 1071.
+func icmpChecksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(b[i])<<8 | uint32(b[i+1])
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func buildEcho(typ byte, id, seq uint16, payload []byte) []byte {
+	b := make([]byte, icmpHdrLen+len(payload))
+	b[0] = typ
+	b[1] = 0
+	binary.BigEndian.PutUint16(b[4:6], id)
+	binary.BigEndian.PutUint16(b[6:8], seq)
+	copy(b[icmpHdrLen:], payload)
+	binary.BigEndian.PutUint16(b[2:4], icmpChecksum(b))
+	return b
+}
+
+// stripIP removes an IPv4 header if the kernel handed us one. Raw sockets do
+// this inconsistently across platforms, so look rather than assume.
+func stripIP(b []byte) []byte {
+	if len(b) >= 20 && b[0]>>4 == 4 {
+		ihl := int(b[0]&0x0f) * 4
+		if ihl >= 20 && ihl <= len(b) {
+			return b[ihl:]
+		}
+	}
+	return b
+}
+
+type sessionKey struct {
+	peer    string
+	session uint32
+	carrier uint8
+}
+
+// icmpTransport owns the one raw socket and fans packets out to the ARQ
+// connection they belong to.
+type icmpTransport struct {
+	pc  net.PacketConn
+	psk []byte
+
+	mu       sync.Mutex
+	sessions map[sessionKey]*arqConn
+	inbound  chan net.Conn
+	closed   bool
+	done     chan struct{}
+}
+
+func newICMPTransport(psk []byte) (*icmpTransport, error) {
+	pc, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		return nil, fmt.Errorf("raw ICMP socket: %v (needs CAP_NET_RAW; are you root?)", err)
+	}
+	t := &icmpTransport{
+		pc:       pc,
+		psk:      psk,
+		sessions: make(map[sessionKey]*arqConn),
+		inbound:  make(chan net.Conn, 16),
+		done:     make(chan struct{}),
+	}
+	go t.readLoop()
+	return t, nil
+}
+
+func (t *icmpTransport) tag(hdr []byte) []byte {
+	m := hmac.New(sha256.New, t.psk)
+	m.Write([]byte("pingify/v3 icmp tag"))
+	m.Write(hdr)
+	return m.Sum(nil)[:icmpTagLen]
+}
+
+// sender returns the function one ARQ connection uses to put a datagram on
+// the wire, addressed to its peer.
+func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
+	var seq uint32
+	return func(datagram []byte) error {
+		body := make([]byte, icmpTagLen+len(datagram))
+		copy(body[:icmpTagLen], t.tag(datagram[:min(len(datagram), arqOver)]))
+		copy(body[icmpTagLen:], datagram)
+		s := uint16(atomic.AddUint32(&seq, 1))
+		_, err := t.pc.WriteTo(buildEcho(icmpEchoReply, id, s, body), peer)
+		return err
+	}
+}
+
+func (t *icmpTransport) readLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, addr, err := t.pc.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-t.done:
+				return
+			default:
+			}
+			logDebug("icmp read: %v", err)
+			continue
+		}
+		msg := stripIP(buf[:n])
+		if len(msg) < icmpHdrLen+icmpTagLen+arqOver {
+			continue
+		}
+		if msg[0] != icmpEchoReply && msg[0] != icmpEchoRequest {
+			continue
+		}
+		body := msg[icmpHdrLen:]
+		datagram := body[icmpTagLen:]
+
+		// Reject the ordinary pings a public address collects before doing
+		// any real work on them.
+		if !hmac.Equal(body[:icmpTagLen], t.tag(datagram[:min(len(datagram), arqOver)])) {
+			continue
+		}
+
+		ip, _ := addr.(*net.IPAddr)
+		if ip == nil {
+			continue
+		}
+		t.dispatch(ip, binary.BigEndian.Uint16(msg[4:6]), append([]byte(nil), datagram...))
+	}
+}
+
+// dispatch hands the datagram to its connection, creating one if this is a
+// session the listening side has not seen before.
+func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
+	// The header is masked with a key both ends derive from the PSK, so the
+	// session and carrier can be read out before any connection exists.
+	hdr := make([]byte, arqHdr)
+	copy(hdr, datagram[arqNonce:arqOver])
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), t.psk), []byte("arq header"), 32)
+	maskHeader(blockFrom(k), datagram[:arqNonce], hdr)
+	var h arqHeader
+	h.get(hdr)
+
+	key := sessionKey{peer: peer.String(), session: h.session, carrier: h.carrier}
+
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	conn, known := t.sessions[key]
+	if !known {
+		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.sender(peer, id))
+		conn.remote = peer
+		t.sessions[key] = conn
+		t.mu.Unlock()
+		select {
+		case t.inbound <- conn:
+		case <-t.done:
+			return
+		}
+	} else {
+		t.mu.Unlock()
+	}
+	conn.onDatagram(datagram)
+}
+
+// Dial opens one carrier towards the peer.
+func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
+	ip, err := net.ResolveIPAddr("ip4", peer)
+	if err != nil {
+		return nil, err
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	session := binary.BigEndian.Uint32(b[:])
+	id := uint16(session)
+
+	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.sender(ip, id))
+	conn.remote = ip
+
+	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil, errICMPClosed
+	}
+	t.sessions[key] = conn
+	t.mu.Unlock()
+
+	// Nudge the peer so it creates its side before the handshake starts.
+	conn.mu.Lock()
+	conn.ackOnly()
+	conn.mu.Unlock()
+	return conn, nil
+}
+
+func (t *icmpTransport) Accept() (net.Conn, error) {
+	select {
+	case c := <-t.inbound:
+		return c, nil
+	case <-t.done:
+		return nil, errICMPClosed
+	}
+}
+
+func (t *icmpTransport) Close() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	close(t.done)
+	conns := make([]*arqConn, 0, len(t.sessions))
+	for _, c := range t.sessions {
+		conns = append(conns, c)
+	}
+	t.sessions = make(map[sessionKey]*arqConn)
+	t.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+	return t.pc.Close()
+}
+
+// reap drops sessions whose connection has failed, so a long-lived listener
+// does not accumulate them.
+func (t *icmpTransport) reap() {
+	tick := time.NewTicker(30 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tick.C:
+			t.mu.Lock()
+			for k, c := range t.sessions {
+				c.mu.Lock()
+				dead := c.err != nil || c.closed
+				c.mu.Unlock()
+				if dead {
+					delete(t.sessions, k)
+				}
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+PINGIFY_SRC_EOF
     cat > "$d/pingify.go" <<'PINGIFY_SRC_EOF'
 // Pingify engine - one encrypted tunnel between an Iran server and a server
 // abroad, carried over several parallel TCP connections.
@@ -1873,7 +3932,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.8.0"
+const version = "3.9.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -1881,8 +3940,9 @@ type Config struct {
 	Name string `json:"name"`
 
 	// Role decides who owns the user-facing ports.
-	//   edge   — users connect here (normally the Iran server)
-	//   origin — the real services live here (normally the Kharej server)
+	//   server — users connect here; normally the Iran box
+	//   client — the real services live here; normally the Kharej box
+	// "edge" and "origin" are accepted as the old names for these.
 	Role string `json:"role"`
 
 	// Mode selects what rides on top of the carrier pool.
@@ -1890,9 +3950,11 @@ type Config struct {
 	//   tun     — full layer-3 IP tunnel
 	Mode string `json:"mode"`
 
-	// Transport is how the carriers themselves travel. Only "direct" exists
-	// today: the core's own encrypted stream with nothing wrapped around it.
-	// TLS and WebSocket variants slot in here without touching a line above.
+	// Transport is how the carriers themselves travel.
+	//   braid — several parallel TCP connections braided into one encrypted
+	//           stream; what "direct" and "tcp" used to be called
+	// TLS, WebSocket and ICMP variants slot in here without touching a line
+	// above.
 	Transport string `json:"transport,omitempty"`
 
 	// Exactly one of Listen/Connect is set. It is independent of Role, so the
@@ -1900,13 +3962,22 @@ type Config struct {
 	Listen  string `json:"listen,omitempty"`
 	Connect string `json:"connect,omitempty"`
 
-	PSK      string `json:"psk"`
+	// Token is what both servers are given; it may be any text. The 32-byte
+	// key is derived from it, so a memorable token is still a strong key.
+	// PSK is the older form: 32 bytes of hex, used directly.
+	Token    string `json:"token,omitempty"`
 	Carriers int    `json:"carriers"`
 	WindowKB int    `json:"window_kb"`
 
 	// forward mode: "443", "443=8443", "443=10.0.0.5:8443", "udp:500=500",
 	// "8000-8010" (range, same port on the far side).
 	Forwards []string `json:"forwards,omitempty"`
+
+	// BindAddr is the address the forwarded ports listen on. Empty means every
+	// interface, which is what an Iran server wants: clients arrive from
+	// outside. Setting it to 127.0.0.1 keeps the ports off the network, which
+	// is what the tests want and what a host firewall stops asking about.
+	BindAddr string `json:"bind_addr,omitempty"`
 	// origin side: if non-empty, only these host:port targets may be dialled.
 	Allow []string `json:"allow,omitempty"`
 
@@ -1914,10 +3985,11 @@ type Config struct {
 
 	StatusAddr   string `json:"status_addr,omitempty"`
 	KeepaliveSec int    `json:"keepalive_sec,omitempty"`
-	DialTimeout  int    `json:"dial_timeout_sec,omitempty"`
-	SndBufKB     int    `json:"sndbuf_kb,omitempty"`
-	RcvBufKB     int    `json:"rcvbuf_kb,omitempty"`
-	LogLevel     string `json:"log_level,omitempty"`
+
+	DialTimeout int    `json:"dial_timeout_sec,omitempty"`
+	SndBufKB    int    `json:"sndbuf_kb,omitempty"`
+	RcvBufKB    int    `json:"rcvbuf_kb,omitempty"`
+	LogLevel    string `json:"log_level,omitempty"`
 }
 
 type TUNConfig struct {
@@ -1928,11 +4000,20 @@ type TUNConfig struct {
 }
 
 func (c *Config) applyDefaults() {
+	switch c.Role {
+	case "edge":
+		c.Role = "server"
+	case "origin":
+		c.Role = "client"
+	}
 	if c.Mode == "" {
 		c.Mode = "forward"
 	}
-	if c.Transport == "" || c.Transport == "tcp" {
-		c.Transport = "direct"
+	switch c.Transport {
+	case "", "braid", "direct":
+		c.Transport = "tcp"
+	case "echo":
+		c.Transport = "icmp"
 	}
 	if c.Carriers <= 0 {
 		c.Carriers = 4
@@ -1977,31 +4058,30 @@ func (c *Config) applyDefaults() {
 
 func (c *Config) validate() error {
 	switch c.Role {
-	case "edge", "origin":
+	case "server", "client":
 	default:
-		return fmt.Errorf("role must be \"edge\" or \"origin\", got %q", c.Role)
+		return fmt.Errorf("role must be \"server\" or \"client\", got %q", c.Role)
 	}
 	switch c.Mode {
-	case "forward", "tun":
+	case "forward", "tun", "both":
 	default:
-		return fmt.Errorf("mode must be \"forward\" or \"tun\", got %q", c.Mode)
+		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "direct":
+	case "tcp", "icmp":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
 	if (c.Listen == "") == (c.Connect == "") {
 		return fmt.Errorf("set exactly one of \"listen\" or \"connect\"")
 	}
-	key, err := hex.DecodeString(strings.TrimSpace(c.PSK))
-	if err != nil || len(key) < 16 {
-		return fmt.Errorf("psk must be a hex string of at least 16 bytes (use -genpsk)")
+	if strings.TrimSpace(c.Token) == "" {
+		return fmt.Errorf("a security token is required, and must be the same on both servers")
 	}
-	if c.Mode == "forward" && c.Role == "edge" && len(c.Forwards) == 0 {
+	if c.Mode != "tun" && c.Role == "server" && len(c.Forwards) == 0 {
 		return fmt.Errorf("edge side in forward mode needs at least one entry in \"forwards\"")
 	}
-	if c.Mode == "tun" && c.Local() == "" {
+	if (c.Mode == "tun" || c.Mode == "both") && c.Local() == "" {
 		return fmt.Errorf("tun mode needs tun.local (e.g. 10.71.0.1/30)")
 	}
 	return nil
@@ -2009,20 +4089,38 @@ func (c *Config) validate() error {
 
 func (c *Config) Local() string { return c.TUN.Local }
 
+// key is the 32 bytes everything else is derived from. A token of any length
+// is stretched to it; a legacy hex psk is used as-is.
+// tokenPrint is a short public name for the shared secret: the same token
+// gives the same eight characters on both servers, and a different token
+// gives different ones. It is safe to print, paste into a chat, and compare
+// by eye - which is the only way to tell "the tokens differ" apart from
+// "the network ate it" when a tunnel will not come up.
+func (c *Config) tokenPrint() string {
+	secret := strings.TrimSpace(c.Token)
+	if secret == "" {
+		return "none"
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:4])
+}
+
+// key turns the token typed on both servers into the 32 bytes everything
+// else is derived from. One secret, one way in.
 func (c *Config) key() []byte {
-	k, _ := hex.DecodeString(strings.TrimSpace(c.PSK))
-	return k
+	return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
+		[]byte(strings.TrimSpace(c.Token))), []byte("tunnel key"), 32)
 }
 
 func main() {
 	var (
 		cfgPath = flag.String("c", "", "path to tunnel config JSON")
-		genPSK  = flag.Bool("genpsk", false, "print a fresh 32-byte pre-shared key and exit")
 		showVer = flag.Bool("version", false, "print version and exit")
 		check   = flag.Bool("check", false, "validate the config and exit")
 		status  = flag.String("status", "", "print the status of a running tunnel (host:port) and exit")
 		healthz = flag.String("healthz", "", "probe a running tunnel (host:port); exit 0 only when a carrier is up")
 		brief   = flag.Bool("brief", false, "with -status, print one machine-readable line")
+		probe   = flag.Bool("probe", false, "with -c, try every forwarded port end to end and exit")
 	)
 	flag.Parse()
 
@@ -2040,28 +4138,14 @@ func main() {
 		fmt.Println("pingify-core " + version)
 		return
 	}
-	if *genPSK {
-		b := make([]byte, 32)
-		if _, err := rand.Read(b); err != nil {
-			fmt.Fprintln(os.Stderr, "rand:", err)
-			os.Exit(1)
-		}
-		fmt.Println(hex.EncodeToString(b))
-		return
-	}
 	if *cfgPath == "" {
 		fmt.Fprintln(os.Stderr, "usage: pingify-core -c /etc/pingify/<name>.json")
 		os.Exit(2)
 	}
 
-	raw, err := os.ReadFile(*cfgPath)
+	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read config:", err)
-		os.Exit(1)
-	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "parse config:", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 	cfg.applyDefaults()
@@ -2069,16 +4153,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
 	}
+	if *probe {
+		os.Exit(runProbe(cfg))
+	}
 	if *check {
 		fmt.Println("config OK")
 		return
 	}
 
 	setLogLevel(cfg.LogLevel)
-	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
-		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
+	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d keepalive=%ds token=%s",
+		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
+		cfg.KeepaliveSec, cfg.tokenPrint())
 
-	p := newPool(&cfg)
+	p := newPool(cfg)
 	if err := p.start(); err != nil {
 		logError("start: %v", err)
 		os.Exit(1)
@@ -2087,7 +4175,7 @@ func main() {
 	var top interface{ Close() error }
 	switch cfg.Mode {
 	case "forward":
-		f, err := startForward(&cfg, p)
+		f, err := startForward(cfg, p)
 		if err != nil {
 			logError("forward: %v", err)
 			p.close()
@@ -2095,17 +4183,34 @@ func main() {
 		}
 		top = f
 	case "tun":
-		t, err := startTUN(&cfg, p)
+		t, err := startTUN(cfg, p)
 		if err != nil {
 			logError("tun: %v", err)
 			p.close()
 			os.Exit(1)
 		}
 		top = t
+	case "both":
+		f, err := startForward(cfg, p)
+		if err != nil {
+			logError("forward: %v", err)
+			p.close()
+			os.Exit(1)
+		}
+		t, err := startTUN(cfg, p)
+		if err != nil {
+			logError("tun: %v", err)
+			f.Close()
+			p.close()
+			os.Exit(1)
+		}
+		b := &bothHandler{f: f, t: t}
+		p.setHandler(b) // startTUN replaced it; put the pair back
+		top = b
 	}
 
 	if cfg.StatusAddr != "" {
-		startStatusServer(cfg.StatusAddr, &cfg, p)
+		startStatusServer(cfg.StatusAddr, cfg, p)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -2122,40 +4227,90 @@ func main() {
 // 2. logging
 // ==========================================================================
 
+// Five levels, not seven. panic and fatal say how a program died rather than
+// how bad the news is, and both come out of this one as an error followed by
+// the process ending - so they would only ever have been two more words for
+// the same line. trace is worth its own level: it is the one that prints per
+// packet, and mixing that into debug makes debug unusable.
+//
+//	error   something is broken and stays broken
+//	warn    something is wrong but the tunnel carried on
+//	info    the things worth knowing on a healthy tunnel
+//	debug   why a carrier or a stream did what it did
+//	trace   every packet - loud enough to slow a busy tunnel down
 const (
 	lvlError = 0
 	lvlWarn  = 1
 	lvlInfo  = 2
 	lvlDebug = 3
+	lvlTrace = 4
 )
 
 var logLevel int32 = lvlInfo
 
+// logNames maps a level to what it is called, both ways round, so the manager
+// and the core cannot drift on the spelling.
+var logNames = []string{"error", "warn", "info", "debug", "trace"}
+
 func setLogLevel(s string) {
-	switch s {
-	case "error":
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "error", "err", "fatal", "panic":
 		atomic.StoreInt32(&logLevel, lvlError)
-	case "warn":
+	case "warn", "warning":
 		atomic.StoreInt32(&logLevel, lvlWarn)
 	case "debug":
 		atomic.StoreInt32(&logLevel, lvlDebug)
+	case "trace":
+		atomic.StoreInt32(&logLevel, lvlTrace)
 	default:
 		atomic.StoreInt32(&logLevel, lvlInfo)
 	}
 }
 
-func logAt(lvl int32, tag, format string, args ...interface{}) {
+// logSink is where a formatted line goes. Only the tests replace it, so they
+// can assert on what an operator would actually have seen.
+var logSink = func(line string) { fmt.Fprintln(os.Stderr, line) }
+
+// Colour is decided once. journalctl keeps the escapes and renders them; a
+// file or a pipe gets none, so a log that is grepped later stays clean.
+var logColour = func() bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}()
+
+// Red for what is broken, yellow for what is merely wrong, and everything a
+// healthy tunnel says in the colour of the terminal it is read in.
+var logTags = [5]struct{ plain, coloured string }{
+	{"ERROR", "\033[31mERROR\033[0m"},
+	{"WARN ", "\033[33mWARN \033[0m"},
+	{"INFO ", "\033[36mINFO \033[0m"},
+	{"DEBUG", "\033[90mDEBUG\033[0m"},
+	{"TRACE", "\033[90mTRACE\033[0m"},
+}
+
+func logAt(lvl int32, format string, args ...interface{}) {
 	if atomic.LoadInt32(&logLevel) < lvl {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s %s %s\n",
-		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...))
+	tag := logTags[lvl].plain
+	if logColour {
+		tag = logTags[lvl].coloured
+	}
+	logSink(fmt.Sprintf("%s %s %s",
+		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...)))
 }
 
-func logError(f string, a ...interface{}) { logAt(lvlError, "ERR ", f, a...) }
-func logWarn(f string, a ...interface{})  { logAt(lvlWarn, "WARN", f, a...) }
-func logInfo(f string, a ...interface{})  { logAt(lvlInfo, "INFO", f, a...) }
-func logDebug(f string, a ...interface{}) { logAt(lvlDebug, "DBG ", f, a...) }
+func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }
+func logWarn(f string, a ...interface{})  { logAt(lvlWarn, f, a...) }
+func logInfo(f string, a ...interface{})  { logAt(lvlInfo, f, a...) }
+func logDebug(f string, a ...interface{}) { logAt(lvlDebug, f, a...) }
+func logTrace(f string, a ...interface{}) { logAt(lvlTrace, f, a...) }
 
 // ==========================================================================
 // 3. key derivation
@@ -2280,7 +4435,7 @@ const (
 var errHandshake = errors.New("handshake rejected")
 
 func roleByte(role string) byte {
-	if role == "edge" {
+	if role == "server" {
 		return 0
 	}
 	return 1
@@ -2509,6 +4664,7 @@ type pool struct {
 	h     recordHandler
 
 	ln        net.Listener
+	icmp      *icmpTransport
 	guard     *replayGuard
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -2534,6 +4690,26 @@ func (p *pool) handler() recordHandler {
 }
 
 func (p *pool) start() error {
+	// The echo transport owns a single raw socket for every carrier, so it is
+	// set up once here rather than per connection.
+	if p.cfg.Transport == "icmp" {
+		t, err := newICMPTransport(p.cfg.key())
+		if err != nil {
+			return err
+		}
+		p.icmp = t
+		go t.reap()
+		if p.cfg.Connect != "" {
+			for i := 0; i < p.cfg.Carriers; i++ {
+				go p.dialLoop(i)
+			}
+			logInfo("opening %d echo carriers to %s", p.cfg.Carriers, p.cfg.Connect)
+		} else {
+			go p.acceptEcho()
+			logInfo("waiting for echo carriers")
+		}
+		return nil
+	}
 	if p.cfg.Connect != "" {
 		for i := 0; i < p.cfg.Carriers; i++ {
 			go p.dialLoop(i)
@@ -2549,6 +4725,28 @@ func (p *pool) start() error {
 	go p.acceptLoop(ln)
 	logInfo("waiting for carriers on %s", p.cfg.Listen)
 	return nil
+}
+
+func (p *pool) acceptEcho() {
+	for {
+		c, err := p.icmp.Accept()
+		if err != nil {
+			return
+		}
+		go p.serveInbound(c)
+	}
+}
+
+// dialCarrier opens one carrier with whichever transport is configured.
+func (p *pool) dialCarrier(idx int) (net.Conn, error) {
+	if p.icmp != nil {
+		host := p.cfg.Connect
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		return p.icmp.Dial(host, idx)
+	}
+	return net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
 }
 
 func (p *pool) acceptLoop(ln net.Listener) {
@@ -2582,6 +4780,13 @@ func (p *pool) serveInbound(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	if idx >= p.cfg.Carriers {
+		// Not fatal - the pool holds it either way - but it means the two
+		// configs were written with different tuning, and every setting that
+		// has to match is now suspect.
+		logWarn("carrier %d arrived but this side is configured for %d: the two ends disagree on [transport] carriers",
+			idx, p.cfg.Carriers)
+	}
 	l := newLink(idx, p.cfg, conn, keys, p)
 	p.install(idx, l)
 	logInfo("carrier %d up from %s", idx, conn.RemoteAddr())
@@ -2596,7 +4801,7 @@ func (p *pool) dialLoop(idx int) {
 			return
 		default:
 		}
-		conn, err := net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
+		conn, err := p.dialCarrier(idx)
 		if err != nil {
 			logWarn("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
 			p.sleepBackoff(&backoff)
@@ -2708,6 +4913,9 @@ func (p *pool) close() {
 		close(p.closed)
 		if p.ln != nil {
 			p.ln.Close()
+		}
+		if p.icmp != nil {
+			p.icmp.Close()
 		}
 		p.mu.Lock()
 		links := p.links
@@ -3092,8 +5300,16 @@ type link struct {
 	streams map[uint32]*stream
 	nextID  uint32
 
-	txBytes uint64
+	downWhy string // why the carrier died; read once, when it is logged
+
+	txBytes uint64 // payload carried for streams, tun and UDP
 	rxBytes uint64
+	// Bytes actually written to and read from the socket, keepalives and all.
+	// txBytes only counts payload, so an idle tunnel reports zero either way
+	// and cannot answer the one question that matters when nothing works:
+	// did our bytes leave this machine, and did any of theirs arrive?
+	wireTx  uint64
+	wireRx  uint64
 	lastRx  int64 // unix nano
 	rttUS   int64
 	upSince int64
@@ -3109,7 +5325,7 @@ func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link
 	}
 	// Odd ids from the edge, even from the origin. Ids are per-carrier, so this
 	// is only belt and braces against a future origin-initiated stream.
-	if cfg.Role == "edge" {
+	if cfg.Role == "server" {
 		l.nextID = 1
 	} else {
 		l.nextID = 2
@@ -3133,6 +5349,18 @@ func (l *link) alive() bool {
 	default:
 		return true
 	}
+}
+
+// died records why this carrier is going away and then closes it. The first
+// reason wins: the read loop, the write loop and the keepalive all race to
+// close a dying carrier, and the first one to notice knows the most.
+func (l *link) died(format string, a ...interface{}) {
+	l.mu.Lock()
+	if l.downWhy == "" {
+		l.downWhy = fmt.Sprintf(format, a...)
+	}
+	l.mu.Unlock()
+	l.close()
 }
 
 func (l *link) send(r *recBuf) bool {
@@ -3198,11 +5426,32 @@ func (l *link) writeLoop() {
 		maskLen(l.keys.maskTx, ctr, out[:4])
 		l.conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 		if _, err := l.conn.Write(out); err != nil {
-			logDebug("carrier %d write: %v", l.idx, err)
+			l.died("write: %v", err)
 			return
 		}
+		atomic.AddUint64(&l.wireTx, uint64(len(out)))
+		logTrace("carrier %d tx frame %d: %d bytes on the wire, %d of records",
+			l.idx, ctr, len(out), len(frame))
 		out = out[:0]
 	}
+}
+
+// readReason turns a socket error into something worth reading at 4am. A
+// timeout means nothing arrived and the peer may be fine; a reset means
+// something actively tore the connection down, which on this path is usually
+// not the peer.
+func readReason(err error, idle time.Duration) string {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return fmt.Sprintf("nothing received for %s - the peer stopped sending, or the path dropped it", idle)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "peer closed the connection"
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return "connection reset - something on the path killed it, not the peer"
+	}
+	return "read: " + err.Error()
 }
 
 func (l *link) readLoop() {
@@ -3214,13 +5463,13 @@ func (l *link) readLoop() {
 	for {
 		l.conn.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
-			logDebug("carrier %d read: %v", l.idx, err)
+			l.died("%s%s", readReason(err, idle), l.rxSummary())
 			return
 		}
 		maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
 		n := int(binary.BigEndian.Uint32(hdr[:]))
 		if n < 16 || n > maxFrame {
-			logWarn("carrier %d: bad frame length %d", l.idx, n)
+			l.died("bad frame length %d - the two ends disagree or something rewrote the stream", n)
 			return
 		}
 		if cap(ct) < n {
@@ -3228,19 +5477,22 @@ func (l *link) readLoop() {
 		}
 		ct = ct[:n]
 		if _, err := io.ReadFull(l.conn, ct); err != nil {
+			l.died("%s%s", readReason(err, idle), l.rxSummary())
 			return
 		}
+		atomic.AddUint64(&l.wireRx, uint64(len(hdr)+n))
+		logTrace("carrier %d rx frame %d: %d bytes on the wire", l.idx, l.rxCtr, len(hdr)+n)
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
 		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
 		if err != nil {
-			logWarn("carrier %d: authentication failed", l.idx)
+			l.died("authentication failed - the token does not match, or a middlebox altered the stream")
 			return
 		}
 		plain = p[:0]
 		atomic.StoreInt64(&l.lastRx, time.Now().UnixNano())
 		if err := l.dispatch(p); err != nil {
-			logWarn("carrier %d: %v", l.idx, err)
+			l.died("%v", err)
 			return
 		}
 	}
@@ -3276,17 +5528,23 @@ func (l *link) dispatch(p []byte) error {
 				s.rb.closeEOF()
 			}
 		case cmdRST:
+			if n > 0 {
+				// Sent by the far side, which is the only end that knows why.
+				logWarn("the other server refused a connection: %s", string(body))
+			}
 			if s := l.getStream(id); s != nil {
 				s.reset()
 			}
 		case cmdPad:
-			// deliberately ignored
+			logTrace("carrier %d rx pad %d bytes", l.idx, n)
 		case cmdPing:
+			logTrace("carrier %d rx ping, answering", l.idx)
 			// Never block the read loop: if the send queue is momentarily
 			// full, drop the pong rather than risk both ends stalling on
 			// each other's socket buffers.
 			l.trySend(ctrlRec(cmdPong, 0, body))
 		case cmdPong:
+			logTrace("carrier %d rx pong", l.idx)
 			if n == 8 {
 				sent := int64(binary.BigEndian.Uint64(body))
 				atomic.StoreInt64(&l.rttUS, (time.Now().UnixNano()-sent)/1000)
@@ -3302,6 +5560,18 @@ func (l *link) dispatch(p []byte) error {
 	return nil
 }
 
+// rxSummary says whether this carrier ever heard anything and how long ago,
+// which is the difference between "the peer went away" and "the peer was never
+// able to reach us at all".
+func (l *link) rxSummary() string {
+	n := atomic.LoadUint64(&l.wireRx)
+	if n == 0 {
+		return " (nothing was EVER received on this carrier)"
+	}
+	last := time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Second)
+	return fmt.Sprintf(" (received %s in all, last %s ago)", humanBytes(n), last)
+}
+
 func (l *link) keepaliveLoop() {
 	t := time.NewTicker(time.Duration(l.cfg.KeepaliveSec) * time.Second)
 	defer t.Stop()
@@ -3310,12 +5580,14 @@ func (l *link) keepaliveLoop() {
 		select {
 		case <-t.C:
 			if time.Now().UnixNano()-atomic.LoadInt64(&l.lastRx) > idle {
-				logWarn("carrier %d: silent for %ds, recycling", l.idx, l.cfg.KeepaliveSec*3)
-				l.close()
+				l.died("silent for %ds - nothing came back from the peer%s",
+					l.cfg.KeepaliveSec*3, l.rxSummary())
 				return
 			}
 			var b [8]byte
 			binary.BigEndian.PutUint64(b[:], uint64(time.Now().UnixNano()))
+			logTrace("carrier %d tx ping (last heard %s ago)", l.idx,
+				time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Millisecond))
 			l.send(ctrlRec(cmdPing, 0, b[:]))
 		case <-l.closed:
 			return
@@ -3333,6 +5605,7 @@ func (l *link) close() {
 			streams = append(streams, s)
 		}
 		l.streams = make(map[uint32]*stream)
+		why := l.downWhy
 		l.mu.Unlock()
 		for _, s := range streams {
 			s.reset()
@@ -3342,7 +5615,11 @@ func (l *link) close() {
 				h.onLinkDown(l)
 			}
 		}
-		logInfo("carrier %d down", l.idx)
+		if why == "" {
+			why = "closed locally"
+		}
+		logInfo("carrier %d down: %s (up %s)", l.idx, why,
+			time.Since(time.Unix(0, atomic.LoadInt64(&l.upSince))).Round(time.Second))
 	})
 }
 
@@ -3514,7 +5791,7 @@ func startForward(cfg *Config, p *pool) (*forwarder, error) {
 	}
 	p.setHandler(f)
 
-	if cfg.Role == "edge" {
+	if cfg.Role == "server" {
 		for _, spec := range cfg.Forwards {
 			rules, err := parseForward(spec)
 			if err != nil {
@@ -3534,7 +5811,7 @@ func startForward(cfg *Config, p *pool) (*forwarder, error) {
 }
 
 func (f *forwarder) bind(r fwdRule) error {
-	addr := fmt.Sprintf(":%d", r.lport)
+	addr := net.JoinHostPort(f.cfg.BindAddr, strconv.Itoa(r.lport))
 	if r.proto == "udp" {
 		pc, err := net.ListenPacket("udp", addr)
 		if err != nil {
@@ -3689,9 +5966,12 @@ func (f *forwarder) targetAllowed(target string) bool {
 }
 
 func (f *forwarder) dialTCP(s *stream, target string) {
+	// The reason travels back with the reset. Without it the other server
+	// closes the user's connection with nothing to say, and "the tunnel does
+	// not work" is indistinguishable from "the service is not running here".
 	refuse := func(why string) {
 		logWarn("stream to %s: %s", target, why)
-		s.l.send(ctrlRec(cmdRST, s.id, nil))
+		s.l.send(ctrlRec(cmdRST, s.id, []byte(target+": "+why)))
 		s.reset()
 	}
 	if !f.targetAllowed(target) {
@@ -3897,8 +6177,20 @@ func configureTUN(c TUNConfig) error {
 		return err
 	}
 	if c.Local != "" {
-		if c.Peer != "" {
-			if err := run("addr", "add", c.Local, "peer", c.Peer, "dev", c.Name); err != nil {
+		// The "peer" form is right for a point-to-point /30 or /32. On a
+		// wider prefix both addresses live in the same subnet and a plain
+		// address is what gives the kernel the route it needs.
+		pfx := ""
+		if i := strings.LastIndex(c.Local, "/"); i >= 0 {
+			pfx = c.Local[i+1:]
+		}
+		ptp := c.Peer != "" && (pfx == "30" || pfx == "31" || pfx == "32")
+		if ptp {
+			peer := c.Peer
+			if i := strings.Index(peer, "/"); i >= 0 {
+				peer = peer[:i]
+			}
+			if err := run("addr", "add", c.Local, "peer", peer, "dev", c.Name); err != nil {
 				return err
 			}
 		} else if err := run("addr", "add", c.Local, "dev", c.Name); err != nil {
@@ -3947,6 +6239,34 @@ func (t *tunnel) onRecord(l *link, cmd byte, id uint32, body []byte) {
 }
 
 func (t *tunnel) onLinkDown(*link) {}
+
+// bothHandler runs a private layer-3 link and port forwarding over the same
+// carriers. Raw IP packets go to the tun device, everything else to the
+// forwarder, so one tunnel can give you a private network between the two
+// servers and forwarded ports at the same time.
+type bothHandler struct {
+	f *forwarder
+	t *tunnel
+}
+
+func (b *bothHandler) onRecord(l *link, cmd byte, id uint32, body []byte) {
+	if cmd == cmdTUN {
+		b.t.onRecord(l, cmd, id, body)
+		return
+	}
+	b.f.onRecord(l, cmd, id, body)
+}
+
+func (b *bothHandler) onLinkDown(l *link) {
+	b.f.onLinkDown(l)
+	b.t.onLinkDown(l)
+}
+
+func (b *bothHandler) Close() error {
+	b.f.Close()
+	b.t.Close()
+	return nil
+}
 
 func (t *tunnel) Close() error {
 	t.once.Do(func() {
@@ -4143,6 +6463,8 @@ type carrierStatus struct {
 	Streams int     `json:"streams"`
 	TxBytes uint64  `json:"tx_bytes"`
 	RxBytes uint64  `json:"rx_bytes"`
+	WireTx  uint64  `json:"wire_tx_bytes"`
+	WireRx  uint64  `json:"wire_rx_bytes"`
 	RTTms   float64 `json:"rtt_ms"`
 	UptimeS int64   `json:"uptime_s"`
 }
@@ -4160,6 +6482,8 @@ type statusDoc struct {
 	Streams   int             `json:"streams"`
 	TxBytes   uint64          `json:"tx_bytes"`
 	RxBytes   uint64          `json:"rx_bytes"`
+	WireTx    uint64          `json:"wire_tx_bytes"`
+	WireRx    uint64          `json:"wire_rx_bytes"`
 	RTTms     float64         `json:"rtt_ms"`
 	UptimeS   int64           `json:"uptime_s"`
 	Detail    []carrierStatus `json:"detail"`
@@ -4212,6 +6536,8 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 			Streams: l.streamCount(),
 			TxBytes: atomic.LoadUint64(&l.txBytes),
 			RxBytes: atomic.LoadUint64(&l.rxBytes),
+			WireTx:  atomic.LoadUint64(&l.wireTx),
+			WireRx:  atomic.LoadUint64(&l.wireRx),
 			RTTms:   float64(atomic.LoadInt64(&l.rttUS)) / 1000,
 			UptimeS: (now - atomic.LoadInt64(&l.upSince)) / int64(time.Second),
 		}
@@ -4224,6 +6550,8 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		}
 		d.TxBytes += cs.TxBytes
 		d.RxBytes += cs.RxBytes
+		d.WireTx += cs.WireTx
+		d.WireRx += cs.WireRx
 		d.Detail = append(d.Detail, cs)
 	}
 	d.Healthy = d.Up > 0
@@ -4309,27 +6637,214 @@ func printStatus(addr string, brief bool) int {
 	}
 	fmt.Printf("  tunnel     %s  (%s, %s, %s)\n", d.Name, d.Role, d.Mode, d.Transport)
 	fmt.Printf("  state      %s  -  %d of %d carriers\n", state, d.Up, d.Carriers)
+	if d.Up == 0 {
+		// The usual reason, by a wide margin, is that only one of the two
+		// servers has been set up so far. Saying so beats leaving DOWN on
+		// screen looking like a fault.
+		if d.Role == "server" {
+			fmt.Println("             nothing has connected yet - set the tunnel up on KHAREJ too")
+		} else {
+			fmt.Println("             cannot reach IRAN yet - check it is set up, and the port is open")
+		}
+	}
 	fmt.Printf("  peer       %s\n", d.Peer)
 	fmt.Printf("  rtt        %.1f ms\n", d.RTTms)
 	fmt.Printf("  streams    %d open\n", d.Streams)
-	fmt.Printf("  traffic    tx %s / rx %s\n", humanBytes(d.TxBytes), humanBytes(d.RxBytes))
+	fmt.Printf("  traffic    tx %s / rx %s   (payload)\n", humanBytes(d.TxBytes), humanBytes(d.RxBytes))
+	fmt.Printf("  on the wire tx %s / rx %s   (everything, keepalives included)\n",
+		humanBytes(d.WireTx), humanBytes(d.WireRx))
+	if d.WireTx > 0 && d.WireRx == 0 {
+		fmt.Printf("  %s\n", "NOTE: this server is sending and receiving nothing at all.")
+		fmt.Printf("  %s\n", "      Check the same two numbers on the other server. If it is also")
+		fmt.Printf("  %s\n", "      sending with nothing arriving, the bytes are leaving both")
+		fmt.Printf("  %s\n", "      machines and dying on the path between them.")
+	}
 	fmt.Printf("  uptime     %s\n", humanDuration(d.UptimeS))
 	if len(d.Detail) > 0 {
-		fmt.Printf("\n  %-4s %-6s %-8s %-9s %-12s %-12s\n", "#", "state", "streams", "rtt", "tx", "rx")
+		fmt.Printf("\n  %-4s %-6s %-8s %-9s %-12s %-12s %-12s %-12s\n",
+			"#", "state", "streams", "rtt", "tx", "rx", "wire tx", "wire rx")
 		for _, c := range d.Detail {
 			cs := "down"
 			if c.Up {
 				cs = "up"
 			}
-			fmt.Printf("  %-4d %-6s %-8d %-9s %-12s %-12s\n",
+			fmt.Printf("  %-4d %-6s %-8d %-9s %-12s %-12s %-12s %-12s\n",
 				c.Index, cs, c.Streams, fmt.Sprintf("%.1f ms", c.RTTms),
-				humanBytes(c.TxBytes), humanBytes(c.RxBytes))
+				humanBytes(c.TxBytes), humanBytes(c.RxBytes),
+				humanBytes(c.WireTx), humanBytes(c.WireRx))
 		}
 	}
 	if d.Healthy {
 		return 0
 	}
 	return 1
+}
+PINGIFY_SRC_EOF
+    cat > "$d/probe.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"time"
+)
+
+// runProbe answers the question a bare connection cannot.
+//
+// The near server accepts on a forwarded port before it has said a word to the
+// tunnel, so "it connected" proves only that something is listening here. What
+// separates a working path from a broken one is what happens next: if the far
+// server cannot reach the service it sends back a reset and the connection
+// dies within moments, and if it can, the connection simply stays open.
+func runProbe(cfg *Config) int {
+	if cfg.Role != "server" {
+		fmt.Println("Run this on the IRAN server: that is the end with the ports.")
+		return 2
+	}
+	var before *statusDoc
+	if cfg.StatusAddr != "" {
+		d, err := fetchStatus(cfg.StatusAddr)
+		if err != nil {
+			fmt.Printf("No carrier is up (%v). Nothing can cross the tunnel yet.\n", err)
+			return 1
+		}
+		before = d
+		fmt.Printf("%d of %d carriers up, %.0f ms to the other server.\n\n",
+			d.Up, d.Carriers, d.RTTms)
+	}
+
+	bad := 0
+	for _, spec := range cfg.Forwards {
+		rules, err := parseForward(spec)
+		if err != nil {
+			fmt.Printf("  %-30s cannot be read: %v\n", spec, err)
+			bad++
+			continue
+		}
+		for _, r := range rules {
+			if r.proto != "tcp" {
+				fmt.Printf("  udp :%-25d not testable this way\n", r.lport)
+				continue
+			}
+			if !probeOne(r) {
+				bad++
+			}
+		}
+	}
+	// A stream that is simply never answered looks identical to one the far
+	// side accepted and had nothing to say about - both leave the connection
+	// open. The only thing that tells them apart is whether the other server
+	// sent us anything at all while we were asking.
+	if before != nil {
+		after, err := fetchStatus(cfg.StatusAddr)
+		if err == nil {
+			// A carrier that dies mid-test resets every stream on it, and the
+			// near end cannot tell that apart from the far end refusing: both
+			// arrive as EOF. Saying "the other server could not reach it" when
+			// the carrier went out from under the test sends the reader to the
+			// wrong machine, which is exactly what happened.
+			if carrierRestarted(before, after) {
+				fmt.Println("\nA carrier restarted while this was running, so every stream on")
+				fmt.Println("it was reset. Any failure above may be that and not the service")
+				fmt.Println("on the other server - fix the carriers dropping first, then test")
+				fmt.Println("the ports again.")
+				return 1
+			}
+			sent := after.WireTx - before.WireTx
+			got := after.WireRx - before.WireRx
+			fmt.Printf("\nDuring this test we sent %s and the other server sent back %s.\n",
+				humanBytes(sent), humanBytes(got))
+			if got == 0 {
+				fmt.Println("\nNothing came back at all. The carriers are connected, so the")
+				fmt.Println("path carries a handshake, but nothing after it is getting through")
+				fmt.Println("in this direction. An \"open\" above means only that no refusal")
+				fmt.Println("arrived - which is also what a one-way path looks like.")
+				return 1
+			}
+		}
+	}
+
+	if bad > 0 {
+		fmt.Println("\nA port that failed is one the other server could not reach.")
+		fmt.Println("Check that the service is listening there on the address after")
+		fmt.Println("the arrow, and read that server's log for the reason.")
+		return 1
+	}
+	fmt.Println("\nEvery port reached the service on the other server.")
+	return 0
+}
+
+func probeOne(r fwdRule) bool {
+	label := fmt.Sprintf(":%d -> %s", r.lport, r.target)
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", r.lport), 5*time.Second)
+	if err != nil {
+		// These two look alike and mean opposite things. Refused is an empty
+		// port: the tunnel is not listening. A timeout on loopback is not -
+		// the kernel answers its own sockets instantly - so something between
+		// the dial and the socket swallowed it, and on this tool that is
+		// almost always a leftover DNAT rule from an iptables tunnel.
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			fmt.Printf("  %-30s no answer on loopback - something is intercepting this port\n", label)
+			fmt.Printf("  %-30s   check:  iptables -t nat -S\n", "")
+			return false
+		}
+		fmt.Printf("  %-30s nothing listening on this server: %v\n", label, err)
+		return false
+	}
+	defer c.Close()
+
+	// One harmless line, purely so the stream carries a byte and gives the far
+	// side a reason either to answer or to hang up.
+	c.SetDeadline(time.Now().Add(6 * time.Second))
+	if _, err := c.Write([]byte("\r\n")); err != nil {
+		fmt.Printf("  %-30s the other server refused it: %v\n", label, err)
+		return false
+	}
+
+	buf := make([]byte, 256)
+	n, err := c.Read(buf)
+	if n > 0 {
+		fmt.Printf("  %-30s open, and the service answered %d bytes\n", label, n)
+		return true
+	}
+	if err == nil {
+		fmt.Printf("  %-30s open\n", label)
+		return true
+	}
+
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		// Held open for six seconds without a word. Plenty of services say
+		// nothing until spoken to properly - the path is what was on trial.
+		fmt.Printf("  %-30s open, service silent (normal for xray and the like)\n", label)
+		return true
+	}
+	fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
+	return false
+}
+
+// carrierRestarted reports whether any carrier went away and came back while
+// the probe was running. A carrier's uptime only ever grows; a smaller number
+// than before means that index is a different connection now, and every stream
+// that was riding on the old one was reset when it closed.
+func carrierRestarted(before, after *statusDoc) bool {
+	if after.Up < before.Up {
+		return true
+	}
+	was := make(map[int]int64, len(before.Detail))
+	for _, c := range before.Detail {
+		if c.Up {
+			was[c.Index] = c.UptimeS
+		}
+	}
+	for _, c := range after.Detail {
+		if old, seen := was[c.Index]; seen && c.UptimeS < old {
+			return true
+		}
+	}
+	return false
 }
 PINGIFY_SRC_EOF
     cat > "$d/tun_linux.go" <<'PINGIFY_SRC_EOF'
@@ -4407,72 +6922,164 @@ PINGIFY_SRC_EOF
 # installation of the manager itself
 # ---------------------------------------------------------------------------
 
+release_script() { printf 'https://github.com/%s/releases/latest/download/Pingify.sh' "$PINGIFY_REPO"; }
+
 install_self() {
     local src="${BASH_SOURCE[0]}"
-    if [ -r "$src" ] && [ "$(readlink -f "$src" 2>/dev/null)" != "$(readlink -f "$SELF_BIN" 2>/dev/null)" ]; then
-        install -m 0755 "$src" "$SELF_BIN" 2>/dev/null || cp -f "$src" "$SELF_BIN"
-        chmod 0755 "$SELF_BIN"
+    if [ -f "$src" ] && [ -r "$src" ]; then
+        if [ "$(readlink -f "$src" 2>/dev/null)" != "$(readlink -f "$SELF_BIN" 2>/dev/null)" ]; then
+            install -m 0755 "$src" "$SELF_BIN" 2>/dev/null || cp -f "$src" "$SELF_BIN"
+            chmod 0755 "$SELF_BIN"
+        fi
+    else
+        # Started straight from a pipe - bash <(wget ...) - so there is no file
+        # on disk to copy. Pull the published script instead.
+        local tmp="/tmp/pingify.self"
+        if spin "installing the pingify command" \
+             fetch "$(release_script)" "$tmp" 120 \
+           && bash -n "$tmp" 2>/dev/null; then
+            install -m 0755 "$tmp" "$SELF_BIN"
+        else
+            warn "could not fetch the manager; the pingify command is not installed"
+        fi
+        rm -f "$tmp"
     fi
     ensure_deps
     write_units
-    ok "the ${C_B}pingify${C_OFF} command is installed"
+}
+
+# Earlier versions scattered files across /etc, /var/lib and /usr/local. Move
+# anything left behind into the single directory, once, without asking.
+migrate_layout() {
+    local moved=0 f
+    if [ -d /etc/pingify ]; then
+        for f in /etc/pingify/*.json; do
+            [ -e "$f" ] || continue
+            if [ ! -e "$CFG_DIR/$(basename "$f")" ]; then
+                install -m 600 "$f" "$CFG_DIR/$(basename "$f")" && moved=1
+            fi
+        done
+        rm -rf /etc/pingify
+    fi
+    if [ -x /usr/local/bin/pingify-core ] && [ ! -x "$CORE_BIN" ]; then
+        install -m 0755 /usr/local/bin/pingify-core "$CORE_BIN" && moved=1
+    fi
+    rm -f /usr/local/bin/pingify-core
+    rm -rf /var/lib/pingify /usr/local/src/pingify
+
+    # 3.2 and earlier wrote JSON; tunnel_names only looks for TOML now.
+    for f in "$CFG_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        json_to_toml "$f" && moved=1
+    done
+
+    if [ "$moved" = "1" ]; then
+        write_units
+        for f in $(tunnel_names); do systemctl restart "pingify@$f" >/dev/null 2>&1; done
+        info "moved the existing setup into $BASE_DIR"
+        sleep 1
+    fi
+}
+
+# Rewrites one 3.2-era JSON config as TOML and removes the original.
+json_to_toml() {
+    local j="$1" name out k v
+    name="$(basename "$j" .json)"
+    out="$(cfg_file "$name")"
+    [ -f "$out" ] && { rm -f "$j"; return 1; }
+    {
+        printf '# Pingify tunnel - converted from %s\n\n' "$(basename "$j")"
+        for k in name role mode transport listen connect token status_addr log_level; do
+            v="$(json_str "$j" "$k")"
+            [ -n "$v" ] && printf '%s = "%s"\n' "$k" "$v"
+        done
+        for k in carriers window_kb keepalive_sec; do
+            v="$(json_num "$j" "$k")"
+            [ -n "$v" ] && printf '%s = %s\n' "$k" "$v"
+        done
+        v="$(sed -n 's/.*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\].*/\1/p' "$j" | head -n1)"
+        [ -n "$v" ] && printf 'forwards = [%s]\n' "$v"
+        if grep -q '"tun"' "$j"; then
+            local tl; tl="$(grep -m1 '"tun"' "$j")"
+            printf '\n[tun]\n'
+            printf 'name  = "%s"\n' "$(printf '%s' "$tl" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf 'local = "%s"\n' "$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf 'peer  = "%s"\n' "$(printf '%s' "$tl" | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf 'mtu   = %s\n'   "$(printf '%s' "$tl" | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
+        fi
+    } > "$out"
+    chmod 600 "$out"
+    rm -f "$j"
+    return 0
 }
 
 usage() {
     cat <<USAGE
 Pingify $PINGIFY_VERSION - tunnel manager for Iran <-> Kharej server pairs
 
-  pingify                  open the menu
-  pingify --install        install the command and the systemd units
-  pingify --health-check   run the watchdog pass once (used by the timer)
-  pingify --status [name]  print tunnel status and exit
-  pingify --version        print the version
-  pingify --help           this text
+  pingify                    open the menu
+  pingify --install          install the command and the systemd units
+  pingify --health-check     run the watchdog pass once (used by the timer)
+  pingify --apply-firewall   re-apply the blocking rules (used at boot)
+  pingify --status [name]    print tunnel status and exit
+  pingify --version          print the version
+  pingify --help             this text
+
+Files: $BASE_DIR
 USAGE
 }
 
 # ---------------------------------------------------------------------------
-# the status panel above the menu
+# front page
 # ---------------------------------------------------------------------------
 
-status_panel() {
+info_panel() {
     local name addr up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(json_str "$CFG_DIR/$name.json" status_addr)"
+        addr="$(toml_get "$(cfg_file "$name")" status addr)"
         if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
             up=$((up + 1))
         fi
     done
 
-    local edot="$C_RED$BX_OFF$C_OFF" ever
-    ever="$(core_version)"
-    [ -x "$CORE_BIN" ] && edot="$C_GRN$BX_ON$C_OFF"
+    panel "SERVER"
+    field "IP" "$SRV_IP"
+    field "Location" "$SRV_LOC"
+    field "Datacenter" "$(printf '%.44s' "$SRV_ORG")"
+    panel_end
 
-    local tdot="$C_GRY$BX_OFF$C_OFF"
-    if [ "$total" != "0" ]; then
-        if [ "$up" = "$total" ]; then tdot="$C_GRN$BX_ON$C_OFF"
-        elif [ "$up" = "0" ]; then    tdot="$C_RED$BX_ON$C_OFF"
-        else                          tdot="$C_YEL$BX_ON$C_OFF"; fi
+    local core_txt tun_txt
+    if [ ! -x "$CORE_BIN" ]; then
+        core_txt="${C_RED}not installed${C_OFF}"
+    elif core_matches_script; then
+        core_txt="$(core_version)"
+    else
+        core_txt="${C_RED}$(core_version) - does not match the script${C_OFF}"
+    fi
+    if [ "$total" = "0" ]; then
+        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none configured"
+    elif [ "$up" = "$total" ]; then
+        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up of $total up"
+    elif [ "$up" = "0" ]; then
+        tun_txt="${C_RED}${BX_ON}${C_OFF} $up of $total up"
+    else
+        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up of $total up"
     fi
 
-    local wd wdot="$C_YEL$BX_OFF$C_OFF"
-    wd="$(watchdog_state)"
-    [ "$wd" = "on" ] && wdot="$C_GRN$BX_ON$C_OFF"
-
-    local cc; cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-
-    box_top
-    box_row "$edot $(pad_to "core ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
-    box_row "$wdot $(pad_to "watchdog ${C_B}${wd}${C_OFF}" 22)${C_GRY}${BX_DOT}${C_OFF} tcp ${C_B}${cc:-unknown}${C_OFF}"
-    box_bot
+    panel "STATUS"
+    field "Core ver" "$core_txt"
+    field "Script ver" "$PINGIFY_VERSION"
+    field "Tunnels" "$tun_txt"
+    field "Watchdog" "$(state_badge "$(watchdog_state)")"
+    panel_end
 }
 
 first_run() {
     [ -x "$CORE_BIN" ] && return 0
     banner
     head2 "First run"
-    dim "setting up the core for this server"
+    dim "installing the core into $BASE_DIR"
     say ""
     if install_core; then
         say ""
@@ -4481,7 +7088,7 @@ first_run() {
     else
         say ""
         fail "the core could not be installed"
-        dim "the Core menu has the other ways to get it"
+        dim "Update core has the other ways to get it"
         pause
     fi
 }
@@ -4489,16 +7096,19 @@ first_run() {
 main_menu() {
     while :; do
         banner
-        status_panel
-        say ""
-        item 1 "New Tunnel"        "create one, or apply a token"
-        item 2 "Tunnels"           "status, ports, logs, remove"
-        item 3 "Health"            "dashboard, watchdog, restarts"
-        item 4 "Optimize"          "BBR, buffers, limits, swap"
-        item 5 "Core"              "install, update, import, export"
-        item 6 "Remove"            "uninstall parts, or everything"
-        item 7 "Diagnostics"       "reach the peer, verify configs"
-        item 8 "Backup"            "save or restore your tunnels"
+        info_panel
+        group "TUNNELS"
+        item 1 "New tunnel"      "set this server up"
+        item 2 "Manage tunnels"  "status, ports, logs, remove"
+        item 3 "Health"          "live status, watchdog, health log"
+        group "NETWORK"
+        item 4 "Optimize"        "buffers, limits, swap, clock"
+        item 5 "Blocking"        "ICMP, speedtest, UDP 443"
+        item 6 "Diagnostics"     "connectivity and configs"
+        group "MAINTENANCE"
+        item 7 "Update Pingify"  "script and core together, to the same version"
+        item 8 "Core options"    "build here, import, export"
+        item 9 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
         say ""
@@ -4509,10 +7119,11 @@ main_menu() {
             2) manage_tunnels ;;
             3) health_menu ;;
             4) optimize_menu ;;
-            5) update_menu ;;
-            6) remove_menu ;;
-            7) diagnostics_menu ;;
-            8) backup_menu ;;
+            5) blocking_menu ;;
+            6) diagnostics_menu ;;
+            7) update_pingify ;;
+            8) update_menu ;;
+            9) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
         esac
@@ -4524,12 +7135,14 @@ main() {
     case "${1:-}" in
         --health-check)
             require_root; run_health_check; exit 0 ;;
+        --apply-firewall)
+            require_root; apply_blocking quiet; apply_nat quiet; exit 0 ;;
         --version | -v)
             echo "Pingify $PINGIFY_VERSION"; exit 0 ;;
         --help | -h)
             usage; exit 0 ;;
         --install)
-            require_root; install_self; exit 0 ;;
+            require_root; install_self; ok "installed"; exit 0 ;;
         --status)
             require_root
             if [ -n "${2:-}" ]; then tunnel_status_block "$2"; else list_tunnels; fi
@@ -4540,7 +7153,15 @@ main() {
 
     require_root
     ensure_deps
+    # Every time, not only the first. Running the install line is how people
+    # update, and skipping this when a copy already existed left an older
+    # script on PATH beside a core that had just been updated - which is the
+    # one combination the two of them cannot work in.
+    install_self
+    migrate_layout
+    server_info
     first_run
+    ensure_core_current
     main_menu
 }
 
