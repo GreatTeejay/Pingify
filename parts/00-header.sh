@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.13.0"
+PINGIFY_VERSION="3.13.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 BASE_DIR="/root/Pingify"
@@ -81,6 +81,43 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
+# A panel carries its title in the top border, so a page of them reads as a
+# list of labelled blocks rather than a wall of rules.
+panel() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        printf '  %s%s%s%s%s
+' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        return
+    fi
+    n=$(( ${#t} + 3 ))
+    printf '  %s%s%s %s%s%s %s%s%s
+'         "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF"         "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+}
+
+panel_end() { printf '  %s%s%s%s%s
+' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+
+# field <label> <value> - one labelled line inside a panel, values aligned.
+field() {
+    printf '  %s%s%s %s %s%s%s
+'         "$C_GRY" "$BX_V" "$C_OFF"         "$(pad_to "$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}" $((UI_W - 2)))"         "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# A label above a run of related menu entries.
+group() { printf '
+  %s%s%s
+' "$C_DIM$C_B" "$1" "$C_OFF"; }
+
+# state <on|off> - a coloured badge for a toggle.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
+    fi
+}
+
 box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
 box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
 box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
@@ -120,31 +157,53 @@ item() {
 banner() {
     clear 2>/dev/null || true
     printf '\n'
-    local l
+    local l w pad
     if [ "$PINGIFY_UTF8" = "1" ]; then
-        for l in \
+        set -- \
             '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
             '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
             '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
             '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
             '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
             '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
     else
-        for l in \
-            ' ___  _                 _   __       ' \
-            '| _ \(_)_ _   __ _   (_) / _|_  _  ' \
-            '|  _/| |  \ \ / _` |  | ||  _| || | ' \
-            '|_|  |_|_||_|\__, |  |_||_|   \_, | ' \
-            '             |___/           |__/  '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
+        set -- \
+            ' ___  _                 _   __     ' \
+            '| _ \(_)_ _  __ _ (_) / _|_  _     ' \
+            '|  _/| | | \| | (_| | | ||  _| || |' \
+            '|_|  |_|_||_|\__, | |_||_|   \_, |ذ' \
+            '             |___/          |__/   '
     fi
-    printf '  %s%sby Teejay%s   %sIran %s Kharej tunnel   %s   v%s%s\n\n' \
-        "$C_CYN" "$C_DIM" "$C_OFF" "$C_DIM" "$BX_ARR" "$BX_DOT" "$PINGIFY_VERSION" "$C_OFF"
+
+    # The name sits in its own frame, centred, so the page opens with one
+    # object rather than six lines floating above a rule.
+    w=0
+    for l in "$@"; do
+        [ "$(vislen "$l")" -gt "$w" ] && w="$(vislen "$l")"
+    done
+    local inner=$((UI_W))
+    pad=$(( (inner - w) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+
+    printf '  %s%s%s%s%s\n' "$C_CYN$C_DIM" "$BX_TL" "$(repeat "$BX_H" "$inner")" "$BX_TR" "$C_OFF"
+    for l in "$@"; do
+        printf '  %s%s%s%s%s%s%s%s\n' \
+            "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+            "$(repeat ' ' "$pad")" "$C_CYN$C_B$l$C_OFF" \
+            "$(repeat ' ' $((inner - pad - $(vislen "$l"))))" \
+            "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    done
+
+    # and the one line that says what it is, centred under it
+    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel   ${BX_DOT}   v${PINGIFY_VERSION}"
+    pad=$(( (inner - ${#sub}) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '  %s%s%s%s%s%s%s%s\n' \
+        "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+        "$(repeat ' ' "$pad")" "$C_DIM$sub$C_OFF" \
+        "$(repeat ' ' $((inner - pad - ${#sub})))" \
+        "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    printf '  %s%s%s%s%s\n\n' "$C_CYN$C_DIM" "$BX_BL" "$(repeat "$BX_H" "$inner")" "$BX_BR" "$C_OFF"
 }
 
 pause() { printf '\n'; read -rsp "  ${C_DIM}press enter${C_OFF}" _; printf '\n'; }
@@ -255,6 +314,27 @@ pick_free_port() {
         p=$((p + 1))
     done
     printf '%s' "$1"
+}
+
+# Where this server is, for the front page. Looked up once per run: the
+# answer does not change while the menu is open, and a small VPS should not
+# spend a round trip redrawing it.
+server_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
+    if have curl; then
+        local j
+        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
+        if [ -n "$j" ]; then
+            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*//p')"
+            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*//p')"
+            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*//p')"
+        fi
+    fi
+    [ -n "$SRV_IP" ]  || SRV_IP="$(public_ip)"
+    [ -n "$SRV_IP" ]  || SRV_IP="unknown"
+    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
+    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
 }
 
 public_ip() {

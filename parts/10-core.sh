@@ -121,6 +121,37 @@ ensure_core() {
     install_core
 }
 
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
+}
+
+# The core and the script share the config format, so a mismatch is not a
+# cosmetic thing: a script that writes TOML beside a core that still parses
+# JSON produces "invalid character" the moment you build a tunnel. Updating
+# one without the other has to be impossible rather than merely discouraged.
+ensure_core_current() {
+    [ -x "$CORE_BIN" ] || return 0
+    core_matches_script && return 0
+    banner
+    head2 "Core update"
+    warn "the core is $(core_version) and this script is $PINGIFY_VERSION"
+    dim "they read the same config file, so they have to be the same version"
+    say ""
+    if install_core; then
+        local n
+        for n in $(tunnel_names); do systemctl restart "pingify@$n" >/dev/null 2>&1; done
+        say ""
+        ok "the core is now $(core_version)"
+    else
+        say ""
+        fail "the core could not be updated"
+        dim "until it matches, new tunnels will be rejected"
+        dim "Core has the other ways to install it"
+    fi
+    pause
+}
+
 # ---------------------------------------------------------------------------
 # systemd
 # ---------------------------------------------------------------------------

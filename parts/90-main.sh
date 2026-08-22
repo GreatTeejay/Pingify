@@ -41,27 +41,39 @@ status_panel() {
         fi
     done
 
-    local edot="$C_RED$BX_OFF$C_OFF" ever
-    ever="$(core_version)"
-    [ -x "$CORE_BIN" ] && edot="$C_GRN$BX_ON$C_OFF"
+    server_info
+    panel "SERVER"
+    field "IP" "$SRV_IP"
+    field "Location" "$SRV_LOC"
+    field "Datacenter" "$(printf '%.44s' "$SRV_ORG")"
+    panel_end
 
-    local tdot="$C_GRY$BX_OFF$C_OFF"
-    if [ "$total" != "0" ]; then
-        if [ "$up" = "$total" ]; then tdot="$C_GRN$BX_ON$C_OFF"
-        elif [ "$up" = "0" ]; then    tdot="$C_RED$BX_ON$C_OFF"
-        else                          tdot="$C_YEL$BX_ON$C_OFF"; fi
+    local core_txt
+    if [ ! -x "$CORE_BIN" ]; then
+        core_txt="${C_RED}not installed${C_OFF}"
+    elif core_matches_script; then
+        core_txt="$(core_version)"
+    else
+        core_txt="${C_RED}$(core_version) - does not match the script${C_OFF}"
     fi
 
-    local wd wdot="$C_YEL$BX_OFF$C_OFF"
-    wd="$(watchdog_state)"
-    [ "$wd" = "on" ] && wdot="$C_GRN$BX_ON$C_OFF"
+    local tun_txt
+    if [ "$total" = "0" ]; then
+        tun_txt="${C_GRY}${BX_OFF}${C_OFF} none configured"
+    elif [ "$up" = "$total" ]; then
+        tun_txt="${C_GRN}${BX_ON}${C_OFF} $up of $total up"
+    elif [ "$up" = "0" ]; then
+        tun_txt="${C_RED}${BX_ON}${C_OFF} $up of $total up"
+    else
+        tun_txt="${C_YEL}${BX_ON}${C_OFF} $up of $total up"
+    fi
 
-    local cc; cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-
-    box_top
-    box_row "$edot $(pad_to "core ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
-    box_row "$wdot $(pad_to "watchdog ${C_B}${wd}${C_OFF}" 22)${C_GRY}${BX_DOT}${C_OFF} tcp ${C_B}${cc:-unknown}${C_OFF}"
-    box_bot
+    panel "STATUS"
+    field "Core ver" "$core_txt"
+    field "Script ver" "$PINGIFY_VERSION"
+    field "Tunnels" "$tun_txt"
+    field "Watchdog" "$(state_badge "$(watchdog_state)")"
+    panel_end
 }
 
 # ---------------------------------------------------------------------------
@@ -192,14 +204,17 @@ main_menu() {
         banner
         status_panel
         say ""
-        item 1 "New Tunnel"        "create one, or apply a token"
-        item 2 "Tunnels"           "status, ports, logs, remove"
+        group "TUNNELS"
+        item 1 "New tunnel"        "set this server up"
+        item 2 "Manage tunnels"    "status, ports, logs, remove"
         item 3 "Health"            "dashboard, watchdog, restarts"
+        group "NETWORK"
         item 4 "Optimize"          "BBR, buffers, limits, swap"
-        item 5 "Core"              "install, update, import, export"
-        item 6 "Remove"            "uninstall parts, or everything"
         item 7 "Diagnostics"       "reach the peer, verify configs"
+        group "MAINTENANCE"
+        item 5 "Core"              "install, update, import, export"
         item 8 "Backup"            "save or restore your tunnels"
+        item 6 "Remove"            "uninstall parts, or everything"
         say ""
         item 0 "Exit"
         say ""
@@ -243,6 +258,7 @@ main() {
     ensure_deps
     migrate_layout
     first_run
+    ensure_core_current
     main_menu
 }
 
