@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.7.1"
+PINGIFY_VERSION="4.8.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -3782,7 +3782,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.7.1"
+const version = "4.8.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -5311,7 +5311,7 @@ func (l *link) readLoop() {
 	for {
 		l.conn.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
-			l.died("%s", readReason(err, idle))
+			l.died("%s%s", readReason(err, idle), l.rxSummary())
 			return
 		}
 		if l.obf {
@@ -5327,7 +5327,7 @@ func (l *link) readLoop() {
 		}
 		ct = ct[:n]
 		if _, err := io.ReadFull(l.conn, ct); err != nil {
-			l.died("%s", readReason(err, idle))
+			l.died("%s%s", readReason(err, idle), l.rxSummary())
 			return
 		}
 		atomic.AddUint64(&l.wireRx, uint64(len(hdr)+n))
@@ -5416,6 +5416,18 @@ func (l *link) dispatch(p []byte) error {
 // side hanging up every nine seconds while the other was still perfectly
 // happy. The floor makes that impossible: however impatient this end is
 // configured to be, it waits a full minute of real silence before giving up.
+// rxSummary says whether this carrier ever heard anything and how long ago,
+// which is the difference between "the peer went away" and "the peer was never
+// able to reach us at all".
+func (l *link) rxSummary() string {
+	n := atomic.LoadUint64(&l.wireRx)
+	if n == 0 {
+		return " (nothing was EVER received on this carrier)"
+	}
+	last := time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Second)
+	return fmt.Sprintf(" (received %s in all, last %s ago)", humanBytes(n), last)
+}
+
 func (l *link) idleLimit() time.Duration {
 	d := time.Duration(l.cfg.KeepaliveSec) * time.Second * 3
 	if d < minIdle {
@@ -5432,7 +5444,8 @@ func (l *link) keepaliveLoop() {
 		select {
 		case <-t.C:
 			if time.Now().UnixNano()-atomic.LoadInt64(&l.lastRx) > idle {
-				l.died("silent for %s - nothing came back from the peer", l.idleLimit())
+				l.died("silent for %s - nothing came back from the peer%s",
+					l.idleLimit(), l.rxSummary())
 				return
 			}
 			var b [8]byte
@@ -6551,12 +6564,14 @@ func runProbe(cfg *Config) int {
 		fmt.Println("Run this on the IRAN server: that is the end with the ports.")
 		return 2
 	}
+	var before *statusDoc
 	if cfg.StatusAddr != "" {
 		d, err := fetchStatus(cfg.StatusAddr)
 		if err != nil {
 			fmt.Printf("No carrier is up (%v). Nothing can cross the tunnel yet.\n", err)
 			return 1
 		}
+		before = d
 		fmt.Printf("%d of %d carriers up, %.0f ms to the other server.\n\n",
 			d.Up, d.Carriers, d.RTTms)
 	}
@@ -6579,6 +6594,27 @@ func runProbe(cfg *Config) int {
 			}
 		}
 	}
+	// A stream that is simply never answered looks identical to one the far
+	// side accepted and had nothing to say about - both leave the connection
+	// open. The only thing that tells them apart is whether the other server
+	// sent us anything at all while we were asking.
+	if before != nil {
+		after, err := fetchStatus(cfg.StatusAddr)
+		if err == nil {
+			sent := after.WireTx - before.WireTx
+			got := after.WireRx - before.WireRx
+			fmt.Printf("\nDuring this test we sent %s and the other server sent back %s.\n",
+				humanBytes(sent), humanBytes(got))
+			if got == 0 {
+				fmt.Println("\nNothing came back at all. The carriers are connected, so the")
+				fmt.Println("path carries a handshake, but nothing after it is getting through")
+				fmt.Println("in this direction. An \"open\" above means only that no refusal")
+				fmt.Println("arrived - which is also what a one-way path looks like.")
+				return 1
+			}
+		}
+	}
+
 	if bad > 0 {
 		fmt.Println("\nA port that failed is one the other server could not reach.")
 		fmt.Println("Check that the service is listening there on the address after")
