@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.6.1"
+PINGIFY_VERSION="5.7.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -81,6 +81,42 @@ pad_to() {
     local s="$1" w="$2" n; n="$(vislen "$s")"
     printf '%s' "$s"
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
+}
+
+# ---------------------------------------------------------------------------
+# round trip time
+#
+# The number on its own means nothing to most people looking at it. What they
+# want to know is whether it is normal for this path, so the bands are drawn
+# where an Iran <-> abroad tunnel changes character rather than at round
+# numbers:
+#
+#   under 100 ms   a European or nearby datacentre behaving itself
+#   100 - 200 ms   usable, but interactive traffic feels it
+#   over 200 ms    either a very long way round, or the path is in trouble
+#
+# A tunnel that is down has no round trip at all, and that is dim, not red -
+# red here should mean "this path is slow", not "there is no path".
+# ---------------------------------------------------------------------------
+rtt_colour() {
+    local ms="${1%ms}"; ms="${ms%%.*}"
+    case "$ms" in
+        '' | *[!0-9]*) printf '%s' "$C_DIM"; return ;;
+    esac
+    if   [ "$ms" -lt 100 ]; then printf '%s' "$C_GRN"
+    elif [ "$ms" -lt 200 ]; then printf '%s' "$C_YEL"
+    else                         printf '%s' "$C_RED"
+    fi
+}
+
+# rtt_tint prints the value already wrapped in its colour.
+rtt_tint() { printf '%s%s%s' "$(rtt_colour "$1")" "$1" "$C_OFF"; }
+
+# true when the path is slow enough to be worth a word of explanation
+rtt_slow() {
+    local ms="${1%ms}"; ms="${ms%%.*}"
+    case "$ms" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$ms" -ge 200 ]
 }
 
 # A panel carries its title in the top border, so a screen full of them reads
@@ -419,6 +455,28 @@ pick_free_port() {
         p=$((p + 1))
     done
     printf '%s' "$1"
+}
+
+# The status endpoint has to be unique per tunnel. Asking the kernel whether a
+# port is free only answers for the tunnels that happen to be running right
+# now, so a second tunnel built while the first one was stopped was handed the
+# same port - and then the two of them fought over it at the next boot, with
+# the loser reporting no carriers to a health check that could see nothing
+# wrong with it.
+pick_status_port() {
+    local want="${1:-9700}" p="${1:-9700}" taken="" f
+    for f in "$CFG_DIR"/*.toml "$CFG_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        taken="$taken $(toml_get "$f" status addr)"
+    done
+    while [ "$p" -lt 65535 ]; do
+        case " $taken " in
+            *":$p "*) p=$((p + 1)); continue ;;
+        esac
+        if port_free "$p"; then printf '%s' "$p"; return 0; fi
+        p=$((p + 1))
+    done
+    printf '%s' "$want"
 }
 
 public_ip() {
@@ -1192,7 +1250,7 @@ TOKEN
         confirm "replace it?" || return 1
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
-    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
+    T_STATUS="127.0.0.1:$(pick_status_port 9700)"
 
     banner
     head2 "Ready to create"
@@ -1432,7 +1490,7 @@ new_tunnel() {
         *) T_LOG="info" ;;
     esac
 
-    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
+    T_STATUS="127.0.0.1:$(pick_status_port 9700)"
 
     # -- review ------------------------------------------------------------
     banner
@@ -1730,22 +1788,20 @@ tunnel_status_block() {
 # One line per tunnel, for the overview table.
 tunnel_row() {
     local name="$1" f="$(cfg_file "$1")"
-    local role proto fwder addr state brief up total rtt streams
+    local role proto fwder addr state brief up total rtt
     role="$(side_label "$(toml_get "$f" tunnel role)")"
     proto="$(transport_label "$(toml_get "$f" transport type)")"
     fwder="$(forwarder_label "$(toml_get "$f" forward forwarder)")"
-    peer="$(toml_get "$f" transport connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
     addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
             # state up total rtt streams uptime
             set -- $brief
-            up="$2"; streams="$5"
+            up="$2"
             # An unreachable endpoint reports zeroes; keep the configured
             # carrier count so the column still says what was asked for.
             [ "$3" != "0" ] && total="$3"
@@ -1771,7 +1827,7 @@ tunnel_row() {
         "$(pad_to "$proto" 10)" \
         "$(pad_to "$fwder" 9)" \
         "$(pad_to "$up/$total" 6)" \
-        "$C_DIM" "$rtt" "$C_OFF"
+        "$(rtt_colour "$rtt")" "$rtt" "$C_OFF"
 }
 
 list_tunnels() {
@@ -1876,7 +1932,14 @@ live_log() {
     say ""
     dim "ctrl-c to stop following"
     say ""
+    # ctrl-c goes to every process in the foreground group, and a script with
+    # no handler for it dies. So the key that stops following also closed the
+    # manager and dropped you back to a shell - the same "I had to start it
+    # again" as the dashboard that would not take enter. Catch it here, let
+    # journalctl take the signal and go, and come back to the menu.
+    trap ':' INT
     journalctl -u "pingify@$name" -n 60 -f --no-pager -o cat || true
+    trap - INT
 }
 
 edit_logging() {
@@ -2332,7 +2395,13 @@ health_check() {
         hc_note "some are being dropped - the path is lossy or something is trimming them"
         hc_fix "Manage ${BX_ARR} $name ${BX_ARR} Live log, and look for 'carrier .* down'"
     else
-        hc_ok "$up of $total carriers up, ${rtt}ms to the other server"
+        hc_ok "$up of $total carriers up, $(rtt_tint "${rtt}ms") to the other server"
+        # A long round trip is usually geography rather than a fault, so it
+        # explains itself and is not counted as a problem.
+        if rtt_slow "$rtt"; then
+            hc_note "that is a long way round - anything interactive will feel it"
+            hc_note "the other server being closer is the only thing that fixes it"
+        fi
     fi
 
     # --- the forwarded ports, on the end that has them ---------------------
@@ -3111,7 +3180,7 @@ diag_tunnel() {
     set -- $brief
     state="${1:-down}"; up="${2:-0}"; total="${3:-0}"; rtt="${4:-0}"
     if [ "$state" = "up" ]; then
-        check_pass "link is up - $up of $total connections, ${rtt}ms"
+        check_pass "link is up - $up of $total connections, $(rtt_tint "${rtt}ms")"
         [ "$up" != "$total" ] && check_warn "some connections are still down"
     else
         check_fail "no connection to the other server"
@@ -3224,10 +3293,7 @@ diagnostics_menu() {
         case "$c" in
             1) diag_full ;;
             2) diag_ping ;;
-            3) if pick_tunnel; then
-                   say ""; dim "ctrl-c to stop"; say ""
-                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager -o cat || true
-               fi ;;
+            3) if pick_tunnel; then live_log "$PICKED"; fi ;;
             4) diag_system ;;
             5) show_nat; pause ;;
             0 | "") return ;;
@@ -4539,7 +4605,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.6.1"
+const version = "5.7.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

@@ -175,7 +175,7 @@ diag_tunnel() {
     set -- $brief
     state="${1:-down}"; up="${2:-0}"; total="${3:-0}"; rtt="${4:-0}"
     if [ "$state" = "up" ]; then
-        check_pass "link is up - $up of $total connections, ${rtt}ms"
+        check_pass "link is up - $up of $total connections, $(rtt_tint "${rtt}ms")"
         [ "$up" != "$total" ] && check_warn "some connections are still down"
     else
         check_fail "no connection to the other server"
@@ -288,10 +288,7 @@ diagnostics_menu() {
         case "$c" in
             1) diag_full ;;
             2) diag_ping ;;
-            3) if pick_tunnel; then
-                   say ""; dim "ctrl-c to stop"; say ""
-                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager -o cat || true
-               fi ;;
+            3) if pick_tunnel; then live_log "$PICKED"; fi ;;
             4) diag_system ;;
             5) show_nat; pause ;;
             0 | "") return ;;

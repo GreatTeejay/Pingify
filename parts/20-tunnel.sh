@@ -401,7 +401,7 @@ TOKEN
         confirm "replace it?" || return 1
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
-    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
+    T_STATUS="127.0.0.1:$(pick_status_port 9700)"
 
     banner
     head2 "Ready to create"
@@ -641,7 +641,7 @@ new_tunnel() {
         *) T_LOG="info" ;;
     esac
 
-    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
+    T_STATUS="127.0.0.1:$(pick_status_port 9700)"
 
     # -- review ------------------------------------------------------------
     banner

@@ -82,22 +82,20 @@ tunnel_status_block() {
 # One line per tunnel, for the overview table.
 tunnel_row() {
     local name="$1" f="$(cfg_file "$1")"
-    local role proto fwder addr state brief up total rtt streams
+    local role proto fwder addr state brief up total rtt
     role="$(side_label "$(toml_get "$f" tunnel role)")"
     proto="$(transport_label "$(toml_get "$f" transport type)")"
     fwder="$(forwarder_label "$(toml_get "$f" forward forwarder)")"
-    peer="$(toml_get "$f" transport connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
     addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
             # state up total rtt streams uptime
             set -- $brief
-            up="$2"; streams="$5"
+            up="$2"
             # An unreachable endpoint reports zeroes; keep the configured
             # carrier count so the column still says what was asked for.
             [ "$3" != "0" ] && total="$3"
@@ -123,7 +121,7 @@ tunnel_row() {
         "$(pad_to "$proto" 10)" \
         "$(pad_to "$fwder" 9)" \
         "$(pad_to "$up/$total" 6)" \
-        "$C_DIM" "$rtt" "$C_OFF"
+        "$(rtt_colour "$rtt")" "$rtt" "$C_OFF"
 }
 
 list_tunnels() {
@@ -228,7 +226,14 @@ live_log() {
     say ""
     dim "ctrl-c to stop following"
     say ""
+    # ctrl-c goes to every process in the foreground group, and a script with
+    # no handler for it dies. So the key that stops following also closed the
+    # manager and dropped you back to a shell - the same "I had to start it
+    # again" as the dashboard that would not take enter. Catch it here, let
+    # journalctl take the signal and go, and come back to the menu.
+    trap ':' INT
     journalctl -u "pingify@$name" -n 60 -f --no-pager -o cat || true
+    trap - INT
 }
 
 edit_logging() {
