@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.9.0"
+PINGIFY_VERSION="4.9.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -278,6 +278,21 @@ require_root() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# fetch <url> <dest> [timeout] - download one file with whatever this machine
+# has. The install line is written with wget, so wget is the tool most likely
+# to be present and curl the one most likely to be missing; assuming curl left
+# servers quietly running an old script while the core updated around them.
+fetch() {
+    local url="$1" dest="$2" t="${3:-120}"
+    if have curl; then
+        curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
+    fi
+    if have wget; then
+        wget -q --tries=2 --timeout="$t" -O "$dest" "$url" && return 0
+    fi
+    return 1
+}
 
 # Config files are TOML written by this script, one key per line, so a
 # targeted sed reads them back and Pingify needs no parser of its own.

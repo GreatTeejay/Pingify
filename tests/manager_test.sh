@@ -275,5 +275,26 @@ PYEOF
     wait "$IRAN_PID" "$KHAREJ_PID" 2>/dev/null
 fi
 
+# ---------------------------------------------------------------------------
+note "downloads work without curl"
+# ---------------------------------------------------------------------------
+# The install line is written with wget, so wget is the tool most likely to be
+# present and curl the one most likely to be missing. Reaching for curl alone
+# left a server running an old script beside a core that had just updated -
+# the one pairing the two of them cannot work in.
+have() { case "$1" in curl) return 1 ;; wget) return 0 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+wget() {
+    local out=""
+    while [ $# -gt 0 ]; do case "$1" in -O) out="$2"; shift 2 ;; *) shift ;; esac; done
+    printf 'downloaded\n' > "$out"
+}
+fetch "http://example.invalid/x" "$WORK/fetched" 5
+check "fetch falls back to wget" "$(cat "$WORK/fetched" 2>/dev/null)" "downloaded"
+
+have() { case "$1" in curl|wget) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+fetch "http://example.invalid/x" "$WORK/none" 5
+check "and fails when neither is here" "$?" "1"
+unset -f have wget
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

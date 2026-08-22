@@ -17,7 +17,7 @@ install_self() {
         # on disk to copy. Pull the published script instead.
         local tmp="/tmp/pingify.self"
         if spin "installing the pingify command" \
-             curl -fsSL --retry 2 --max-time 120 -o "$tmp" "$(release_script)" \
+             fetch "$(release_script)" "$tmp" 120 \
            && bash -n "$tmp" 2>/dev/null; then
             install -m 0755 "$tmp" "$SELF_BIN"
         else
@@ -198,8 +198,8 @@ main_menu() {
         item 5 "Blocking"        "ICMP, speedtest, UDP 443"
         item 6 "Diagnostics"     "connectivity and configs"
         group "MAINTENANCE"
-        item 7 "Update core"     "download, build, import, export"
-        item 8 "Update script"   "fetch the latest Pingify"
+        item 7 "Update Pingify"  "script and core together, to the same version"
+        item 8 "Core options"    "build here, import, export"
         item 9 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
@@ -213,8 +213,8 @@ main_menu() {
             4) optimize_menu ;;
             5) blocking_menu ;;
             6) diagnostics_menu ;;
-            7) update_menu ;;
-            8) self_update; pause ;;
+            7) update_pingify ;;
+            8) update_menu ;;
             9) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
@@ -245,9 +245,11 @@ main() {
 
     require_root
     ensure_deps
-    # Running from bash <(wget ...) leaves nothing behind, so put the command
-    # in place the first time through.
-    [ -x "$SELF_BIN" ] || install_self
+    # Every time, not only the first. Running the install line is how people
+    # update, and skipping this when a copy already existed left an older
+    # script on PATH beside a core that had just been updated - which is the
+    # one combination the two of them cannot work in.
+    install_self
     migrate_layout
     server_info
     first_run
