@@ -271,7 +271,11 @@ cfg_check_complete() {
 
 cfg_save() {
     local file
-    cfg_check_complete || return 1
+    # Everything here is read through a command substitution, so anything the
+    # check prints on stdout ends up inside the caller's variable instead of on
+    # the screen. That turned a named missing field into a confirm prompt that
+    # appeared to do nothing at all.
+    cfg_check_complete >&2 || return 1
     file="$(cfg_file "$T_NAME")"
     cfg_endpoints
     cfg_render "$CFG_LISTEN" "$CFG_CONNECT" "$T_STATUS" > "$file"
@@ -412,53 +416,30 @@ TOKEN
         T_AWG_OBF="$awgobf"
     fi
 
-    # The other end told us which side it is by telling us what to do about
-    # the connection, so our own role follows from that plus who owns ports.
+    # A setup token is printed by the IRAN server and nowhere else, so a
+    # machine pasting one is KHAREJ. There is nothing to ask: asking invited
+    # the wrong answer, and the wrong answer built a tunnel with no address to
+    # dial and no explanation of why it would not start.
+    T_ROLE="client"
     if [ "$dial" = "1" ]; then
-        T_PEER_IP="$host"
-        T_ROLE="$( [ -n "$host" ] && printf 'client' || printf 'server' )"
-        T_ACCEPTS="$( [ "$T_ROLE" = "client" ] && printf 'server' || printf 'client' )"
-    else
-        T_ACCEPTS="$T_ROLE"
-    fi
-
-    # Which end this machine is cannot be guessed from the token alone when
-    # both could dial, so ask - it is one question and it decides everything.
-    say ""
-    head2 "Which server is this?"
-    choice 1 "IRAN" "clients connect here, and the ports live here"
-    choice 2 "KHAREJ" "your panel and inbounds run here"
-    say ""
-    local side=""
-    pick side "select" 1 2
-    [ "$side" = "2" ] && T_ROLE="client" || T_ROLE="server"
-    if [ "$dial" = "1" ]; then
-        # they accept, so we dial them
-        T_ACCEPTS="$( [ "$T_ROLE" = "server" ] && printf 'client' || printf 'server' )"
+        # IRAN waits, so this end comes to it - the usual arrangement
+        T_ACCEPTS="server"
         T_PEER_IP="$host"
     else
-        # they dial, so we accept
-        T_ACCEPTS="$T_ROLE"
+        # IRAN dials out, so this end is the one that waits
+        T_ACCEPTS="client"
     fi
 
     say ""
-    [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && {
-        T_PUBLIC_IP="$SRV_IP"
-    
-    }
-    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP"
+    head2 "This server"
+    dim "the token came from IRAN, so this is the KHAREJ side"
+    say ""
+    [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && T_PUBLIC_IP="$SRV_IP"
+    ask T_PUBLIC_IP "address of this KHAREJ server" "$T_PUBLIC_IP"
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if [ "$T_ROLE" = "server" ]; then
-        say ""
-        head2 "Ports"
-        dim "the ports your clients will connect to, here on IRAN"
-        say ""
-        local raw_ports=""
-        ask raw_ports "ports, comma separated" "443"
-        T_FORWARDS="$(parse_forwards "$raw_ports")"
-        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
-    fi
+    # The ports live on IRAN, which already has them - there is nothing to ask
+    # for here, and nothing on this side to answer with.
 
     T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
     case "$T_TRANSPORT" in
@@ -475,6 +456,8 @@ TOKEN
         confirm "replace it?" || return 1
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
+    # The interface is named after the tunnel, which only just got its name.
+    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
     # A kernel tunnel runs no process of ours, so there is nothing to serve a
     # status endpoint and nothing that would read one.
     kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:$(pick_status_port 9700)"
@@ -503,14 +486,22 @@ TOKEN
     say ""
     local file
     file="$(cfg_save)" || { pause; return 1; }
-    if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
-        fail "the core rejected this configuration"
-        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION"
-        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
-        rm -f "$file"
-        pause; return 1
+    # The core only judges configs it is going to run, and a kernel tunnel has
+    # no core in the path - the same split the wizard makes.
+    if ! kernel_transport; then
+        if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
+            fail "the core rejected this configuration"
+            core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION"
+            "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
+            rm -f "$file"
+            pause; return 1
+        fi
     fi
     write_units
+    if kernel_transport; then
+        [ "$T_TRANSPORT" = "awg" ] && awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
+        write_link_unit "$T_NAME" || { fail "could not write the unit"; pause; return 1; }
+    fi
     service_enable_start "$T_NAME"
     enable_watchdog quiet
     [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
@@ -843,21 +834,27 @@ new_tunnel() {
 
     ok "$T_NAME is running"
     dim "$file"
+    say ""
 
     # -- the other server --------------------------------------------------
-    # One line to carry across. The panel of values this used to print is
-    # what the token is for, and printing both invited somebody to copy the
-    # long way round and get one field wrong.
-    local other
-    other="$( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN )"
-    head2 "Now the $other server"
-    dim "New tunnel ${BX_ARR} Paste a token"
-    say ""
-    rule
-    printf '%s\n' "${C_YEL}$(cfg_setup_token)${C_OFF}"
-    rule
-    say ""
-    warn "treat it like a password - it carries the security token"
+    #
+    # Only IRAN prints one. A token is a description of the tunnel written
+    # from the point of view of the end that owns the ports, and the KHAREJ
+    # end is what it builds - so a token printed there has nowhere to go, and
+    # printing one anyway taught people to carry it the wrong way round.
+    if [ "$T_ROLE" = "server" ]; then
+        head2 "Now the KHAREJ server"
+        dim "run Pingify there and choose  New tunnel ${BX_ARR} Paste a token"
+        say ""
+        rule
+        printf '%s\n' "${C_YEL}$(cfg_setup_token)${C_OFF}"
+        rule
+        say ""
+        warn "treat it like a password - it carries the security token"
+    else
+        head2 "Both servers are set up"
+        dim "this end was built from IRAN's token, so there is nothing to carry back"
+    fi
     say ""
     tunnel_status_block "$T_NAME"
     pause

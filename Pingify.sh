@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.8.0"
+PINGIFY_VERSION="5.9.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1123,7 +1123,11 @@ cfg_check_complete() {
 
 cfg_save() {
     local file
-    cfg_check_complete || return 1
+    # Everything here is read through a command substitution, so anything the
+    # check prints on stdout ends up inside the caller's variable instead of on
+    # the screen. That turned a named missing field into a confirm prompt that
+    # appeared to do nothing at all.
+    cfg_check_complete >&2 || return 1
     file="$(cfg_file "$T_NAME")"
     cfg_endpoints
     cfg_render "$CFG_LISTEN" "$CFG_CONNECT" "$T_STATUS" > "$file"
@@ -1264,53 +1268,30 @@ TOKEN
         T_AWG_OBF="$awgobf"
     fi
 
-    # The other end told us which side it is by telling us what to do about
-    # the connection, so our own role follows from that plus who owns ports.
+    # A setup token is printed by the IRAN server and nowhere else, so a
+    # machine pasting one is KHAREJ. There is nothing to ask: asking invited
+    # the wrong answer, and the wrong answer built a tunnel with no address to
+    # dial and no explanation of why it would not start.
+    T_ROLE="client"
     if [ "$dial" = "1" ]; then
-        T_PEER_IP="$host"
-        T_ROLE="$( [ -n "$host" ] && printf 'client' || printf 'server' )"
-        T_ACCEPTS="$( [ "$T_ROLE" = "client" ] && printf 'server' || printf 'client' )"
-    else
-        T_ACCEPTS="$T_ROLE"
-    fi
-
-    # Which end this machine is cannot be guessed from the token alone when
-    # both could dial, so ask - it is one question and it decides everything.
-    say ""
-    head2 "Which server is this?"
-    choice 1 "IRAN" "clients connect here, and the ports live here"
-    choice 2 "KHAREJ" "your panel and inbounds run here"
-    say ""
-    local side=""
-    pick side "select" 1 2
-    [ "$side" = "2" ] && T_ROLE="client" || T_ROLE="server"
-    if [ "$dial" = "1" ]; then
-        # they accept, so we dial them
-        T_ACCEPTS="$( [ "$T_ROLE" = "server" ] && printf 'client' || printf 'server' )"
+        # IRAN waits, so this end comes to it - the usual arrangement
+        T_ACCEPTS="server"
         T_PEER_IP="$host"
     else
-        # they dial, so we accept
-        T_ACCEPTS="$T_ROLE"
+        # IRAN dials out, so this end is the one that waits
+        T_ACCEPTS="client"
     fi
 
     say ""
-    [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && {
-        T_PUBLIC_IP="$SRV_IP"
-    
-    }
-    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP"
+    head2 "This server"
+    dim "the token came from IRAN, so this is the KHAREJ side"
+    say ""
+    [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && T_PUBLIC_IP="$SRV_IP"
+    ask T_PUBLIC_IP "address of this KHAREJ server" "$T_PUBLIC_IP"
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if [ "$T_ROLE" = "server" ]; then
-        say ""
-        head2 "Ports"
-        dim "the ports your clients will connect to, here on IRAN"
-        say ""
-        local raw_ports=""
-        ask raw_ports "ports, comma separated" "443"
-        T_FORWARDS="$(parse_forwards "$raw_ports")"
-        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
-    fi
+    # The ports live on IRAN, which already has them - there is nothing to ask
+    # for here, and nothing on this side to answer with.
 
     T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
     case "$T_TRANSPORT" in
@@ -1327,6 +1308,8 @@ TOKEN
         confirm "replace it?" || return 1
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
+    # The interface is named after the tunnel, which only just got its name.
+    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
     # A kernel tunnel runs no process of ours, so there is nothing to serve a
     # status endpoint and nothing that would read one.
     kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:$(pick_status_port 9700)"
@@ -1355,14 +1338,22 @@ TOKEN
     say ""
     local file
     file="$(cfg_save)" || { pause; return 1; }
-    if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
-        fail "the core rejected this configuration"
-        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION"
-        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
-        rm -f "$file"
-        pause; return 1
+    # The core only judges configs it is going to run, and a kernel tunnel has
+    # no core in the path - the same split the wizard makes.
+    if ! kernel_transport; then
+        if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
+            fail "the core rejected this configuration"
+            core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION"
+            "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
+            rm -f "$file"
+            pause; return 1
+        fi
     fi
     write_units
+    if kernel_transport; then
+        [ "$T_TRANSPORT" = "awg" ] && awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
+        write_link_unit "$T_NAME" || { fail "could not write the unit"; pause; return 1; }
+    fi
     service_enable_start "$T_NAME"
     enable_watchdog quiet
     [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
@@ -1695,21 +1686,27 @@ new_tunnel() {
 
     ok "$T_NAME is running"
     dim "$file"
+    say ""
 
     # -- the other server --------------------------------------------------
-    # One line to carry across. The panel of values this used to print is
-    # what the token is for, and printing both invited somebody to copy the
-    # long way round and get one field wrong.
-    local other
-    other="$( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN )"
-    head2 "Now the $other server"
-    dim "New tunnel ${BX_ARR} Paste a token"
-    say ""
-    rule
-    printf '%s\n' "${C_YEL}$(cfg_setup_token)${C_OFF}"
-    rule
-    say ""
-    warn "treat it like a password - it carries the security token"
+    #
+    # Only IRAN prints one. A token is a description of the tunnel written
+    # from the point of view of the end that owns the ports, and the KHAREJ
+    # end is what it builds - so a token printed there has nowhere to go, and
+    # printing one anyway taught people to carry it the wrong way round.
+    if [ "$T_ROLE" = "server" ]; then
+        head2 "Now the KHAREJ server"
+        dim "run Pingify there and choose  New tunnel ${BX_ARR} Paste a token"
+        say ""
+        rule
+        printf '%s\n' "${C_YEL}$(cfg_setup_token)${C_OFF}"
+        rule
+        say ""
+        warn "treat it like a password - it carries the security token"
+    else
+        head2 "Both servers are set up"
+        dim "this end was built from IRAN's token, so there is nothing to carry back"
+    fi
     say ""
     tunnel_status_block "$T_NAME"
     pause
@@ -2209,6 +2206,8 @@ cfg_load() {
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
     T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=false}"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
+    T_SNDBUF="$(toml_get "$f" tuning sndbuf_kb)";           : "${T_SNDBUF:=$T_WINDOW}"
+    T_RCVBUF="$(toml_get "$f" tuning rcvbuf_kb)";           : "${T_RCVBUF:=$T_WINDOW}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
     T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
@@ -2616,6 +2615,52 @@ edit_forwards() {
 # Every number that shapes a tunnel, on one screen, split by the only
 # distinction that matters when two servers disagree: the settings that have to
 # match, and the ones that are nobody's business but this machine's.
+# ---------------------------------------------------------------------------
+# what the numbers actually buy
+#
+# A window in kilobytes and a carrier count mean nothing on their own. What a
+# person wants to know is how fast one connection can go, and that has one
+# answer: a stream may have at most one window of data in flight, so it cannot
+# beat window / round-trip no matter what the path underneath can do.
+#
+#   1024 KB at 90 ms  ->  93 Mbit/s for a single connection
+#   4096 KB at 90 ms  -> 372 Mbit/s
+#
+# Which is the whole reason the bigger presets exist, and the reason raising
+# carriers does nothing for a single download.
+# ---------------------------------------------------------------------------
+
+# stream_ceiling WINDOW_KB RTT_MS -> megabits per second, or "-"
+stream_ceiling() {
+    local win="$1" rtt="${2%%.*}"
+    # Checked apart, not joined: an empty window beside a good round trip
+    # reads as a perfectly good number when the two are concatenated.
+    case "$win" in '' | *[!0-9]*) printf '%s' '-'; return 1 ;; esac
+    case "$rtt" in '' | *[!0-9]*) printf '%s' '-'; return 1 ;; esac
+    [ "$rtt" -gt 0 ] || { printf '%s' '-'; return 1; }
+    # KB * 8 bits / ms  ==  kbit/ms  ==  Mbit/s, near enough for a menu
+    printf '%s' "$(( win * 8 / rtt ))"
+}
+
+# The round trip this tunnel is actually seeing, so the ceiling above is about
+# this path rather than a number out of a book. Falls back to a typical
+# Iran-to-Europe figure when the tunnel is not up to be asked.
+tuning_rtt() {
+    local name="$1" brief=""
+    if [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ] && [ "$(svc_state "$name")" = "active" ]; then
+        brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    fi
+    if [ -n "$brief" ]; then
+        set -- $brief
+        if [ "$1" = "up" ] && [ "${4%%.*}" -gt 0 ] 2>/dev/null; then
+            printf '%s' "${4%%.*}"
+            return 0
+        fi
+    fi
+    printf '90'
+    return 1
+}
+
 tuning_menu() {
     local name="$1" f v
     f="$(cfg_file "$name")"
@@ -2623,6 +2668,10 @@ tuning_menu() {
         cfg_load "$name" || return 1
         banner
         head2 "Tuning: $name"
+
+        local rtt measured ceiling
+        rtt="$(tuning_rtt "$name")" && measured="measured" || measured="assumed"
+        ceiling="$(stream_ceiling "$T_WINDOW" "$rtt")"
 
         panel "both servers must agree"
         field "Token" "$(token_print "$T_TOKEN")" "Shaping" "$(shaping_label "$name")"
@@ -2632,53 +2681,112 @@ tuning_menu() {
         panel "local to this server"
         field "Profile" "$T_PRESET"
         field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
-        field "Keepalive" "${T_KEEPALIVE} s"
+        field "Buffers" "${T_SNDBUF} / ${T_RCVBUF} KB" "Keepalive" "${T_KEEPALIVE} s"
         field "Health port" "$T_STATUS"
         panel_end
         say ""
+
+        # The one number worth reading off this screen.
+        panel "what that buys"
+        field "One link" "up to ${ceiling} Mbit/s" "Round trip" "${rtt} ms, ${measured}"
+        # More carriers spread more connections; they do nothing for one.
+        field "Spread over" "$T_CARRIERS carriers at once"
+        panel_end
+
+        # A socket that cannot hold a window's worth of data makes the window
+        # a number on paper: the kernel stops the writer before the credit
+        # runs out, and the extra window buys nothing.
+        if [ "$T_SNDBUF" -lt "$T_WINDOW" ] || [ "$T_RCVBUF" -lt "$T_WINDOW" ]; then
+            say ""
+            warn "the buffers are smaller than the window"
+            dim "a socket that cannot hold one window makes the rest of it"
+            dim "unreachable - raise the buffers to ${T_WINDOW} KB or lower the window"
+        fi
+
+        say ""
         dim "Read the top box on the other server and make it read the same."
-        dim "The bottom box may differ; it will not break the link."
+        dim "The rest is local; it will not break the link."
 
         rule
-        item 1 "Profile" "pick a preset and set all three at once"
+        item 1 "Profile" "pick a preset and set them all at once"
         item 2 "Carriers" "$T_CARRIERS - parallel connections"
-        item 3 "Window" "$T_WINDOW KB per connection"
-        item 4 "Keepalive" "$T_KEEPALIVE seconds"
-        item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
-        item 6 "Logging" "$T_LOG"
-        item 7 "Health port" "$T_STATUS"
+        item 3 "Window" "$T_WINDOW KB - the ceiling on one connection"
+        item 4 "Buffers" "$T_SNDBUF / $T_RCVBUF KB - what the sockets hold"
+        item 5 "Keepalive" "$T_KEEPALIVE seconds"
+        item 6 "Traffic shaping" "$(shaping_label "$name") - must match"
+        item 7 "Logging" "$T_LOG"
+        item 8 "Health port" "$T_STATUS"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
             1) say ""; preset_menu
-               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" ;;
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
             2) say ""; ask v "parallel connections" "$T_CARRIERS"
-               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" ;;
-            3) say ""; ask v "window per connection, KB" "$T_WINDOW"
-               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" ;;
-            4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
-               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
-            5) edit_shaping "$name" ;;
-            6) edit_logging "$name" ;;
-            7) edit_health "$name" ;;
+               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
+            3) say ""
+               dim "one connection tops out at window / round trip"
+               dim "at ${rtt} ms:  1024 KB = $(stream_ceiling 1024 "$rtt") Mbit/s   4096 KB = $(stream_ceiling 4096 "$rtt") Mbit/s"
+               say ""
+               ask v "window per connection, KB" "$T_WINDOW"
+               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
+            4) edit_buffers "$name" ;;
+            5) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" "$T_SNDBUF" "$T_RCVBUF" ;;
+            6) edit_shaping "$name" ;;
+            7) edit_logging "$name" ;;
+            8) edit_health "$name" ;;
             0|"") return ;;
         esac
     done
 }
 
-# tuning_write <name> <carriers> <window> <keepalive>
+# The socket buffers, on their own screen because there are two of them and
+# because getting them wrong is quiet: too small and the window above is a
+# fiction, too large and a busy server spends real memory on carriers that
+# are idle.
+edit_buffers() {
+    local name="$1" snd rcv
+    cfg_load "$name" || return 1
+    banner
+    head2 "Buffers: $name"
+    say ""
+    dim "Each carrier gets a send and a receive buffer of this size, so a"
+    dim "$T_CARRIERS-carrier tunnel holds ${T_CARRIERS} of each."
+    say ""
+    field "Now" "${T_SNDBUF} / ${T_RCVBUF} KB" \
+          "In total" "$(( (T_SNDBUF + T_RCVBUF) * T_CARRIERS / 1024 )) MB"
+    say ""
+    dim "They should be at least the window (${T_WINDOW} KB), or the window"
+    dim "cannot fill. Past that they buy nothing."
+    say ""
+    ask snd "send buffer, KB" "$T_SNDBUF"
+    ask rcv "receive buffer, KB" "$T_RCVBUF"
+    tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$snd" "$rcv"
+}
+
+# tuning_write <name> <carriers> <window> <keepalive> [sndbuf] [rcvbuf]
 tuning_write() {
-    local name="$1" car="$2" win="$3" ka="$4" f
+    local name="$1" car="$2" win="$3" ka="$4" snd="${5:-}" rcv="${6:-}" f
     f="$(cfg_file "$name")"
-    case "$car$win$ka" in *[!0-9]*|"") fail "numbers only"; pause; return ;; esac
+    [ -n "$snd" ] || snd="$win"
+    [ -n "$rcv" ] || rcv="$win"
+    case "$car$win$ka$snd$rcv" in *[!0-9]* | "") fail "numbers only"; pause; return ;; esac
     [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
+    [ "$win" -ge 16 ] || { fail "a window under 16 KB stalls every connection"; pause; return; }
+    # 64 MB a socket is already past anything a real path can use, and 64 of
+    # them is 4 GB of a server that has other work to do.
+    [ "$snd" -le 65536 ] && [ "$rcv" -le 65536 ] || { fail "a buffer over 64 MB is not a tuning, it is a leak"; pause; return; }
 
     cp -f "$f" "$f.bak"
     sed -i "s#^carriers.*#carriers         = $car#" "$f"
     sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
     sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
+    sed -i "s#^sndbuf_kb.*#sndbuf_kb        = $snd#" "$f"
+    sed -i "s#^rcvbuf_kb.*#rcvbuf_kb        = $rcv#" "$f"
+    # A hand-set profile is no longer whichever preset it started as.
+    sed -i "s#^profile.*#profile          = \"$(preset_name "$car" "$win")\"#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
@@ -5157,7 +5265,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.8.0"
+const version = "5.9.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
