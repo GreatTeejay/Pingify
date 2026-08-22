@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.3.0"
+PINGIFY_VERSION="4.3.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -258,7 +258,6 @@ toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:s
 # The public name of a security token: eight characters derived from it, safe
 # to read aloud. Both servers print the same one when the token matches, which
 # is the only way to tell a wrong token apart from a broken network.
-TOKEN_MIN=16
 token_print() {
     local t
     t="$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -1035,22 +1034,14 @@ new_tunnel() {
 
     # -- security ----------------------------------------------------------
     head2 "Security token"
-    dim "One secret, typed by hand on BOTH servers, exactly the same. It is the"
-    dim "only thing standing between this tunnel and anyone who finds the port,"
-    dim "so treat it like a password: at least $TOKEN_MIN characters, and not a word."
+    dim "One secret, typed by hand on BOTH servers, exactly the same. Any length"
+    dim "you like - it is what the two ends use to recognise each other."
     say ""
     while :; do
         ask T_TOKEN "token"
         T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        if [ "${#T_TOKEN}" -lt "$TOKEN_MIN" ]; then
-            fail "too short - ${#T_TOKEN} characters, the minimum is $TOKEN_MIN"
-            continue
-        fi
-        case "$T_TOKEN" in
-            *[!a-zA-Z0-9]*) break ;;
-            *[a-zA-Z]*[0-9]*|*[0-9]*[a-zA-Z]*) break ;;
-            *) warn "letters only - mix in digits or punctuation to make it worth typing" ; break ;;
-        esac
+        [ -n "$T_TOKEN" ] && break
+        fail "a token is required"
     done
     say ""
     ok "token fingerprint: ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
@@ -3593,7 +3584,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.3.0"
+const version = "4.3.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -3732,9 +3723,6 @@ func (c *Config) validate() error {
 	}
 	if c.Token == "" && c.PSK == "" {
 		return fmt.Errorf("a security token is required, and must be the same on both servers")
-	}
-	if c.Token != "" && len(strings.TrimSpace(c.Token)) < 8 {
-		return fmt.Errorf("the security token is too short - use at least 8 characters")
 	}
 	if c.Token == "" {
 		if k, err := hex.DecodeString(strings.TrimSpace(c.PSK)); err != nil || len(k) < 16 {

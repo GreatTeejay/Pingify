@@ -147,3 +147,24 @@ func TestTokenPrintIdentifiesTheSecret(t *testing.T) {
 		t.Error("the fingerprint leaked the token")
 	}
 }
+
+// A token's length is the operator's decision, not ours. There is exactly one
+// rule: there has to be one. This exists so the minimum does not creep back.
+func TestShortTokensAreAccepted(t *testing.T) {
+	base := func(tok string) *Config {
+		c := &Config{
+			Role: "server", Mode: "forward", Transport: "tcp",
+			Listen: "0.0.0.0:9443", Token: tok, Forwards: []string{"443"},
+		}
+		c.applyDefaults()
+		return c
+	}
+	for _, tok := range []string{"mit", "a", "12", "ab cd", "!"} {
+		if err := base(tok).validate(); err != nil {
+			t.Errorf("token %q rejected: %v", tok, err)
+		}
+	}
+	if err := base("").validate(); err == nil {
+		t.Error("an empty token was accepted; the core has no key without one")
+	}
+}

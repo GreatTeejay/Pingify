@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.3.0"
+const version = "4.3.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -191,9 +191,6 @@ func (c *Config) validate() error {
 	}
 	if c.Token == "" && c.PSK == "" {
 		return fmt.Errorf("a security token is required, and must be the same on both servers")
-	}
-	if c.Token != "" && len(strings.TrimSpace(c.Token)) < 8 {
-		return fmt.Errorf("the security token is too short - use at least 8 characters")
 	}
 	if c.Token == "" {
 		if k, err := hex.DecodeString(strings.TrimSpace(c.PSK)); err != nil || len(k) < 16 {
