@@ -35,18 +35,19 @@ adopt_core() {
 
 download_core() {
     [ -n "$GOARCH" ] || { warn "no prebuilt core for $ARCH"; return 1; }
+    have curl || return 1
     local base tmp="/tmp/pingify-core.dl" sums="/tmp/pingify-core.sums"
     base="$(release_base)"
 
     if ! spin "downloading the core for $GOARCH" \
-         fetch_to "$base/$(core_asset)" "$tmp" 180; then
+         fetch "$base/$(core_asset)" "$tmp" 180; then
         rm -f "$tmp"
         return 1
     fi
 
     # The checksum file is published alongside the binaries. A missing one is
     # not fatal, a wrong one is.
-    if fetch_to "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
+    if fetch "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
         want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
@@ -96,7 +97,7 @@ import_core_binary() {
     local tmp="/tmp/pingify-core.import"
     case "$src" in
         http://* | https://*)
-            spin "downloading" fetch_to "$src" "$tmp" 300 \
+            spin "downloading" fetch "$src" "$tmp" 300 \
                 || { fail "download failed"; return 1; } ;;
         *)
             [ -f "$src" ] || { fail "no such file: $src"; return 1; }
@@ -120,33 +121,31 @@ ensure_core() {
     install_core
 }
 
+# The script and the core share the config format, so a core left behind by an
+# older install reads a newer config as if half of it were not there. 3.4 moved
+# configs into sections; a 3.3 core reads one of those and reports every field
+# as empty - which surfaced as "role must be \"server\" or \"client\", got \"\""
+# with nothing to point at the real cause. They are kept in step here instead.
 core_matches_script() {
     [ -x "$CORE_BIN" ] || return 1
     [ "$(core_version)" = "$PINGIFY_VERSION" ]
 }
 
-# The core and the script share the config format, so a mismatch is not a
-# cosmetic thing: a script that writes TOML beside a core that still parses
-# JSON produces "invalid character" the moment you build a tunnel. Updating
-# one without the other has to be impossible rather than merely discouraged.
 ensure_core_current() {
     [ -x "$CORE_BIN" ] || return 0
     core_matches_script && return 0
     banner
     head2 "Core update"
-    warn "the core is $(core_version) and this script is $PINGIFY_VERSION"
-    dim "they read the same config file, so they have to be the same version"
+    warn "the core is $(core_version), this script is $PINGIFY_VERSION"
+    dim "they have to match - the config format is shared between them"
     say ""
-    if install_core; then
-        local n
-        for n in $(tunnel_names); do systemctl restart "pingify@$n" >/dev/null 2>&1; done
-        say ""
-        ok "the core is now $(core_version)"
+    if download_core; then
+        restart_all "the core was updated"
     else
         say ""
         fail "the core could not be updated"
         dim "until it matches, new tunnels will be rejected"
-        dim "Core has the other ways to install it"
+        dim "Update core in the menu has the other ways to install it"
     fi
     pause
 }
@@ -167,6 +166,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 ExecStart=$CORE_BIN -c $CFG_DIR/%i.$CFG_EXT
+WorkingDirectory=$BASE_DIR
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -174,7 +174,7 @@ TasksMax=infinity
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-# ProtectHome is off: the core and its config live under /root now.
+# ProtectHome is deliberately off: the core and its config live under /root.
 ProtectHome=no
 ProtectSystem=full
 StandardOutput=journal

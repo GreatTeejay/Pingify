@@ -9,43 +9,36 @@ import (
 	"strings"
 )
 
-// Configs are TOML, grouped into sections so that reading one tells you how a
-// tunnel is put together rather than handing you thirty flat keys in the order
-// somebody happened to add them.
+// ---------------------------------------------------------------------------
+// configuration files
 //
-//	[tunnel]     what this tunnel is and which end this is
-//	[transport]  how the carriers travel
-//	[security]   the shared secret
-//	[forward]    the ports this end serves
-//	[tun]        the private link, when there is one
-//	[tuning]     numbers you may want to change
-//	[status]     where to ask how it is doing
-//	[logging]    how much to say
+// TOML is what people expect for this kind of tool, so that is what Pingify
+// writes. What it reads back is a deliberately small subset: bare `key = value`
+// at the top level, one `[tun]` table, string arrays, integers and strings.
+// Pingify generates these files, so a full TOML implementation would be a
+// dependency bought for nothing - and a dependency is exactly what the offline
+// build path cannot afford.
 //
-// JSON is still read, because that is what versions before this wrote and a
-// config on a running server should not stop working because of a release.
-//
-// The parser is deliberately small: this is a config file written by our own
-// manager, not a document from the internet. It handles sections, key = value,
-// quoted strings, integers with _ separators, and arrays of strings. A key it
-// does not know is skipped rather than refused, so a config from a newer
-// Pingify still starts an older core instead of leaving a server with nothing.
+// JSON is still accepted so that configs written by 3.2 and earlier keep
+// working without anyone having to convert them.
+// ---------------------------------------------------------------------------
+
 func loadConfig(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("read config: %v", err)
 	}
-	var c Config
+	var cfg Config
 	if strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
-		if err := json.Unmarshal(raw, &c); err != nil {
-			return nil, fmt.Errorf("parse json config: %v", err)
+		if err := json.Unmarshal(raw, &cfg); err != nil {
+			return nil, fmt.Errorf("parse config: %v", err)
 		}
-		return &c, nil
+		return &cfg, nil
 	}
-	if err := parseTOML(string(raw), &c); err != nil {
-		return nil, err
+	if err := parseTOML(string(raw), &cfg); err != nil {
+		return nil, fmt.Errorf("parse config: %v", err)
 	}
-	return &c, nil
+	return &cfg, nil
 }
 
 func parseTOML(text string, c *Config) error {
@@ -62,9 +55,9 @@ func parseTOML(text string, c *Config) error {
 		}
 		if strings.HasPrefix(s, "[") {
 			if !strings.HasSuffix(s, "]") {
-				return fmt.Errorf("line %d: unterminated section header", line)
+				return fmt.Errorf("line %d: unterminated table header", line)
 			}
-			section = strings.Trim(s[1:len(s)-1], " \t\"'")
+			section = strings.Trim(s[1:len(s)-1], " \t\"")
 			continue
 		}
 		eq := strings.Index(s, "=")
@@ -73,9 +66,6 @@ func parseTOML(text string, c *Config) error {
 		}
 		key := strings.TrimSpace(s[:eq])
 		val := strings.TrimSpace(s[eq+1:])
-		if key == "" {
-			return fmt.Errorf("line %d: empty key", line)
-		}
 		if err := assign(c, section, key, val); err != nil {
 			return fmt.Errorf("line %d: %v", line, err)
 		}
@@ -83,8 +73,8 @@ func parseTOML(text string, c *Config) error {
 	return sc.Err()
 }
 
-// stripComment drops a trailing # comment, unless the # is inside quotes -
-// a password or a hostname is allowed to contain one.
+// stripComment removes a trailing # comment, leaving anything inside quotes
+// alone so a value may contain a hash.
 func stripComment(s string) string {
 	inQ := false
 	for i := 0; i < len(s); i++ {
@@ -111,35 +101,24 @@ func unquote(s string) string {
 	return s
 }
 
-// atoi accepts 10_000 as well as 10000: the tuning numbers are big enough to
-// be worth grouping, and a config is easier to check when they are.
-func atoi(key, val string) (int, error) {
-	v := strings.ReplaceAll(unquote(val), "_", "")
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return 0, fmt.Errorf("%s must be a number, got %q", key, val)
+// parseArray reads ["a", "b"] into its elements.
+func parseArray(s string) ([]string, error) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+		return nil, fmt.Errorf("expected a [...] array")
 	}
-	return n, nil
-}
-
-// strList reads ["443", "udp:500"], and also a bare "443" so a single value
-// does not need brackets.
-func strList(val string) []string {
-	v := strings.TrimSpace(val)
-	if !strings.HasPrefix(v, "[") {
-		if s := unquote(v); s != "" {
-			return []string{s}
-		}
-		return nil
+	body := strings.TrimSpace(s[1 : len(s)-1])
+	if body == "" {
+		return nil, nil
 	}
-	v = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
 	var out []string
-	for _, part := range splitTop(v) {
-		if s := unquote(part); s != "" {
-			out = append(out, s)
+	for _, part := range splitTop(body) {
+		part = unquote(part)
+		if part != "" {
+			out = append(out, part)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // splitTop splits on commas that are not inside quotes.
@@ -160,10 +139,18 @@ func splitTop(s string) []string {
 	return append(out, s[start:])
 }
 
-// assign maps one key onto the Config.
-//
-// Every section also accepts its keys with no section at all, which is what
-// the flat JSON layout used. One table, both shapes, no second parser.
+func atoi(key, s string) (int, error) {
+	// TOML allows 10_000 as a readability separator.
+	n, err := strconv.Atoi(strings.ReplaceAll(strings.TrimSpace(s), "_", ""))
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a number", key, s)
+	}
+	return n, nil
+}
+
+// assign maps one key onto the Config. Sections group what belongs together;
+// a key with no section is the flat layout Pingify wrote before 3.4 and is
+// still accepted so an existing file keeps working.
 func assign(c *Config, section, key, val string) error {
 	var err error
 	num := func(dst *int) error {
@@ -172,6 +159,19 @@ func assign(c *Config, section, key, val string) error {
 			*dst = n
 		}
 		return e
+	}
+	boolean := func(dst **bool) error {
+		switch strings.ToLower(strings.TrimSpace(unquote(val))) {
+		case "true", "yes", "on", "1":
+			t := true
+			*dst = &t
+		case "false", "no", "off", "0":
+			f := false
+			*dst = &f
+		default:
+			return fmt.Errorf("%s must be true or false, got %q", key, val)
+		}
+		return nil
 	}
 
 	switch section {
@@ -201,12 +201,17 @@ func assign(c *Config, section, key, val string) error {
 			err = num(&c.KeepaliveSec)
 		case "dial_timeout_sec":
 			err = num(&c.DialTimeout)
+		case "obfuscate":
+			err = boolean(&c.Obfuscate)
 		}
 	}
 
 	switch section {
 	case "", "security":
-		if key == "psk" {
+		switch key {
+		case "token":
+			c.Token = unquote(val)
+		case "psk":
 			c.PSK = unquote(val)
 		}
 	}
@@ -215,23 +220,11 @@ func assign(c *Config, section, key, val string) error {
 	case "", "forward":
 		switch key {
 		case "ports", "forwards":
-			c.Forwards = strList(val)
+			c.Forwards, err = parseArray(val)
+		case "bind_addr":
+			c.BindAddr = unquote(val)
 		case "allow":
-			c.Allow = strList(val)
-		}
-	}
-
-	switch section {
-	case "tun":
-		switch key {
-		case "name", "device":
-			c.TUN.Name = unquote(val)
-		case "local_addr", "local":
-			c.TUN.Local = unquote(val)
-		case "remote_addr", "peer":
-			c.TUN.Peer = unquote(val)
-		case "mtu":
-			err = num(&c.TUN.MTU)
+			c.Allow, err = parseArray(val)
 		}
 	}
 
@@ -261,5 +254,20 @@ func assign(c *Config, section, key, val string) error {
 		}
 	}
 
+	if section == "tun" {
+		switch key {
+		case "name":
+			c.TUN.Name = unquote(val)
+		case "local", "local_addr":
+			c.TUN.Local = unquote(val)
+		case "peer", "remote_addr":
+			c.TUN.Peer = unquote(val)
+		case "mtu":
+			err = num(&c.TUN.MTU)
+		}
+	}
+
+	// Anything unrecognised is ignored on purpose: a config written by a newer
+	// Pingify should not stop an older core from starting.
 	return err
 }
