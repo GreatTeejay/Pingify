@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.13.1"
+PINGIFY_VERSION="3.13.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 BASE_DIR="/root/Pingify"
@@ -195,7 +195,7 @@ banner() {
     done
 
     # and the one line that says what it is, centred under it
-    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel   ${BX_DOT}   v${PINGIFY_VERSION}"
+    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel"
     pad=$(( (inner - ${#sub}) / 2 ))
     [ "$pad" -lt 0 ] && pad=0
     printf '  %s%s%s%s%s%s%s%s\n' \
@@ -254,6 +254,30 @@ require_root() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# fetch <url> [timeout] - print a URL's body using whatever this box has.
+fetch() {
+    local url="$1" t="${2:-10}"
+    if have curl; then
+        curl -fsS --max-time "$t" "$url" 2>/dev/null && return 0
+    fi
+    if have wget; then
+        wget -qO- --timeout="$t" "$url" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# fetch_to <url> <file> [timeout] - the same, into a file.
+fetch_to() {
+    local url="$1" dest="$2" t="${3:-120}"
+    if have curl; then
+        curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
+    fi
+    if have wget; then
+        wget -q --tries=2 --timeout="$t" -O "$dest" "$url" && return 0
+    fi
+    return 1
+}
 
 # These configs are written by this script, one key per line, so a targeted
 # sed is enough and Pingify stays free of a jq dependency.
@@ -322,14 +346,12 @@ pick_free_port() {
 server_info() {
     [ -n "${SRV_IP:-}" ] && return 0
     SRV_IP=""; SRV_LOC=""; SRV_ORG=""
-    if have curl; then
-        local j
-        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
-        if [ -n "$j" ]; then
-            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*//p')"
-            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*//p')"
-            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*//p')"
-        fi
+    local j
+    j="$(fetch 'http://ip-api.com/json/?fields=query,country,isp' 6)"
+    if [ -n "$j" ]; then
+        SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
+        SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+        SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
     fi
     [ -n "$SRV_IP" ]  || SRV_IP="$(public_ip)"
     [ -n "$SRV_IP" ]  || SRV_IP="unknown"
@@ -339,9 +361,7 @@ server_info() {
 
 public_ip() {
     local ip=""
-    if have curl; then
-        ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null)
-    fi
+    ip="$(fetch https://api.ipify.org 5)"
     if [ -z "$ip" ] && have ip; then
         ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
     fi
@@ -398,7 +418,7 @@ apt_install() {
 
 ensure_deps() {
     local missing=()
-    have curl   || missing+=(curl)
+    have curl || have wget || missing+=(curl)
     have tar    || missing+=(tar)
     have ip     || missing+=(iproute2)
     have ss     || missing+=(iproute2)
@@ -449,11 +469,11 @@ find_go() {
 install_go_tarball() {
     [ -n "$GOARCH" ] || { fail "unsupported CPU architecture: $ARCH"; return 1; }
     local ver=""
-    ver=$(curl -fsS --max-time 8 "https://go.dev/VERSION?m=text" 2>/dev/null | head -n1)
+    ver=$(fetch "https://go.dev/VERSION?m=text" 8 | head -n1)
     case "$ver" in go1.*) ;; *) ver="$GO_FALLBACK" ;; esac
     info "downloading $ver for $GOARCH"
-    if ! curl -fL --retry 2 --max-time 300 -o /tmp/pingify-go.tgz \
-         "https://go.dev/dl/${ver}.linux-${GOARCH}.tar.gz"; then
+    if ! fetch_to "https://go.dev/dl/${ver}.linux-${GOARCH}.tar.gz" /tmp/pingify-go.tgz 300 \
+         ; then
         fail "could not download the Go toolchain"
         dim "this is only the fallback path - see Update Core for other options"
         return 1
@@ -517,19 +537,18 @@ adopt_core() {
 
 download_core() {
     [ -n "$GOARCH" ] || { warn "no prebuilt core for $ARCH"; return 1; }
-    have curl || return 1
     local base tmp="/tmp/pingify-core.dl" sums="/tmp/pingify-core.sums"
     base="$(release_base)"
 
     if ! spin "downloading the core for $GOARCH" \
-         curl -fsSL --retry 2 --max-time 180 -o "$tmp" "$base/$(core_asset)"; then
+         fetch_to "$base/$(core_asset)" "$tmp" 180; then
         rm -f "$tmp"
         return 1
     fi
 
     # The checksum file is published alongside the binaries. A missing one is
     # not fatal, a wrong one is.
-    if curl -fsSL --max-time 30 -o "$sums" "$base/SHA256SUMS" 2>/dev/null; then
+    if fetch_to "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
         want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
@@ -579,7 +598,7 @@ import_core_binary() {
     local tmp="/tmp/pingify-core.import"
     case "$src" in
         http://* | https://*)
-            spin "downloading" curl -fsSL --max-time 300 -o "$tmp" "$src" \
+            spin "downloading" fetch_to "$src" "$tmp" 300 \
                 || { fail "download failed"; return 1; } ;;
         *)
             [ -f "$src" ] || { fail "no such file: $src"; return 1; }
@@ -833,17 +852,41 @@ cfg_save() {
 
 # The peer document is this one mirrored: the sides swap, and whichever end
 # dials becomes the end that listens.
+# The token is the other server's half of the tunnel.
+#
+# It used to be the whole config document, base64'd - long, and tied to
+# whatever format that document happened to be in, so changing the format
+# quietly broke every token. It is a short list of values now, and the far end
+# builds its own config from them with the same renderer this end used. A token
+# from any version therefore produces a file in the current format.
+#
+#   p1|mode|transport|endpoint|psk|carriers|window|keepalive|tunlocal|tunpeer|mtu
+#
+# endpoint is c=host:port when the far end should dial, or l=0.0.0.0:port when
+# it should accept. Everything else the far end can work out for itself.
 cfg_peer_token() {
-    local prole plisten pconnect pfwd
-    if [ "$T_ROLE" = "server" ]; then prole="client"; else prole="server"; fi
+    local ep tl="" tp="" mtu=""
     if [ -n "$T_CONNECT" ]; then
-        plisten="0.0.0.0:${T_CONNECT##*:}"; pconnect=""
+        # We dial them, so they accept - on the port we were dialling.
+        ep="l=0.0.0.0:${T_CONNECT##*:}"
     else
-        plisten=""; pconnect="${T_PUBLIC_IP}:${T_LISTEN##*:}"
+        # We accept, so they dial us, and they need our address to do it.
+        ep="c=${T_PUBLIC_IP}:${T_LISTEN##*:}"
     fi
-    if [ "$prole" = "server" ]; then pfwd="$T_FORWARDS"; else pfwd=""; fi
-    cfg_render "$prole" "$T_MODE" "$plisten" "$pconnect" "$pfwd" "$T_STATUS" | base64 | tr -d '\n'
+    if [ "$T_MODE" = "tun" ]; then
+        # Their end of the /30 is our peer address, and ours becomes theirs.
+        local pfx="${T_TUNLOCAL##*/}"
+        [ "$pfx" = "$T_TUNLOCAL" ] && pfx=30
+        tl="${T_TUNPEER}/${pfx}"
+        tp="${T_TUNLOCAL%%/*}"
+        mtu="$T_TUNMTU"
+    fi
+    printf 'p1|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+        "$T_MODE" "$T_TRANSPORT" "$ep" "$T_PSK" \
+        "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$tl" "$tp" "$mtu" \
+        | base64 | tr -d '\n'
 }
+
 
 parse_forwards() {
     local raw="$1" out="" item
@@ -1068,66 +1111,74 @@ new_tunnel() {
 # apply a token
 # ---------------------------------------------------------------------------
 
+# apply_token turns one of those back into a running tunnel on this server.
 import_tunnel() {
+    banner
     head2 "Apply a token"
-    dim "configure the other server first; it prints the token at the end"
+    dim "paste what the other server printed when you made the tunnel there"
     say ""
     local token=""
     ask token "token"
     [ -n "$token" ] || return 1
 
-    local tmp="/tmp/pingify-import.cfg"
-    if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
-        fail "that is not a Pingify token"
+    local raw
+    raw="$(printf '%s' "$token" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)"
+    case "$raw" in
+        p1\|*) ;;
+        *) fail "that is not a Pingify token"; pause; return 1 ;;
+    esac
+
+    local ver mode transport ep psk carriers window keepalive tl tp mtu
+    IFS='|' read -r ver mode transport ep psk carriers window keepalive tl tp mtu <<TOKEN
+$raw
+TOKEN
+    if [ -z "$psk" ] || [ -z "$ep" ]; then
+        fail "the token is incomplete"
         pause; return 1
     fi
-    local name; name="$(json_str "$tmp" name)"
-    if [ -z "$name" ]; then
-        fail "the token is incomplete"
-        rm -f "$tmp"; pause; return 1
+
+    cfg_reset
+    T_MODE="$mode"; T_TRANSPORT="$transport"; T_PSK="$psk"
+    T_CARRIERS="$carriers"; T_WINDOW="$window"; T_KEEPALIVE="$keepalive"
+    case "$ep" in
+        c=*)  T_CONNECT="${ep#c=}"; T_ROLE="client" ;;
+        l=*)  T_LISTEN="${ep#l=}";  T_ROLE="client" ;;
+        *) fail "the token is malformed"; pause; return 1 ;;
+    esac
+    if [ "$T_MODE" = "tun" ]; then
+        T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; T_TUNIF="pfy0"
     fi
 
-    if [ -f "$(cfg_file "$name")" ]; then
+    # The ports live on the IRAN server, so this end carries none. The name
+    # follows the same rule as everywhere else: which end, and which port.
+    local port="${ep##*:}"
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')-${port}"
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
         say ""
-        warn "a tunnel named $name already exists on this server"
-        confirm "replace it?" || { rm -f "$tmp"; return 1; }
-        systemctl stop "pingify@$name" >/dev/null 2>&1
+        warn "a tunnel named $T_NAME already exists on this server"
+        confirm "replace it?" || return 1
+        systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
+    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
 
-    # The status port chosen on the other server may be taken here.
-    local sp; sp="$(json_str "$tmp" status_addr)"
-    sed -i "s#\"status_addr\": \"[^\"]*\"#\"status_addr\": \"127.0.0.1:$(pick_free_port "${sp##*:}")\"#" "$tmp"
-
-    # A token that dials needs the address of the server that issued it.
-    local conn; conn="$(json_str "$tmp" connect)"
-    if [ -n "$conn" ]; then
-        case "${conn%%:*}" in
-            "" | "0.0.0.0")
-                say ""
-                local ip=""
-                ask ip "public address of the other server"
-                sed -i "s#\"connect\": \"[^\"]*\"#\"connect\": \"$ip:${conn##*:}\"#" "$tmp" ;;
-        esac
-    fi
-
-    install -m 600 "$tmp" "$(cfg_file "$name")"
-    rm -f "$tmp"
-
-    if ! "$CORE_BIN" -c "$(cfg_file "$name")" -check >/dev/null 2>&1; then
+    local file
+    file="$(cfg_save)"
+    if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
-        "$CORE_BIN" -c "$(cfg_file "$name")" -check 2>&1 | sed 's/^/      /'
-        rm -f "$(cfg_file "$name")"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION"
+        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
+        rm -f "$file"
         pause; return 1
     fi
 
     write_units
-    service_enable_start "$name"
+    service_enable_start "$T_NAME"
     enable_watchdog quiet
     say ""
-    ok "$name is configured and running"
+    ok "$T_NAME is configured and running"
     say ""
-    tunnel_status_block "$name"
+    tunnel_status_block "$T_NAME"
     pause
 }
 
@@ -1786,10 +1837,9 @@ restart_all() {
 
 self_update() {
     say ""
-    have curl || { fail "curl is needed for this"; return 1; }
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! curl -fsSL --max-time 60 "$RAW_BASE/Pingify.sh" -o "$tmp"; then
+    if ! fetch_to "$RAW_BASE/Pingify.sh" "$tmp" 60; then
         fail "could not reach GitHub"
         dim "on an Iranian server this often fails; update from the Kharej box"
         dim "and copy the file across instead."
@@ -2352,7 +2402,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.13.1"
+const version = "3.13.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
