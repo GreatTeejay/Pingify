@@ -61,6 +61,17 @@ func probeOne(r fwdRule) bool {
 	label := fmt.Sprintf(":%d -> %s", r.lport, r.target)
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", r.lport), 5*time.Second)
 	if err != nil {
+		// These two look alike and mean opposite things. Refused is an empty
+		// port: the tunnel is not listening. A timeout on loopback is not -
+		// the kernel answers its own sockets instantly - so something between
+		// the dial and the socket swallowed it, and on this tool that is
+		// almost always a leftover DNAT rule from an iptables tunnel.
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			fmt.Printf("  %-30s no answer on loopback - something is intercepting this port\n", label)
+			fmt.Printf("  %-30s   check:  iptables -t nat -S\n", "")
+			return false
+		}
 		fmt.Printf("  %-30s nothing listening on this server: %v\n", label, err)
 		return false
 	}

@@ -202,10 +202,13 @@ parse_forwards() {
 }
 
 side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
+# BRAID is what the TCP transport does: several carriers woven together, each
+# flow pinned to one strand so nothing arrives out of order. The protocol is
+# still plain TCP - the name describes the weave, not a new protocol.
 transport_label() {
     case "$1" in
         icmp | echo) printf 'ICMP' ;;
-        *)           printf 'TCP' ;;
+        *)           printf 'TCP BRAID' ;;
     esac
 }
 
@@ -232,7 +235,7 @@ new_tunnel() {
 
     # -- kind --------------------------------------------------------------
     wiz "Tunnel type"
-    choice 1 "TCP" "over the two public addresses - fast, adds nothing"
+    choice 1 "TCP BRAID" "several connections woven into one - the fast one"
     choice 2 "TUN" "a private network between the servers"
     say ""
     local kind=""
@@ -270,7 +273,7 @@ new_tunnel() {
     else
         T_KIND="tcp"; T_TRANSPORT="tcp"
         T_FORWARDER="pingify"
-        wiz_add "TCP"
+        wiz_add "TCP BRAID"
     fi
     cfg_mode
 
@@ -374,7 +377,7 @@ new_tunnel() {
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        field "Type" "TCP BRAID" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     fi
     if [ -n "$CFG_LISTEN" ]; then
         field "Link" "accepts on $CFG_LISTEN"
@@ -407,7 +410,9 @@ new_tunnel() {
     write_units
     service_enable_start "$T_NAME"
     enable_watchdog quiet
-    [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
+    # Unconditional: apply_nat tears the chains down when no tunnel needs
+    # them, so this is also what cleans up after a forwarder that changed.
+    apply_nat quiet
     ok "$T_NAME is running"
     dim "$file"
 
@@ -422,7 +427,7 @@ new_tunnel() {
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP"
+        field "Type" "TCP BRAID"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
     field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
