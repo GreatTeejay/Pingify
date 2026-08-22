@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.9.1"
+const version = "5.0.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -395,23 +395,41 @@ func main() {
 // 2. logging
 // ==========================================================================
 
+// Five levels, not seven. panic and fatal say how a program died rather than
+// how bad the news is, and both come out of this one as an error followed by
+// the process ending - so they would only ever have been two more words for
+// the same line. trace is worth its own level: it is the one that prints per
+// packet, and mixing that into debug makes debug unusable.
+//
+//	error   something is broken and stays broken
+//	warn    something is wrong but the tunnel carried on
+//	info    the things worth knowing on a healthy tunnel
+//	debug   why a carrier or a stream did what it did
+//	trace   every packet - loud enough to slow a busy tunnel down
 const (
 	lvlError = 0
 	lvlWarn  = 1
 	lvlInfo  = 2
 	lvlDebug = 3
+	lvlTrace = 4
 )
 
 var logLevel int32 = lvlInfo
 
+// logNames maps a level to what it is called, both ways round, so the manager
+// and the core cannot drift on the spelling.
+var logNames = []string{"error", "warn", "info", "debug", "trace"}
+
 func setLogLevel(s string) {
-	switch s {
-	case "error":
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "error", "err", "fatal", "panic":
 		atomic.StoreInt32(&logLevel, lvlError)
-	case "warn":
+	case "warn", "warning":
 		atomic.StoreInt32(&logLevel, lvlWarn)
 	case "debug":
 		atomic.StoreInt32(&logLevel, lvlDebug)
+	case "trace":
+		atomic.StoreInt32(&logLevel, lvlTrace)
 	default:
 		atomic.StoreInt32(&logLevel, lvlInfo)
 	}
@@ -421,18 +439,46 @@ func setLogLevel(s string) {
 // can assert on what an operator would actually have seen.
 var logSink = func(line string) { fmt.Fprintln(os.Stderr, line) }
 
-func logAt(lvl int32, tag, format string, args ...interface{}) {
+// Colour is decided once. journalctl keeps the escapes and renders them; a
+// file or a pipe gets none, so a log that is grepped later stays clean.
+var logColour = func() bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}()
+
+// Red for what is broken, yellow for what is merely wrong, and everything a
+// healthy tunnel says in the colour of the terminal it is read in.
+var logTags = [5]struct{ plain, coloured string }{
+	{"ERROR", "\033[31mERROR\033[0m"},
+	{"WARN ", "\033[33mWARN \033[0m"},
+	{"INFO ", "\033[36mINFO \033[0m"},
+	{"DEBUG", "\033[90mDEBUG\033[0m"},
+	{"TRACE", "\033[90mTRACE\033[0m"},
+}
+
+func logAt(lvl int32, format string, args ...interface{}) {
 	if atomic.LoadInt32(&logLevel) < lvl {
 		return
+	}
+	tag := logTags[lvl].plain
+	if logColour {
+		tag = logTags[lvl].coloured
 	}
 	logSink(fmt.Sprintf("%s %s %s",
 		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...)))
 }
 
-func logError(f string, a ...interface{}) { logAt(lvlError, "ERR ", f, a...) }
-func logWarn(f string, a ...interface{})  { logAt(lvlWarn, "WARN", f, a...) }
-func logInfo(f string, a ...interface{})  { logAt(lvlInfo, "INFO", f, a...) }
-func logDebug(f string, a ...interface{}) { logAt(lvlDebug, "DBG ", f, a...) }
+func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }
+func logWarn(f string, a ...interface{})  { logAt(lvlWarn, f, a...) }
+func logInfo(f string, a ...interface{})  { logAt(lvlInfo, f, a...) }
+func logDebug(f string, a ...interface{}) { logAt(lvlDebug, f, a...) }
+func logTrace(f string, a ...interface{}) { logAt(lvlTrace, f, a...) }
 
 // ==========================================================================
 // 3. key derivation
@@ -644,6 +690,24 @@ func readPadding(conn net.Conn, tag []byte) error {
 	}
 	_, err := io.CopyN(io.Discard, conn, int64(n))
 	return err
+}
+
+// The wire a tunnel speaks is one decision, not two. Obfuscation used to
+// govern only the frame lengths while the handshake stayed on v3 regardless -
+// a shape that had never been run anywhere. Now off means the whole v2.1.1
+// wire, the one with field evidence behind it, and on means the whole v3 one.
+func clientHandshakeFor(cfg *Config, conn net.Conn, carrier int) (*sessionKeys, error) {
+	if !cfg.obfuscated() {
+		return clientHandshakeV2(conn, cfg, carrier)
+	}
+	return clientHandshake(conn, cfg, carrier)
+}
+
+func serverHandshakeFor(cfg *Config, conn net.Conn, g *replayGuard) (*sessionKeys, int, error) {
+	if !cfg.obfuscated() {
+		return serverHandshakeV2(conn, cfg, g)
+	}
+	return serverHandshake(conn, cfg, g)
 }
 
 // clientHandshake runs on the side that dials out.
@@ -894,7 +958,7 @@ func (p *pool) acceptLoop(ln net.Listener) {
 
 func (p *pool) serveInbound(conn net.Conn) {
 	tuneSocket(conn, p.cfg)
-	keys, idx, err := serverHandshake(conn, p.cfg, p.guard)
+	keys, idx, err := serverHandshakeFor(p.cfg, conn, p.guard)
 	if err != nil {
 		// Stay quiet: a probe should learn nothing from timing or content.
 		time.Sleep(time.Duration(200+mrand.Intn(600)) * time.Millisecond)
@@ -934,7 +998,7 @@ func (p *pool) dialLoop(idx int) {
 			continue
 		}
 		tuneSocket(conn, p.cfg)
-		keys, err := clientHandshake(conn, p.cfg, idx)
+		keys, err := clientHandshakeFor(p.cfg, conn, idx)
 		if err != nil {
 			conn.Close()
 			logWarn("carrier %d handshake: %v (check the key on both servers)", idx, err)

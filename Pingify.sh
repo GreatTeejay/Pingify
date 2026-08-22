@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.9.1"
+PINGIFY_VERSION="5.0.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -776,7 +776,7 @@ cfg_reset() {
     T_PUBLIC_IP=""; T_PEER_IP=""
     T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
-    T_FORWARDS=""; T_STATUS=""
+    T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
 }
 
@@ -900,7 +900,7 @@ cfg_render() {
     printf '\n[status]\n'
     printf 'addr             = "%s"\n' "$status"
     printf '\n[logging]\n'
-    printf 'level            = "info"\n'
+    printf 'level            = "%s"\n' "$T_LOG"
 }
 
 # Name the missing field rather than letting the core report it as a flat
@@ -1025,24 +1025,6 @@ new_tunnel() {
     fi
     cfg_mode
 
-    # -- name --------------------------------------------------------------
-    local suggested="main"
-    [ -f "$(cfg_file main)" ] && suggested="tunnel$(( $(tunnel_count) + 1 ))"
-    wiz "Name it" "Anything you like - it names the service and the config file."
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$(cfg_file "$T_NAME")" ]; then
-                    fail "a tunnel named $T_NAME already exists here"
-                else
-                    break
-                fi ;;
-        esac
-    done
-    wiz_add "$T_NAME"
-
     # -- where the servers are ---------------------------------------------
     wiz "Addresses"
     if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
@@ -1063,6 +1045,32 @@ new_tunnel() {
         case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
     fi
+
+    # -- name --------------------------------------------------------------
+    # iran9443 / kharej9443: which end this is, and which tunnel. Two servers
+    # side by side then say what they are without opening either file.
+    local suggested
+    suggested="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    if [ "$T_TRANSPORT" = "icmp" ]; then
+        suggested="${suggested}icmp"
+    else
+        suggested="${suggested}${T_PORT}"
+    fi
+    [ -f "$(cfg_file "$suggested")" ] && suggested="${suggested}-$(( $(tunnel_count) + 1 ))"
+    wiz "Name it" "Names the service, the log and the config file."
+    while :; do
+        ask T_NAME "name" "$suggested"
+        case "$T_NAME" in
+            "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
+            *)
+                if [ -f "$(cfg_file "$T_NAME")" ]; then
+                    fail "a tunnel named $T_NAME already exists here"
+                else
+                    break
+                fi ;;
+        esac
+    done
+    wiz_add "$T_NAME"
 
     # -- the private link, whenever one is needed --------------------------
     if cfg_needs_link; then
@@ -1114,6 +1122,22 @@ new_tunnel() {
     wiz "Performance" "Pick the shape of your traffic; you can change it later."
     preset_menu
 
+    # -- logging -----------------------------------------------------------
+    wiz "How much to log" "Each level includes the ones above it."
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    say ""
+    local lg=""
+    ask lg "select" "3"
+    case "$lg" in
+        1) T_LOG="error" ;; 2) T_LOG="warn" ;;
+        4) T_LOG="debug" ;; 5) T_LOG="trace" ;;
+        *) T_LOG="info" ;;
+    esac
+
     T_STATUS="127.0.0.1:$(pick_free_port 9700)"
 
     # -- review ------------------------------------------------------------
@@ -1138,6 +1162,7 @@ new_tunnel() {
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Tuning" "$T_PRESET"
+    field "Logging" "$T_LOG"
     panel_end
     say ""
     if ! confirm "create it?"; then
@@ -1571,6 +1596,48 @@ probe_path() {
     pause
 }
 
+edit_logging() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    banner
+    head2 "Logging: $name"
+    say ""
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    say ""
+    dim "This is local. The two servers may log at different levels."
+    say ""
+    local c="" lvl
+    ask c "select" "3"
+    case "$c" in
+        1) lvl="error" ;; 2) lvl="warn" ;;
+        4) lvl="debug" ;; 5) lvl="trace" ;;
+        3|"") lvl="info" ;;
+        *) fail "pick 1 to 5"; pause; return ;;
+    esac
+    cp -f "$f" "$f.bak"
+    if grep -q '^level' "$f"; then
+        sed -i "s#^level.*#level            = \"$lvl\"#" "$f"
+    else
+        printf '
+[logging]
+level            = "%s"
+' "$lvl" >> "$f"
+    fi
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "logging at $lvl"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
+}
+
 shaping_label() {
     case "$(toml_get "$(cfg_file "$1")" transport obfuscate)" in
         true) printf 'on' ;;
@@ -1688,6 +1755,7 @@ tuning_menu() {
         item 3 "Window" "$T_WINDOW KB per connection"
         item 4 "Keepalive" "$T_KEEPALIVE seconds"
         item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
+        item 6 "Logging" "$T_LOG"
         item 0 "Back"
         say ""
         local c=""
@@ -1702,6 +1770,7 @@ tuning_menu() {
             4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
                tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
             5) edit_shaping "$name" ;;
+            6) edit_logging "$name" ;;
             0|"") return ;;
         esac
     done
@@ -3448,6 +3517,136 @@ func assign(c *Config, section, key, val string) error {
 	return err
 }
 PINGIFY_SRC_EOF
+    cat > "$d/handshake_v2.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"io"
+	"net"
+	"time"
+)
+
+// The plain handshake, byte for byte as v2.1.1 shipped it.
+//
+// v3 removed every constant from the wire so nothing could be fingerprinted:
+// no magic, no version, a header XORed with a key-derived block, a variable
+// amount of trailing padding, and masked frame lengths. On a real Iran<->Europe
+// path that stream stopped carrying anything a few seconds after each carrier
+// came up, in both directions, every time - while this one, with a four-byte
+// magic in the clear, worked on the same two servers.
+//
+// Both are kept. Which one a tunnel speaks is [transport] obfuscate, and it has
+// to match on the two ends. Off - this one - is the default, because a tunnel
+// that carries no traffic protects nothing.
+const (
+	hs2Magic     = "PFY2"
+	hs2Version   = 2
+	hs2ClientLen = 4 + 1 + 1 + 2 + 8 + 16 + 32
+	hs2ServerLen = 16 + 32
+)
+
+func deriveSessionV2(psk, nonceC, nonceS []byte, carrier uint16, dialer bool) *sessionKeys {
+	salt := make([]byte, 0, len(nonceC)+len(nonceS)+2)
+	salt = append(salt, nonceC...)
+	salt = append(salt, nonceS...)
+	salt = append(salt, byte(carrier>>8), byte(carrier))
+	prk := hkdfExtract(salt, psk)
+	c2s := hkdfExpand(prk, []byte("pingify/v2 c2s"), 32)
+	s2c := hkdfExpand(prk, []byte("pingify/v2 s2c"), 32)
+
+	// The length masks are never used in this mode; they are filled in so the
+	// struct is always whole and nothing has to check before reading it.
+	if dialer {
+		return &sessionKeys{aeadFrom(c2s), aeadFrom(s2c), blockFrom(c2s), blockFrom(s2c)}
+	}
+	return &sessionKeys{aeadFrom(s2c), aeadFrom(c2s), blockFrom(s2c), blockFrom(c2s)}
+}
+
+func clientHandshakeV2(conn net.Conn, cfg *Config, carrier int) (*sessionKeys, error) {
+	psk := cfg.key()
+	buf := make([]byte, hs2ClientLen)
+	copy(buf[0:4], hs2Magic)
+	buf[4] = hs2Version
+	buf[5] = roleByte(cfg.Role)
+	binary.BigEndian.PutUint16(buf[6:8], uint16(carrier))
+	binary.BigEndian.PutUint64(buf[8:16], uint64(time.Now().Unix()))
+	if _, err := rand.Read(buf[16:32]); err != nil {
+		return nil, err
+	}
+	m := hmac.New(sha256.New, psk)
+	m.Write(buf[:32])
+	copy(buf[32:], m.Sum(nil))
+
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if _, err := conn.Write(buf); err != nil {
+		return nil, err
+	}
+	resp := make([]byte, hs2ServerLen)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		return nil, err
+	}
+	m2 := hmac.New(sha256.New, psk)
+	m2.Write([]byte("pingify/v2 srv"))
+	m2.Write(buf[16:32])
+	m2.Write(resp[:16])
+	if !hmac.Equal(m2.Sum(nil), resp[16:]) {
+		return nil, errHandshake
+	}
+	conn.SetDeadline(time.Time{})
+
+	return deriveSessionV2(psk, buf[16:32], resp[:16], uint16(carrier), true), nil
+}
+
+func serverHandshakeV2(conn net.Conn, cfg *Config, g *replayGuard) (*sessionKeys, int, error) {
+	psk := cfg.key()
+	buf := make([]byte, hs2ClientLen)
+	conn.SetDeadline(time.Now().Add(15 * time.Second))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		return nil, 0, err
+	}
+	if string(buf[0:4]) != hs2Magic || buf[4] != hs2Version {
+		return nil, 0, errHandshake
+	}
+	if buf[5] == roleByte(cfg.Role) {
+		return nil, 0, errHandshake // both ends configured with the same role
+	}
+	ts := int64(binary.BigEndian.Uint64(buf[8:16]))
+	if d := time.Since(time.Unix(ts, 0)); d > hsSkew || d < -hsSkew {
+		return nil, 0, errHandshake
+	}
+	m := hmac.New(sha256.New, psk)
+	m.Write(buf[:32])
+	if !hmac.Equal(m.Sum(nil), buf[32:]) {
+		return nil, 0, errHandshake
+	}
+	var nc [16]byte
+	copy(nc[:], buf[16:32])
+	if !g.accept(nc) {
+		return nil, 0, errHandshake
+	}
+
+	resp := make([]byte, hs2ServerLen)
+	if _, err := rand.Read(resp[:16]); err != nil {
+		return nil, 0, err
+	}
+	m2 := hmac.New(sha256.New, psk)
+	m2.Write([]byte("pingify/v2 srv"))
+	m2.Write(buf[16:32])
+	m2.Write(resp[:16])
+	copy(resp[16:], m2.Sum(nil))
+	if _, err := conn.Write(resp); err != nil {
+		return nil, 0, err
+	}
+	conn.SetDeadline(time.Time{})
+
+	carrier := int(binary.BigEndian.Uint16(buf[6:8]))
+	return deriveSessionV2(psk, buf[16:32], resp[:16], uint16(carrier), false), carrier, nil
+}
+PINGIFY_SRC_EOF
     cat > "$d/icmp.go" <<'PINGIFY_SRC_EOF'
 package main
 
@@ -3808,7 +4007,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.9.1"
+const version = "5.0.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -4151,23 +4350,41 @@ func main() {
 // 2. logging
 // ==========================================================================
 
+// Five levels, not seven. panic and fatal say how a program died rather than
+// how bad the news is, and both come out of this one as an error followed by
+// the process ending - so they would only ever have been two more words for
+// the same line. trace is worth its own level: it is the one that prints per
+// packet, and mixing that into debug makes debug unusable.
+//
+//	error   something is broken and stays broken
+//	warn    something is wrong but the tunnel carried on
+//	info    the things worth knowing on a healthy tunnel
+//	debug   why a carrier or a stream did what it did
+//	trace   every packet - loud enough to slow a busy tunnel down
 const (
 	lvlError = 0
 	lvlWarn  = 1
 	lvlInfo  = 2
 	lvlDebug = 3
+	lvlTrace = 4
 )
 
 var logLevel int32 = lvlInfo
 
+// logNames maps a level to what it is called, both ways round, so the manager
+// and the core cannot drift on the spelling.
+var logNames = []string{"error", "warn", "info", "debug", "trace"}
+
 func setLogLevel(s string) {
-	switch s {
-	case "error":
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "error", "err", "fatal", "panic":
 		atomic.StoreInt32(&logLevel, lvlError)
-	case "warn":
+	case "warn", "warning":
 		atomic.StoreInt32(&logLevel, lvlWarn)
 	case "debug":
 		atomic.StoreInt32(&logLevel, lvlDebug)
+	case "trace":
+		atomic.StoreInt32(&logLevel, lvlTrace)
 	default:
 		atomic.StoreInt32(&logLevel, lvlInfo)
 	}
@@ -4177,18 +4394,46 @@ func setLogLevel(s string) {
 // can assert on what an operator would actually have seen.
 var logSink = func(line string) { fmt.Fprintln(os.Stderr, line) }
 
-func logAt(lvl int32, tag, format string, args ...interface{}) {
+// Colour is decided once. journalctl keeps the escapes and renders them; a
+// file or a pipe gets none, so a log that is grepped later stays clean.
+var logColour = func() bool {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
+		return false
+	}
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}()
+
+// Red for what is broken, yellow for what is merely wrong, and everything a
+// healthy tunnel says in the colour of the terminal it is read in.
+var logTags = [5]struct{ plain, coloured string }{
+	{"ERROR", "\033[31mERROR\033[0m"},
+	{"WARN ", "\033[33mWARN \033[0m"},
+	{"INFO ", "\033[36mINFO \033[0m"},
+	{"DEBUG", "\033[90mDEBUG\033[0m"},
+	{"TRACE", "\033[90mTRACE\033[0m"},
+}
+
+func logAt(lvl int32, format string, args ...interface{}) {
 	if atomic.LoadInt32(&logLevel) < lvl {
 		return
+	}
+	tag := logTags[lvl].plain
+	if logColour {
+		tag = logTags[lvl].coloured
 	}
 	logSink(fmt.Sprintf("%s %s %s",
 		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...)))
 }
 
-func logError(f string, a ...interface{}) { logAt(lvlError, "ERR ", f, a...) }
-func logWarn(f string, a ...interface{})  { logAt(lvlWarn, "WARN", f, a...) }
-func logInfo(f string, a ...interface{})  { logAt(lvlInfo, "INFO", f, a...) }
-func logDebug(f string, a ...interface{}) { logAt(lvlDebug, "DBG ", f, a...) }
+func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }
+func logWarn(f string, a ...interface{})  { logAt(lvlWarn, f, a...) }
+func logInfo(f string, a ...interface{})  { logAt(lvlInfo, f, a...) }
+func logDebug(f string, a ...interface{}) { logAt(lvlDebug, f, a...) }
+func logTrace(f string, a ...interface{}) { logAt(lvlTrace, f, a...) }
 
 // ==========================================================================
 // 3. key derivation
@@ -4400,6 +4645,24 @@ func readPadding(conn net.Conn, tag []byte) error {
 	}
 	_, err := io.CopyN(io.Discard, conn, int64(n))
 	return err
+}
+
+// The wire a tunnel speaks is one decision, not two. Obfuscation used to
+// govern only the frame lengths while the handshake stayed on v3 regardless -
+// a shape that had never been run anywhere. Now off means the whole v2.1.1
+// wire, the one with field evidence behind it, and on means the whole v3 one.
+func clientHandshakeFor(cfg *Config, conn net.Conn, carrier int) (*sessionKeys, error) {
+	if !cfg.obfuscated() {
+		return clientHandshakeV2(conn, cfg, carrier)
+	}
+	return clientHandshake(conn, cfg, carrier)
+}
+
+func serverHandshakeFor(cfg *Config, conn net.Conn, g *replayGuard) (*sessionKeys, int, error) {
+	if !cfg.obfuscated() {
+		return serverHandshakeV2(conn, cfg, g)
+	}
+	return serverHandshake(conn, cfg, g)
 }
 
 // clientHandshake runs on the side that dials out.
@@ -4650,7 +4913,7 @@ func (p *pool) acceptLoop(ln net.Listener) {
 
 func (p *pool) serveInbound(conn net.Conn) {
 	tuneSocket(conn, p.cfg)
-	keys, idx, err := serverHandshake(conn, p.cfg, p.guard)
+	keys, idx, err := serverHandshakeFor(p.cfg, conn, p.guard)
 	if err != nil {
 		// Stay quiet: a probe should learn nothing from timing or content.
 		time.Sleep(time.Duration(200+mrand.Intn(600)) * time.Millisecond)
@@ -4690,7 +4953,7 @@ func (p *pool) dialLoop(idx int) {
 			continue
 		}
 		tuneSocket(conn, p.cfg)
-		keys, err := clientHandshake(conn, p.cfg, idx)
+		keys, err := clientHandshakeFor(p.cfg, conn, idx)
 		if err != nil {
 			conn.Close()
 			logWarn("carrier %d handshake: %v (check the key on both servers)", idx, err)

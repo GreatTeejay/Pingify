@@ -29,7 +29,7 @@ cfg_reset() {
     T_PUBLIC_IP=""; T_PEER_IP=""
     T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
-    T_FORWARDS=""; T_STATUS=""
+    T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
 }
 
@@ -153,7 +153,7 @@ cfg_render() {
     printf '\n[status]\n'
     printf 'addr             = "%s"\n' "$status"
     printf '\n[logging]\n'
-    printf 'level            = "info"\n'
+    printf 'level            = "%s"\n' "$T_LOG"
 }
 
 # Name the missing field rather than letting the core report it as a flat
@@ -278,24 +278,6 @@ new_tunnel() {
     fi
     cfg_mode
 
-    # -- name --------------------------------------------------------------
-    local suggested="main"
-    [ -f "$(cfg_file main)" ] && suggested="tunnel$(( $(tunnel_count) + 1 ))"
-    wiz "Name it" "Anything you like - it names the service and the config file."
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$(cfg_file "$T_NAME")" ]; then
-                    fail "a tunnel named $T_NAME already exists here"
-                else
-                    break
-                fi ;;
-        esac
-    done
-    wiz_add "$T_NAME"
-
     # -- where the servers are ---------------------------------------------
     wiz "Addresses"
     if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
@@ -316,6 +298,32 @@ new_tunnel() {
         case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
     fi
+
+    # -- name --------------------------------------------------------------
+    # iran9443 / kharej9443: which end this is, and which tunnel. Two servers
+    # side by side then say what they are without opening either file.
+    local suggested
+    suggested="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    if [ "$T_TRANSPORT" = "icmp" ]; then
+        suggested="${suggested}icmp"
+    else
+        suggested="${suggested}${T_PORT}"
+    fi
+    [ -f "$(cfg_file "$suggested")" ] && suggested="${suggested}-$(( $(tunnel_count) + 1 ))"
+    wiz "Name it" "Names the service, the log and the config file."
+    while :; do
+        ask T_NAME "name" "$suggested"
+        case "$T_NAME" in
+            "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
+            *)
+                if [ -f "$(cfg_file "$T_NAME")" ]; then
+                    fail "a tunnel named $T_NAME already exists here"
+                else
+                    break
+                fi ;;
+        esac
+    done
+    wiz_add "$T_NAME"
 
     # -- the private link, whenever one is needed --------------------------
     if cfg_needs_link; then
@@ -367,6 +375,22 @@ new_tunnel() {
     wiz "Performance" "Pick the shape of your traffic; you can change it later."
     preset_menu
 
+    # -- logging -----------------------------------------------------------
+    wiz "How much to log" "Each level includes the ones above it."
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    say ""
+    local lg=""
+    ask lg "select" "3"
+    case "$lg" in
+        1) T_LOG="error" ;; 2) T_LOG="warn" ;;
+        4) T_LOG="debug" ;; 5) T_LOG="trace" ;;
+        *) T_LOG="info" ;;
+    esac
+
     T_STATUS="127.0.0.1:$(pick_free_port 9700)"
 
     # -- review ------------------------------------------------------------
@@ -391,6 +415,7 @@ new_tunnel() {
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Tuning" "$T_PRESET"
+    field "Logging" "$T_LOG"
     panel_end
     say ""
     if ! confirm "create it?"; then

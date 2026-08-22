@@ -244,6 +244,48 @@ probe_path() {
     pause
 }
 
+edit_logging() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    banner
+    head2 "Logging: $name"
+    say ""
+    choice 1 "error" "only what is broken"
+    choice 2 "warn" "and what is wrong but survivable"
+    choice 3 "info" "and what a healthy tunnel does"
+    choice 4 "debug" "and why each carrier and stream did what it did"
+    choice 5 "trace" "and every packet - slows a busy tunnel down"
+    say ""
+    dim "This is local. The two servers may log at different levels."
+    say ""
+    local c="" lvl
+    ask c "select" "3"
+    case "$c" in
+        1) lvl="error" ;; 2) lvl="warn" ;;
+        4) lvl="debug" ;; 5) lvl="trace" ;;
+        3|"") lvl="info" ;;
+        *) fail "pick 1 to 5"; pause; return ;;
+    esac
+    cp -f "$f" "$f.bak"
+    if grep -q '^level' "$f"; then
+        sed -i "s#^level.*#level            = \"$lvl\"#" "$f"
+    else
+        printf '
+[logging]
+level            = "%s"
+' "$lvl" >> "$f"
+    fi
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "logging at $lvl"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
+}
+
 shaping_label() {
     case "$(toml_get "$(cfg_file "$1")" transport obfuscate)" in
         true) printf 'on' ;;
@@ -361,6 +403,7 @@ tuning_menu() {
         item 3 "Window" "$T_WINDOW KB per connection"
         item 4 "Keepalive" "$T_KEEPALIVE seconds"
         item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
+        item 6 "Logging" "$T_LOG"
         item 0 "Back"
         say ""
         local c=""
@@ -375,6 +418,7 @@ tuning_menu() {
             4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
                tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
             5) edit_shaping "$name" ;;
+            6) edit_logging "$name" ;;
             0|"") return ;;
         esac
     done
