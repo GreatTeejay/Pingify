@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.2.0"
+PINGIFY_VERSION="4.2.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -3571,7 +3571,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.2.0"
+const version = "4.2.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -4364,6 +4364,13 @@ func (p *pool) serveInbound(conn net.Conn) {
 		conn.Close()
 		return
 	}
+	if idx >= p.cfg.Carriers {
+		// Not fatal - the pool holds it either way - but it means the two
+		// configs were written with different tuning, and every setting that
+		// has to match is now suspect.
+		logWarn("carrier %d arrived but this side is configured for %d: the two ends disagree on [transport] carriers",
+			idx, p.cfg.Carriers)
+	}
 	l := newLink(idx, p.cfg, conn, keys, p)
 	p.install(idx, l)
 	logInfo("carrier %d up from %s", idx, conn.RemoteAddr())
@@ -4877,6 +4884,8 @@ type link struct {
 	streams map[uint32]*stream
 	nextID  uint32
 
+	downWhy string // why the carrier died; read once, when it is logged
+
 	txBytes uint64
 	rxBytes uint64
 	lastRx  int64 // unix nano
@@ -4918,6 +4927,18 @@ func (l *link) alive() bool {
 	default:
 		return true
 	}
+}
+
+// died records why this carrier is going away and then closes it. The first
+// reason wins: the read loop, the write loop and the keepalive all race to
+// close a dying carrier, and the first one to notice knows the most.
+func (l *link) died(format string, a ...interface{}) {
+	l.mu.Lock()
+	if l.downWhy == "" {
+		l.downWhy = fmt.Sprintf(format, a...)
+	}
+	l.mu.Unlock()
+	l.close()
 }
 
 func (l *link) send(r *recBuf) bool {
@@ -4983,11 +5004,29 @@ func (l *link) writeLoop() {
 		maskLen(l.keys.maskTx, ctr, out[:4])
 		l.conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 		if _, err := l.conn.Write(out); err != nil {
-			logDebug("carrier %d write: %v", l.idx, err)
+			l.died("write: %v", err)
 			return
 		}
 		out = out[:0]
 	}
+}
+
+// readReason turns a socket error into something worth reading at 4am. A
+// timeout means nothing arrived and the peer may be fine; a reset means
+// something actively tore the connection down, which on this path is usually
+// not the peer.
+func readReason(err error, idle time.Duration) string {
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return fmt.Sprintf("nothing received for %s - the peer stopped sending, or the path dropped it", idle)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return "peer closed the connection"
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return "connection reset - something on the path killed it, not the peer"
+	}
+	return "read: " + err.Error()
 }
 
 func (l *link) readLoop() {
@@ -4999,13 +5038,13 @@ func (l *link) readLoop() {
 	for {
 		l.conn.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
-			logDebug("carrier %d read: %v", l.idx, err)
+			l.died("%s", readReason(err, idle))
 			return
 		}
 		maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
 		n := int(binary.BigEndian.Uint32(hdr[:]))
 		if n < 16 || n > maxFrame {
-			logWarn("carrier %d: bad frame length %d", l.idx, n)
+			l.died("bad frame length %d - the two ends disagree or something rewrote the stream", n)
 			return
 		}
 		if cap(ct) < n {
@@ -5013,19 +5052,20 @@ func (l *link) readLoop() {
 		}
 		ct = ct[:n]
 		if _, err := io.ReadFull(l.conn, ct); err != nil {
+			l.died("%s", readReason(err, idle))
 			return
 		}
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
 		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
 		if err != nil {
-			logWarn("carrier %d: authentication failed", l.idx)
+			l.died("authentication failed - the token does not match, or a middlebox altered the stream")
 			return
 		}
 		plain = p[:0]
 		atomic.StoreInt64(&l.lastRx, time.Now().UnixNano())
 		if err := l.dispatch(p); err != nil {
-			logWarn("carrier %d: %v", l.idx, err)
+			l.died("%v", err)
 			return
 		}
 	}
@@ -5095,8 +5135,7 @@ func (l *link) keepaliveLoop() {
 		select {
 		case <-t.C:
 			if time.Now().UnixNano()-atomic.LoadInt64(&l.lastRx) > idle {
-				logWarn("carrier %d: silent for %ds, recycling", l.idx, l.cfg.KeepaliveSec*3)
-				l.close()
+				l.died("silent for %ds - no keepalive came back", l.cfg.KeepaliveSec*3)
 				return
 			}
 			var b [8]byte
@@ -5118,6 +5157,7 @@ func (l *link) close() {
 			streams = append(streams, s)
 		}
 		l.streams = make(map[uint32]*stream)
+		why := l.downWhy
 		l.mu.Unlock()
 		for _, s := range streams {
 			s.reset()
@@ -5127,7 +5167,11 @@ func (l *link) close() {
 				h.onLinkDown(l)
 			}
 		}
-		logInfo("carrier %d down", l.idx)
+		if why == "" {
+			why = "closed locally"
+		}
+		logInfo("carrier %d down: %s (up %s)", l.idx, why,
+			time.Since(time.Unix(0, atomic.LoadInt64(&l.upSince))).Round(time.Second))
 	})
 }
 
