@@ -160,6 +160,19 @@ func assign(c *Config, section, key, val string) error {
 		}
 		return e
 	}
+	boolean := func(dst **bool) error {
+		switch strings.ToLower(strings.TrimSpace(unquote(val))) {
+		case "true", "yes", "on", "1":
+			t := true
+			*dst = &t
+		case "false", "no", "off", "0":
+			f := false
+			*dst = &f
+		default:
+			return fmt.Errorf("%s must be true or false, got %q", key, val)
+		}
+		return nil
+	}
 
 	switch section {
 	case "", "tunnel":
@@ -188,6 +201,8 @@ func assign(c *Config, section, key, val string) error {
 			err = num(&c.KeepaliveSec)
 		case "dial_timeout_sec":
 			err = num(&c.DialTimeout)
+		case "obfuscate":
+			err = boolean(&c.Obfuscate)
 		}
 	}
 

@@ -28,6 +28,7 @@ cfg_reset() {
     T_ACCEPTS="server"   # IRAN accepts the link, KHAREJ dials it
     T_PUBLIC_IP=""; T_PEER_IP=""
     T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
+    T_OBFUSCATE="true"   # hide the shape of the traffic; must match the peer
     T_FORWARDS=""; T_STATUS=""
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
 }
@@ -133,6 +134,7 @@ cfg_render() {
     [ -n "$connect" ] && printf 'connect          = "%s"\n' "$connect"
     printf 'carriers         = %s\n' "$T_CARRIERS"
     printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
+    printf 'obfuscate        = %s\n' "$T_OBFUSCATE"
     printf '\n[security]\n'
     printf 'token            = "%s"\n' "$T_TOKEN"
     printf '\n[forward]\n'

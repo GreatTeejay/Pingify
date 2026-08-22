@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.3.1"
+const version = "4.4.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -100,10 +100,23 @@ type Config struct {
 
 	StatusAddr   string `json:"status_addr,omitempty"`
 	KeepaliveSec int    `json:"keepalive_sec,omitempty"`
-	DialTimeout  int    `json:"dial_timeout_sec,omitempty"`
-	SndBufKB     int    `json:"sndbuf_kb,omitempty"`
-	RcvBufKB     int    `json:"rcvbuf_kb,omitempty"`
-	LogLevel     string `json:"log_level,omitempty"`
+
+	// Obfuscate hides the shape of the traffic: the frame length prefix is
+	// masked per frame and the opening frames carry random filler, so nothing
+	// on the wire has a fixed offset or a recognisable value.
+	//
+	// The cost is that the stream then looks like nothing at all - uniformly
+	// random from the first byte - and a filter that drops flows it cannot
+	// identify will drop exactly that. Turning it off puts a plaintext length
+	// in front of each frame, which is what an ordinary length-prefixed
+	// protocol looks like. The payload stays encrypted either way.
+	//
+	// It must be the same on both servers. Nil means on.
+	Obfuscate   *bool  `json:"obfuscate,omitempty"`
+	DialTimeout int    `json:"dial_timeout_sec,omitempty"`
+	SndBufKB    int    `json:"sndbuf_kb,omitempty"`
+	RcvBufKB    int    `json:"rcvbuf_kb,omitempty"`
+	LogLevel    string `json:"log_level,omitempty"`
 }
 
 type TUNConfig struct {
@@ -227,6 +240,9 @@ func (c *Config) tokenPrint() string {
 	return hex.EncodeToString(sum[:4])
 }
 
+// obfuscated reports whether this tunnel hides the shape of its traffic.
+func (c *Config) obfuscated() bool { return c.Obfuscate == nil || *c.Obfuscate }
+
 func (c *Config) key() []byte {
 	if c.Token != "" {
 		return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
@@ -295,6 +311,9 @@ func main() {
 	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d keepalive=%ds token=%s",
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
 		cfg.KeepaliveSec, cfg.tokenPrint())
+	if !cfg.obfuscated() {
+		logInfo("traffic shaping is off: frame lengths are in the clear, and both servers must agree")
+	}
 
 	p := newPool(cfg)
 	if err := p.start(); err != nil {
@@ -1384,10 +1403,17 @@ type link struct {
 	streams map[uint32]*stream
 	nextID  uint32
 
+	obf     bool   // mask frame lengths and pad the opening frames
 	downWhy string // why the carrier died; read once, when it is logged
 
-	txBytes uint64
+	txBytes uint64 // payload carried for streams, tun and UDP
 	rxBytes uint64
+	// Bytes actually written to and read from the socket, keepalives and all.
+	// txBytes only counts payload, so an idle tunnel reports zero either way
+	// and cannot answer the one question that matters when nothing works:
+	// did our bytes leave this machine, and did any of theirs arrive?
+	wireTx  uint64
+	wireRx  uint64
 	lastRx  int64 // unix nano
 	rttUS   int64
 	upSince int64
@@ -1395,7 +1421,7 @@ type link struct {
 
 func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link {
 	l := &link{
-		idx: idx, cfg: cfg, conn: conn, pool: p,
+		idx: idx, cfg: cfg, conn: conn, pool: p, obf: cfg.obfuscated(),
 		keys:    k,
 		sendQ:   make(chan *recBuf, sendQueue),
 		closed:  make(chan struct{}),
@@ -1492,7 +1518,7 @@ func (l *link) writeLoop() {
 		}
 		// Only the opening frames are padded. That is where a fingerprint
 		// would be taken, and padding every frame would cost real bandwidth.
-		if ctr := l.txCtr; ctr < earlyPadFrames && len(frame) < maxPlain-recHdr-earlyPadMax {
+		if ctr := l.txCtr; l.obf && ctr < earlyPadFrames && len(frame) < maxPlain-recHdr-earlyPadMax {
 			frame = appendPad(frame)
 		}
 		ctr := l.txCtr
@@ -1501,12 +1527,15 @@ func (l *link) writeLoop() {
 		out = out[:4]
 		out = l.keys.tx.Seal(out, n[:], frame, nil)
 		binary.BigEndian.PutUint32(out[:4], uint32(len(out)-4))
-		maskLen(l.keys.maskTx, ctr, out[:4])
+		if l.obf {
+			maskLen(l.keys.maskTx, ctr, out[:4])
+		}
 		l.conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 		if _, err := l.conn.Write(out); err != nil {
 			l.died("write: %v", err)
 			return
 		}
+		atomic.AddUint64(&l.wireTx, uint64(len(out)))
 		out = out[:0]
 	}
 }
@@ -1541,7 +1570,9 @@ func (l *link) readLoop() {
 			l.died("%s", readReason(err, idle))
 			return
 		}
-		maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
+		if l.obf {
+			maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
+		}
 		n := int(binary.BigEndian.Uint32(hdr[:]))
 		if n < 16 || n > maxFrame {
 			l.died("bad frame length %d - the two ends disagree or something rewrote the stream", n)
@@ -1555,6 +1586,7 @@ func (l *link) readLoop() {
 			l.died("%s", readReason(err, idle))
 			return
 		}
+		atomic.AddUint64(&l.wireRx, uint64(len(hdr)+n))
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
 		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
@@ -2529,6 +2561,8 @@ type carrierStatus struct {
 	Streams int     `json:"streams"`
 	TxBytes uint64  `json:"tx_bytes"`
 	RxBytes uint64  `json:"rx_bytes"`
+	WireTx  uint64  `json:"wire_tx_bytes"`
+	WireRx  uint64  `json:"wire_rx_bytes"`
 	RTTms   float64 `json:"rtt_ms"`
 	UptimeS int64   `json:"uptime_s"`
 }
@@ -2546,6 +2580,8 @@ type statusDoc struct {
 	Streams   int             `json:"streams"`
 	TxBytes   uint64          `json:"tx_bytes"`
 	RxBytes   uint64          `json:"rx_bytes"`
+	WireTx    uint64          `json:"wire_tx_bytes"`
+	WireRx    uint64          `json:"wire_rx_bytes"`
 	RTTms     float64         `json:"rtt_ms"`
 	UptimeS   int64           `json:"uptime_s"`
 	Detail    []carrierStatus `json:"detail"`
@@ -2598,6 +2634,8 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 			Streams: l.streamCount(),
 			TxBytes: atomic.LoadUint64(&l.txBytes),
 			RxBytes: atomic.LoadUint64(&l.rxBytes),
+			WireTx:  atomic.LoadUint64(&l.wireTx),
+			WireRx:  atomic.LoadUint64(&l.wireRx),
 			RTTms:   float64(atomic.LoadInt64(&l.rttUS)) / 1000,
 			UptimeS: (now - atomic.LoadInt64(&l.upSince)) / int64(time.Second),
 		}
@@ -2610,6 +2648,8 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		}
 		d.TxBytes += cs.TxBytes
 		d.RxBytes += cs.RxBytes
+		d.WireTx += cs.WireTx
+		d.WireRx += cs.WireRx
 		d.Detail = append(d.Detail, cs)
 	}
 	d.Healthy = d.Up > 0
@@ -2698,18 +2738,28 @@ func printStatus(addr string, brief bool) int {
 	fmt.Printf("  peer       %s\n", d.Peer)
 	fmt.Printf("  rtt        %.1f ms\n", d.RTTms)
 	fmt.Printf("  streams    %d open\n", d.Streams)
-	fmt.Printf("  traffic    tx %s / rx %s\n", humanBytes(d.TxBytes), humanBytes(d.RxBytes))
+	fmt.Printf("  traffic    tx %s / rx %s   (payload)\n", humanBytes(d.TxBytes), humanBytes(d.RxBytes))
+	fmt.Printf("  on the wire tx %s / rx %s   (everything, keepalives included)\n",
+		humanBytes(d.WireTx), humanBytes(d.WireRx))
+	if d.WireTx > 0 && d.WireRx == 0 {
+		fmt.Printf("  %s\n", "NOTE: this server is sending and receiving nothing at all.")
+		fmt.Printf("  %s\n", "      Check the same two numbers on the other server. If it is also")
+		fmt.Printf("  %s\n", "      sending with nothing arriving, the bytes are leaving both")
+		fmt.Printf("  %s\n", "      machines and dying on the path between them.")
+	}
 	fmt.Printf("  uptime     %s\n", humanDuration(d.UptimeS))
 	if len(d.Detail) > 0 {
-		fmt.Printf("\n  %-4s %-6s %-8s %-9s %-12s %-12s\n", "#", "state", "streams", "rtt", "tx", "rx")
+		fmt.Printf("\n  %-4s %-6s %-8s %-9s %-12s %-12s %-12s %-12s\n",
+			"#", "state", "streams", "rtt", "tx", "rx", "wire tx", "wire rx")
 		for _, c := range d.Detail {
 			cs := "down"
 			if c.Up {
 				cs = "up"
 			}
-			fmt.Printf("  %-4d %-6s %-8d %-9s %-12s %-12s\n",
+			fmt.Printf("  %-4d %-6s %-8d %-9s %-12s %-12s %-12s %-12s\n",
 				c.Index, cs, c.Streams, fmt.Sprintf("%.1f ms", c.RTTms),
-				humanBytes(c.TxBytes), humanBytes(c.RxBytes))
+				humanBytes(c.TxBytes), humanBytes(c.RxBytes),
+				humanBytes(c.WireTx), humanBytes(c.WireRx))
 		}
 	}
 	if d.Healthy {

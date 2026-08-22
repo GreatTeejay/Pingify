@@ -1,7 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"crypto/rand"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -166,5 +170,168 @@ func TestShortTokensAreAccepted(t *testing.T) {
 	}
 	if err := base("").validate(); err == nil {
 		t.Error("an empty token was accepted; the core has no key without one")
+	}
+}
+
+// The question that matters when a tunnel is silent is "did my bytes leave,
+// and did any of theirs arrive?" - and payload counters cannot answer it,
+// because an idle tunnel carries no payload. These count the socket itself.
+func TestWireCountersMoveOnAnIdleTunnel(t *testing.T) {
+	if testing.Short() {
+		t.Skip("waits for a keepalive round trip")
+	}
+	setLogLevel("error")
+
+	psk := testPSK(t)
+	port := freePort(t)
+	iran := &Config{
+		Role: "server", Mode: "forward",
+		Listen: fmt.Sprintf("127.0.0.1:%d", port),
+		Token:  psk, Carriers: 2, KeepaliveSec: 1,
+		Forwards: []string{fmt.Sprint(freePort(t))},
+	}
+	kharej := &Config{
+		Role: "client", Mode: "forward",
+		Connect: fmt.Sprintf("127.0.0.1:%d", port),
+		Token:   psk, Carriers: 2, KeepaliveSec: 1,
+	}
+	for _, c := range []*Config{iran, kharej} {
+		c.applyDefaults()
+		if err := c.validate(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ip := newPool(iran)
+	if err := ip.start(); err != nil {
+		t.Fatal(err)
+	}
+	ifw, err := startForward(iran, ip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kp := newPool(kharej)
+	if err := kp.start(); err != nil {
+		t.Fatal(err)
+	}
+	kf, err := startForward(kharej, kp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ifw.Close(); kf.Close(); kp.close(); ip.close() })
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if up, _, _, _ := kp.stats(); up >= kharej.Carriers {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Long enough for keepalives to have crossed in both directions, and not
+	// one byte of payload sent by anybody.
+	time.Sleep(3 * time.Second)
+
+	for _, side := range []struct {
+		name string
+		p    *pool
+		cfg  *Config
+	}{{"IRAN", ip, iran}, {"KHAREJ", kp, kharej}} {
+		d := snapshot(side.cfg, side.p)
+		if d.TxBytes != 0 || d.RxBytes != 0 {
+			t.Errorf("%s: payload counters moved on an idle tunnel: tx %d rx %d",
+				side.name, d.TxBytes, d.RxBytes)
+		}
+		if d.WireTx == 0 {
+			t.Errorf("%s: wire tx is zero after 3s of keepalives; "+
+				"a silent tunnel cannot be told apart from a broken one", side.name)
+		}
+		if d.WireRx == 0 {
+			t.Errorf("%s: wire rx is zero after 3s of keepalives", side.name)
+		}
+	}
+}
+
+// Both wire shapes have to carry traffic. Obfuscation hides the frame length
+// and pads the opening frames; with it off the length is in the clear and the
+// stream looks like an ordinary length-prefixed protocol. The payload is
+// encrypted either way, and a round trip must survive both.
+func TestBothWireShapesRoundTrip(t *testing.T) {
+	setLogLevel("error")
+	for _, obf := range []bool{true, false} {
+		name := "obfuscated"
+		if !obf {
+			name = "plain length prefix"
+		}
+		t.Run(name, func(t *testing.T) {
+			echo := echoServer(t)
+			local := freePort(t)
+			port := freePort(t)
+			psk := testPSK(t)
+			flag := obf
+
+			iran := &Config{
+				Role: "server", Mode: "forward",
+				Listen: fmt.Sprintf("127.0.0.1:%d", port),
+				Token:  psk, Carriers: 2, Obfuscate: &flag,
+				Forwards: []string{fmt.Sprintf("%d=%d", local, echo)},
+			}
+			kharej := &Config{
+				Role: "client", Mode: "forward",
+				Connect: fmt.Sprintf("127.0.0.1:%d", port),
+				Token:   psk, Carriers: 2, Obfuscate: &flag,
+			}
+			for _, c := range []*Config{iran, kharej} {
+				c.applyDefaults()
+				if err := c.validate(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ip := newPool(iran)
+			if err := ip.start(); err != nil {
+				t.Fatal(err)
+			}
+			ifw, err := startForward(iran, ip)
+			if err != nil {
+				t.Fatal(err)
+			}
+			kp := newPool(kharej)
+			if err := kp.start(); err != nil {
+				t.Fatal(err)
+			}
+			kf, err := startForward(kharej, kp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { ifw.Close(); kf.Close(); kp.close(); ip.close() })
+
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				if up, _, _, _ := ip.stats(); up >= 2 {
+					break
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+
+			c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", local), 3*time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			payload := make([]byte, 512<<10)
+			if _, err := rand.Read(payload); err != nil {
+				t.Fatal(err)
+			}
+			go func() {
+				c.Write(payload)
+				c.(*net.TCPConn).CloseWrite()
+			}()
+			got := make([]byte, len(payload))
+			c.SetReadDeadline(time.Now().Add(30 * time.Second))
+			if _, err := io.ReadFull(c, got); err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatal("payload came back corrupted")
+			}
+		})
 	}
 }

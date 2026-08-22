@@ -127,6 +127,15 @@ for kind in tcp tun; do
     done
 done
 
+# traffic shaping has to survive a write/read round trip, and default to on
+# for a config written before it existed
+check "shaping is written"        "$(toml_get "$(cfg_file tcp-pingify-server)" transport obfuscate)" "true"
+cfg_load tcp-pingify-server
+check "shaping reads back"        "$T_OBFUSCATE" "true"
+sed -i '/^obfuscate/d' "$(cfg_file tcp-pingify-server)"
+cfg_load tcp-pingify-server
+check "a config without it is on" "$T_OBFUSCATE" "true"
+
 # an older config, written before the kind was recorded, still reads sensibly
 sed -i '/^kind /d' "$(cfg_file tun-iptables-server)"
 cfg_load tun-iptables-server
