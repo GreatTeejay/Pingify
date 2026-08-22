@@ -57,8 +57,9 @@ tunnel_status_block() {
 
     local colour="$C_RED"
     [ "$state" = "active" ] && colour="$C_GRN"
-    printf '  %s%s%s  service %s%s%s\n' \
-        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF"
+    printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
+        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
     if [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         "$CORE_BIN" -status "$addr" 2>/dev/null || true
     fi
@@ -239,6 +240,7 @@ edit_tuning() {
     ask car "carriers" "$T_CARRIERS"
     ask win "window (KB)" "$T_WINDOW"
     ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
+    dim "these are local: the two servers may differ without breaking the link"
     case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
 
     cp -f "$f" "$f.bak"

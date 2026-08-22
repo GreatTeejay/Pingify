@@ -336,17 +336,27 @@ new_tunnel() {
 
     # -- security ----------------------------------------------------------
     head2 "Security token"
-    dim "type the same token on both servers - anything you like, 8 characters"
-    dim "or more. It is what the two ends use to recognise each other."
+    dim "One secret, typed by hand on BOTH servers, exactly the same. It is the"
+    dim "only thing standing between this tunnel and anyone who finds the port,"
+    dim "so treat it like a password: at least $TOKEN_MIN characters, and not a word."
     say ""
     while :; do
         ask T_TOKEN "token"
-        if [ "${#T_TOKEN}" -lt 8 ]; then
-            fail "too short - use at least 8 characters"
-        else
-            break
+        T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ "${#T_TOKEN}" -lt "$TOKEN_MIN" ]; then
+            fail "too short - ${#T_TOKEN} characters, the minimum is $TOKEN_MIN"
+            continue
         fi
+        case "$T_TOKEN" in
+            *[!a-zA-Z0-9]*) break ;;
+            *[a-zA-Z]*[0-9]*|*[0-9]*[a-zA-Z]*) break ;;
+            *) warn "letters only - mix in digits or punctuation to make it worth typing" ; break ;;
+        esac
     done
+    say ""
+    ok "token fingerprint: ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
+    dim "the other server must show these same eight characters. If it does not,"
+    dim "the tokens differ - fix that before looking at anything else."
 
     # -- ports: the IRAN side owns them ------------------------------------
     if [ "$T_ROLE" = "server" ]; then
@@ -442,7 +452,7 @@ new_tunnel() {
         box_row "$(pad_to "Its private addr" 18)${T_TUNPEER}"
         box_row "$(pad_to "Peer private addr" 18)${T_TUNLOCAL}"
     fi
-    box_row "$(pad_to "Security token" 18)${C_YEL}the same one${C_OFF}"
+    box_row "$(pad_to "Token fingerprint" 18)${C_YEL}$(token_print "$T_TOKEN")${C_OFF} ${C_DIM}(must match the other server)${C_OFF}"
     box_bot
     say ""
     tunnel_status_block "$T_NAME"
