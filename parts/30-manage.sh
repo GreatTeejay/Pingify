@@ -186,7 +186,7 @@ tunnel_menu() {
         tunnel_status_block "$name"
         rule
         group "Check"
-        item 1 "Test the path" "go through the tunnel and say where it stops"
+        item 1 "Health check" "what is wrong, and what to do about it"
         item 2 "Live log"
         group "Settings"
         item 3 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
@@ -203,7 +203,7 @@ tunnel_menu() {
         local c=""
         ask c "select"
         case "$c" in
-            1) probe_path "$name" ;;
+            1) health_check "$name" ;;
             2) say ""; dim "ctrl-c to stop following"; say ""
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
             3) edit_forwards "$name" ;;
@@ -216,32 +216,6 @@ tunnel_menu() {
             0|"") return ;;
         esac
     done
-}
-
-# Connecting to a forwarded port proves nothing on its own: this server accepts
-# before it has said a word to the tunnel. The core's probe goes the whole way
-# and reports where it stopped.
-probe_path() {
-    local name="$1" f
-    f="$(cfg_file "$name")"
-    cfg_load "$name" || return 1
-    banner
-    head2 "Testing the path for: $name"
-    say ""
-    if [ "$T_ROLE" != "server" ]; then
-        warn "this is the KHAREJ end - the ports live on the IRAN server"
-        dim "run this from the menu over there instead"
-        pause; return
-    fi
-    if ! systemctl is-active --quiet "pingify@$name"; then
-        fail "the tunnel is not running; start it first"
-        pause; return
-    fi
-    "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
-    say ""
-    dim "A port that fails is one the other server could not reach. The service"
-    dim "there must be listening on the address after the arrow."
-    pause
 }
 
 edit_logging() {

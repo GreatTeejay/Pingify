@@ -414,5 +414,66 @@ pick picked "select" 1 2 >/dev/null 2>&1 < <(printf 'x
 ')
 check "pick takes the valid answer" "$picked" "2"
 
+
+# ---------------------------------------------------------------------------
+note "the health check prints a fix under every problem"
+# ---------------------------------------------------------------------------
+# A report that says something is wrong and stops there leaves you where you
+# started. Every failing check has to carry the command or the menu entry that
+# addresses it.
+HC="$WORK/hc.out"
+hc_run() {
+    (
+        banner() { :; }; pause() { :; }
+        svc_state() { printf '%s' "$1_state_stub"; }
+        "$@"
+    ) > "$HC" 2>&1
+}
+
+# a stopped service, a stale core, an unbound port
+cfg_reset
+T_NAME="sick"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="server"
+cfg_mode
+T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+T_FORWARDS='"6526"'; T_STATUS="127.0.0.1:9700"
+cfg_save >/dev/null
+(
+    banner() { :; }; pause() { :; }
+    svc_state() { printf 'stopped'; }
+    core_matches_script() { return 1; }
+    core_version() { printf '1.0.0'; }
+    CORE_BIN=/bin/false
+    have() { case "$1" in iptables) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    port_free() { return 0; }
+    health_check sick
+) > "$HC" 2>&1
+
+check "it reports the stopped service" "$(grep -c 'the service is stopped' "$HC")"   "1"
+check "and says how to start it"       "$(grep -c 'systemctl start pingify@sick' "$HC")" "1"
+check "it reports the stale core"      "$(grep -c 'against script' "$HC")"           "1"
+check "and points at the update"       "$(grep -c 'Update Pingify' "$HC")"           "1"
+check "it reports the unbound port"    "$(grep -c 'nothing is listening on :6526' "$HC")" "1"
+# the failure marker is ASCII when the console is not talking UTF-8, so count
+# the problems off the summary line rather than matching the glyph
+hc_probs="$(grep -oE "[0-9]+ problem" "$HC" | head -1 | cut -d" " -f1)"
+check "every failure has a fix"        "$hc_probs" "$(grep -c "fix:" "$HC")"
+check "and it counts them"             "$(grep -c 'problems' "$HC")"                 "1"
+
+# a healthy tunnel says so and stops
+(
+    banner() { :; }; pause() { :; }
+    svc_state() { printf 'active'; }
+    core_matches_script() { return 0; }
+    have() { case "$1" in iptables) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    port_free() { return 1; }
+    CORE_BIN="$WORK/hcore"
+    printf '#!/bin/sh\ncase "$*" in *-brief*) echo "up 14 14 78.0 0 900";; *-probe*) exit 0;; esac\nexit 0\n' > "$CORE_BIN"
+    chmod +x "$CORE_BIN"
+    health_check sick
+) > "$HC" 2>&1
+check "a healthy tunnel says nothing is wrong" "$(grep -c 'nothing wrong on this server' "$HC")" "1"
+check "and prints no fixes"                    "$(grep -c 'fix:' "$HC")"                         "0"
+check "it names the carriers and the rtt"      "$(grep -c '14 of 14 carriers up' "$HC")"         "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
