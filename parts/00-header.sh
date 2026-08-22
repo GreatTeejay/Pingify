@@ -8,13 +8,14 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.12.0"
+PINGIFY_VERSION="3.13.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
-CFG_DIR="/etc/pingify"
-STATE_DIR="/var/lib/pingify"
-SRC_DIR="/usr/local/src/pingify"
-CORE_BIN="/usr/local/bin/pingify-core"
+BASE_DIR="/root/Pingify"
+CFG_DIR="$BASE_DIR"
+STATE_DIR="$BASE_DIR/.state"
+SRC_DIR="$BASE_DIR/.build"
+CORE_BIN="$BASE_DIR/pingify-core"
 SELF_BIN="/usr/local/bin/pingify"
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
@@ -197,6 +198,45 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # These configs are written by this script, one key per line, so a targeted
 # sed is enough and Pingify stays free of a jq dependency.
+CFG_EXT="toml"
+cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
+
+# toml_get <file> <section> <key> - one value out of one section.
+#
+# A key sitting outside any section matches too: that is the shape the flat
+# JSON era wrote, and a config that has been migrated should not need a second
+# reader. Done in one awk pass because the tunnel list calls this per field and
+# a subshell per value adds up on a small VPS.
+toml_get() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ {
+            sec = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
+            next
+        }
+        {
+            line = $0
+            sub(/#.*$/, "", line)
+            if (index(line, "=") == 0) next
+            k = substr(line, 1, index(line, "=") - 1)
+            gsub(/[[:space:]]/, "", k)
+            if (k != key) next
+            if (sec != want && sec != "") next
+            v = substr(line, index(line, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            gsub(/^"|"$/, "", v)
+            print v
+            exit
+        }
+    ' "$1"
+}
+
+# toml_arr <file> <key> - the inside of  ports = ["443", "udp:500"]
+toml_arr() {
+    [ -f "$1" ] || return 0
+    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1
+}
 json_str() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
 json_num() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
@@ -231,9 +271,9 @@ public_ip() {
 tunnel_names() {
     [ -d "$CFG_DIR" ] || return 0
     local f
-    for f in "$CFG_DIR"/*.json; do
+    for f in "$CFG_DIR"/*."$CFG_EXT"; do
         [ -e "$f" ] || continue
-        basename "$f" .json
+        basename "$f" ".$CFG_EXT"
     done
 }
 

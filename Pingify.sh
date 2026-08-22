@@ -8,13 +8,14 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.12.0"
+PINGIFY_VERSION="3.13.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
-CFG_DIR="/etc/pingify"
-STATE_DIR="/var/lib/pingify"
-SRC_DIR="/usr/local/src/pingify"
-CORE_BIN="/usr/local/bin/pingify-core"
+BASE_DIR="/root/Pingify"
+CFG_DIR="$BASE_DIR"
+STATE_DIR="$BASE_DIR/.state"
+SRC_DIR="$BASE_DIR/.build"
+CORE_BIN="$BASE_DIR/pingify-core"
 SELF_BIN="/usr/local/bin/pingify"
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
@@ -197,6 +198,45 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 # These configs are written by this script, one key per line, so a targeted
 # sed is enough and Pingify stays free of a jq dependency.
+CFG_EXT="toml"
+cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
+
+# toml_get <file> <section> <key> - one value out of one section.
+#
+# A key sitting outside any section matches too: that is the shape the flat
+# JSON era wrote, and a config that has been migrated should not need a second
+# reader. Done in one awk pass because the tunnel list calls this per field and
+# a subshell per value adds up on a small VPS.
+toml_get() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ {
+            sec = $0
+            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
+            next
+        }
+        {
+            line = $0
+            sub(/#.*$/, "", line)
+            if (index(line, "=") == 0) next
+            k = substr(line, 1, index(line, "=") - 1)
+            gsub(/[[:space:]]/, "", k)
+            if (k != key) next
+            if (sec != want && sec != "") next
+            v = substr(line, index(line, "=") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+            gsub(/^"|"$/, "", v)
+            print v
+            exit
+        }
+    ' "$1"
+}
+
+# toml_arr <file> <key> - the inside of  ports = ["443", "udp:500"]
+toml_arr() {
+    [ -f "$1" ] || return 0
+    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1
+}
 json_str() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
 json_num() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
@@ -231,9 +271,9 @@ public_ip() {
 tunnel_names() {
     [ -d "$CFG_DIR" ] || return 0
     local f
-    for f in "$CFG_DIR"/*.json; do
+    for f in "$CFG_DIR"/*."$CFG_EXT"; do
         [ -e "$f" ] || continue
-        basename "$f" .json
+        basename "$f" ".$CFG_EXT"
     done
 }
 
@@ -488,7 +528,7 @@ ensure_core() {
 # ---------------------------------------------------------------------------
 
 write_units() {
-    cat > "$UNIT_DIR/pingify@.service" <<'UNIT'
+    cat > "$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
 Documentation=https://github.com/GreatTeejay/Pingify
@@ -498,7 +538,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pingify-core -c /etc/pingify/%i.json
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.$CFG_EXT
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -506,7 +546,8 @@ TasksMax=infinity
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-ProtectHome=yes
+# ProtectHome is off: the core and its config live under /root now.
+ProtectHome=no
 ProtectSystem=full
 StandardOutput=journal
 StandardError=journal
@@ -574,20 +615,64 @@ cfg_reset() {
 # cfg_render <role> <mode> <listen> <connect> <forwards-json> <status-addr>
 # Prints one config document. Every key sits on its own line, which is what
 # lets the manager read these files back with sed instead of a JSON parser.
+# A config should read like a description of the tunnel, not a bag of keys.
+# Each section is one question about how this end is set up, and the sections
+# come in the order you would explain it to somebody: what it is, how it
+# travels, what protects it, what it carries, and how it behaves.
+#
+# Only what applies is written. A forward tunnel has no [tun] section at all
+# rather than an empty one, so nothing on the page is there to be ignored.
 cfg_render() {
     local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
-    printf '{\n'
-    printf '  "name": "%s",\n' "$T_NAME"
-    printf '  "role": "%s",\n' "$role"
-    printf '  "mode": "%s",\n' "$mode"
-    printf '  "transport": "%s",\n' "$T_TRANSPORT"
-    [ -n "$listen" ]  && printf '  "listen": "%s",\n' "$listen"
-    [ -n "$connect" ] && printf '  "connect": "%s",\n' "$connect"
-    printf '  "psk": "%s",\n' "$T_PSK"
-    printf '  "carriers": %s,\n' "$T_CARRIERS"
-    printf '  "window_kb": %s,\n' "$T_WINDOW"
-    printf '  "keepalive_sec": %s,\n' "$T_KEEPALIVE"
-    [ -n "$fwd" ] && printf '  "forwards": [%s],\n' "$fwd"
+    printf '# Pingify tunnel - written by the manager, safe to edit by hand.
+'
+    printf '# Both servers need the same psk; everything else is local to this one.
+'
+
+    printf '
+[tunnel]
+'
+    printf '%-16s = "%s"
+' name "$T_NAME"
+    printf '%-16s = "%s"   # server = IRAN, client = KHAREJ
+' role "$role"
+    printf '%-16s = "%s"   # forward = ports, tun = a private layer-3 link
+' mode "$mode"
+
+    printf '
+[transport]
+'
+    printf '%-16s = "%s"
+' type "$T_TRANSPORT"
+    [ -n "$listen" ]  && printf '%-16s = "%s"   # this end accepts the carriers
+' listen "$listen"
+    [ -n "$connect" ] && printf '%-16s = "%s"   # this end dials them
+' connect "$connect"
+    printf '%-16s = %s   # connections the tunnel is spread over
+' carriers "$T_CARRIERS"
+    printf '%-16s = %s   # how often this end speaks when idle
+' keepalive_sec "$T_KEEPALIVE"
+
+    printf '
+[security]
+'
+    printf '%-16s = "%s"
+' psk "$T_PSK"
+
+    if [ -n "$fwd" ]; then
+        printf '
+[forward]
+'
+        printf '# 443            the same port on both servers
+'
+        printf '# 443=8443       clients hit 443 here, it lands on 8443 there
+'
+        printf '# udp:500        a UDP port
+'
+        printf '%-16s = [%s]
+' ports "$fwd"
+    fi
+
     if [ "$mode" = "tun" ]; then
         local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
         if [ "$role" != "$T_ROLE" ]; then
@@ -596,16 +681,40 @@ cfg_render() {
             lo="$T_TUNPEER/$pfx"
             pe="${T_TUNLOCAL%%/*}"
         fi
-        printf '  "tun": { "name": "%s", "local": "%s", "peer": "%s", "mtu": %s },\n' \
-               "$T_TUNIF" "$lo" "$pe" "$T_TUNMTU"
+        printf '
+[tun]
+'
+        printf '%-16s = "%s"
+' name "$T_TUNIF"
+        printf '%-16s = "%s"   # this server, on the private link
+' local_addr "$lo"
+        printf '%-16s = "%s"   # the other one
+' remote_addr "$pe"
+        printf '%-16s = %s
+' mtu "$T_TUNMTU"
     fi
-    printf '  "status_addr": "%s",\n' "$status"
-    printf '  "log_level": "info"\n'
-    printf '}\n'
+
+    printf '
+[tuning]
+'
+    printf '%-16s = %s   # in flight per forwarded connection
+' window_kb "$T_WINDOW"
+
+    printf '
+[status]
+'
+    printf '%-16s = "%s"
+' addr "$status"
+
+    printf '
+[logging]
+'
+    printf '%-16s = "info"   # error, warn, info, debug
+' level
 }
 
 cfg_save() {
-    local file="$CFG_DIR/$T_NAME.json"
+    local file="$(cfg_file "$T_NAME")"
     cfg_render "$T_ROLE" "$T_MODE" "$T_LISTEN" "$T_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
     chmod 600 "$file"
     printf '%s' "$file"
@@ -670,7 +779,7 @@ new_tunnel() {
             "" | *[!a-zA-Z0-9_-]*)
                 fail "letters, digits, dash and underscore only" ;;
             *)
-                if [ -f "$CFG_DIR/$T_NAME.json" ]; then
+                if [ -f "$(cfg_file "$T_NAME")" ]; then
                     fail "a tunnel named $T_NAME already exists"
                 else
                     break
@@ -863,7 +972,7 @@ import_tunnel() {
     ask token "token"
     [ -n "$token" ] || return 1
 
-    local tmp="/tmp/pingify-import.json"
+    local tmp="/tmp/pingify-import.cfg"
     if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
         fail "that is not a Pingify token"
         pause; return 1
@@ -874,7 +983,7 @@ import_tunnel() {
         rm -f "$tmp"; pause; return 1
     fi
 
-    if [ -f "$CFG_DIR/$name.json" ]; then
+    if [ -f "$(cfg_file "$name")" ]; then
         say ""
         warn "a tunnel named $name already exists on this server"
         confirm "replace it?" || { rm -f "$tmp"; return 1; }
@@ -897,14 +1006,14 @@ import_tunnel() {
         esac
     fi
 
-    install -m 600 "$tmp" "$CFG_DIR/$name.json"
+    install -m 600 "$tmp" "$(cfg_file "$name")"
     rm -f "$tmp"
 
-    if ! "$CORE_BIN" -c "$CFG_DIR/$name.json" -check >/dev/null 2>&1; then
+    if ! "$CORE_BIN" -c "$(cfg_file "$name")" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
-        "$CORE_BIN" -c "$CFG_DIR/$name.json" -check 2>&1 | sed 's/^/      /'
-        rm -f "$CFG_DIR/$name.json"
+        "$CORE_BIN" -c "$(cfg_file "$name")" -check 2>&1 | sed 's/^/      /'
+        rm -f "$(cfg_file "$name")"
         pause; return 1
     fi
 
@@ -923,28 +1032,27 @@ import_tunnel() {
 # ---------------------------------------------------------------------------
 
 cfg_load() {
-    local f="$CFG_DIR/$1.json"
+    local f
+    f="$(cfg_file "$1")"
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME="$(json_str "$f" name)"
-    T_ROLE="$(json_str "$f" role)"
-    T_MODE="$(json_str "$f" mode)"
-    T_TRANSPORT="$(json_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
-    T_LISTEN="$(json_str "$f" listen)"
-    T_CONNECT="$(json_str "$f" connect)"
-    T_PSK="$(json_str "$f" psk)"
-    T_STATUS="$(json_str "$f" status_addr)"
-    T_CARRIERS="$(json_num "$f" carriers)";      : "${T_CARRIERS:=4}"
-    T_WINDOW="$(json_num "$f" window_kb)";       : "${T_WINDOW:=1024}"
-    T_KEEPALIVE="$(json_num "$f" keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_FORWARDS="$(sed -n 's/^[[:space:]]*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\],*[[:space:]]*$/\1/p' "$f" | head -n1)"
+    T_NAME="$(toml_get "$f" tunnel name)"
+    T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)";                  : "${T_MODE:=forward}"
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=direct}"
+    T_LISTEN="$(toml_get "$f" transport listen)"
+    T_CONNECT="$(toml_get "$f" transport connect)"
+    T_PSK="$(toml_get "$f" security psk)"
+    T_STATUS="$(toml_get "$f" status addr)"
+    T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
+    T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=1024}"
+    T_FORWARDS="$(toml_arr "$f" ports)"
     if [ "$T_MODE" = "tun" ]; then
-        local tl; tl="$(grep -m1 '"tun"' "$f")"
-        T_TUNIF="$(printf '%s' "$tl"    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNLOCAL="$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNPEER="$(printf '%s' "$tl"  | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNMTU="$(printf '%s' "$tl"   | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
-        : "${T_TUNMTU:=1380}"
+        T_TUNIF="$(toml_get "$f" tun name)";                : "${T_TUNIF:=pfy0}"
+        T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+        T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+        T_TUNMTU="$(toml_get "$f" tun mtu)";                : "${T_TUNMTU:=1380}"
     fi
     return 0
 }
@@ -954,9 +1062,9 @@ cfg_load() {
 # ---------------------------------------------------------------------------
 
 tunnel_status_block() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
-    local addr; addr="$(json_str "$f" status_addr)"
+    local addr; addr="$(toml_get "$f" status addr)"
     local state; state="$(svc_state "$name")"
 
     local colour="$C_RED"
@@ -970,16 +1078,16 @@ tunnel_status_block() {
 
 # One line per tunnel, for the overview table.
 tunnel_row() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     local role mode peer addr state brief up total rtt streams
-    role="$(json_str "$f" role)"
-    mode="$(json_str "$f" mode)"
-    peer="$(json_str "$f" connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(json_str "$f" listen)"
-    addr="$(json_str "$f" status_addr)"
+    role="$(toml_get "$f" tunnel role)"
+    mode="$(toml_get "$f" tunnel mode)"
+    peer="$(toml_get "$f" transport connect)"
+    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
+    addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(json_num "$f" carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
@@ -1101,7 +1209,7 @@ tunnel_menu() {
 }
 
 edit_forwards() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     cfg_load "$name" || return 1
     if [ "$T_MODE" != "forward" ]; then
         warn "this is a full-IP tunnel; it has no port list"
@@ -1138,7 +1246,7 @@ edit_forwards() {
 }
 
 edit_tuning() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     cfg_load "$name" || return 1
     say ""
     local car win ka
@@ -1223,7 +1331,7 @@ delete_tunnel() {
     systemctl disable --now "pingify@$name" >/dev/null 2>&1
     systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
-    rm -f "$CFG_DIR/$name.json" "$CFG_DIR/$name.json.bak" "$STATE_DIR/$name.fail"
+    rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
     ok "tunnel $name removed"
     sleep 1
@@ -1245,7 +1353,7 @@ run_health_check() {
     local n f addr fails
     for n in $(tunnel_names); do
         systemctl is-enabled --quiet "pingify@$n" 2>/dev/null || continue
-        f="$CFG_DIR/$n.json"
+        f="$(cfg_file "$n")"
 
         if ! systemctl is-active --quiet "pingify@$n"; then
             echo "pingify: $n is not running, starting it"
@@ -1254,7 +1362,7 @@ run_health_check() {
             continue
         fi
 
-        addr="$(json_str "$f" status_addr)"
+        addr="$(toml_get "$f" status addr)"
         if [ -z "$addr" ] || [ ! -x "$CORE_BIN" ]; then
             continue
         fi
@@ -1631,7 +1739,7 @@ remove_menu() {
             for n in $(tunnel_names); do
                 systemctl disable --now "pingify@$n" >/dev/null 2>&1
                 systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
-                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$CFG_DIR/$n.json"
+                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$(cfg_file "$n")"
             done
             systemctl daemon-reload
             ok "all tunnels removed"
@@ -1742,12 +1850,12 @@ diag_configs() {
     say ""
     local n bad=0
     for n in $(tunnel_names); do
-        if "$CORE_BIN" -c "$CFG_DIR/$n.json" -check >/dev/null 2>&1; then
+        if "$CORE_BIN" -c "$(cfg_file "$n")" -check >/dev/null 2>&1; then
             ok "$n"
         else
             bad=1
             fail "$n"
-            "$CORE_BIN" -c "$CFG_DIR/$n.json" -check 2>&1 | sed 's/^/      /'
+            "$CORE_BIN" -c "$(cfg_file "$n")" -check 2>&1 | sed 's/^/      /'
         fi
     done
     [ "$bad" = "0" ] && dim "every config is valid"
@@ -1818,6 +1926,273 @@ backup_menu() {
 write_core_sources() {
     local d="$1"
     mkdir -p "$d" || return 1
+    cat > "$d/config.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+)
+
+// Configs are TOML, grouped into sections so that reading one tells you how a
+// tunnel is put together rather than handing you thirty flat keys in the order
+// somebody happened to add them.
+//
+//	[tunnel]     what this tunnel is and which end this is
+//	[transport]  how the carriers travel
+//	[security]   the shared secret
+//	[forward]    the ports this end serves
+//	[tun]        the private link, when there is one
+//	[tuning]     numbers you may want to change
+//	[status]     where to ask how it is doing
+//	[logging]    how much to say
+//
+// JSON is still read, because that is what versions before this wrote and a
+// config on a running server should not stop working because of a release.
+//
+// The parser is deliberately small: this is a config file written by our own
+// manager, not a document from the internet. It handles sections, key = value,
+// quoted strings, integers with _ separators, and arrays of strings. A key it
+// does not know is skipped rather than refused, so a config from a newer
+// Pingify still starts an older core instead of leaving a server with nothing.
+func loadConfig(path string) (*Config, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var c Config
+	if strings.HasPrefix(strings.TrimSpace(string(raw)), "{") {
+		if err := json.Unmarshal(raw, &c); err != nil {
+			return nil, fmt.Errorf("parse json config: %v", err)
+		}
+		return &c, nil
+	}
+	if err := parseTOML(string(raw), &c); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func parseTOML(text string, c *Config) error {
+	sc := bufio.NewScanner(strings.NewReader(text))
+	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+	section := ""
+	line := 0
+
+	for sc.Scan() {
+		line++
+		s := stripComment(sc.Text())
+		if s == "" {
+			continue
+		}
+		if strings.HasPrefix(s, "[") {
+			if !strings.HasSuffix(s, "]") {
+				return fmt.Errorf("line %d: unterminated section header", line)
+			}
+			section = strings.Trim(s[1:len(s)-1], " \t\"'")
+			continue
+		}
+		eq := strings.Index(s, "=")
+		if eq < 0 {
+			return fmt.Errorf("line %d: expected key = value", line)
+		}
+		key := strings.TrimSpace(s[:eq])
+		val := strings.TrimSpace(s[eq+1:])
+		if key == "" {
+			return fmt.Errorf("line %d: empty key", line)
+		}
+		if err := assign(c, section, key, val); err != nil {
+			return fmt.Errorf("line %d: %v", line, err)
+		}
+	}
+	return sc.Err()
+}
+
+// stripComment drops a trailing # comment, unless the # is inside quotes -
+// a password or a hostname is allowed to contain one.
+func stripComment(s string) string {
+	inQ := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			inQ = !inQ
+		case '#':
+			if !inQ {
+				return strings.TrimSpace(s[:i])
+			}
+		}
+	}
+	return strings.TrimSpace(s)
+}
+
+func unquote(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		if out, err := strconv.Unquote(s); err == nil {
+			return out
+		}
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// atoi accepts 10_000 as well as 10000: the tuning numbers are big enough to
+// be worth grouping, and a config is easier to check when they are.
+func atoi(key, val string) (int, error) {
+	v := strings.ReplaceAll(unquote(val), "_", "")
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a number, got %q", key, val)
+	}
+	return n, nil
+}
+
+// strList reads ["443", "udp:500"], and also a bare "443" so a single value
+// does not need brackets.
+func strList(val string) []string {
+	v := strings.TrimSpace(val)
+	if !strings.HasPrefix(v, "[") {
+		if s := unquote(v); s != "" {
+			return []string{s}
+		}
+		return nil
+	}
+	v = strings.TrimSuffix(strings.TrimPrefix(v, "["), "]")
+	var out []string
+	for _, part := range splitTop(v) {
+		if s := unquote(part); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// splitTop splits on commas that are not inside quotes.
+func splitTop(s string) []string {
+	var out []string
+	inQ, start := false, 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '"':
+			inQ = !inQ
+		case ',':
+			if !inQ {
+				out = append(out, s[start:i])
+				start = i + 1
+			}
+		}
+	}
+	return append(out, s[start:])
+}
+
+// assign maps one key onto the Config.
+//
+// Every section also accepts its keys with no section at all, which is what
+// the flat JSON layout used. One table, both shapes, no second parser.
+func assign(c *Config, section, key, val string) error {
+	var err error
+	num := func(dst *int) error {
+		n, e := atoi(key, val)
+		if e == nil {
+			*dst = n
+		}
+		return e
+	}
+
+	switch section {
+	case "", "tunnel":
+		switch key {
+		case "name":
+			c.Name = unquote(val)
+		case "role":
+			c.Role = unquote(val)
+		case "mode":
+			c.Mode = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "transport":
+		switch key {
+		case "type", "transport":
+			c.Transport = unquote(val)
+		case "listen":
+			c.Listen = unquote(val)
+		case "connect":
+			c.Connect = unquote(val)
+		case "carriers":
+			err = num(&c.Carriers)
+		case "keepalive_sec":
+			err = num(&c.KeepaliveSec)
+		case "dial_timeout_sec":
+			err = num(&c.DialTimeout)
+		}
+	}
+
+	switch section {
+	case "", "security":
+		if key == "psk" {
+			c.PSK = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "forward":
+		switch key {
+		case "ports", "forwards":
+			c.Forwards = strList(val)
+		case "allow":
+			c.Allow = strList(val)
+		}
+	}
+
+	switch section {
+	case "tun":
+		switch key {
+		case "name", "device":
+			c.TUN.Name = unquote(val)
+		case "local_addr", "local":
+			c.TUN.Local = unquote(val)
+		case "remote_addr", "peer":
+			c.TUN.Peer = unquote(val)
+		case "mtu":
+			err = num(&c.TUN.MTU)
+		}
+	}
+
+	switch section {
+	case "", "tuning":
+		switch key {
+		case "window_kb":
+			err = num(&c.WindowKB)
+		case "sndbuf_kb":
+			err = num(&c.SndBufKB)
+		case "rcvbuf_kb":
+			err = num(&c.RcvBufKB)
+		}
+	}
+
+	switch section {
+	case "", "status":
+		if key == "addr" || key == "status_addr" {
+			c.StatusAddr = unquote(val)
+		}
+	}
+
+	switch section {
+	case "", "logging":
+		if key == "level" || key == "log_level" {
+			c.LogLevel = unquote(val)
+		}
+	}
+
+	return err
+}
+PINGIFY_SRC_EOF
     cat > "$d/pingify.go" <<'PINGIFY_SRC_EOF'
 // Pingify engine - one encrypted tunnel between an Iran server and a server
 // abroad, carried over several parallel TCP connections.
@@ -1873,7 +2248,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.12.0"
+const version = "3.13.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -2016,7 +2391,7 @@ func (c *Config) key() []byte {
 
 func main() {
 	var (
-		cfgPath = flag.String("c", "", "path to tunnel config JSON")
+		cfgPath = flag.String("c", "", "path to the tunnel config (TOML, or the older JSON)")
 		genPSK  = flag.Bool("genpsk", false, "print a fresh 32-byte pre-shared key and exit")
 		showVer = flag.Bool("version", false, "print version and exit")
 		check   = flag.Bool("check", false, "validate the config and exit")
@@ -2050,18 +2425,13 @@ func main() {
 		return
 	}
 	if *cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: pingify-core -c /etc/pingify/<name>.json")
+		fmt.Fprintln(os.Stderr, "usage: pingify-core -c /root/Pingify/<name>.toml")
 		os.Exit(2)
 	}
 
-	raw, err := os.ReadFile(*cfgPath)
+	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read config:", err)
-		os.Exit(1)
-	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "parse config:", err)
+		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
 	}
 	cfg.applyDefaults()
@@ -2078,7 +2448,7 @@ func main() {
 	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
 
-	p := newPool(&cfg)
+	p := newPool(cfg)
 	if err := p.start(); err != nil {
 		logError("start: %v", err)
 		os.Exit(1)
@@ -2087,7 +2457,7 @@ func main() {
 	var top interface{ Close() error }
 	switch cfg.Mode {
 	case "forward":
-		f, err := startForward(&cfg, p)
+		f, err := startForward(cfg, p)
 		if err != nil {
 			logError("forward: %v", err)
 			p.close()
@@ -2095,7 +2465,7 @@ func main() {
 		}
 		top = f
 	case "tun":
-		t, err := startTUN(&cfg, p)
+		t, err := startTUN(cfg, p)
 		if err != nil {
 			logError("tun: %v", err)
 			p.close()
@@ -2105,7 +2475,7 @@ func main() {
 	}
 
 	if cfg.StatusAddr != "" {
-		startStatusServer(cfg.StatusAddr, &cfg, p)
+		startStatusServer(cfg.StatusAddr, cfg, p)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -4439,7 +4809,7 @@ status_panel() {
     local name addr up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(json_str "$CFG_DIR/$name.json" status_addr)"
+        addr="$(toml_get "$(cfg_file "$name")" status addr)"
         if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
             up=$((up + 1))
         fi
@@ -4466,6 +4836,111 @@ status_panel() {
     box_row "$edot $(pad_to "core ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
     box_row "$wdot $(pad_to "watchdog ${C_B}${wd}${C_OFF}" 22)${C_GRY}${BX_DOT}${C_OFF} tcp ${C_B}${cc:-unknown}${C_OFF}"
     box_bot
+}
+
+# ---------------------------------------------------------------------------
+# moving an older install into place
+#
+# Before this version the config was JSON spread over /etc/pingify, the core
+# sat in /usr/local/bin and the state in /var/lib. Everything Pingify owns now
+# lives in one directory, and the format is sectioned TOML.
+#
+# A tunnel that is running should not need rebuilding for that, so this
+# converts it in place and leaves the old file behind only if the new one
+# cannot be written. It runs once: after the move there is nothing to find.
+# ---------------------------------------------------------------------------
+
+json_to_toml() {
+    local j="$1" name out
+    name="$(basename "$j" .json)"
+    out="$(cfg_file "$name")"
+    [ -f "$out" ] && return 1
+
+    local role mode transport listen connect psk status level
+    local carriers window keepalive fwd
+    role="$(json_str "$j" role)"
+    mode="$(json_str "$j" mode)";           : "${mode:=forward}"
+    transport="$(json_str "$j" transport)"; : "${transport:=direct}"
+    listen="$(json_str "$j" listen)"
+    connect="$(json_str "$j" connect)"
+    psk="$(json_str "$j" psk)"
+    status="$(json_str "$j" status_addr)"
+    level="$(json_str "$j" log_level)";     : "${level:=info}"
+    carriers="$(json_num "$j" carriers)";   : "${carriers:=4}"
+    window="$(json_num "$j" window_kb)";    : "${window:=1024}"
+    keepalive="$(json_num "$j" keepalive_sec)"; : "${keepalive:=10}"
+    fwd="$(sed -n 's/^[[:space:]]*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\],*[[:space:]]*$/\1/p' "$j" | head -n1)"
+
+    # edge and origin were what the roles used to be called.
+    case "$role" in edge) role="server" ;; origin) role="client" ;; esac
+
+    {
+        printf '# Pingify tunnel - converted from %s\n' "$(basename "$j")"
+        printf '\n[tunnel]\n'
+        printf '%-16s = "%s"\n' name "$name"
+        printf '%-16s = "%s"\n' role "$role"
+        printf '%-16s = "%s"\n' mode "$mode"
+        printf '\n[transport]\n'
+        printf '%-16s = "%s"\n' type "$transport"
+        [ -n "$listen" ]  && printf '%-16s = "%s"\n' listen "$listen"
+        [ -n "$connect" ] && printf '%-16s = "%s"\n' connect "$connect"
+        printf '%-16s = %s\n' carriers "$carriers"
+        printf '%-16s = %s\n' keepalive_sec "$keepalive"
+        printf '\n[security]\n'
+        printf '%-16s = "%s"\n' psk "$psk"
+        if [ -n "$fwd" ]; then
+            printf '\n[forward]\n'
+            printf '%-16s = [%s]\n' ports "$fwd"
+        fi
+        if [ "$mode" = "tun" ]; then
+            local tl; tl="$(grep -m1 '"tun"' "$j")"
+            printf '\n[tun]\n'
+            printf '%-16s = "%s"\n' name  "$(printf '%s' "$tl" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf '%-16s = "%s"\n' local_addr  "$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf '%-16s = "%s"\n' remote_addr "$(printf '%s' "$tl" | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf '%-16s = %s\n'   mtu "$(printf '%s' "$tl" | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
+        fi
+        printf '\n[tuning]\n'
+        printf '%-16s = %s\n' window_kb "$window"
+        printf '\n[status]\n'
+        printf '%-16s = "%s"\n' addr "$status"
+        printf '\n[logging]\n'
+        printf '%-16s = "%s"\n' level "$level"
+    } > "$out"
+    chmod 600 "$out"
+    rm -f "$j"
+    return 0
+}
+
+migrate_layout() {
+    local moved=0 f
+    mkdir -p "$CFG_DIR" "$STATE_DIR"
+    chmod 700 "$CFG_DIR"
+
+    if [ -x /usr/local/bin/pingify-core ] && [ ! -x "$CORE_BIN" ]; then
+        install -m 0755 /usr/local/bin/pingify-core "$CORE_BIN" && moved=1
+    fi
+    rm -f /usr/local/bin/pingify-core
+
+    if [ -d /etc/pingify ]; then
+        for f in /etc/pingify/*.json; do
+            [ -e "$f" ] || continue
+            json_to_toml "$f" && moved=1
+        done
+        rmdir /etc/pingify 2>/dev/null
+    fi
+    for f in "$CFG_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        json_to_toml "$f" && moved=1
+    done
+    rm -rf /var/lib/pingify /usr/local/src/pingify
+
+    if [ "$moved" = "1" ]; then
+        write_units
+        for f in $(tunnel_names); do systemctl restart "pingify@$f" >/dev/null 2>&1; done
+        info "moved the existing setup into $BASE_DIR"
+        sleep 1
+    fi
 }
 
 first_run() {
@@ -4540,6 +5015,7 @@ main() {
 
     require_root
     ensure_deps
+    migrate_layout
     first_run
     main_menu
 }

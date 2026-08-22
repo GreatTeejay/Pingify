@@ -4,28 +4,27 @@
 # ---------------------------------------------------------------------------
 
 cfg_load() {
-    local f="$CFG_DIR/$1.json"
+    local f
+    f="$(cfg_file "$1")"
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME="$(json_str "$f" name)"
-    T_ROLE="$(json_str "$f" role)"
-    T_MODE="$(json_str "$f" mode)"
-    T_TRANSPORT="$(json_str "$f" transport)"; : "${T_TRANSPORT:=direct}"
-    T_LISTEN="$(json_str "$f" listen)"
-    T_CONNECT="$(json_str "$f" connect)"
-    T_PSK="$(json_str "$f" psk)"
-    T_STATUS="$(json_str "$f" status_addr)"
-    T_CARRIERS="$(json_num "$f" carriers)";      : "${T_CARRIERS:=4}"
-    T_WINDOW="$(json_num "$f" window_kb)";       : "${T_WINDOW:=1024}"
-    T_KEEPALIVE="$(json_num "$f" keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_FORWARDS="$(sed -n 's/^[[:space:]]*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\],*[[:space:]]*$/\1/p' "$f" | head -n1)"
+    T_NAME="$(toml_get "$f" tunnel name)"
+    T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)";                  : "${T_MODE:=forward}"
+    T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=direct}"
+    T_LISTEN="$(toml_get "$f" transport listen)"
+    T_CONNECT="$(toml_get "$f" transport connect)"
+    T_PSK="$(toml_get "$f" security psk)"
+    T_STATUS="$(toml_get "$f" status addr)"
+    T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
+    T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=1024}"
+    T_FORWARDS="$(toml_arr "$f" ports)"
     if [ "$T_MODE" = "tun" ]; then
-        local tl; tl="$(grep -m1 '"tun"' "$f")"
-        T_TUNIF="$(printf '%s' "$tl"    | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNLOCAL="$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNPEER="$(printf '%s' "$tl"  | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-        T_TUNMTU="$(printf '%s' "$tl"   | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
-        : "${T_TUNMTU:=1380}"
+        T_TUNIF="$(toml_get "$f" tun name)";                : "${T_TUNIF:=pfy0}"
+        T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
+        T_TUNPEER="$(toml_get "$f" tun remote_addr)"
+        T_TUNMTU="$(toml_get "$f" tun mtu)";                : "${T_TUNMTU:=1380}"
     fi
     return 0
 }
@@ -35,9 +34,9 @@ cfg_load() {
 # ---------------------------------------------------------------------------
 
 tunnel_status_block() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
-    local addr; addr="$(json_str "$f" status_addr)"
+    local addr; addr="$(toml_get "$f" status addr)"
     local state; state="$(svc_state "$name")"
 
     local colour="$C_RED"
@@ -51,16 +50,16 @@ tunnel_status_block() {
 
 # One line per tunnel, for the overview table.
 tunnel_row() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     local role mode peer addr state brief up total rtt streams
-    role="$(json_str "$f" role)"
-    mode="$(json_str "$f" mode)"
-    peer="$(json_str "$f" connect)"
-    [ -z "$peer" ] && peer="on ${C_OFF}$(json_str "$f" listen)"
-    addr="$(json_str "$f" status_addr)"
+    role="$(toml_get "$f" tunnel role)"
+    mode="$(toml_get "$f" tunnel mode)"
+    peer="$(toml_get "$f" transport connect)"
+    [ -z "$peer" ] && peer="on ${C_OFF}$(toml_get "$f" transport listen)"
+    addr="$(toml_get "$f" status addr)"
     state="$(svc_state "$name")"
 
-    up="-"; total="$(json_num "$f" carriers)"; rtt="-"; streams="-"
+    up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"; streams="-"
     if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         if [ -n "$brief" ]; then
@@ -182,7 +181,7 @@ tunnel_menu() {
 }
 
 edit_forwards() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     cfg_load "$name" || return 1
     if [ "$T_MODE" != "forward" ]; then
         warn "this is a full-IP tunnel; it has no port list"
@@ -219,7 +218,7 @@ edit_forwards() {
 }
 
 edit_tuning() {
-    local name="$1" f="$CFG_DIR/$1.json"
+    local name="$1" f="$(cfg_file "$1")"
     cfg_load "$name" || return 1
     say ""
     local car win ka
@@ -304,7 +303,7 @@ delete_tunnel() {
     systemctl disable --now "pingify@$name" >/dev/null 2>&1
     systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
-    rm -f "$CFG_DIR/$name.json" "$CFG_DIR/$name.json.bak" "$STATE_DIR/$name.fail"
+    rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
     ok "tunnel $name removed"
     sleep 1
