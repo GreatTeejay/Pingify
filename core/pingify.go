@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.1.0"
+const version = "5.2.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -452,26 +452,42 @@ var logColour = func() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }()
 
-// Red for what is broken, yellow for what is merely wrong, and everything a
-// healthy tunnel says in the colour of the terminal it is read in.
+// A log line is three fixed columns and then the message, so a screenful of
+// them reads down rather than across:
+//
+//	2026-08-22 14:31:07.482  INFO   carrier 3 up to 2.26.26.37:9443
+//	2026-08-22 14:31:07.913  WARN   no carrier up, dropping connection to :6526
+//	2026-08-22 14:32:07.914  ERROR  carrier 3 down: nothing received for 30s
+//
+// Milliseconds are worth the three characters: carriers come up and die in
+// bursts, and whole seconds put four events on the same timestamp with no way
+// to tell what happened first.
+//
+// Red for what is broken, yellow for what is wrong but survivable, cyan for
+// what a healthy tunnel does, grey for the two levels that are only ever read
+// while chasing something. Journald keeps the escapes and renders them; a file
+// or a pipe gets none, so a log that is grepped later stays clean.
 var logTags = [5]struct{ plain, coloured string }{
-	{"ERROR", "\033[31mERROR\033[0m"},
-	{"WARN ", "\033[33mWARN \033[0m"},
+	{"ERROR", "\033[1;31mERROR\033[0m"},
+	{"WARN ", "\033[1;33mWARN \033[0m"},
 	{"INFO ", "\033[36mINFO \033[0m"},
 	{"DEBUG", "\033[90mDEBUG\033[0m"},
 	{"TRACE", "\033[90mTRACE\033[0m"},
 }
+
+const logStamp = "2006-01-02 15:04:05.000"
 
 func logAt(lvl int32, format string, args ...interface{}) {
 	if atomic.LoadInt32(&logLevel) < lvl {
 		return
 	}
 	tag := logTags[lvl].plain
+	stamp := time.Now().Format(logStamp)
 	if logColour {
 		tag = logTags[lvl].coloured
+		stamp = "\033[90m" + stamp + "\033[0m"
 	}
-	logSink(fmt.Sprintf("%s %s %s",
-		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...)))
+	logSink(fmt.Sprintf("%s  %s  %s", stamp, tag, fmt.Sprintf(format, args...)))
 }
 
 func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }

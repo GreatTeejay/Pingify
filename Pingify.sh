@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.1.0"
+PINGIFY_VERSION="5.2.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -210,31 +210,53 @@ state_badge() {
 banner() {
     clear 2>/dev/null || true
     printf '\n'
-    local l
+    local l w pad
     if [ "$PINGIFY_UTF8" = "1" ]; then
-        for l in \
+        set -- \
             '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
             '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
             '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
             '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
             '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
             '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
     else
-        for l in \
-            ' ___  _                 _   __       ' \
-            '| _ \(_)_ _   __ _   (_) / _|_  _  ' \
-            '|  _/| |  \ \ / _` |  | ||  _| || | ' \
-            '|_|  |_|_||_|\__, |  |_||_|   \_, | ' \
-            '             |___/           |__/  '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
+        set -- \
+            ' ___  _                 _   __     ' \
+            '| _ \(_)_ _  __ _ (_) / _|_  _     ' \
+            '|  _/| | | \| | (_| | | ||  _| || |' \
+            '|_|  |_|_||_|\__, | |_||_|   \_, |ذ' \
+            '             |___/          |__/   '
     fi
-    printf '  %s%sby Teejay%s   %sIran %s Kharej tunnel   %s   v%s%s\n\n' \
-        "$C_CYN" "$C_DIM" "$C_OFF" "$C_DIM" "$BX_ARR" "$BX_DOT" "$PINGIFY_VERSION" "$C_OFF"
+
+    # The name sits in its own frame, centred, so the page opens with one
+    # object rather than six lines floating above a rule.
+    w=0
+    for l in "$@"; do
+        [ "$(vislen "$l")" -gt "$w" ] && w="$(vislen "$l")"
+    done
+    local inner=$((UI_W))
+    pad=$(( (inner - w) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+
+    printf '  %s%s%s%s%s\n' "$C_CYN$C_DIM" "$BX_TL" "$(repeat "$BX_H" "$inner")" "$BX_TR" "$C_OFF"
+    for l in "$@"; do
+        printf '  %s%s%s%s%s%s%s%s\n' \
+            "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+            "$(repeat ' ' "$pad")" "$C_CYN$C_B$l$C_OFF" \
+            "$(repeat ' ' $((inner - pad - $(vislen "$l"))))" \
+            "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    done
+
+    # and the one line that says what it is, centred under it
+    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel"
+    pad=$(( (inner - ${#sub}) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '  %s%s%s%s%s%s%s%s\n' \
+        "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+        "$(repeat ' ' "$pad")" "$C_DIM$sub$C_OFF" \
+        "$(repeat ' ' $((inner - pad - ${#sub})))" \
+        "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    printf '  %s%s%s%s%s\n\n' "$C_CYN$C_DIM" "$BX_BL" "$(repeat "$BX_H" "$inner")" "$BX_BR" "$C_OFF"
 }
 
 pause() { printf '\n'; read -rsp "  ${C_DIM}press enter${C_OFF}" _; printf '\n'; }
@@ -781,7 +803,8 @@ cfg_reset() {
     T_PORT=9443          # the tunnel's own port, TCP only
     T_ACCEPTS="client"   # KHAREJ accepts the link, IRAN dials out to it
     T_PUBLIC_IP=""; T_PEER_IP=""
-    T_CARRIERS=4; T_WINDOW=512; T_KEEPALIVE=10; T_PRESET="balanced"
+    T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
+    T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
@@ -821,35 +844,56 @@ cfg_endpoints() {
 # ---------------------------------------------------------------------------
 # performance presets
 #
-# carriers  how many connections the link is spread over; more of them absorb
-#           packet loss better, because one stalled connection is a smaller
-#           share of the whole
-# window    how much one forwarded connection may have in flight; bigger fills
-#           a long path better and is the memory ceiling per open connection
+# These numbers used to be guesses. They are now taken from iperf3 between a
+# real Iran and Kharej pair:
+#
+#   the path carries ~100 Mbit/s in both directions
+#   round trip is ~78 ms
+#   one TCP connection reaches only 4-6 Mbit/s, because loss holds its
+#   congestion window down around 30-90 KB
+#
+# A single connection is therefore worth about 6 Mbit/s no matter how much
+# bandwidth exists, and filling 100 Mbit/s takes 15-20 of them. Four carriers -
+# the old default - left seventy Mbit/s of a hundred unused.
+#
+# carriers  how many connections the link is spread over. On a lossy path this
+#           is the setting that decides throughput, because each connection is
+#           capped by its own window, not by the path.
+# window    how much one forwarded connection may have in flight. The delay
+#           bandwidth product here is about 1 MB, so anything below that
+#           throttles a single large transfer even when the carriers could
+#           carry it.
 # ---------------------------------------------------------------------------
 
 apply_preset() {
     case "$1" in
-        gaming)     T_CARRIERS=8;  T_WINDOW=128;  T_KEEPALIVE=5 ;;
-        latency)    T_CARRIERS=6;  T_WINDOW=256;  T_KEEPALIVE=5 ;;
-        balanced)   T_CARRIERS=4;  T_WINDOW=512;  T_KEEPALIVE=10 ;;
-        throughput) T_CARRIERS=8;  T_WINDOW=2048; T_KEEPALIVE=15 ;;
-        extreme)    T_CARRIERS=16; T_WINDOW=4096; T_KEEPALIVE=15 ;;
+        gaming)     T_CARRIERS=8;  T_WINDOW=256 ;;
+        latency)    T_CARRIERS=10; T_WINDOW=512 ;;
+        balanced)   T_CARRIERS=14; T_WINDOW=1024 ;;
+        throughput) T_CARRIERS=20; T_WINDOW=2048 ;;
+        extreme)    T_CARRIERS=24; T_WINDOW=4096 ;;
         *)          return 1 ;;
     esac
+    # One keepalive for every preset. What kept a carrier alive was how often
+    # the *peer* spoke, so two ends on different presets used to disagree about
+    # how long to wait - and the impatient one hung up on a healthy tunnel.
+    T_KEEPALIVE=10
     T_PRESET="$1"
     return 0
 }
 
 preset_menu() {
     CHOICE_DEF="3"
-    choice 1 "Gaming" "lowest ping, small bursts"
-    choice 2 "Latency" "browsing, calls, anything interactive"
-    choice 3 "Balanced" "a good default"
-    choice 4 "Download" "large files"
-    choice 5 "Extreme" "fastest, uses the most memory"
+    choice 1 "Gaming" "8 carriers - lowest ping, small bursts"
+    choice 2 "Latency" "10 carriers - browsing, calls, anything interactive"
+    choice 3 "Balanced" "14 carriers - fills a 100 Mbit path"
+    choice 4 "Download" "20 carriers - large files"
+    choice 5 "Extreme" "24 carriers - fastest, uses the most memory"
     choice 6 "Custom" "set the numbers yourself"
     CHOICE_DEF=""
+    say ""
+    dim "One connection is worth about 6 Mbit/s on an Iran-Europe path, so"
+    dim "the carrier count is what decides speed. More of them cost memory."
     say ""
     local p=""
     ask p "select" "3"
@@ -865,11 +909,20 @@ preset_menu() {
            ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE" ;;
         *) apply_preset balanced ;;
     esac
-    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=4 ;; esac
-    case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=512 ;; esac
+    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=14 ;; esac
+    case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=1024 ;; esac
     case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
     [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1
     [ "$T_CARRIERS" -gt 64 ] && T_CARRIERS=64
+
+    # Socket buffers have to hold a delay bandwidth product or the kernel
+    # window cannot grow into one. Sized from the chosen window, capped where
+    # more stops helping.
+    T_SNDBUF="$T_WINDOW"; T_RCVBUF="$T_WINDOW"
+    [ "$T_SNDBUF" -lt 512 ] && T_SNDBUF=512
+    [ "$T_RCVBUF" -lt 512 ] && T_RCVBUF=512
+    [ "$T_SNDBUF" -gt 4096 ] && T_SNDBUF=4096
+    [ "$T_RCVBUF" -gt 4096 ] && T_RCVBUF=4096
 }
 
 # ---------------------------------------------------------------------------
@@ -906,6 +959,8 @@ cfg_render() {
     printf '\n[tuning]\n'
     printf 'profile          = "%s"\n' "$T_PRESET"
     printf 'window_kb        = %s\n' "$T_WINDOW"
+    printf 'sndbuf_kb        = %s\n' "$T_SNDBUF"
+    printf 'rcvbuf_kb        = %s\n' "$T_RCVBUF"
     printf '\n[status]\n'
     printf 'addr             = "%s"\n' "$status"
     printf '\n[logging]\n'
@@ -1042,6 +1097,32 @@ new_tunnel() {
     fi
     cfg_mode
 
+    # -- which way the link is opened --------------------------------------
+    #
+    # Ports live on IRAN either way and clients always arrive there. This is
+    # only about which end makes the TCP connection, and it matters because
+    # the two are not equally reachable: one Iranian server here refuses
+    # nothing and runs at 100 Mbit/s with no retransmits, another accepts the
+    # connection and then loses the flow a few kilobytes in. If one direction
+    # will not stay up, the other usually will.
+    wiz "Link direction"
+    CHOICE_DEF="1"
+    choice 1 "Direct" "IRAN opens the connection to KHAREJ"
+    choice 2 "Reverse" "KHAREJ opens it to IRAN - IRAN needs the port reachable"
+    CHOICE_DEF=""
+    say ""
+    dim "The same on both servers. The token carries it, so the second"
+    dim "server is not asked."
+    say ""
+    local dir=""
+    ask dir "select" "1"
+    if [ "$dir" = "2" ]; then
+        T_ACCEPTS="server"      # IRAN accepts; KHAREJ dials in
+    else
+        T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
+    fi
+    T_DIRECTION="$( [ "$T_ACCEPTS" = "server" ] && printf 'reverse' || printf 'direct' )"
+
     # -- where the servers are ---------------------------------------------
     wiz "Addresses"
     if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
@@ -1053,7 +1134,7 @@ new_tunnel() {
 
     if ! this_side_accepts; then
         say ""
-        ask T_PEER_IP "address of the KHAREJ server"
+        ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server"
         [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
     fi
 
@@ -1217,7 +1298,7 @@ new_tunnel() {
         field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
-    field "KHAREJ address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
+    field "Direction" "$( [ "$T_ACCEPTS" = "server" ] && echo "Reverse - KHAREJ dials IRAN" || echo "Direct - IRAN dials KHAREJ" )"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if cfg_needs_link; then
         field "Its address" "$T_TUNPEER"
@@ -4018,7 +4099,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.1.0"
+const version = "5.2.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -4418,26 +4499,42 @@ var logColour = func() bool {
 	return fi.Mode()&os.ModeCharDevice != 0
 }()
 
-// Red for what is broken, yellow for what is merely wrong, and everything a
-// healthy tunnel says in the colour of the terminal it is read in.
+// A log line is three fixed columns and then the message, so a screenful of
+// them reads down rather than across:
+//
+//	2026-08-22 14:31:07.482  INFO   carrier 3 up to 2.26.26.37:9443
+//	2026-08-22 14:31:07.913  WARN   no carrier up, dropping connection to :6526
+//	2026-08-22 14:32:07.914  ERROR  carrier 3 down: nothing received for 30s
+//
+// Milliseconds are worth the three characters: carriers come up and die in
+// bursts, and whole seconds put four events on the same timestamp with no way
+// to tell what happened first.
+//
+// Red for what is broken, yellow for what is wrong but survivable, cyan for
+// what a healthy tunnel does, grey for the two levels that are only ever read
+// while chasing something. Journald keeps the escapes and renders them; a file
+// or a pipe gets none, so a log that is grepped later stays clean.
 var logTags = [5]struct{ plain, coloured string }{
-	{"ERROR", "\033[31mERROR\033[0m"},
-	{"WARN ", "\033[33mWARN \033[0m"},
+	{"ERROR", "\033[1;31mERROR\033[0m"},
+	{"WARN ", "\033[1;33mWARN \033[0m"},
 	{"INFO ", "\033[36mINFO \033[0m"},
 	{"DEBUG", "\033[90mDEBUG\033[0m"},
 	{"TRACE", "\033[90mTRACE\033[0m"},
 }
+
+const logStamp = "2006-01-02 15:04:05.000"
 
 func logAt(lvl int32, format string, args ...interface{}) {
 	if atomic.LoadInt32(&logLevel) < lvl {
 		return
 	}
 	tag := logTags[lvl].plain
+	stamp := time.Now().Format(logStamp)
 	if logColour {
 		tag = logTags[lvl].coloured
+		stamp = "\033[90m" + stamp + "\033[0m"
 	}
-	logSink(fmt.Sprintf("%s %s %s",
-		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...)))
+	logSink(fmt.Sprintf("%s  %s  %s", stamp, tag, fmt.Sprintf(format, args...)))
 }
 
 func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }
