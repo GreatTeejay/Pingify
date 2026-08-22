@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.3.1"
+PINGIFY_VERSION="5.4.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -281,18 +281,22 @@ ask() {
 # Some questions have no sensible default. Which server this is, what protocol
 # to speak, who forwards - an empty enter that quietly means "the first one" is
 # how somebody ends up with a tunnel they did not choose and cannot explain.
+# The locals here are named apart from ask's on purpose. bash scopes locals
+# dynamically, so a caller that asks ask to write into a variable ask also
+# declares local gets ask's copy, and the caller's stays empty - which is a
+# loop that rejects every answer, forever.
 pick() {
-    local __var="$1" __prompt="$2"; shift 2
-    local __in="" __v
+    local _pk_var="$1" _pk_prompt="$2"; shift 2
+    local _pk_in="" _pk_opt
     while :; do
-        ask __in "$__prompt"
-        if [ -z "$__in" ]; then
+        ask _pk_in "$_pk_prompt"
+        if [ -z "$_pk_in" ]; then
             fail "this one has no default - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
             continue
         fi
-        for __v in "$@"; do
-            if [ "$__in" = "$__v" ]; then
-                printf -v "$__var" '%s' "$__in"
+        for _pk_opt in "$@"; do
+            if [ "$_pk_in" = "$_pk_opt" ]; then
+                printf -v "$_pk_var" '%s' "$_pk_in"
                 return 0
             fi
         done

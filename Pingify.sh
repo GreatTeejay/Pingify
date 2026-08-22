@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.3.1"
+PINGIFY_VERSION="5.4.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -281,18 +281,22 @@ ask() {
 # Some questions have no sensible default. Which server this is, what protocol
 # to speak, who forwards - an empty enter that quietly means "the first one" is
 # how somebody ends up with a tunnel they did not choose and cannot explain.
+# The locals here are named apart from ask's on purpose. bash scopes locals
+# dynamically, so a caller that asks ask to write into a variable ask also
+# declares local gets ask's copy, and the caller's stays empty - which is a
+# loop that rejects every answer, forever.
 pick() {
-    local __var="$1" __prompt="$2"; shift 2
-    local __in="" __v
+    local _pk_var="$1" _pk_prompt="$2"; shift 2
+    local _pk_in="" _pk_opt
     while :; do
-        ask __in "$__prompt"
-        if [ -z "$__in" ]; then
+        ask _pk_in "$_pk_prompt"
+        if [ -z "$_pk_in" ]; then
             fail "this one has no default - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
             continue
         fi
-        for __v in "$@"; do
-            if [ "$__in" = "$__v" ]; then
-                printf -v "$__var" '%s' "$__in"
+        for _pk_opt in "$@"; do
+            if [ "$_pk_in" = "$_pk_opt" ]; then
+                printf -v "$_pk_var" '%s' "$_pk_in"
                 return 0
             fi
         done
@@ -1059,6 +1063,192 @@ transport_label() {
 # new tunnel
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# the setup token
+#
+# Build the tunnel on one server, paste one line on the other, and the second
+# server is finished. Everything both ends have to agree on travels in it, so
+# there is nothing to copy by hand and nothing to get wrong:
+#
+#   p2|kind|transport|mode|forwarder|dial|host|port|token|carriers|window|
+#      keepalive|snd|rcv|tunlocal|tunpeer|mtu
+#
+# dial says what the far end does about the connection: 1 means it dials us
+# and host is where, 0 means it accepts and supplies its own address. The
+# private addresses are already swapped - what is ours becomes theirs.
+#
+# It is a list of values rather than a config document on purpose. A document
+# ties the token to whatever format that document is in, and changing the
+# format then breaks every token that was ever printed.
+# ---------------------------------------------------------------------------
+
+cfg_setup_token() {
+    local dial host="" port="" tl="" tp="" mtu=""
+    if this_side_accepts; then
+        dial=1; host="$T_PUBLIC_IP"
+    else
+        dial=0
+    fi
+    [ "$T_TRANSPORT" = "tcp" ] && port="$T_PORT"
+    if [ "$T_MODE" = "tun" ] || [ "$T_MODE" = "both" ]; then
+        local pfx="${T_TUNLOCAL##*/}"
+        [ "$pfx" = "$T_TUNLOCAL" ] && pfx=24
+        tl="${T_TUNPEER%%/*}/${pfx}"
+        tp="${T_TUNLOCAL}"
+        mtu="$T_TUNMTU"
+    fi
+    printf 'p2|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+        "$T_KIND" "$T_TRANSPORT" "$T_MODE" "$T_FORWARDER" \
+        "$dial" "$host" "$port" "$T_TOKEN" \
+        "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
+        "$tl" "$tp" "$mtu" \
+        | base64 | tr -d '\n'
+}
+
+# import_tunnel turns one of those into a running tunnel on this server.
+import_tunnel() {
+    banner
+    head2 "Paste the setup token"
+    dim "Build the tunnel on the other server first; it prints the token at"
+    dim "the end. Everything comes across - only this machine's own address"
+    dim "is asked for, because the token cannot know it."
+    say ""
+    local token=""
+    ask token "token"
+    [ -n "$token" ] || return 1
+
+    local raw
+    raw="$(printf '%s' "$token" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)"
+    case "$raw" in
+        p2\|*) ;;
+        *) fail "that is not a Pingify setup token"; pause; return 1 ;;
+    esac
+
+    local v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu
+    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu <<TOKEN
+$raw
+TOKEN
+    if [ -z "$tok" ] || [ -z "$tr" ]; then
+        fail "the token is incomplete"
+        pause; return 1
+    fi
+
+    cfg_reset
+    server_info
+    T_KIND="$kind"; T_TRANSPORT="$tr"; T_MODE="$mode"; T_FORWARDER="$fwd"
+    T_TOKEN="$tok"; T_PORT="${port:-9443}"
+    T_CARRIERS="$car"; T_WINDOW="$win"; T_KEEPALIVE="$ka"
+    T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
+    T_PRESET="from token"
+    [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
+
+    # The other end told us which side it is by telling us what to do about
+    # the connection, so our own role follows from that plus who owns ports.
+    if [ "$dial" = "1" ]; then
+        T_PEER_IP="$host"
+        T_ROLE="$( [ -n "$host" ] && printf 'client' || printf 'server' )"
+        T_ACCEPTS="$( [ "$T_ROLE" = "client" ] && printf 'server' || printf 'client' )"
+    else
+        T_ACCEPTS="$T_ROLE"
+    fi
+
+    # Which end this machine is cannot be guessed from the token alone when
+    # both could dial, so ask - it is one question and it decides everything.
+    say ""
+    head2 "Which server is this?"
+    choice 1 "IRAN" "clients connect here, and the ports live here"
+    choice 2 "KHAREJ" "your panel and inbounds run here"
+    choice 3 "Paste a token" "finish this server from the other one - no questions"
+    say ""
+    local side=""
+    pick side "select" 1 2 3
+    [ "$side" = "3" ] && { import_tunnel; return $?; }
+    [ "$side" = "2" ] && T_ROLE="client" || T_ROLE="server"
+    if [ "$dial" = "1" ]; then
+        # they accept, so we dial them
+        T_ACCEPTS="$( [ "$T_ROLE" = "server" ] && printf 'client' || printf 'server' )"
+        T_PEER_IP="$host"
+    else
+        # they dial, so we accept
+        T_ACCEPTS="$T_ROLE"
+    fi
+
+    say ""
+    [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && {
+        T_PUBLIC_IP="$SRV_IP"
+        dim "this machine reports ${C_OFF}${SRV_IP}${C_DIM} - press enter to take it"
+        say ""
+    }
+    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP"
+    [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
+
+    if [ "$T_ROLE" = "server" ]; then
+        say ""
+        head2 "Ports"
+        dim "the ports your clients will connect to, here on IRAN"
+        say ""
+        local raw_ports=""
+        ask raw_ports "ports, comma separated" "443"
+        T_FORWARDS="$(parse_forwards "$raw_ports")"
+        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
+    fi
+
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    if [ "$T_TRANSPORT" = "icmp" ]; then
+        T_NAME="${T_NAME}-icmp"
+    else
+        T_NAME="${T_NAME}-${T_PORT}"
+    fi
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        say ""
+        warn "a tunnel named $T_NAME already exists on this server"
+        confirm "replace it?" || return 1
+        systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
+    fi
+    T_STATUS="127.0.0.1:$(pick_free_port 9700)"
+
+    banner
+    head2 "Ready to create"
+    cfg_endpoints
+    panel "$T_NAME"
+    field "This server" "$(side_label "$T_ROLE")"
+    field "Address" "$T_PUBLIC_IP"
+    field "Protocol" "$(transport_label "$T_TRANSPORT")"
+    field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+    if [ -n "$CFG_LISTEN" ]; then
+        field "Link" "accepts on $CFG_LISTEN"
+    else
+        field "Link" "dials $CFG_CONNECT"
+    fi
+    cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
+    field "Token" "$(token_print "$T_TOKEN")"
+    field "Carriers" "$T_CARRIERS"
+    panel_end
+    say ""
+    confirm_yes "create the tunnel ${C_B}${T_NAME}${C_OFF}?" || { warn "cancelled"; pause; return 1; }
+
+    say ""
+    local file
+    file="$(cfg_save)" || { pause; return 1; }
+    if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
+        fail "the core rejected this configuration"
+        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION"
+        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
+        rm -f "$file"
+        pause; return 1
+    fi
+    write_units
+    service_enable_start "$T_NAME"
+    enable_watchdog quiet
+    [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
+    say ""
+    ok "$T_NAME is configured and running"
+    say ""
+    tunnel_status_block "$T_NAME"
+    pause
+}
+
 new_tunnel() {
     banner
     head2 "New tunnel"
@@ -1323,7 +1513,17 @@ new_tunnel() {
     # -- what to do on the other server ------------------------------------
     local other
     other="$( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN )"
-    head2 "Now do the other side"
+    head2 "Setup token for the other server"
+    dim "On the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server: New tunnel ${BX_ARR} Paste a token"
+    say ""
+    rule
+    printf '%s
+' "${C_YEL}$(cfg_setup_token)${C_OFF}"
+    rule
+    say ""
+    warn "treat it like a password - it carries the security token"
+    say ""
+    head2 "Or set it up by hand"
     dim "Run Pingify on the $other server, choose New tunnel, and answer:"
     say ""
     panel "on $other"
@@ -4179,7 +4379,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.3.1"
+const version = "5.4.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
