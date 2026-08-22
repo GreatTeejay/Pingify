@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.7.0"
+const version = "5.7.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -898,6 +898,13 @@ type pool struct {
 	// what the log was last told the strength was, so it can be told again
 	// only when that changed
 	reported int
+
+	// How many times the far end has told us it could not reach a target.
+	// A stream that ends because the service on the other server hung up and
+	// a stream that ends because there was no service to hang up both arrive
+	// here as a closed socket; this counter is the only thing that separates
+	// them, and the probe needs that distinction badly.
+	refusals uint64
 
 	// when each kind of failure was last written down. Every carrier fails
 	// the same way at the same moment, so without this the log is the same
@@ -1846,6 +1853,9 @@ func (l *link) dispatch(p []byte) error {
 			if n > 0 {
 				// Sent by the far side, which is the only end that knows why.
 				logWarn("the other server refused a connection: %s", string(body))
+				if l.pool != nil {
+					atomic.AddUint64(&l.pool.refusals, 1)
+				}
 			}
 			if s := l.getStream(id); s != nil {
 				s.reset()
@@ -2824,6 +2834,7 @@ type statusDoc struct {
 	WireRx    uint64          `json:"wire_rx_bytes"`
 	RTTms     float64         `json:"rtt_ms"`
 	UptimeS   int64           `json:"uptime_s"`
+	Refusals  uint64          `json:"refusals"`
 	Detail    []carrierStatus `json:"detail"`
 }
 
@@ -2892,6 +2903,7 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		d.WireRx += cs.WireRx
 		d.Detail = append(d.Detail, cs)
 	}
+	d.Refusals = atomic.LoadUint64(&p.refusals)
 	d.Healthy = d.Up > 0
 	return d
 }

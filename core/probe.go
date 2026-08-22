@@ -44,7 +44,7 @@ func runProbe(cfg *Config) int {
 				fmt.Printf("  udp :%-25d not testable this way\n", r.lport)
 				continue
 			}
-			if !probeOne(r) {
+			if !probeOne(r, cfg.StatusAddr) {
 				bad++
 			}
 		}
@@ -92,7 +92,21 @@ func runProbe(cfg *Config) int {
 	return 0
 }
 
-func probeOne(r fwdRule) bool {
+// refusalCount reads how many times the far end has said it could not reach a
+// target. Zero when there is no status endpoint to ask, which only costs the
+// probe its ability to tell two failures apart.
+func refusalCount(addr string) (uint64, bool) {
+	if addr == "" {
+		return 0, false
+	}
+	d, err := fetchStatus(addr)
+	if err != nil {
+		return 0, false
+	}
+	return d.Refusals, true
+}
+
+func probeOne(r fwdRule, statusAddr string) bool {
 	label := fmt.Sprintf(":%d -> %s", r.lport, r.target)
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", r.lport), 5*time.Second)
 	if err != nil {
@@ -111,6 +125,10 @@ func probeOne(r fwdRule) bool {
 		return false
 	}
 	defer c.Close()
+
+	// Counted before the write, so anything the far end refuses during this
+	// one exchange shows up as an increase.
+	refusedBefore, canAsk := refusalCount(statusAddr)
 
 	// One harmless line, purely so the stream carries a byte and gives the far
 	// side a reason either to answer or to hang up.
@@ -138,8 +156,27 @@ func probeOne(r fwdRule) bool {
 		fmt.Printf("  %-30s open, service silent (normal for xray and the like)\n", label)
 		return true
 	}
-	fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
-	return false
+	// Here is where this used to blame the wrong machine. The connection
+	// ended, and there are two ways that happens: the far end had nothing
+	// to connect to, or the far end connected fine and the service there
+	// took one look at a bare CRLF, decided it was not the protocol it
+	// speaks, and hung up. Xray, and most proxies worth tunnelling, do
+	// exactly the second thing - so a healthy tunnel carrying a working
+	// service reported a failed port.
+	//
+	// Both arrive here as a closed socket, and nothing about the socket
+	// tells them apart. The far end does know: when it cannot reach a
+	// target it sends a reset carrying the reason, and the tunnel counts
+	// those. So ask whether one arrived while we were waiting.
+	// With no endpoint to ask, or one that will not answer, there is nothing
+	// to go on and the old pessimistic reading stands.
+	refusedAfter, asked := refusalCount(statusAddr)
+	if !canAsk || !asked || refusedAfter > refusedBefore {
+		fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
+		return false
+	}
+	fmt.Printf("  %-30s open, the service closed it (normal for xray and the like)\n", label)
+	return true
 }
 
 // carrierRestarted reports whether any carrier went away and came back while

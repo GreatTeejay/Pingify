@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.7.0"
+PINGIFY_VERSION="5.7.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -4605,7 +4605,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.7.0"
+const version = "5.7.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -5451,6 +5451,13 @@ type pool struct {
 	// what the log was last told the strength was, so it can be told again
 	// only when that changed
 	reported int
+
+	// How many times the far end has told us it could not reach a target.
+	// A stream that ends because the service on the other server hung up and
+	// a stream that ends because there was no service to hang up both arrive
+	// here as a closed socket; this counter is the only thing that separates
+	// them, and the probe needs that distinction badly.
+	refusals uint64
 
 	// when each kind of failure was last written down. Every carrier fails
 	// the same way at the same moment, so without this the log is the same
@@ -6399,6 +6406,9 @@ func (l *link) dispatch(p []byte) error {
 			if n > 0 {
 				// Sent by the far side, which is the only end that knows why.
 				logWarn("the other server refused a connection: %s", string(body))
+				if l.pool != nil {
+					atomic.AddUint64(&l.pool.refusals, 1)
+				}
 			}
 			if s := l.getStream(id); s != nil {
 				s.reset()
@@ -7377,6 +7387,7 @@ type statusDoc struct {
 	WireRx    uint64          `json:"wire_rx_bytes"`
 	RTTms     float64         `json:"rtt_ms"`
 	UptimeS   int64           `json:"uptime_s"`
+	Refusals  uint64          `json:"refusals"`
 	Detail    []carrierStatus `json:"detail"`
 }
 
@@ -7445,6 +7456,7 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		d.WireRx += cs.WireRx
 		d.Detail = append(d.Detail, cs)
 	}
+	d.Refusals = atomic.LoadUint64(&p.refusals)
 	d.Healthy = d.Up > 0
 	return d
 }
@@ -7618,7 +7630,7 @@ func runProbe(cfg *Config) int {
 				fmt.Printf("  udp :%-25d not testable this way\n", r.lport)
 				continue
 			}
-			if !probeOne(r) {
+			if !probeOne(r, cfg.StatusAddr) {
 				bad++
 			}
 		}
@@ -7666,7 +7678,21 @@ func runProbe(cfg *Config) int {
 	return 0
 }
 
-func probeOne(r fwdRule) bool {
+// refusalCount reads how many times the far end has said it could not reach a
+// target. Zero when there is no status endpoint to ask, which only costs the
+// probe its ability to tell two failures apart.
+func refusalCount(addr string) (uint64, bool) {
+	if addr == "" {
+		return 0, false
+	}
+	d, err := fetchStatus(addr)
+	if err != nil {
+		return 0, false
+	}
+	return d.Refusals, true
+}
+
+func probeOne(r fwdRule, statusAddr string) bool {
 	label := fmt.Sprintf(":%d -> %s", r.lport, r.target)
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", r.lport), 5*time.Second)
 	if err != nil {
@@ -7685,6 +7711,10 @@ func probeOne(r fwdRule) bool {
 		return false
 	}
 	defer c.Close()
+
+	// Counted before the write, so anything the far end refuses during this
+	// one exchange shows up as an increase.
+	refusedBefore, canAsk := refusalCount(statusAddr)
 
 	// One harmless line, purely so the stream carries a byte and gives the far
 	// side a reason either to answer or to hang up.
@@ -7712,8 +7742,27 @@ func probeOne(r fwdRule) bool {
 		fmt.Printf("  %-30s open, service silent (normal for xray and the like)\n", label)
 		return true
 	}
-	fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
-	return false
+	// Here is where this used to blame the wrong machine. The connection
+	// ended, and there are two ways that happens: the far end had nothing
+	// to connect to, or the far end connected fine and the service there
+	// took one look at a bare CRLF, decided it was not the protocol it
+	// speaks, and hung up. Xray, and most proxies worth tunnelling, do
+	// exactly the second thing - so a healthy tunnel carrying a working
+	// service reported a failed port.
+	//
+	// Both arrive here as a closed socket, and nothing about the socket
+	// tells them apart. The far end does know: when it cannot reach a
+	// target it sends a reset carrying the reason, and the tunnel counts
+	// those. So ask whether one arrived while we were waiting.
+	// With no endpoint to ask, or one that will not answer, there is nothing
+	// to go on and the old pessimistic reading stands.
+	refusedAfter, asked := refusalCount(statusAddr)
+	if !canAsk || !asked || refusedAfter > refusedBefore {
+		fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
+		return false
+	}
+	fmt.Printf("  %-30s open, the service closed it (normal for xray and the like)\n", label)
+	return true
 }
 
 // carrierRestarted reports whether any carrier went away and came back while
