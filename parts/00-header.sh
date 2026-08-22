@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.1.0"
+PINGIFY_VERSION="5.2.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -210,31 +210,53 @@ state_badge() {
 banner() {
     clear 2>/dev/null || true
     printf '\n'
-    local l
+    local l w pad
     if [ "$PINGIFY_UTF8" = "1" ]; then
-        for l in \
+        set -- \
             '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
             '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
             '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
             '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
             '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
             '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
     else
-        for l in \
-            ' ___  _                 _   __       ' \
-            '| _ \(_)_ _   __ _   (_) / _|_  _  ' \
-            '|  _/| |  \ \ / _` |  | ||  _| || | ' \
-            '|_|  |_|_||_|\__, |  |_||_|   \_, | ' \
-            '             |___/           |__/  '
-        do
-            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
-        done
+        set -- \
+            ' ___  _                 _   __     ' \
+            '| _ \(_)_ _  __ _ (_) / _|_  _     ' \
+            '|  _/| | | \| | (_| | | ||  _| || |' \
+            '|_|  |_|_||_|\__, | |_||_|   \_, |ذ' \
+            '             |___/          |__/   '
     fi
-    printf '  %s%sby Teejay%s   %sIran %s Kharej tunnel   %s   v%s%s\n\n' \
-        "$C_CYN" "$C_DIM" "$C_OFF" "$C_DIM" "$BX_ARR" "$BX_DOT" "$PINGIFY_VERSION" "$C_OFF"
+
+    # The name sits in its own frame, centred, so the page opens with one
+    # object rather than six lines floating above a rule.
+    w=0
+    for l in "$@"; do
+        [ "$(vislen "$l")" -gt "$w" ] && w="$(vislen "$l")"
+    done
+    local inner=$((UI_W))
+    pad=$(( (inner - w) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+
+    printf '  %s%s%s%s%s\n' "$C_CYN$C_DIM" "$BX_TL" "$(repeat "$BX_H" "$inner")" "$BX_TR" "$C_OFF"
+    for l in "$@"; do
+        printf '  %s%s%s%s%s%s%s%s\n' \
+            "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+            "$(repeat ' ' "$pad")" "$C_CYN$C_B$l$C_OFF" \
+            "$(repeat ' ' $((inner - pad - $(vislen "$l"))))" \
+            "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    done
+
+    # and the one line that says what it is, centred under it
+    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel"
+    pad=$(( (inner - ${#sub}) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '  %s%s%s%s%s%s%s%s\n' \
+        "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
+        "$(repeat ' ' "$pad")" "$C_DIM$sub$C_OFF" \
+        "$(repeat ' ' $((inner - pad - ${#sub})))" \
+        "$C_CYN$C_DIM$BX_V" "$C_OFF"
+    printf '  %s%s%s%s%s\n\n' "$C_CYN$C_DIM" "$BX_BL" "$(repeat "$BX_H" "$inner")" "$BX_BR" "$C_OFF"
 }
 
 pause() { printf '\n'; read -rsp "  ${C_DIM}press enter${C_OFF}" _; printf '\n'; }
