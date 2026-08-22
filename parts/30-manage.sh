@@ -61,9 +61,22 @@ tunnel_status_block() {
     printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
         "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
         "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
-    if [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
-        "$CORE_BIN" -status "$addr" 2>/dev/null || true
+
+    # A stopped tunnel has no status endpoint to ask, and printing the raw
+    # "connection refused" from trying anyway reads like a fault when it is
+    # only the consequence of the line above.
+    if [ "$state" != "active" ]; then
+        dim "not running - nothing to report"
+        return 0
     fi
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 0
+    if ! "$CORE_BIN" -status "$addr" 2>/dev/null; then
+        # Either it is still coming up, or no carrier has arrived. The status
+        # server answers within a second of starting, so a refusal this soon
+        # after a start is the former.
+        dim "starting up, or the other server has not connected yet"
+    fi
+    return 0
 }
 
 # One line per tunnel, for the overview table.

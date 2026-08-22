@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.7.0"
+const version = "4.7.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -2756,6 +2756,16 @@ func printStatus(addr string, brief bool) int {
 	}
 	fmt.Printf("  tunnel     %s  (%s, %s, %s)\n", d.Name, d.Role, d.Mode, d.Transport)
 	fmt.Printf("  state      %s  -  %d of %d carriers\n", state, d.Up, d.Carriers)
+	if d.Up == 0 {
+		// The usual reason, by a wide margin, is that only one of the two
+		// servers has been set up so far. Saying so beats leaving DOWN on
+		// screen looking like a fault.
+		if d.Role == "server" {
+			fmt.Println("             nothing has connected yet - set the tunnel up on KHAREJ too")
+		} else {
+			fmt.Println("             cannot reach IRAN yet - check it is set up, and the port is open")
+		}
+	}
 	fmt.Printf("  peer       %s\n", d.Peer)
 	fmt.Printf("  rtt        %.1f ms\n", d.RTTms)
 	fmt.Printf("  streams    %d open\n", d.Streams)
