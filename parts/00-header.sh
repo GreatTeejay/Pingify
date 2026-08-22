@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.4.0"
+PINGIFY_VERSION="5.4.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -197,7 +197,7 @@ choice() {
     fi
     printf '  %s%s%s%s  %s  %s%s%s\n' \
         "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
-        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
+        "$(pad_to "${C_B}$2${C_OFF}" 14)" \
         "$C_DIM" "$hint" "$C_OFF"
 }
 

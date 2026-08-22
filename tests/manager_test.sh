@@ -383,5 +383,36 @@ if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
     check "the core accepts it"  "$?"                                   "0"
 fi
 
+
+# ---------------------------------------------------------------------------
+note "the wizard's first question"
+# ---------------------------------------------------------------------------
+# Both new_tunnel and import_tunnel ask which server this is, and an edit that
+# meant the wizard landed in the importer instead - which offered a way into
+# itself, while the wizard people actually reach offered nothing.
+first_q() {
+    awk '/^new_tunnel\(\) \{/{f=1} f&&/pick side "select"/{print; exit}' Pingify.sh
+}
+importer_q() {
+    awk '/^import_tunnel\(\) \{/{f=1} f&&/pick side "select"/{print; exit}' Pingify.sh
+}
+check "the wizard offers three ways in" \
+      "$(first_q | grep -c '1 2 3')" "1"
+check "the importer offers two"        \
+      "$(importer_q | grep -c '1 2$')" "1"
+check "and three is the token"         \
+      "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/side" = "3"/{print; exit}' Pingify.sh | grep -c import_tunnel)" "1"
+
+# pick has to survive an empty answer and a wrong one without looping forever.
+# It shares a name space with ask, and when their locals collided it rejected
+# every answer including the right ones.
+picked=""
+# a pipe would run pick in a subshell and the answer would not come back
+pick picked "select" 1 2 >/dev/null 2>&1 < <(printf 'x
+
+2
+')
+check "pick takes the valid answer" "$picked" "2"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
