@@ -269,6 +269,7 @@ func bringUp(t *testing.T, forwards []string, carriers int) *pool {
 		Role: "server", Mode: "forward",
 		Connect: fmt.Sprintf("127.0.0.1:%d", carrierPort),
 		Token:   psk, Carriers: carriers, Forwards: forwards,
+		BindAddr: "127.0.0.1",
 	}
 	edgeCfg.applyDefaults()
 	if err := edgeCfg.validate(); err != nil {

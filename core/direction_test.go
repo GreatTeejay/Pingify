@@ -32,6 +32,7 @@ func TestTheFarSideDialsTheTarget(t *testing.T) {
 		Role: "server", Mode: "forward",
 		Listen: fmt.Sprintf("127.0.0.1:%d", port),
 		Token:  psk, Carriers: 2,
+		BindAddr: "127.0.0.1",
 		Forwards: []string{fmt.Sprintf("%d=%d", local, echo)},
 		// IRAN must never dial the service. If it does, this refuses it and
 		// the round trip below fails.

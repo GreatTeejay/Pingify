@@ -221,6 +221,8 @@ func assign(c *Config, section, key, val string) error {
 		switch key {
 		case "ports", "forwards":
 			c.Forwards, err = parseArray(val)
+		case "bind_addr":
+			c.BindAddr = unquote(val)
 		case "allow":
 			c.Allow, err = parseArray(val)
 		}

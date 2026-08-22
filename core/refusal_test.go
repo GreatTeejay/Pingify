@@ -45,6 +45,7 @@ func TestARefusalSaysWhichServerAndWhy(t *testing.T) {
 		Role: "server", Mode: "forward",
 		Listen: fmt.Sprintf("127.0.0.1:%d", port),
 		Token:  psk, Carriers: 2,
+		BindAddr: "127.0.0.1",
 		Forwards: []string{fmt.Sprintf("%d=%d", local, dead)},
 	}
 	kharej := &Config{

@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.5.1"
+const version = "4.6.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -93,6 +93,12 @@ type Config struct {
 	// forward mode: "443", "443=8443", "443=10.0.0.5:8443", "udp:500=500",
 	// "8000-8010" (range, same port on the far side).
 	Forwards []string `json:"forwards,omitempty"`
+
+	// BindAddr is the address the forwarded ports listen on. Empty means every
+	// interface, which is what an Iran server wants: clients arrive from
+	// outside. Setting it to 127.0.0.1 keeps the ports off the network, which
+	// is what the tests want and what a host firewall stops asking about.
+	BindAddr string `json:"bind_addr,omitempty"`
 	// origin side: if non-empty, only these host:port targets may be dialled.
 	Allow []string `json:"allow,omitempty"`
 
@@ -1924,7 +1930,7 @@ func startForward(cfg *Config, p *pool) (*forwarder, error) {
 }
 
 func (f *forwarder) bind(r fwdRule) error {
-	addr := fmt.Sprintf(":%d", r.lport)
+	addr := net.JoinHostPort(f.cfg.BindAddr, strconv.Itoa(r.lport))
 	if r.proto == "udp" {
 		pc, err := net.ListenPacket("udp", addr)
 		if err != nil {

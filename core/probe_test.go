@@ -17,7 +17,7 @@ func bringPair(t *testing.T, forwards []string) *Config {
 	iran := &Config{
 		Role: "server", Mode: "forward",
 		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Token:  psk, Carriers: 2, Forwards: forwards,
+		Token:  psk, Carriers: 2, Forwards: forwards, BindAddr: "127.0.0.1",
 	}
 	kharej := &Config{
 		Role: "client", Mode: "forward",
