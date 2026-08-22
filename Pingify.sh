@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.1.0"
+PINGIFY_VERSION="3.8.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 CFG_DIR="/etc/pingify"
@@ -1873,7 +1873,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.1.0"
+const version = "3.8.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
