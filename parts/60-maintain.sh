@@ -16,7 +16,8 @@ update_menu() {
         item 1 "Download the latest core" "prebuilt, from GitHub Releases"
         item 2 "Compile the core here" "from the sources inside this script"
         item 3 "Import a core binary" "path or URL"
-        item 4 "Export this core binary" "to copy to the other server"
+        item 4 "Export this core binary" "to copy to the peer"
+        item 5 "Update Pingify itself" "fetch the newest manager script"
         item 0 "Back"
         say ""
         local c=""
@@ -26,6 +27,7 @@ update_menu() {
             2) say ""; if build_core; then restart_all "the core was rebuilt"; fi; pause ;;
             3) say ""; if import_core_binary; then restart_all "the core was replaced"; fi; pause ;;
             4) export_core; pause ;;
+            5) self_update; pause ;;
             0|"") return ;;
         esac
     done
@@ -37,24 +39,12 @@ restart_all() {
     [ "$any" = "1" ] && ok "$1; every tunnel was restarted" || ok "$1"
 }
 
-# The script and the core share a config format, so they have to move
-# together. Updating one alone is how a machine ends up with two versions of
-# Pingify on it that refuse to work with each other.
-update_pingify() {
-    banner
-    head2 "Update Pingify"
-    if ! self_update; then pause; return 1; fi
-    say ""
-    info "restarting with the new version to bring the core along"
-    sleep 1
-    exec "$SELF_BIN"
-}
-
 self_update() {
     say ""
+    have curl || { fail "curl is needed for this"; return 1; }
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
+    if ! curl -fsSL --max-time 60 "$RAW_BASE/Pingify.sh" -o "$tmp"; then
         fail "could not reach GitHub"
         dim "on an Iranian server this often fails; update from the Kharej box"
         dim "and copy the file across instead."
@@ -68,6 +58,7 @@ self_update() {
     install -m 0755 "$tmp" "$SELF_BIN"
     rm -f "$tmp"
     ok "Pingify updated to ${newver:-unknown}"
+    dim "run 'pingify' again to pick up the new version"
 }
 
 export_core() {
@@ -76,7 +67,7 @@ export_core() {
     local dest="/root/pingify-core-$(uname -m)"
     cp -f "$CORE_BIN" "$dest"
     ok "copied to $dest"
-    dim "Copy it to the other server, then Update core -> 3 there."
+    dim "Move it to the other server and use Update Core -> 3 there."
     dim "Example, run this on the other server:"
     say ""
     say "    ${C_DIM}scp root@$(public_ip):$dest /root/pingify-core${C_OFF}"
@@ -107,7 +98,7 @@ remove_menu() {
             for n in $(tunnel_names); do
                 systemctl disable --now "pingify@$n" >/dev/null 2>&1
                 systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
-                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$(cfg_file "$n")"
+                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$CFG_DIR/$n.json"
             done
             systemctl daemon-reload
             ok "all tunnels removed"
@@ -127,7 +118,6 @@ full_uninstall() {
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
     systemctl disable --now pingify-health.timer >/dev/null 2>&1
-    remove_blocking
     rm -f "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-health.service \
           "$UNIT_DIR"/pingify-health.timer "$UNIT_DIR"/pingify-recycle@*.service \
           "$UNIT_DIR"/pingify-recycle@*.timer
@@ -143,220 +133,143 @@ full_uninstall() {
 
 # ---------------------------------------------------------------------------
 # diagnostics
-#
-# One command that answers "is this thing working, and if not, which part is
-# broken" - in the order the failures actually happen, so the first red line
-# is the one to fix.
 # ---------------------------------------------------------------------------
 
-DIAG_BAD=0
-
-check_pass() { printf '  %s%s%s %s\n' "$C_GRN" "$MK_OK" "$C_OFF" "$1"; }
-check_fail() { printf '  %s%s%s %s\n' "$C_RED" "$MK_NO" "$C_OFF" "$1"; DIAG_BAD=$((DIAG_BAD + 1)); }
-check_warn() { printf '  %s%s%s %s\n' "$C_YEL" "$MK_WARN" "$C_OFF" "$1"; }
-check_note() { printf '      %s%s%s\n' "$C_DIM" "$1" "$C_OFF"; }
-
 tcp_probe() {
-    timeout 5 bash -c ": < /dev/tcp/$1/$2" 2>/dev/null
-}
-
-diag_tunnel() {
-    local name="$1" f
-    f="$(cfg_file "$name")"
-    cfg_load "$name" || { check_fail "$name: no config"; return; }
-
-    printf '\n  %s%s%s\n' "$C_B" "$name" "$C_OFF"
-
-    # 1. the config the core will actually read
-    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
-        check_pass "config is valid"
-    else
-        check_fail "the core rejects this config"
-        "$CORE_BIN" -c "$f" -check 2>&1 | sed 's/^/      /'
-        return
-    fi
-
-    # 2. the service
-    case "$(svc_state "$name")" in
-        active)   check_pass "service is running" ;;
-        stopped)  check_fail "service is stopped"; check_note "start it from Manage tunnels"; return ;;
-        *)        check_fail "service is not enabled"; return ;;
-    esac
-
-    # 3. the link itself, straight from the core
-    local brief state up total rtt
-    brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
-    set -- $brief
-    state="${1:-down}"; up="${2:-0}"; total="${3:-0}"; rtt="${4:-0}"
-    if [ "$state" = "up" ]; then
-        check_pass "link is up - $up of $total connections, ${rtt}ms"
-        [ "$up" != "$total" ] && check_warn "some connections are still down"
-    else
-        check_fail "no connection to the other server"
-    fi
-
-    # 4. the path, so a down link points at a cause
-    cfg_endpoints
-    if [ -n "$CFG_CONNECT" ]; then
-        local host="${CFG_CONNECT%:*}" port="${CFG_CONNECT##*:}"
-        if [ "$T_TRANSPORT" = "icmp" ]; then
-            host="$CFG_CONNECT"
-            if have ping && ping -c 2 -W 2 "$host" >/dev/null 2>&1; then
-                check_pass "$host answers a ping - the ICMP path is open"
-            else
-                check_fail "$host does not answer a ping"
-                check_note "an ICMP tunnel cannot work if ping does not get through"
-            fi
-            return
-        fi
-        if tcp_probe "$host" "$port"; then
-            check_pass "port $port on $host accepts connections"
-        else
-            check_fail "cannot reach $host:$port"
-            check_note "is the other server running, and is the port open there?"
-        fi
-    else
-        local port="${CFG_LISTEN##*:}"
-        if [ "$T_TRANSPORT" = "icmp" ]; then
-            check_pass "ICMP needs no port to be open here"
-            return
-        fi
-        if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
-            check_pass "listening on port $port"
-            [ "$state" = "up" ] || check_note "open $port in your firewall and check the other server"
-        else
-            check_fail "nothing is listening on port $port"
-        fi
-    fi
-
-    # 5. the ports clients are told to use
-    if [ "$T_MODE" = "forward" ] && [ -n "$T_FORWARDS" ]; then
-        local spec p missing=""
-        for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
-            p="${spec%%=*}"; p="${p##*:}"; p="${p%%-*}"
-            case "$p" in "" | *[!0-9]*) continue ;; esac
-            ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || missing="$missing $p"
-        done
-        if [ -n "$missing" ]; then
-            check_fail "not listening on:$missing"
-        else
-            check_pass "all forwarded ports are open"
-        fi
-    fi
-}
-
-diag_full() {
-    banner
-    head2 "Full check"
-    DIAG_BAD=0
-
-    # --- the machine ------------------------------------------------------
-    printf '  %s%s%s\n' "$C_B" "This server" "$C_OFF"
-    [ -x "$CORE_BIN" ] && check_pass "core $(core_version)" || check_fail "the core is not installed"
-
-    if have timedatectl && timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -q yes; then
-        check_pass "clock is synchronised"
-    else
-        check_warn "clock may be off"
-        check_note "the handshake rejects a difference over 3 minutes - see Optimize"
-    fi
-
-    if [ "$(watchdog_state)" = "on" ]; then
-        check_pass "watchdog is on"
-    else
-        check_warn "watchdog is off - a dead tunnel will not be restarted"
-    fi
-
-    # --- each tunnel ------------------------------------------------------
-    local names; names="$(tunnel_names)"
-    if [ -z "$names" ]; then
-        printf '\n'
-        check_warn "no tunnels configured"
-    else
-        local n
-        for n in $names; do diag_tunnel "$n"; done
-    fi
-
-    printf '\n'
-    if [ "$DIAG_BAD" = "0" ]; then
-        ok "everything checks out"
-    else
-        fail "$DIAG_BAD problem(s) above"
-    fi
-    pause
+    local host="$1" port="$2"
+    timeout 5 bash -c ": < /dev/tcp/$host/$port" 2>/dev/null
 }
 
 diagnostics_menu() {
     while :; do
         banner
         head2 "Diagnostics"
-        item 1 "Full check" "config, service, link, path, ports"
-        item 2 "Ping the other server" "plain ICMP, to see the raw latency"
-        item 3 "Live log" "follow a tunnel as it runs"
-        item 4 "System summary"
-        item 5 "Forwarding rules" "what iptables is doing for Pingify"
+        item 1 "Reach the other server"
+        item 2 "Ping the peer"
+        item 3 "Validate every config"
+        item 4 "Listening ports"
+        item 5 "System summary"
+        item 6 "Tail a tunnel log"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) diag_full ;;
+            1) diag_reach ;;
             2) diag_ping ;;
-            3) if pick_tunnel; then
-                   say ""; dim "ctrl-c to stop"; say ""
-                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager || true
-               fi ;;
-            4) diag_system ;;
-            5) show_nat; pause ;;
-            0 | "") return ;;
+            3) diag_configs ;;
+            4) say ""; ss -Hltnp 2>/dev/null | sed 's/^/  /' | head -n 40; pause ;;
+            5) diag_system ;;
+            6) if pick_tunnel; then journalctl -u "pingify@$PICKED" -n 80 --no-pager | sed 's/^/  /'; pause; fi ;;
+            0|"") return ;;
         esac
     done
+}
+
+diag_reach() {
+    pick_tunnel || return
+    cfg_load "$PICKED" || return
+    say ""
+    if [ -n "$T_CONNECT" ]; then
+        local host="${T_CONNECT%:*}" port="${T_CONNECT##*:}"
+        info "opening a TCP connection to $host:$port"
+        if tcp_probe "$host" "$port"; then
+            ok "the peer accepted the connection - the path is clear"
+        else
+            fail "no answer from $host:$port"
+            dim "check that the peer's tunnel is running, that its firewall allows"
+            dim "the port, and that the provider is not blocking it"
+        fi
+    else
+        local port="${T_LISTEN##*:}"
+        info "this server listens on port $port; checking it is bound"
+        if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+            ok "port $port is open and listening"
+            dim "run this same check from the other server to test the path"
+        else
+            fail "nothing is listening on $port - is the tunnel running?"
+        fi
+    fi
+    pause
 }
 
 diag_ping() {
     pick_tunnel || return
     cfg_load "$PICKED" || return
     local host=""
-    cfg_endpoints
-    [ -n "$CFG_CONNECT" ] && host="${CFG_CONNECT%:*}"
-    say ""
-    if [ -z "$host" ]; then
-        dim "this server waits for the other one, so it does not know its address"
-        say ""
-        ask host "address to ping"
-    fi
+    if [ -n "$T_CONNECT" ]; then host="${T_CONNECT%:*}"; fi
+    [ -n "$host" ] || ask host "peer IP"
     [ -n "$host" ] || return
     say ""
-    if have ping; then
-        ping -c 5 -W 2 "$host" 2>&1 | sed 's/^/    /'
-    else
-        warn "ping is not installed"
-    fi
+    ping -c 5 -W 2 "$host" 2>&1 | sed 's/^/  /'
+    pause
+}
+
+diag_configs() {
+    say ""
+    local n bad=0
+    for n in $(tunnel_names); do
+        if "$CORE_BIN" -c "$CFG_DIR/$n.json" -check >/dev/null 2>&1; then
+            ok "$n"
+        else
+            bad=1
+            fail "$n"
+            "$CORE_BIN" -c "$CFG_DIR/$n.json" -check 2>&1 | sed 's/^/      /'
+        fi
+    done
+    [ "$bad" = "0" ] && dim "every config is valid"
     pause
 }
 
 diag_system() {
-    banner
-    head2 "System"
-    panel "MACHINE"
-    field "OS" "$OS_PRETTY"
-    field "Kernel" "$(uname -r)"
-    field "Arch" "$ARCH"
-    field "CPU" "$(nproc) cores"
-    field "Memory" "$(free -h 2>/dev/null | awk '/^Mem:/{print $3" of "$2}')"
-    panel_end
-    panel "NETWORK"
-    field "Public IP" "$SRV_IP"
-    field "Congestion" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-    field "Qdisc" "$(sysctl -n net.core.default_qdisc 2>/dev/null)"
-    field "Blocking" "$(block_summary)"
-    field "Open files" "$(ulimit -n)"
-    panel_end
-    panel "PINGIFY"
-    field "Script" "$PINGIFY_VERSION"
-    field "Core" "$(core_version)"
-    field "Directory" "$BASE_DIR"
-    field "Time" "$(date -u '+%Y-%m-%d %H:%M UTC')"
-    panel_end
+    say ""
+    printf '  %-22s %s\n' "os" "$OS_PRETTY"
+    printf '  %-22s %s\n' "kernel" "$(uname -r)"
+    printf '  %-22s %s\n' "arch" "$ARCH"
+    printf '  %-22s %s\n' "cpu" "$(nproc) cores"
+    printf '  %-22s %s\n' "memory" "$(free -h | awk '/^Mem:/{print $3" used of "$2}')"
+    printf '  %-22s %s\n' "public ip" "$(public_ip)"
+    printf '  %-22s %s\n' "core" "$(core_version)"
+    printf '  %-22s %s\n' "watchdog" "$(watchdog_state)"
+    printf '  %-22s %s\n' "congestion control" "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+    printf '  %-22s %s\n' "time" "$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
     pause
+}
+
+# ---------------------------------------------------------------------------
+# backup / restore
+# ---------------------------------------------------------------------------
+
+backup_menu() {
+    banner
+    head2 "Backup & Restore"
+    item 1 "Back up every tunnel"
+    item 2 "Restore from a backup"
+    item 0 "Back"
+    say ""
+    local c=""
+    ask c "select"
+    case "$c" in
+        1)  say ""
+            local out="/root/pingify-backup-$(date +%Y%m%d-%H%M%S).tar.gz"
+            if tar -czf "$out" -C / etc/pingify 2>/dev/null; then
+                chmod 600 "$out"
+                ok "written to $out"
+                warn "it contains your shared keys - keep it somewhere safe"
+            else
+                fail "nothing to back up"
+            fi
+            pause ;;
+        2)  say ""
+            local src=""
+            ask src "path to the backup file"
+            [ -f "$src" ] || { fail "no such file"; pause; return; }
+            confirm "this replaces the configs on this server. continue?" || return
+            tar -xzf "$src" -C / || { fail "could not unpack it"; pause; return; }
+            write_units
+            local n
+            for n in $(tunnel_names); do service_enable_start "$n"; ok "started $n"; done
+            pause ;;
+        0|"") return ;;
+    esac
 }
