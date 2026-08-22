@@ -19,12 +19,14 @@ func runProbe(cfg *Config) int {
 		fmt.Println("Run this on the IRAN server: that is the end with the ports.")
 		return 2
 	}
+	var before *statusDoc
 	if cfg.StatusAddr != "" {
 		d, err := fetchStatus(cfg.StatusAddr)
 		if err != nil {
 			fmt.Printf("No carrier is up (%v). Nothing can cross the tunnel yet.\n", err)
 			return 1
 		}
+		before = d
 		fmt.Printf("%d of %d carriers up, %.0f ms to the other server.\n\n",
 			d.Up, d.Carriers, d.RTTms)
 	}
@@ -47,6 +49,27 @@ func runProbe(cfg *Config) int {
 			}
 		}
 	}
+	// A stream that is simply never answered looks identical to one the far
+	// side accepted and had nothing to say about - both leave the connection
+	// open. The only thing that tells them apart is whether the other server
+	// sent us anything at all while we were asking.
+	if before != nil {
+		after, err := fetchStatus(cfg.StatusAddr)
+		if err == nil {
+			sent := after.WireTx - before.WireTx
+			got := after.WireRx - before.WireRx
+			fmt.Printf("\nDuring this test we sent %s and the other server sent back %s.\n",
+				humanBytes(sent), humanBytes(got))
+			if got == 0 {
+				fmt.Println("\nNothing came back at all. The carriers are connected, so the")
+				fmt.Println("path carries a handshake, but nothing after it is getting through")
+				fmt.Println("in this direction. An \"open\" above means only that no refusal")
+				fmt.Println("arrived - which is also what a one-way path looks like.")
+				return 1
+			}
+		}
+	}
+
 	if bad > 0 {
 		fmt.Println("\nA port that failed is one the other server could not reach.")
 		fmt.Println("Check that the service is listening there on the address after")

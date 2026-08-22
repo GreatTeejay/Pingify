@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.7.1"
+const version = "4.8.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -1581,7 +1581,7 @@ func (l *link) readLoop() {
 	for {
 		l.conn.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
-			l.died("%s", readReason(err, idle))
+			l.died("%s%s", readReason(err, idle), l.rxSummary())
 			return
 		}
 		if l.obf {
@@ -1597,7 +1597,7 @@ func (l *link) readLoop() {
 		}
 		ct = ct[:n]
 		if _, err := io.ReadFull(l.conn, ct); err != nil {
-			l.died("%s", readReason(err, idle))
+			l.died("%s%s", readReason(err, idle), l.rxSummary())
 			return
 		}
 		atomic.AddUint64(&l.wireRx, uint64(len(hdr)+n))
@@ -1686,6 +1686,18 @@ func (l *link) dispatch(p []byte) error {
 // side hanging up every nine seconds while the other was still perfectly
 // happy. The floor makes that impossible: however impatient this end is
 // configured to be, it waits a full minute of real silence before giving up.
+// rxSummary says whether this carrier ever heard anything and how long ago,
+// which is the difference between "the peer went away" and "the peer was never
+// able to reach us at all".
+func (l *link) rxSummary() string {
+	n := atomic.LoadUint64(&l.wireRx)
+	if n == 0 {
+		return " (nothing was EVER received on this carrier)"
+	}
+	last := time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Second)
+	return fmt.Sprintf(" (received %s in all, last %s ago)", humanBytes(n), last)
+}
+
 func (l *link) idleLimit() time.Duration {
 	d := time.Duration(l.cfg.KeepaliveSec) * time.Second * 3
 	if d < minIdle {
@@ -1702,7 +1714,8 @@ func (l *link) keepaliveLoop() {
 		select {
 		case <-t.C:
 			if time.Now().UnixNano()-atomic.LoadInt64(&l.lastRx) > idle {
-				l.died("silent for %s - nothing came back from the peer", l.idleLimit())
+				l.died("silent for %s - nothing came back from the peer%s",
+					l.idleLimit(), l.rxSummary())
 				return
 			}
 			var b [8]byte
