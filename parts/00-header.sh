@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.3.0"
+PINGIFY_VERSION="5.3.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -274,6 +274,38 @@ ask() {
         read -rp "  ${C_CYN}${BX_ARR}${C_OFF} ${__prompt}${C_B}:${C_OFF} " __in
     fi
     printf -v "$__var" '%s' "$__in"
+}
+
+# pick <var> <prompt> <valid>... - insist on one of the listed answers.
+#
+# Some questions have no sensible default. Which server this is, what protocol
+# to speak, who forwards - an empty enter that quietly means "the first one" is
+# how somebody ends up with a tunnel they did not choose and cannot explain.
+pick() {
+    local __var="$1" __prompt="$2"; shift 2
+    local __in="" __v
+    while :; do
+        ask __in "$__prompt"
+        if [ -z "$__in" ]; then
+            fail "this one has no default - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
+            continue
+        fi
+        for __v in "$@"; do
+            if [ "$__in" = "$__v" ]; then
+                printf -v "$__var" '%s' "$__in"
+                return 0
+            fi
+        done
+        fail "not one of the options - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
+    done
+}
+
+# confirm_yes is confirm with the answer already leaning the right way: by the
+# time it is asked, everything has been reviewed and the expected reply is yes.
+confirm_yes() {
+    local reply=""
+    read -rp "  ${C_YEL}?${C_OFF} $1 ${C_DIM}[Y/n]${C_OFF}${C_B}:${C_OFF} " reply
+    case "$reply" in [nN] | [nN][oO]) return 1 ;; *) return 0 ;; esac
 }
 
 confirm() {

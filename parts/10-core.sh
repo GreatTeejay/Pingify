@@ -29,7 +29,7 @@ adopt_core() {
     fi
     install -m 0755 "$tmp" "$CORE_BIN" || return 1
     rm -f "$tmp"
-    ok "core ready: $("$CORE_BIN" -version)"
+    ok "core $("$CORE_BIN" -version | awk '{print $2}') installed"
     return 0
 }
 
@@ -57,7 +57,6 @@ download_core() {
             rm -f "$tmp"
             return 1
         fi
-        [ -n "$want" ] && dim "checksum verified"
     fi
 
     adopt_core "$tmp"
@@ -109,10 +108,7 @@ import_core_binary() {
 # install_core is the full ladder; ensure_core only runs it when needed.
 install_core() {
     if download_core; then return 0; fi
-    say ""
-    warn "could not fetch the prebuilt core from GitHub"
-    dim "compiling it here instead - this needs Go but downloads nothing"
-    say ""
+    warn "GitHub is not reachable - compiling the core here instead"
     build_core
 }
 
