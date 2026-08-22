@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.6.1"
+PINGIFY_VERSION="5.7.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -81,6 +81,42 @@ pad_to() {
     local s="$1" w="$2" n; n="$(vislen "$s")"
     printf '%s' "$s"
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
+}
+
+# ---------------------------------------------------------------------------
+# round trip time
+#
+# The number on its own means nothing to most people looking at it. What they
+# want to know is whether it is normal for this path, so the bands are drawn
+# where an Iran <-> abroad tunnel changes character rather than at round
+# numbers:
+#
+#   under 100 ms   a European or nearby datacentre behaving itself
+#   100 - 200 ms   usable, but interactive traffic feels it
+#   over 200 ms    either a very long way round, or the path is in trouble
+#
+# A tunnel that is down has no round trip at all, and that is dim, not red -
+# red here should mean "this path is slow", not "there is no path".
+# ---------------------------------------------------------------------------
+rtt_colour() {
+    local ms="${1%ms}"; ms="${ms%%.*}"
+    case "$ms" in
+        '' | *[!0-9]*) printf '%s' "$C_DIM"; return ;;
+    esac
+    if   [ "$ms" -lt 100 ]; then printf '%s' "$C_GRN"
+    elif [ "$ms" -lt 200 ]; then printf '%s' "$C_YEL"
+    else                         printf '%s' "$C_RED"
+    fi
+}
+
+# rtt_tint prints the value already wrapped in its colour.
+rtt_tint() { printf '%s%s%s' "$(rtt_colour "$1")" "$1" "$C_OFF"; }
+
+# true when the path is slow enough to be worth a word of explanation
+rtt_slow() {
+    local ms="${1%ms}"; ms="${ms%%.*}"
+    case "$ms" in '' | *[!0-9]*) return 1 ;; esac
+    [ "$ms" -ge 200 ]
 }
 
 # A panel carries its title in the top border, so a screen full of them reads
@@ -419,6 +455,28 @@ pick_free_port() {
         p=$((p + 1))
     done
     printf '%s' "$1"
+}
+
+# The status endpoint has to be unique per tunnel. Asking the kernel whether a
+# port is free only answers for the tunnels that happen to be running right
+# now, so a second tunnel built while the first one was stopped was handed the
+# same port - and then the two of them fought over it at the next boot, with
+# the loser reporting no carriers to a health check that could see nothing
+# wrong with it.
+pick_status_port() {
+    local want="${1:-9700}" p="${1:-9700}" taken="" f
+    for f in "$CFG_DIR"/*.toml "$CFG_DIR"/*.json; do
+        [ -f "$f" ] || continue
+        taken="$taken $(toml_get "$f" status addr)"
+    done
+    while [ "$p" -lt 65535 ]; do
+        case " $taken " in
+            *":$p "*) p=$((p + 1)); continue ;;
+        esac
+        if port_free "$p"; then printf '%s' "$p"; return 0; fi
+        p=$((p + 1))
+    done
+    printf '%s' "$want"
 }
 
 public_ip() {

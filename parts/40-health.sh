@@ -157,7 +157,13 @@ health_check() {
         hc_note "some are being dropped - the path is lossy or something is trimming them"
         hc_fix "Manage ${BX_ARR} $name ${BX_ARR} Live log, and look for 'carrier .* down'"
     else
-        hc_ok "$up of $total carriers up, ${rtt}ms to the other server"
+        hc_ok "$up of $total carriers up, $(rtt_tint "${rtt}ms") to the other server"
+        # A long round trip is usually geography rather than a fault, so it
+        # explains itself and is not counted as a problem.
+        if rtt_slow "$rtt"; then
+            hc_note "that is a long way round - anything interactive will feel it"
+            hc_note "the other server being closer is the only thing that fixes it"
+        fi
     fi
 
     # --- the forwarded ports, on the end that has them ---------------------

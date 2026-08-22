@@ -562,5 +562,65 @@ db() { awk '/^live_dashboard\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "it tests whether a key arrived" "$(db | grep -c 'if read -rsn1')" "1"
 check "and enter is one of the ways out" "$(db | grep -c 'q|Q|0|""')"    "1"
 
+
+# ---------------------------------------------------------------------------
+note "the round trip has a colour"
+# ---------------------------------------------------------------------------
+# The number alone tells most people nothing. What they want to know is
+# whether it is normal for this path, and the bands say so at a glance.
+grn=$'\033[32m'; yel=$'\033[33m'; red=$'\033[31m'; dimc=$'\033[2m'
+C_GRN="$grn"; C_YEL="$yel"; C_RED="$red"; C_DIM="$dimc"
+check "a nearby datacentre is green"  "$(rtt_colour '42.1ms')"  "$grn"
+check "just under the line is green"  "$(rtt_colour '99.9ms')"  "$grn"
+check "europe on a bad day is yellow" "$(rtt_colour '137.4ms')" "$yel"
+check "the far side of the world is red" "$(rtt_colour '243.9ms')" "$red"
+check "exactly 200 is red"            "$(rtt_colour '200ms')"   "$red"
+check "no round trip is dim, not red" "$(rtt_colour '-')"       "$dimc"
+check "and so is an empty one"        "$(rtt_colour '')"        "$dimc"
+check "it reads a bare number too"    "$(rtt_colour '42')"      "$grn"
+check "slow is only past 200"         "$(rtt_slow '150ms'; echo $?)" "1"
+check "and 250 is slow"               "$(rtt_slow '250ms'; echo $?)" "0"
+check "a missing one is never slow"   "$(rtt_slow '-'; echo $?)"     "1"
+C_GRN=""; C_YEL=""; C_RED=""; C_DIM=""
+
+# ---------------------------------------------------------------------------
+note "following the log does not close the manager"
+# ---------------------------------------------------------------------------
+# ctrl-c reaches every process in the foreground group, so the key the screen
+# tells you to press to stop following was also killing the script.
+ll() { awk '/^live_log\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it catches the interrupt"   "$(ll | grep -c "trap ':' INT")" "1"
+check "and puts it back after"     "$(ll | grep -c 'trap - INT')"   "1"
+check "diagnostics follows the same way" \
+      "$(grep -c 'live_log "$PICKED"' Pingify.sh)" "1"
+check "nothing follows the journal raw any more" \
+      "$(grep -c 'journalctl.*-f --no-pager -o cat' Pingify.sh)" "1"
+
+
+# ---------------------------------------------------------------------------
+note "two tunnels never share a status port"
+# ---------------------------------------------------------------------------
+# Asking the kernel whether a port is free only answers for tunnels that are
+# running. Build a second tunnel while the first is stopped and both used to
+# be handed 9700, which they then fought over at the next boot - and the loser
+# reported no carriers to a health check that could find nothing wrong.
+(
+    # a config dir of its own: the suite's own tunnels have already claimed
+    # the first few, which is the fix working rather than a failure
+    CFG_DIR="$WORK/ports"; mkdir -p "$CFG_DIR"
+    port_free() { return 0; }   # nothing running: every port looks free
+    a="$(pick_status_port 9700)"
+    cfg_reset
+    T_NAME="pa"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="server"
+    cfg_mode; T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"
+    T_FORWARDS='"5650"'; T_STATUS="127.0.0.1:$a"
+    cfg_save >/dev/null
+    b="$(pick_status_port 9700)"
+    printf '%s %s\n' "$a" "$b"
+) > "$WORK/ports.out"
+read -r first second < "$WORK/ports.out"
+check "the first tunnel takes 9700" "$first"  "9700"
+check "the second moves along"      "$second" "9701"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
