@@ -392,12 +392,18 @@ first_q() {
     awk '/^new_tunnel\(\) \{/{f=1} f&&/pick side "select"/{print; exit}' Pingify.sh
 }
 importer_q() {
-    awk '/^import_tunnel\(\) \{/{f=1} f&&/pick side "select"/{print; exit}' Pingify.sh
+    awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f&&/pick side "select"/{print}' Pingify.sh
 }
 check "the wizard offers three ways in" \
       "$(first_q | grep -c '1 2 3')" "1"
-check "the importer offers two"        \
-      "$(importer_q | grep -c '1 2$')" "1"
+# The importer used to ask which server this was. It never had to: a setup
+# token is printed by IRAN and nowhere else, so a machine pasting one is
+# KHAREJ. Asking invited the wrong answer, and the wrong answer built a
+# tunnel with no address to dial and no explanation of why it would not run.
+check "the importer asks nothing" "$(importer_q | wc -l | tr -d ' ')" "0"
+imp() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it knows this is KHAREJ" "$(imp | grep -c 'T_ROLE="client"')" "1"
+check "and never asks for ports" "$(imp | grep -c 'ports, comma separated')" "0"
 check "and three is the token"         \
       "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/side" = "3"/{print; exit}' Pingify.sh | grep -c import_tunnel)" "1"
 
@@ -776,6 +782,68 @@ check "the two agree on H1"        "$(grep -c "H1 = $h1" "$kc")"               "
 check "KHAREJ dials IRAN"          "$(grep -c 'Endpoint = 203.0.113.9:51820' "$kc")" "1"
 check "at its end of the link"     "$(grep -c 'Address = 10.20.10.2/24' "$kc")"      "1"
 unset -f awg
+
+
+# ---------------------------------------------------------------------------
+note "the tuning says what the numbers buy"
+# ---------------------------------------------------------------------------
+# A window in kilobytes means nothing on its own. A stream may have at most
+# one window in flight, so it cannot beat window / round-trip whatever the
+# path underneath can do - and that is the number worth reading.
+check "1024 KB at 90 ms"  "$(stream_ceiling 1024 90)"    "91"
+check "4096 KB at 90 ms"  "$(stream_ceiling 4096 90)"    "364"
+check "the same window on a near path goes further" \
+      "$([ "$(stream_ceiling 1024 30)" -gt "$(stream_ceiling 1024 90)" ] && echo y)" "y"
+check "a decimal round trip is fine" "$(stream_ceiling 1024 89.4)" "92"
+check "no round trip, no answer"     "$(stream_ceiling 1024 '-')"  "-"
+check "and no window either"         "$(stream_ceiling '' 90)"     "-"
+
+# --- the buffers are settable now, and checked -----------------------------
+# They were derived from the window and capped, with no way to reach them.
+# Too small and the window above is a fiction; too large and a busy server
+# spends real memory on carriers that are idle.
+cfg_reset
+T_NAME="tw"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="server"
+cfg_mode
+T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_FORWARDS='"443"'
+T_CARRIERS=14; T_WINDOW=1024; T_SNDBUF=1024; T_RCVBUF=1024
+T_STATUS="127.0.0.1:9700"
+twf="$(cfg_save)"
+
+(
+    pause() { :; }
+    systemctl() { :; }
+    CORE_BIN=/bin/true
+    tuning_write tw 20 2048 10 3072 3072
+) > /dev/null 2>&1
+check "carriers are written"   "$(toml_get "$twf" transport carriers)"  "20"
+check "the window too"         "$(toml_get "$twf" tuning window_kb)"    "2048"
+check "and both buffers"       "$(toml_get "$twf" tuning sndbuf_kb)"    "3072"
+check "receive as well"        "$(toml_get "$twf" tuning rcvbuf_kb)"    "3072"
+# Hand-set numbers are no longer whichever preset they started as.
+check "the profile follows"    "$(toml_get "$twf" tuning profile)"      "throughput"
+
+# and cfg_load has to read them back, or the screen shows a default that is
+# not what is in the file
+cfg_load tw >/dev/null 2>&1
+check "the buffers are read back" "$T_SNDBUF" "3072"
+check "and the receive one"       "$T_RCVBUF" "3072"
+
+# --- what it refuses -------------------------------------------------------
+(
+    pause() { :; }
+    systemctl() { :; }
+    CORE_BIN=/bin/true
+    tuning_write tw 20 2048 10 999999 3072
+) > /dev/null 2>&1
+check "a buffer over 64 MB is refused" "$(toml_get "$twf" tuning sndbuf_kb)" "3072"
+(
+    pause() { :; }
+    systemctl() { :; }
+    CORE_BIN=/bin/true
+    tuning_write tw 20 4 10 3072 3072
+) > /dev/null 2>&1
+check "and a window that would stall"  "$(toml_get "$twf" tuning window_kb)" "2048"
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

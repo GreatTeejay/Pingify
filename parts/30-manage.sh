@@ -23,6 +23,8 @@ cfg_load() {
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
     T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=false}"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
+    T_SNDBUF="$(toml_get "$f" tuning sndbuf_kb)";           : "${T_SNDBUF:=$T_WINDOW}"
+    T_RCVBUF="$(toml_get "$f" tuning rcvbuf_kb)";           : "${T_RCVBUF:=$T_WINDOW}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
     T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
@@ -430,6 +432,52 @@ edit_forwards() {
 # Every number that shapes a tunnel, on one screen, split by the only
 # distinction that matters when two servers disagree: the settings that have to
 # match, and the ones that are nobody's business but this machine's.
+# ---------------------------------------------------------------------------
+# what the numbers actually buy
+#
+# A window in kilobytes and a carrier count mean nothing on their own. What a
+# person wants to know is how fast one connection can go, and that has one
+# answer: a stream may have at most one window of data in flight, so it cannot
+# beat window / round-trip no matter what the path underneath can do.
+#
+#   1024 KB at 90 ms  ->  93 Mbit/s for a single connection
+#   4096 KB at 90 ms  -> 372 Mbit/s
+#
+# Which is the whole reason the bigger presets exist, and the reason raising
+# carriers does nothing for a single download.
+# ---------------------------------------------------------------------------
+
+# stream_ceiling WINDOW_KB RTT_MS -> megabits per second, or "-"
+stream_ceiling() {
+    local win="$1" rtt="${2%%.*}"
+    # Checked apart, not joined: an empty window beside a good round trip
+    # reads as a perfectly good number when the two are concatenated.
+    case "$win" in '' | *[!0-9]*) printf '%s' '-'; return 1 ;; esac
+    case "$rtt" in '' | *[!0-9]*) printf '%s' '-'; return 1 ;; esac
+    [ "$rtt" -gt 0 ] || { printf '%s' '-'; return 1; }
+    # KB * 8 bits / ms  ==  kbit/ms  ==  Mbit/s, near enough for a menu
+    printf '%s' "$(( win * 8 / rtt ))"
+}
+
+# The round trip this tunnel is actually seeing, so the ceiling above is about
+# this path rather than a number out of a book. Falls back to a typical
+# Iran-to-Europe figure when the tunnel is not up to be asked.
+tuning_rtt() {
+    local name="$1" brief=""
+    if [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ] && [ "$(svc_state "$name")" = "active" ]; then
+        brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    fi
+    if [ -n "$brief" ]; then
+        set -- $brief
+        if [ "$1" = "up" ] && [ "${4%%.*}" -gt 0 ] 2>/dev/null; then
+            printf '%s' "${4%%.*}"
+            return 0
+        fi
+    fi
+    printf '90'
+    return 1
+}
+
 tuning_menu() {
     local name="$1" f v
     f="$(cfg_file "$name")"
@@ -437,6 +485,10 @@ tuning_menu() {
         cfg_load "$name" || return 1
         banner
         head2 "Tuning: $name"
+
+        local rtt measured ceiling
+        rtt="$(tuning_rtt "$name")" && measured="measured" || measured="assumed"
+        ceiling="$(stream_ceiling "$T_WINDOW" "$rtt")"
 
         panel "both servers must agree"
         field "Token" "$(token_print "$T_TOKEN")" "Shaping" "$(shaping_label "$name")"
@@ -446,53 +498,112 @@ tuning_menu() {
         panel "local to this server"
         field "Profile" "$T_PRESET"
         field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
-        field "Keepalive" "${T_KEEPALIVE} s"
+        field "Buffers" "${T_SNDBUF} / ${T_RCVBUF} KB" "Keepalive" "${T_KEEPALIVE} s"
         field "Health port" "$T_STATUS"
         panel_end
         say ""
+
+        # The one number worth reading off this screen.
+        panel "what that buys"
+        field "One link" "up to ${ceiling} Mbit/s" "Round trip" "${rtt} ms, ${measured}"
+        # More carriers spread more connections; they do nothing for one.
+        field "Spread over" "$T_CARRIERS carriers at once"
+        panel_end
+
+        # A socket that cannot hold a window's worth of data makes the window
+        # a number on paper: the kernel stops the writer before the credit
+        # runs out, and the extra window buys nothing.
+        if [ "$T_SNDBUF" -lt "$T_WINDOW" ] || [ "$T_RCVBUF" -lt "$T_WINDOW" ]; then
+            say ""
+            warn "the buffers are smaller than the window"
+            dim "a socket that cannot hold one window makes the rest of it"
+            dim "unreachable - raise the buffers to ${T_WINDOW} KB or lower the window"
+        fi
+
+        say ""
         dim "Read the top box on the other server and make it read the same."
-        dim "The bottom box may differ; it will not break the link."
+        dim "The rest is local; it will not break the link."
 
         rule
-        item 1 "Profile" "pick a preset and set all three at once"
+        item 1 "Profile" "pick a preset and set them all at once"
         item 2 "Carriers" "$T_CARRIERS - parallel connections"
-        item 3 "Window" "$T_WINDOW KB per connection"
-        item 4 "Keepalive" "$T_KEEPALIVE seconds"
-        item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
-        item 6 "Logging" "$T_LOG"
-        item 7 "Health port" "$T_STATUS"
+        item 3 "Window" "$T_WINDOW KB - the ceiling on one connection"
+        item 4 "Buffers" "$T_SNDBUF / $T_RCVBUF KB - what the sockets hold"
+        item 5 "Keepalive" "$T_KEEPALIVE seconds"
+        item 6 "Traffic shaping" "$(shaping_label "$name") - must match"
+        item 7 "Logging" "$T_LOG"
+        item 8 "Health port" "$T_STATUS"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
             1) say ""; preset_menu
-               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" ;;
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
             2) say ""; ask v "parallel connections" "$T_CARRIERS"
-               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" ;;
-            3) say ""; ask v "window per connection, KB" "$T_WINDOW"
-               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" ;;
-            4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
-               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
-            5) edit_shaping "$name" ;;
-            6) edit_logging "$name" ;;
-            7) edit_health "$name" ;;
+               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
+            3) say ""
+               dim "one connection tops out at window / round trip"
+               dim "at ${rtt} ms:  1024 KB = $(stream_ceiling 1024 "$rtt") Mbit/s   4096 KB = $(stream_ceiling 4096 "$rtt") Mbit/s"
+               say ""
+               ask v "window per connection, KB" "$T_WINDOW"
+               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
+            4) edit_buffers "$name" ;;
+            5) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" "$T_SNDBUF" "$T_RCVBUF" ;;
+            6) edit_shaping "$name" ;;
+            7) edit_logging "$name" ;;
+            8) edit_health "$name" ;;
             0|"") return ;;
         esac
     done
 }
 
-# tuning_write <name> <carriers> <window> <keepalive>
+# The socket buffers, on their own screen because there are two of them and
+# because getting them wrong is quiet: too small and the window above is a
+# fiction, too large and a busy server spends real memory on carriers that
+# are idle.
+edit_buffers() {
+    local name="$1" snd rcv
+    cfg_load "$name" || return 1
+    banner
+    head2 "Buffers: $name"
+    say ""
+    dim "Each carrier gets a send and a receive buffer of this size, so a"
+    dim "$T_CARRIERS-carrier tunnel holds ${T_CARRIERS} of each."
+    say ""
+    field "Now" "${T_SNDBUF} / ${T_RCVBUF} KB" \
+          "In total" "$(( (T_SNDBUF + T_RCVBUF) * T_CARRIERS / 1024 )) MB"
+    say ""
+    dim "They should be at least the window (${T_WINDOW} KB), or the window"
+    dim "cannot fill. Past that they buy nothing."
+    say ""
+    ask snd "send buffer, KB" "$T_SNDBUF"
+    ask rcv "receive buffer, KB" "$T_RCVBUF"
+    tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$snd" "$rcv"
+}
+
+# tuning_write <name> <carriers> <window> <keepalive> [sndbuf] [rcvbuf]
 tuning_write() {
-    local name="$1" car="$2" win="$3" ka="$4" f
+    local name="$1" car="$2" win="$3" ka="$4" snd="${5:-}" rcv="${6:-}" f
     f="$(cfg_file "$name")"
-    case "$car$win$ka" in *[!0-9]*|"") fail "numbers only"; pause; return ;; esac
+    [ -n "$snd" ] || snd="$win"
+    [ -n "$rcv" ] || rcv="$win"
+    case "$car$win$ka$snd$rcv" in *[!0-9]* | "") fail "numbers only"; pause; return ;; esac
     [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
+    [ "$win" -ge 16 ] || { fail "a window under 16 KB stalls every connection"; pause; return; }
+    # 64 MB a socket is already past anything a real path can use, and 64 of
+    # them is 4 GB of a server that has other work to do.
+    [ "$snd" -le 65536 ] && [ "$rcv" -le 65536 ] || { fail "a buffer over 64 MB is not a tuning, it is a leak"; pause; return; }
 
     cp -f "$f" "$f.bak"
     sed -i "s#^carriers.*#carriers         = $car#" "$f"
     sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
     sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
+    sed -i "s#^sndbuf_kb.*#sndbuf_kb        = $snd#" "$f"
+    sed -i "s#^rcvbuf_kb.*#rcvbuf_kb        = $rcv#" "$f"
+    # A hand-set profile is no longer whichever preset it started as.
+    sed -i "s#^profile.*#profile          = \"$(preset_name "$car" "$win")\"#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
