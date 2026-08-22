@@ -21,7 +21,7 @@ cfg_load() {
     T_STATUS="$(toml_get "$f" status addr)"
     T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
-    T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=true}"
+    T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=false}"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
@@ -246,8 +246,8 @@ probe_path() {
 
 shaping_label() {
     case "$(toml_get "$(cfg_file "$1")" transport obfuscate)" in
-        false) printf 'off' ;;
-        *)     printf 'on' ;;
+        true) printf 'on' ;;
+        *)    printf 'off' ;;
     esac
 }
 

@@ -129,18 +129,18 @@ done
 
 # traffic shaping has to survive a write/read round trip, and default to on
 # for a config written before it existed
-check "shaping is written"        "$(toml_get "$(cfg_file tcp-pingify-server)" transport obfuscate)" "true"
+check "shaping is written"        "$(toml_get "$(cfg_file tcp-pingify-server)" transport obfuscate)" "false"
 cfg_load tcp-pingify-server
-check "shaping reads back"        "$T_OBFUSCATE" "true"
+check "shaping reads back"        "$T_OBFUSCATE" "false"
 sed -i '/^obfuscate/d' "$(cfg_file tcp-pingify-server)"
 cfg_load tcp-pingify-server
-check "a config without it is on" "$T_OBFUSCATE" "true"
+check "a config without it is off" "$T_OBFUSCATE" "false"
 
 # the shaping editor has to flip the value in place, and put it there at all
 # when the config predates the setting
 SF="$(cfg_file tun-pingify-server)"
 sed -i '/^obfuscate/d' "$SF"
-check "shaping label defaults on" "$(shaping_label tun-pingify-server)" "on"
+check "shaping label defaults off" "$(shaping_label tun-pingify-server)" "off"
 # the same edit edit_shaping performs, run twice: it must land once, not twice
 for _ in 1 2; do
     sed -i -e '/^obfuscate/d' \
