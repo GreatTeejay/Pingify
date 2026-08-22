@@ -31,6 +31,28 @@ cfg_load() {
     T_TUNPEER="$(toml_get "$f" tun remote_addr)"
     T_TUNMTU="$(toml_get "$f" tun mtu)";                    : "${T_TUNMTU:=1380}"
 
+    # A kernel tunnel keeps its own section, and both public addresses in it:
+    # nothing about it is derived from a listen or connect line.
+    if kernel_transport; then
+        T_GRE_TTL="$(toml_get "$f" gre ttl)";               : "${T_GRE_TTL:=255}"
+        T_AWG_PORT="$(toml_get "$f" awg listen_port)";      : "${T_AWG_PORT:=51820}"
+        T_AWG_PRIV="$(toml_get "$f" awg private_key)"
+        T_AWG_PUB="$(toml_get "$f" awg peer_key)"
+        T_AWG_OBF="$(toml_get "$f" awg obfuscation)"
+        if [ "$T_TRANSPORT" = "gre" ]; then
+            T_PUBLIC_IP="$(toml_get "$f" gre local_public)"
+            T_PEER_IP="$(toml_get "$f" gre peer_public)"
+        else
+            T_PUBLIC_IP="$(toml_get "$f" awg local_public)"
+            T_PEER_IP="$(toml_get "$f" awg peer_public)"
+        fi
+        # Reverse, like every other Pingify tunnel: IRAN is the end that
+        # waits. T_ACCEPTS names the role that waits, not this machine, so it
+        # reads the same on both servers.
+        T_ACCEPTS="server"
+        return 0
+    fi
+
     # The endpoint is derived, so recover what it was built from.
     local l c
     l="$(toml_get "$f" transport listen)"
@@ -90,17 +112,26 @@ tunnel_row() {
     state="$(svc_state "$name")"
 
     up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"
-    if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
-        brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
-        if [ -n "$brief" ]; then
-            # state up total rtt streams uptime
-            set -- $brief
-            up="$2"
-            # An unreachable endpoint reports zeroes; keep the configured
-            # carrier count so the column still says what was asked for.
-            [ "$3" != "0" ] && total="$3"
-            if [ "$1" = "up" ]; then rtt="${4}ms"; else rtt="-"; fi
+    if [ "$state" = "active" ]; then
+        if kernel_transport "$(toml_get "$f" transport type)"; then
+            # No core and no status endpoint: the kernel holds the link, and
+            # the answer comes from the interface plus one ping across it.
+            # In a subshell, because cfg_load writes every T_ variable and
+            # this runs once per tunnel inside somebody else's loop.
+            total=1
+            brief="$(cfg_load "$name" >/dev/null 2>&1 && kernel_brief "$name")"
+        elif [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
+            brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         fi
+    fi
+    if [ -n "$brief" ]; then
+        # state up total rtt streams uptime - one shape for every kind
+        set -- $brief
+        up="$2"
+        # An unreachable endpoint reports zeroes; keep the configured carrier
+        # count so the column still says what was asked for.
+        [ "$3" != "0" ] && total="$3"
+        if [ "$1" = "up" ]; then rtt="${4}ms"; else rtt="-"; fi
     fi
 
     # Green only when the tunnel is running *and* a carrier is actually up:
@@ -517,9 +548,25 @@ delete_tunnel() {
     local name="$1"
     say ""
     confirm "really delete tunnel $name?" || return 1
+
+    # Read it before the file goes, so the kernel leftovers can be named.
+    local was_kernel=0 iface=""
+    if cfg_load "$name" >/dev/null 2>&1 && kernel_transport; then
+        was_kernel=1; iface="$T_TUNIF"
+    fi
+
     systemctl disable --now "pingify@$name" >/dev/null 2>&1
     systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
+    if [ "$was_kernel" = "1" ]; then
+        # The instance unit is a real file for these, not the shared template,
+        # and the interface outlives the unit if the stop did not run.
+        rm -f "$UNIT_DIR/pingify@$name.service"
+        [ -n "$iface" ] && {
+            ip link del "$iface" 2>/dev/null
+            rm -f "$(awg_conf_path "$iface")"
+        }
+    fi
     rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
     # Its forwarding rules outlive the config unless something removes them,

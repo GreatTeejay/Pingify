@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.7.1"
+PINGIFY_VERSION="5.8.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -21,6 +21,9 @@ CORE_BIN="$BASE_DIR/pingify-core"
 SELF_BIN="/usr/local/bin/pingify"   # has to be on PATH for the "pingify" command
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
+# AmneziaWG reads its interface config from a file, and awg-quick names the
+# interface after that file, so ours live under Pingify's own directory.
+AWG_DIR="$BASE_DIR/awg"
 GO_MIN_MINOR=19          # the core needs Go 1.19 or newer
 GO_FALLBACK="go1.22.12"  # used only when the version index is unreachable
 

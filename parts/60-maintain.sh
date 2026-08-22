@@ -67,6 +67,12 @@ remove_menu() {
             confirm "delete every tunnel on this server?" || return
             local n
             for n in $(tunnel_names); do
+                # A kernel tunnel leaves an interface and a unit file of its
+                # own behind; read it before the config goes.
+                if cfg_load "$n" >/dev/null 2>&1 && kernel_transport; then
+                    ip link del "$T_TUNIF" 2>/dev/null
+                    rm -f "$UNIT_DIR/pingify@$n.service" "$(awg_conf_path "$T_TUNIF")"
+                fi
                 systemctl disable --now "pingify@$n" >/dev/null 2>&1
                 systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
                 rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$(cfg_file "$n")"
@@ -93,12 +99,19 @@ full_uninstall() {
     dim "    the forwarding rules (iptables chains PINGIFY_NAT, PINGIFY_POST)"
     dim "    the blocking rules (chains PINGIFY_IN, PINGIFY_OUT, PINGIFY_FWD)"
     dim "    the ICMP block in /etc/sysctl.d and the speedtest lines in /etc/hosts"
+    dim "    every GRE and AmneziaWG interface it created"
     dim "    the core binary, the state directory and this script"
     say ""
     confirm "go ahead?" || return
 
     local n
     for n in $(tunnel_names); do
+        # The kernel tunnels hold an interface that outlives their unit if
+        # the stop never ran, and a unit file that is not the shared template.
+        if cfg_load "$n" >/dev/null 2>&1 && kernel_transport; then
+            ip link del "$T_TUNIF" 2>/dev/null
+            rm -f "$UNIT_DIR/pingify@$n.service"
+        fi
         systemctl disable --now "pingify@$n" >/dev/null 2>&1
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
