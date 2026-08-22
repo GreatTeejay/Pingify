@@ -675,9 +675,31 @@ new_tunnel() {
     esac
     if cfg_needs_link; then
         wiz "Private link" "Both servers get an address on a small network of their own."
-        local octet=""
-        ask octet "range 10.x.10.0/24 - pick x" "10"
-        case "$octet" in "" | *[!0-9]*) octet=10 ;; esac
+        # Two tunnels on one network route into each other, and the symptom is
+        # traffic going somewhere it was not meant to with nothing on the
+        # server to explain it. So say what is taken, offer one that is not,
+        # and do not accept a repeat.
+        show_taken_nets "$T_NAME"
+        local octet="" owner=""
+        while :; do
+            ask octet "range 10.x.10.0/24 - pick x" "$(free_link_octet "$T_NAME")"
+            case "$octet" in
+                '' | *[!0-9]*) fail "a number from 0 to 255"; continue ;;
+            esac
+            [ "$octet" -le 255 ] || { fail "a number from 0 to 255"; continue; }
+            owner="$(net_owner "10.${octet}.10" "$T_NAME")"
+            if [ -n "$owner" ]; then
+                fail "10.${octet}.10.0/24 already belongs to $owner"
+                dim "pick another x, or delete that tunnel first"
+                continue
+            fi
+            if host_has_net "10.${octet}.10"; then
+                fail "this server already has an address on 10.${octet}.10.0/24"
+                dim "something else is on that network - docker, or another VPN"
+                continue
+            fi
+            break
+        done
         if [ "$T_ROLE" = "server" ]; then
             T_TUNLOCAL="10.${octet}.10.1/24"; T_TUNPEER="10.${octet}.10.2/24"
         else
@@ -728,12 +750,26 @@ new_tunnel() {
     # -- ports: the IRAN side owns them ------------------------------------
     if [ "$T_ROLE" = "server" ]; then
         wiz "Ports" "The ports your clients will connect to, here on IRAN."
+        # Two tunnels forwarding one port means whichever bound it first wins,
+        # and the other simply never sees a connection. Say what is taken, and
+        # do not accept a port that is.
+        show_taken_ports "$T_NAME"
         dim "443   443=8443   443=10.0.0.5:443   udp:500   8000-8010"
         say ""
-        local raw=""
-        ask raw "ports, comma separated" "443"
-        T_FORWARDS="$(parse_forwards "$raw")"
-        [ -n "$T_FORWARDS" ] || { fail "at least one port is required"; pause; return 1; }
+        local raw="" clash=""
+        while :; do
+            ask raw "ports, comma separated" "443"
+            T_FORWARDS="$(parse_forwards "$raw")"
+            if [ -z "$T_FORWARDS" ]; then
+                fail "at least one port is required"
+                continue
+            fi
+            clash="$(forwards_clash "$raw" "$T_NAME")" && break
+            printf '%s\n' "$clash" | while read -r line; do
+                [ -n "$line" ] && fail "$line"
+            done
+            dim "pick another port, or free that one first"
+        done
     fi
 
     # -- performance -------------------------------------------------------
