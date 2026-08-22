@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.0.0"
+PINGIFY_VERSION="5.0.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -184,10 +184,17 @@ wiz() {
 }
 
 # choice <key> <name> <hint> - one option, name and reason on the same line.
+#
+# CHOICE_DEF marks the one enter picks, on the line itself. Having to read the
+# prompt underneath to work out which number that is, is a step nobody should
+# have to take.
+CHOICE_DEF=""
 choice() {
-    printf '    %s%s%s  %s  %s%s%s\n' \
-        "$C_CYN$C_B" "$1" "$C_OFF" \
-        "$(pad_to "${C_B}$2${C_OFF}" 12)" \
+    local mark="  "
+    [ "$1" = "$CHOICE_DEF" ] && mark="${C_GRN}${BX_ARR}${C_OFF} "
+    printf '   %s%s%s%s  %s  %s%s%s\n' \
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
+        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
         "$C_DIM" "${3:-}" "$C_OFF"
 }
 

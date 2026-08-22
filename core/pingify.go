@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.0.0"
+const version = "5.0.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -1623,6 +1623,8 @@ func (l *link) writeLoop() {
 			return
 		}
 		atomic.AddUint64(&l.wireTx, uint64(len(out)))
+		logTrace("carrier %d tx frame %d: %d bytes on the wire, %d of records",
+			l.idx, ctr, len(out), len(frame))
 		out = out[:0]
 	}
 }
@@ -1674,6 +1676,7 @@ func (l *link) readLoop() {
 			return
 		}
 		atomic.AddUint64(&l.wireRx, uint64(len(hdr)+n))
+		logTrace("carrier %d rx frame %d: %d bytes on the wire", l.idx, l.rxCtr, len(hdr)+n)
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
 		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
@@ -1728,13 +1731,15 @@ func (l *link) dispatch(p []byte) error {
 				s.reset()
 			}
 		case cmdPad:
-			// deliberately ignored
+			logTrace("carrier %d rx pad %d bytes", l.idx, n)
 		case cmdPing:
+			logTrace("carrier %d rx ping, answering", l.idx)
 			// Never block the read loop: if the send queue is momentarily
 			// full, drop the pong rather than risk both ends stalling on
 			// each other's socket buffers.
 			l.trySend(ctrlRec(cmdPong, 0, body))
 		case cmdPong:
+			logTrace("carrier %d rx pong", l.idx)
 			if n == 8 {
 				sent := int64(binary.BigEndian.Uint64(body))
 				atomic.StoreInt64(&l.rttUS, (time.Now().UnixNano()-sent)/1000)
@@ -1793,6 +1798,8 @@ func (l *link) keepaliveLoop() {
 			}
 			var b [8]byte
 			binary.BigEndian.PutUint64(b[:], uint64(time.Now().UnixNano()))
+			logTrace("carrier %d tx ping (last heard %s ago)", l.idx,
+				time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Millisecond))
 			l.send(ctrlRec(cmdPing, 0, b[:]))
 		case <-l.closed:
 			return
