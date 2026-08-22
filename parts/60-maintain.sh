@@ -37,12 +37,24 @@ restart_all() {
     [ "$any" = "1" ] && ok "$1; every tunnel was restarted" || ok "$1"
 }
 
+# The script and the core share a config format, so they have to move
+# together. Updating one alone is how a machine ends up with two versions of
+# Pingify on it that refuse to work with each other.
+update_pingify() {
+    banner
+    head2 "Update Pingify"
+    if ! self_update; then pause; return 1; fi
+    say ""
+    info "restarting with the new version to bring the core along"
+    sleep 1
+    exec "$SELF_BIN"
+}
+
 self_update() {
     say ""
-    have curl || { fail "curl is needed for this"; return 1; }
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! curl -fsSL --max-time 60 "$RAW_BASE/Pingify.sh" -o "$tmp"; then
+    if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
         fail "could not reach GitHub"
         dim "on an Iranian server this often fails; update from the Kharej box"
         dim "and copy the file across instead."
@@ -56,7 +68,6 @@ self_update() {
     install -m 0755 "$tmp" "$SELF_BIN"
     rm -f "$tmp"
     ok "Pingify updated to ${newver:-unknown}"
-    dim "run 'pingify' again to pick up the new version"
 }
 
 export_core() {

@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.9.0"
+PINGIFY_VERSION="4.9.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -279,6 +279,21 @@ require_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# fetch <url> <dest> [timeout] - download one file with whatever this machine
+# has. The install line is written with wget, so wget is the tool most likely
+# to be present and curl the one most likely to be missing; assuming curl left
+# servers quietly running an old script while the core updated around them.
+fetch() {
+    local url="$1" dest="$2" t="${3:-120}"
+    if have curl; then
+        curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
+    fi
+    if have wget; then
+        wget -q --tries=2 --timeout="$t" -O "$dest" "$url" && return 0
+    fi
+    return 1
+}
+
 # Config files are TOML written by this script, one key per line, so a
 # targeted sed reads them back and Pingify needs no parser of its own.
 CFG_EXT="toml"
@@ -544,14 +559,14 @@ download_core() {
     base="$(release_base)"
 
     if ! spin "downloading the core for $GOARCH" \
-         curl -fsSL --retry 2 --max-time 180 -o "$tmp" "$base/$(core_asset)"; then
+         fetch "$base/$(core_asset)" "$tmp" 180; then
         rm -f "$tmp"
         return 1
     fi
 
     # The checksum file is published alongside the binaries. A missing one is
     # not fatal, a wrong one is.
-    if curl -fsSL --max-time 30 -o "$sums" "$base/SHA256SUMS" 2>/dev/null; then
+    if fetch "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
         want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
@@ -601,7 +616,7 @@ import_core_binary() {
     local tmp="/tmp/pingify-core.import"
     case "$src" in
         http://* | https://*)
-            spin "downloading" curl -fsSL --max-time 300 -o "$tmp" "$src" \
+            spin "downloading" fetch "$src" "$tmp" 300 \
                 || { fail "download failed"; return 1; } ;;
         *)
             [ -f "$src" ] || { fail "no such file: $src"; return 1; }
@@ -2352,12 +2367,24 @@ restart_all() {
     [ "$any" = "1" ] && ok "$1; every tunnel was restarted" || ok "$1"
 }
 
+# The script and the core share a config format, so they have to move
+# together. Updating one alone is how a machine ends up with two versions of
+# Pingify on it that refuse to work with each other.
+update_pingify() {
+    banner
+    head2 "Update Pingify"
+    if ! self_update; then pause; return 1; fi
+    say ""
+    info "restarting with the new version to bring the core along"
+    sleep 1
+    exec "$SELF_BIN"
+}
+
 self_update() {
     say ""
-    have curl || { fail "curl is needed for this"; return 1; }
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! curl -fsSL --max-time 60 "$RAW_BASE/Pingify.sh" -o "$tmp"; then
+    if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
         fail "could not reach GitHub"
         dim "on an Iranian server this often fails; update from the Kharej box"
         dim "and copy the file across instead."
@@ -2371,7 +2398,6 @@ self_update() {
     install -m 0755 "$tmp" "$SELF_BIN"
     rm -f "$tmp"
     ok "Pingify updated to ${newver:-unknown}"
-    dim "run 'pingify' again to pick up the new version"
 }
 
 export_core() {
@@ -3782,7 +3808,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.9.0"
+const version = "4.9.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -6773,7 +6799,7 @@ install_self() {
         # on disk to copy. Pull the published script instead.
         local tmp="/tmp/pingify.self"
         if spin "installing the pingify command" \
-             curl -fsSL --retry 2 --max-time 120 -o "$tmp" "$(release_script)" \
+             fetch "$(release_script)" "$tmp" 120 \
            && bash -n "$tmp" 2>/dev/null; then
             install -m 0755 "$tmp" "$SELF_BIN"
         else
@@ -6954,8 +6980,8 @@ main_menu() {
         item 5 "Blocking"        "ICMP, speedtest, UDP 443"
         item 6 "Diagnostics"     "connectivity and configs"
         group "MAINTENANCE"
-        item 7 "Update core"     "download, build, import, export"
-        item 8 "Update script"   "fetch the latest Pingify"
+        item 7 "Update Pingify"  "script and core together, to the same version"
+        item 8 "Core options"    "build here, import, export"
         item 9 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
@@ -6969,8 +6995,8 @@ main_menu() {
             4) optimize_menu ;;
             5) blocking_menu ;;
             6) diagnostics_menu ;;
-            7) update_menu ;;
-            8) self_update; pause ;;
+            7) update_pingify ;;
+            8) update_menu ;;
             9) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
@@ -7001,9 +7027,11 @@ main() {
 
     require_root
     ensure_deps
-    # Running from bash <(wget ...) leaves nothing behind, so put the command
-    # in place the first time through.
-    [ -x "$SELF_BIN" ] || install_self
+    # Every time, not only the first. Running the install line is how people
+    # update, and skipping this when a copy already existed left an older
+    # script on PATH beside a core that had just been updated - which is the
+    # one combination the two of them cannot work in.
+    install_self
     migrate_layout
     server_info
     first_run
