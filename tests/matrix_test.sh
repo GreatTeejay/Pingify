@@ -136,6 +136,21 @@ sed -i '/^obfuscate/d' "$(cfg_file tcp-pingify-server)"
 cfg_load tcp-pingify-server
 check "a config without it is on" "$T_OBFUSCATE" "true"
 
+# the shaping editor has to flip the value in place, and put it there at all
+# when the config predates the setting
+SF="$(cfg_file tun-pingify-server)"
+sed -i '/^obfuscate/d' "$SF"
+check "shaping label defaults on" "$(shaping_label tun-pingify-server)" "on"
+# the same edit edit_shaping performs, run twice: it must land once, not twice
+for _ in 1 2; do
+    sed -i -e '/^obfuscate/d' \
+           -e "/^keepalive_sec/a obfuscate        = false" "$SF"
+done
+check "and reads off once set"    "$(shaping_label tun-pingify-server)" "off"
+check "written exactly once"      "$(grep -c '^obfuscate' "$SF")" "1"
+[ -n "$CORE_BIN" ] && { "$CORE_BIN" -c "$SF" -check >/dev/null 2>&1; \
+    check "the core accepts shaping off" "$?" "0"; }
+
 # an older config, written before the kind was recorded, still reads sensibly
 sed -i '/^kind /d' "$(cfg_file tun-iptables-server)"
 cfg_load tun-iptables-server
