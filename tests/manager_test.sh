@@ -845,5 +845,95 @@ check "a buffer over 64 MB is refused" "$(toml_get "$twf" tuning sndbuf_kb)" "30
 ) > /dev/null 2>&1
 check "and a window that would stall"  "$(toml_get "$twf" tuning window_kb)" "2048"
 
+
+# ---------------------------------------------------------------------------
+note "nothing gets handed out twice"
+# ---------------------------------------------------------------------------
+# Two tunnels on one private network route into each other; two forwarding one
+# port means whichever bound it first wins. Both fail quietly - the traffic
+# goes somewhere, just not where it was meant to - so both are caught at the
+# question rather than discovered later.
+COL="$WORK/collide"; mkdir -p "$COL"
+(
+    CFG_DIR="$COL"
+    # no ip and no ss here, so the answers come from the configs alone and the
+    # test does not depend on what this machine happens to have bound
+    have() { case "$1" in ip | ss) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    mkt() {
+        cfg_reset
+        T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
+        T_NAME="$1"; T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_TUNLOCAL="$2.1/24"; T_TUNPEER="$2.2/24"
+        T_FORWARDS="$(parse_forwards "$3")"; T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+    }
+    mkt tun-a 10.10.10 "443,8080"
+    mkt tun-b 10.20.10 "2053,9000-9003"
+
+    # --- private networks --------------------------------------------------
+    echo "owner-a=$(net_owner 10.10.10)"
+    echo "owner-b=$(net_owner 10.20.10)"
+    echo "owner-free=$(net_owner 10.30.10)"
+    echo "free-octet=$(free_link_octet)"
+    # a tunnel is allowed to keep its own network when its settings are edited
+    echo "own-net=$(net_owner 10.10.10 tun-a)"
+
+    # --- ports -------------------------------------------------------------
+    echo "port443=$(port_owner 443)"
+    echo "port9002=$(port_owner 9002)"
+    echo "port1234=$(port_owner 1234)"
+    echo "own-port=$(port_owner 443 tun-a)"
+
+    # --- the whole answer, the way the wizard asks it ----------------------
+    if forwards_clash "7000,7001"; then echo "clean=yes"; else echo "clean=no"; fi
+    if forwards_clash "443"; then echo "dirty=no"; else echo "dirty=yes"; fi
+    echo "why=$(forwards_clash "443,9002" | wc -l | tr -d ' ')"
+    if forwards_clash "443" tun-a; then echo "own=allowed"; else echo "own=blocked"; fi
+
+    # A tunnel being edited has its own ports bound by its own service, so
+    # the "something is listening" check has to let those through or the
+    # port list could never be edited without being emptied first.
+    listening_ports() { printf '443
+8080
+'; }
+    if forwards_clash "443" tun-a; then echo "own-bound=allowed"; else echo "own-bound=blocked"; fi
+    if forwards_clash "5000" tun-a; then echo "free-port=allowed"; else echo "free-port=blocked"; fi
+    listening_ports() { printf '5000
+'; }
+    if forwards_clash "5000" tun-a; then echo "others-bound=allowed"; else echo "others-bound=blocked"; fi
+) > "$WORK/collide.out" 2>&1
+col() { grep -m1 "^$1=" "$WORK/collide.out" | cut -d= -f2-; }
+
+check "the first network has an owner"  "$(col owner-a)"     "tun-a"
+check "and so does the second"          "$(col owner-b)"     "tun-b"
+check "an unused one has none"          "$(col owner-free)"  ""
+# the first free x, counting up from 10 - not the first unmentioned one
+check "the default offered is free"     "$(col free-octet)"  "11"
+check "a tunnel may keep its own"       "$(col own-net)"     ""
+
+check "a forwarded port has an owner"   "$(col port443)"     "tun-a"
+check "a port inside a range too"       "$(col port9002)"    "tun-b"
+check "an unused port has none"         "$(col port1234)"    ""
+check "and a tunnel may keep its own"   "$(col own-port)"    ""
+
+check "a clean answer passes"           "$(col clean)"       "yes"
+check "a taken one does not"            "$(col dirty)"       "yes"
+check "every clash is named, not just one" "$(col why)"      "2"
+check "editing a tunnel keeps its ports"   "$(col own)"      "allowed"
+check "even when its own service has them bound" "$(col own-bound)"    "allowed"
+check "a free port is still free"                "$(col free-port)"    "allowed"
+check "but somebody else's listener is not"      "$(col others-bound)" "blocked"
+
+# --- and the wizard actually uses them --------------------------------------
+# The check is worth nothing if the question does not ask it.
+wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the link question lists what is taken" "$(wz | grep -c 'show_taken_nets')"  "1"
+check "and refuses a repeat"                  "$(wz | grep -c 'net_owner')"        "1"
+check "and a network the host already has"    "$(wz | grep -c 'host_has_net')"     "1"
+check "the ports question lists them too"     "$(wz | grep -c 'show_taken_ports')" "1"
+check "and refuses a clash"                   "$(wz | grep -c 'forwards_clash')"   "1"
+ef() { awk '/^edit_forwards\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "changing ports later checks too"       "$(ef | grep -c 'forwards_clash')"   "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

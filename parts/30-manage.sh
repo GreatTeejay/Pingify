@@ -405,11 +405,22 @@ edit_forwards() {
     say ""
     dim "current: $(printf '%s' "$T_FORWARDS" | tr -d '"')"
     say ""
-    local raw=""
-    ask raw "new port list (comma separated)"
-    [ -n "$raw" ] || return
-    local fwd; fwd="$(parse_forwards "$raw")"
-    [ -n "$fwd" ] || { fail "nothing to set"; pause; return; }
+    # Everything except this tunnel's own list, which it is allowed to keep.
+    show_taken_ports "$name"
+    local raw="" fwd="" clash=""
+    while :; do
+        ask raw "new port list (comma separated)"
+        [ -n "$raw" ] || return
+        fwd="$(parse_forwards "$raw")"
+        [ -n "$fwd" ] || { fail "nothing to set"; return; }
+        clash="$(forwards_clash "$raw" "$name")" && break
+        printf '%s
+' "$clash" | while read -r line; do
+            [ -n "$line" ] && fail "$line"
+        done
+        dim "pick another port, or free that one first"
+        say ""
+    done
 
     cp -f "$f" "$f.bak"
     if grep -q '^ports' "$f"; then
