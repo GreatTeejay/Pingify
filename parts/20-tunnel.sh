@@ -288,23 +288,6 @@ new_tunnel() {
     fi
     cfg_mode
 
-    # -- who opens the connection ------------------------------------------
-    #
-    # Ports are served from IRAN either way; this is only about which end
-    # makes the TCP connection. Reaching an Iranian server from outside is
-    # the part that tends not to survive, so out of Iran is the default.
-    wiz "Which server opens the connection?"
-    CHOICE_DEF="1"
-    choice 1 "IRAN dials" "out of Iran to KHAREJ - usually the one that lasts"
-    choice 2 "KHAREJ dials" "into Iran - needs the port reachable from outside"
-    CHOICE_DEF=""
-    say ""
-    dim "Either way clients connect to IRAN and the ports live there."
-    say ""
-    local dir=""
-    ask dir "select" "1"
-    if [ "$dir" = "2" ]; then T_ACCEPTS="server"; else T_ACCEPTS="client"; fi
-
     # -- where the servers are ---------------------------------------------
     wiz "Addresses"
     if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
@@ -316,7 +299,7 @@ new_tunnel() {
 
     if ! this_side_accepts; then
         say ""
-        ask T_PEER_IP "the server this one dials"
+        ask T_PEER_IP "the IRAN server"
         [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
     fi
 
@@ -480,13 +463,7 @@ new_tunnel() {
         field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
-    if [ "$T_ACCEPTS" = "server" ]; then
-        field "Direction" "KHAREJ dials IRAN"
-        field "IRAN address" "$( [ "$T_ROLE" = "server" ] && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
-    else
-        field "Direction" "IRAN dials KHAREJ"
-        field "KHAREJ address" "$( [ "$T_ROLE" = "client" ] && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
-    fi
+    field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if cfg_needs_link; then
         field "Its address" "$T_TUNPEER"
