@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.4.1"
+const version = "4.5.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -398,12 +398,16 @@ func setLogLevel(s string) {
 	}
 }
 
+// logSink is where a formatted line goes. Only the tests replace it, so they
+// can assert on what an operator would actually have seen.
+var logSink = func(line string) { fmt.Fprintln(os.Stderr, line) }
+
 func logAt(lvl int32, tag, format string, args ...interface{}) {
 	if atomic.LoadInt32(&logLevel) < lvl {
 		return
 	}
-	fmt.Fprintf(os.Stderr, "%s %s %s\n",
-		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...))
+	logSink(fmt.Sprintf("%s %s %s",
+		time.Now().Format("2006-01-02 15:04:05"), tag, fmt.Sprintf(format, args...)))
 }
 
 func logError(f string, a ...interface{}) { logAt(lvlError, "ERR ", f, a...) }
@@ -1633,6 +1637,10 @@ func (l *link) dispatch(p []byte) error {
 				s.rb.closeEOF()
 			}
 		case cmdRST:
+			if n > 0 {
+				// Sent by the far side, which is the only end that knows why.
+				logWarn("the other server refused a connection: %s", string(body))
+			}
 			if s := l.getStream(id); s != nil {
 				s.reset()
 			}
@@ -2067,9 +2075,12 @@ func (f *forwarder) targetAllowed(target string) bool {
 }
 
 func (f *forwarder) dialTCP(s *stream, target string) {
+	// The reason travels back with the reset. Without it the other server
+	// closes the user's connection with nothing to say, and "the tunnel does
+	// not work" is indistinguishable from "the service is not running here".
 	refuse := func(why string) {
 		logWarn("stream to %s: %s", target, why)
-		s.l.send(ctrlRec(cmdRST, s.id, nil))
+		s.l.send(ctrlRec(cmdRST, s.id, []byte(target+": "+why)))
 		s.reset()
 	}
 	if !f.targetAllowed(target) {
