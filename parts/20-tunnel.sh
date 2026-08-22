@@ -15,20 +15,64 @@ cfg_reset() {
 # cfg_render <role> <mode> <listen> <connect> <forwards-json> <status-addr>
 # Prints one config document. Every key sits on its own line, which is what
 # lets the manager read these files back with sed instead of a JSON parser.
+# A config should read like a description of the tunnel, not a bag of keys.
+# Each section is one question about how this end is set up, and the sections
+# come in the order you would explain it to somebody: what it is, how it
+# travels, what protects it, what it carries, and how it behaves.
+#
+# Only what applies is written. A forward tunnel has no [tun] section at all
+# rather than an empty one, so nothing on the page is there to be ignored.
 cfg_render() {
     local role="$1" mode="$2" listen="$3" connect="$4" fwd="$5" status="$6"
-    printf '{\n'
-    printf '  "name": "%s",\n' "$T_NAME"
-    printf '  "role": "%s",\n' "$role"
-    printf '  "mode": "%s",\n' "$mode"
-    printf '  "transport": "%s",\n' "$T_TRANSPORT"
-    [ -n "$listen" ]  && printf '  "listen": "%s",\n' "$listen"
-    [ -n "$connect" ] && printf '  "connect": "%s",\n' "$connect"
-    printf '  "psk": "%s",\n' "$T_PSK"
-    printf '  "carriers": %s,\n' "$T_CARRIERS"
-    printf '  "window_kb": %s,\n' "$T_WINDOW"
-    printf '  "keepalive_sec": %s,\n' "$T_KEEPALIVE"
-    [ -n "$fwd" ] && printf '  "forwards": [%s],\n' "$fwd"
+    printf '# Pingify tunnel - written by the manager, safe to edit by hand.
+'
+    printf '# Both servers need the same psk; everything else is local to this one.
+'
+
+    printf '
+[tunnel]
+'
+    printf '%-16s = "%s"
+' name "$T_NAME"
+    printf '%-16s = "%s"   # server = IRAN, client = KHAREJ
+' role "$role"
+    printf '%-16s = "%s"   # forward = ports, tun = a private layer-3 link
+' mode "$mode"
+
+    printf '
+[transport]
+'
+    printf '%-16s = "%s"
+' type "$T_TRANSPORT"
+    [ -n "$listen" ]  && printf '%-16s = "%s"   # this end accepts the carriers
+' listen "$listen"
+    [ -n "$connect" ] && printf '%-16s = "%s"   # this end dials them
+' connect "$connect"
+    printf '%-16s = %s   # connections the tunnel is spread over
+' carriers "$T_CARRIERS"
+    printf '%-16s = %s   # how often this end speaks when idle
+' keepalive_sec "$T_KEEPALIVE"
+
+    printf '
+[security]
+'
+    printf '%-16s = "%s"
+' psk "$T_PSK"
+
+    if [ -n "$fwd" ]; then
+        printf '
+[forward]
+'
+        printf '# 443            the same port on both servers
+'
+        printf '# 443=8443       clients hit 443 here, it lands on 8443 there
+'
+        printf '# udp:500        a UDP port
+'
+        printf '%-16s = [%s]
+' ports "$fwd"
+    fi
+
     if [ "$mode" = "tun" ]; then
         local lo="$T_TUNLOCAL" pe="$T_TUNPEER"
         if [ "$role" != "$T_ROLE" ]; then
@@ -37,16 +81,40 @@ cfg_render() {
             lo="$T_TUNPEER/$pfx"
             pe="${T_TUNLOCAL%%/*}"
         fi
-        printf '  "tun": { "name": "%s", "local": "%s", "peer": "%s", "mtu": %s },\n' \
-               "$T_TUNIF" "$lo" "$pe" "$T_TUNMTU"
+        printf '
+[tun]
+'
+        printf '%-16s = "%s"
+' name "$T_TUNIF"
+        printf '%-16s = "%s"   # this server, on the private link
+' local_addr "$lo"
+        printf '%-16s = "%s"   # the other one
+' remote_addr "$pe"
+        printf '%-16s = %s
+' mtu "$T_TUNMTU"
     fi
-    printf '  "status_addr": "%s",\n' "$status"
-    printf '  "log_level": "info"\n'
-    printf '}\n'
+
+    printf '
+[tuning]
+'
+    printf '%-16s = %s   # in flight per forwarded connection
+' window_kb "$T_WINDOW"
+
+    printf '
+[status]
+'
+    printf '%-16s = "%s"
+' addr "$status"
+
+    printf '
+[logging]
+'
+    printf '%-16s = "info"   # error, warn, info, debug
+' level
 }
 
 cfg_save() {
-    local file="$CFG_DIR/$T_NAME.json"
+    local file="$(cfg_file "$T_NAME")"
     cfg_render "$T_ROLE" "$T_MODE" "$T_LISTEN" "$T_CONNECT" "$T_FORWARDS" "$T_STATUS" > "$file"
     chmod 600 "$file"
     printf '%s' "$file"
@@ -111,7 +179,7 @@ new_tunnel() {
             "" | *[!a-zA-Z0-9_-]*)
                 fail "letters, digits, dash and underscore only" ;;
             *)
-                if [ -f "$CFG_DIR/$T_NAME.json" ]; then
+                if [ -f "$(cfg_file "$T_NAME")" ]; then
                     fail "a tunnel named $T_NAME already exists"
                 else
                     break
@@ -304,7 +372,7 @@ import_tunnel() {
     ask token "token"
     [ -n "$token" ] || return 1
 
-    local tmp="/tmp/pingify-import.json"
+    local tmp="/tmp/pingify-import.cfg"
     if ! printf '%s' "$token" | base64 -d > "$tmp" 2>/dev/null; then
         fail "that is not a Pingify token"
         pause; return 1
@@ -315,7 +383,7 @@ import_tunnel() {
         rm -f "$tmp"; pause; return 1
     fi
 
-    if [ -f "$CFG_DIR/$name.json" ]; then
+    if [ -f "$(cfg_file "$name")" ]; then
         say ""
         warn "a tunnel named $name already exists on this server"
         confirm "replace it?" || { rm -f "$tmp"; return 1; }
@@ -338,14 +406,14 @@ import_tunnel() {
         esac
     fi
 
-    install -m 600 "$tmp" "$CFG_DIR/$name.json"
+    install -m 600 "$tmp" "$(cfg_file "$name")"
     rm -f "$tmp"
 
-    if ! "$CORE_BIN" -c "$CFG_DIR/$name.json" -check >/dev/null 2>&1; then
+    if ! "$CORE_BIN" -c "$(cfg_file "$name")" -check >/dev/null 2>&1; then
         say ""
         fail "the core rejected this configuration"
-        "$CORE_BIN" -c "$CFG_DIR/$name.json" -check 2>&1 | sed 's/^/      /'
-        rm -f "$CFG_DIR/$name.json"
+        "$CORE_BIN" -c "$(cfg_file "$name")" -check 2>&1 | sed 's/^/      /'
+        rm -f "$(cfg_file "$name")"
         pause; return 1
     fi
 

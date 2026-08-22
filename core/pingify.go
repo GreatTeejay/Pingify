@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "3.12.0"
+const version = "3.13.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -195,7 +195,7 @@ func (c *Config) key() []byte {
 
 func main() {
 	var (
-		cfgPath = flag.String("c", "", "path to tunnel config JSON")
+		cfgPath = flag.String("c", "", "path to the tunnel config (TOML, or the older JSON)")
 		genPSK  = flag.Bool("genpsk", false, "print a fresh 32-byte pre-shared key and exit")
 		showVer = flag.Bool("version", false, "print version and exit")
 		check   = flag.Bool("check", false, "validate the config and exit")
@@ -229,18 +229,13 @@ func main() {
 		return
 	}
 	if *cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: pingify-core -c /etc/pingify/<name>.json")
+		fmt.Fprintln(os.Stderr, "usage: pingify-core -c /root/Pingify/<name>.toml")
 		os.Exit(2)
 	}
 
-	raw, err := os.ReadFile(*cfgPath)
+	cfg, err := loadConfig(*cfgPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read config:", err)
-		os.Exit(1)
-	}
-	var cfg Config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		fmt.Fprintln(os.Stderr, "parse config:", err)
+		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
 	}
 	cfg.applyDefaults()
@@ -257,7 +252,7 @@ func main() {
 	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
 
-	p := newPool(&cfg)
+	p := newPool(cfg)
 	if err := p.start(); err != nil {
 		logError("start: %v", err)
 		os.Exit(1)
@@ -266,7 +261,7 @@ func main() {
 	var top interface{ Close() error }
 	switch cfg.Mode {
 	case "forward":
-		f, err := startForward(&cfg, p)
+		f, err := startForward(cfg, p)
 		if err != nil {
 			logError("forward: %v", err)
 			p.close()
@@ -274,7 +269,7 @@ func main() {
 		}
 		top = f
 	case "tun":
-		t, err := startTUN(&cfg, p)
+		t, err := startTUN(cfg, p)
 		if err != nil {
 			logError("tun: %v", err)
 			p.close()
@@ -284,7 +279,7 @@ func main() {
 	}
 
 	if cfg.StatusAddr != "" {
-		startStatusServer(cfg.StatusAddr, &cfg, p)
+		startStatusServer(cfg.StatusAddr, cfg, p)
 	}
 
 	sig := make(chan os.Signal, 1)

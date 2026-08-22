@@ -35,7 +35,7 @@ status_panel() {
     local name addr up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(json_str "$CFG_DIR/$name.json" status_addr)"
+        addr="$(toml_get "$(cfg_file "$name")" status addr)"
         if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
             up=$((up + 1))
         fi
@@ -62,6 +62,111 @@ status_panel() {
     box_row "$edot $(pad_to "core ${C_B}${ever}${C_OFF}" 22)$tdot tunnels ${C_B}${up}/${total}${C_OFF} up"
     box_row "$wdot $(pad_to "watchdog ${C_B}${wd}${C_OFF}" 22)${C_GRY}${BX_DOT}${C_OFF} tcp ${C_B}${cc:-unknown}${C_OFF}"
     box_bot
+}
+
+# ---------------------------------------------------------------------------
+# moving an older install into place
+#
+# Before this version the config was JSON spread over /etc/pingify, the core
+# sat in /usr/local/bin and the state in /var/lib. Everything Pingify owns now
+# lives in one directory, and the format is sectioned TOML.
+#
+# A tunnel that is running should not need rebuilding for that, so this
+# converts it in place and leaves the old file behind only if the new one
+# cannot be written. It runs once: after the move there is nothing to find.
+# ---------------------------------------------------------------------------
+
+json_to_toml() {
+    local j="$1" name out
+    name="$(basename "$j" .json)"
+    out="$(cfg_file "$name")"
+    [ -f "$out" ] && return 1
+
+    local role mode transport listen connect psk status level
+    local carriers window keepalive fwd
+    role="$(json_str "$j" role)"
+    mode="$(json_str "$j" mode)";           : "${mode:=forward}"
+    transport="$(json_str "$j" transport)"; : "${transport:=direct}"
+    listen="$(json_str "$j" listen)"
+    connect="$(json_str "$j" connect)"
+    psk="$(json_str "$j" psk)"
+    status="$(json_str "$j" status_addr)"
+    level="$(json_str "$j" log_level)";     : "${level:=info}"
+    carriers="$(json_num "$j" carriers)";   : "${carriers:=4}"
+    window="$(json_num "$j" window_kb)";    : "${window:=1024}"
+    keepalive="$(json_num "$j" keepalive_sec)"; : "${keepalive:=10}"
+    fwd="$(sed -n 's/^[[:space:]]*"forwards"[[:space:]]*:[[:space:]]*\[\(.*\)\],*[[:space:]]*$/\1/p' "$j" | head -n1)"
+
+    # edge and origin were what the roles used to be called.
+    case "$role" in edge) role="server" ;; origin) role="client" ;; esac
+
+    {
+        printf '# Pingify tunnel - converted from %s\n' "$(basename "$j")"
+        printf '\n[tunnel]\n'
+        printf '%-16s = "%s"\n' name "$name"
+        printf '%-16s = "%s"\n' role "$role"
+        printf '%-16s = "%s"\n' mode "$mode"
+        printf '\n[transport]\n'
+        printf '%-16s = "%s"\n' type "$transport"
+        [ -n "$listen" ]  && printf '%-16s = "%s"\n' listen "$listen"
+        [ -n "$connect" ] && printf '%-16s = "%s"\n' connect "$connect"
+        printf '%-16s = %s\n' carriers "$carriers"
+        printf '%-16s = %s\n' keepalive_sec "$keepalive"
+        printf '\n[security]\n'
+        printf '%-16s = "%s"\n' psk "$psk"
+        if [ -n "$fwd" ]; then
+            printf '\n[forward]\n'
+            printf '%-16s = [%s]\n' ports "$fwd"
+        fi
+        if [ "$mode" = "tun" ]; then
+            local tl; tl="$(grep -m1 '"tun"' "$j")"
+            printf '\n[tun]\n'
+            printf '%-16s = "%s"\n' name  "$(printf '%s' "$tl" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf '%-16s = "%s"\n' local_addr  "$(printf '%s' "$tl" | sed -n 's/.*"local"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf '%-16s = "%s"\n' remote_addr "$(printf '%s' "$tl" | sed -n 's/.*"peer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+            printf '%-16s = %s\n'   mtu "$(printf '%s' "$tl" | sed -n 's/.*"mtu"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
+        fi
+        printf '\n[tuning]\n'
+        printf '%-16s = %s\n' window_kb "$window"
+        printf '\n[status]\n'
+        printf '%-16s = "%s"\n' addr "$status"
+        printf '\n[logging]\n'
+        printf '%-16s = "%s"\n' level "$level"
+    } > "$out"
+    chmod 600 "$out"
+    rm -f "$j"
+    return 0
+}
+
+migrate_layout() {
+    local moved=0 f
+    mkdir -p "$CFG_DIR" "$STATE_DIR"
+    chmod 700 "$CFG_DIR"
+
+    if [ -x /usr/local/bin/pingify-core ] && [ ! -x "$CORE_BIN" ]; then
+        install -m 0755 /usr/local/bin/pingify-core "$CORE_BIN" && moved=1
+    fi
+    rm -f /usr/local/bin/pingify-core
+
+    if [ -d /etc/pingify ]; then
+        for f in /etc/pingify/*.json; do
+            [ -e "$f" ] || continue
+            json_to_toml "$f" && moved=1
+        done
+        rmdir /etc/pingify 2>/dev/null
+    fi
+    for f in "$CFG_DIR"/*.json; do
+        [ -e "$f" ] || continue
+        json_to_toml "$f" && moved=1
+    done
+    rm -rf /var/lib/pingify /usr/local/src/pingify
+
+    if [ "$moved" = "1" ]; then
+        write_units
+        for f in $(tunnel_names); do systemctl restart "pingify@$f" >/dev/null 2>&1; done
+        info "moved the existing setup into $BASE_DIR"
+        sleep 1
+    fi
 }
 
 first_run() {
@@ -136,6 +241,7 @@ main() {
 
     require_root
     ensure_deps
+    migrate_layout
     first_run
     main_menu
 }

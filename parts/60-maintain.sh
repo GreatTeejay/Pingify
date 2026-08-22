@@ -98,7 +98,7 @@ remove_menu() {
             for n in $(tunnel_names); do
                 systemctl disable --now "pingify@$n" >/dev/null 2>&1
                 systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
-                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$CFG_DIR/$n.json"
+                rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$(cfg_file "$n")"
             done
             systemctl daemon-reload
             ok "all tunnels removed"
@@ -209,12 +209,12 @@ diag_configs() {
     say ""
     local n bad=0
     for n in $(tunnel_names); do
-        if "$CORE_BIN" -c "$CFG_DIR/$n.json" -check >/dev/null 2>&1; then
+        if "$CORE_BIN" -c "$(cfg_file "$n")" -check >/dev/null 2>&1; then
             ok "$n"
         else
             bad=1
             fail "$n"
-            "$CORE_BIN" -c "$CFG_DIR/$n.json" -check 2>&1 | sed 's/^/      /'
+            "$CORE_BIN" -c "$(cfg_file "$n")" -check 2>&1 | sed 's/^/      /'
         fi
     done
     [ "$bad" = "0" ] && dim "every config is valid"

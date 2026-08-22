@@ -51,14 +51,19 @@ T_CARRIERS=6; T_WINDOW=2048; T_KEEPALIVE=15
 T_FORWARDS='"443","udp:500"'; T_STATUS="127.0.0.1:9700"
 file="$(cfg_save)"
 
-check "name round-trips"      "$(json_str "$file" name)"          "t1"
-check "role round-trips"      "$(json_str "$file" role)"          "server"
-check "connect round-trips"   "$(json_str "$file" connect)"       "203.0.113.9:9443"
-check "carriers round-trip"   "$(json_num "$file" carriers)"      "6"
-check "window round-trips"    "$(json_num "$file" window_kb)"     "2048"
-check "status round-trips"    "$(json_str "$file" status_addr)"   "127.0.0.1:9700"
-check "no listen key written" "$(json_str "$file" listen)"        ""
-check "transport written"     "$(json_str "$file" transport)"     "direct"
+check "the file is TOML"      "$(basename "$file")"                         "t1.toml"
+check "name round-trips"      "$(toml_get "$file" tunnel name)"             "t1"
+check "role round-trips"      "$(toml_get "$file" tunnel role)"             "server"
+check "connect round-trips"   "$(toml_get "$file" transport connect)"       "203.0.113.9:9443"
+check "carriers round-trip"   "$(toml_get "$file" transport carriers)"      "6"
+check "keepalive round-trips" "$(toml_get "$file" transport keepalive_sec)" "15"
+check "window round-trips"    "$(toml_get "$file" tuning window_kb)"        "2048"
+check "status round-trips"    "$(toml_get "$file" status addr)"             "127.0.0.1:9700"
+check "no listen key written" "$(toml_get "$file" transport listen)"        ""
+check "transport written"     "$(toml_get "$file" transport type)"          "direct"
+check "ports are a list"      "$(toml_arr "$file" ports)"                   '"443","udp:500"'
+check "every section present" "$(grep -c '^\[' "$file")"                    "7"
+check "no empty tun section"  "$(grep -c '^\[tun\]' "$file")"                "0"
 
 saved_psk="$T_PSK"
 cfg_load t1
@@ -72,23 +77,24 @@ check "cfg_load transport" "$T_TRANSPORT" "direct"
 note "peer token mirrors the tunnel"
 # ---------------------------------------------------------------------------
 peer="$(cfg_peer_token | base64 -d)"
-printf '%s\n' "$peer" > "$WORK/peer.json"
-check "role flips"           "$(json_str "$WORK/peer.json" role)"     "client"
-check "dialler becomes host" "$(json_str "$WORK/peer.json" listen)"   "0.0.0.0:9443"
-check "peer does not dial"   "$(json_str "$WORK/peer.json" connect)"  ""
-check "key is carried over"  "$(json_str "$WORK/peer.json" psk)"      "$saved_psk"
-check "transport mirrored"   "$(json_str "$WORK/peer.json" transport)" "direct"
-check "ports stay on edge"   "$(grep -c forwards "$WORK/peer.json")"  "0"
+printf '%s\n' "$peer" > "$WORK/peer.toml"
+check "role flips"           "$(toml_get "$WORK/peer.toml" tunnel role)"       "client"
+check "dialler becomes host" "$(toml_get "$WORK/peer.toml" transport listen)"  "0.0.0.0:9443"
+check "peer does not dial"   "$(toml_get "$WORK/peer.toml" transport connect)" ""
+check "key is carried over"  "$(toml_get "$WORK/peer.toml" security psk)"      "$saved_psk"
+check "transport mirrored"   "$(toml_get "$WORK/peer.toml" transport type)"    "direct"
+check "ports stay on IRAN"   "$(grep -c '^ports' "$WORK/peer.toml")"           "0"
 
 # a tun tunnel must hand the peer the other end of the /30
 cfg_reset
 T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_LISTEN="0.0.0.0:9500"
 T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"; T_PUBLIC_IP="198.51.100.4"
 T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.1/30"; T_TUNPEER="10.71.1.2"; T_TUNMTU=1380
-cfg_peer_token | base64 -d > "$WORK/peer2.json"
-check "peer dials us"      "$(json_str "$WORK/peer2.json" connect)" "198.51.100.4:9500"
-check "peer takes .2/30"   "$(grep -o '"local": "[^"]*"' "$WORK/peer2.json")" '"local": "10.71.1.2/30"'
-check "peer points at .1"  "$(grep -o '"peer": "[^"]*"' "$WORK/peer2.json")"  '"peer": "10.71.1.1"'
+cfg_peer_token | base64 -d > "$WORK/peer2.toml"
+check "peer dials us"      "$(toml_get "$WORK/peer2.toml" transport connect)" "198.51.100.4:9500"
+check "peer takes .2/30"   "$(toml_get "$WORK/peer2.toml" tun local_addr)"     "10.71.1.2/30"
+check "peer points at .1"  "$(toml_get "$WORK/peer2.toml" tun remote_addr)"    "10.71.1.1"
+check "a tun tunnel has one" "$(grep -c '^\[tun\]' "$WORK/peer2.toml")"        "1"
 
 # ---------------------------------------------------------------------------
 note "the engine accepts what the manager writes"
