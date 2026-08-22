@@ -21,6 +21,7 @@ cfg_load() {
     T_STATUS="$(toml_get "$f" status addr)"
     T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
+    T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=true}"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
@@ -240,10 +241,36 @@ edit_tuning() {
     ask car "carriers" "$T_CARRIERS"
     ask win "window (KB)" "$T_WINDOW"
     ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
-    dim "these are local: the two servers may differ without breaking the link"
+    dim "these three are local: the two servers may differ without breaking the link"
     case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
 
+    # Traffic shaping is the one setting here that is NOT local.
+    say ""
+    head2 "Traffic shaping"
+    dim "On, the frame length is masked and the opening frames carry filler, so"
+    dim "nothing on the wire has a fixed offset. The cost is that the stream then"
+    dim "looks like nothing at all, and a filter that drops what it cannot"
+    dim "identify will drop exactly that."
+    say ""
+    dim "Off, each frame carries a plain length in front, like an ordinary"
+    dim "protocol. The payload stays encrypted either way."
+    say ""
+    warn "this one must be the SAME on both servers, or no traffic will pass"
+    say ""
+    local obf=""
+    ask obf "shaping on? (true/false)" "$T_OBFUSCATE"
+    case "$obf" in
+        true|yes|on|1)    obf="true" ;;
+        false|no|off|0)   obf="false" ;;
+        *) fail "answer true or false"; pause; return ;;
+    esac
+
     cp -f "$f" "$f.bak"
+    if grep -q '^obfuscate' "$f"; then
+        sed -i "s#^obfuscate.*#obfuscate        = $obf#" "$f"
+    else
+        sed -i "s#^keepalive_sec.*#&\nobfuscate        = $obf#" "$f"
+    fi
     sed -i "s#^carriers.*#carriers         = $car#" "$f"
     sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
     sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
