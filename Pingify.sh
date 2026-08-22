@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.4.0"
+PINGIFY_VERSION="5.4.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -197,7 +197,7 @@ choice() {
     fi
     printf '  %s%s%s%s  %s  %s%s%s\n' \
         "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
-        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
+        "$(pad_to "${C_B}$2${C_OFF}" 14)" \
         "$C_DIM" "$hint" "$C_OFF"
 }
 
@@ -928,9 +928,6 @@ preset_menu() {
     choice 6 "Custom" "set the numbers yourself"
     CHOICE_DEF=""
     say ""
-    dim "One connection is worth about 6 Mbit/s on an Iran-Europe path, so"
-    dim "the carrier count is what decides speed. More of them cost memory."
-    say ""
     local p=""
     ask p "select" "3"
     case "$p" in
@@ -1109,9 +1106,7 @@ cfg_setup_token() {
 import_tunnel() {
     banner
     head2 "Paste the setup token"
-    dim "Build the tunnel on the other server first; it prints the token at"
-    dim "the end. Everything comes across - only this machine's own address"
-    dim "is asked for, because the token cannot know it."
+    dim "Printed by the other server when its tunnel was made."
     say ""
     local token=""
     ask token "token"
@@ -1158,11 +1153,9 @@ TOKEN
     head2 "Which server is this?"
     choice 1 "IRAN" "clients connect here, and the ports live here"
     choice 2 "KHAREJ" "your panel and inbounds run here"
-    choice 3 "Paste a token" "finish this server from the other one - no questions"
     say ""
     local side=""
-    pick side "select" 1 2 3
-    [ "$side" = "3" ] && { import_tunnel; return $?; }
+    pick side "select" 1 2
     [ "$side" = "2" ] && T_ROLE="client" || T_ROLE="server"
     if [ "$dial" = "1" ]; then
         # they accept, so we dial them
@@ -1176,8 +1169,7 @@ TOKEN
     say ""
     [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && {
         T_PUBLIC_IP="$SRV_IP"
-        dim "this machine reports ${C_OFF}${SRV_IP}${C_DIM} - press enter to take it"
-        say ""
+    
     }
     ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP"
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
@@ -1261,9 +1253,11 @@ new_tunnel() {
     wiz "Which server is this?"
     choice 1 "IRAN" "clients connect here, and the ports live here"
     choice 2 "KHAREJ" "your panel and inbounds run here"
+    choice 3 "Paste a token" "finish this server from the other one"
     say ""
     local side=""
-    pick side "select" 1 2
+    pick side "select" 1 2 3
+    [ "$side" = "3" ] && { import_tunnel; return $?; }
     if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
     wiz_add "$(side_label "$T_ROLE")"
 
@@ -1283,9 +1277,6 @@ new_tunnel() {
         wiz "Who forwards the ports?"
         choice 1 "PINGIFY" "the core carries every connection itself"
         choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
-        say ""
-        dim "With IPTABLES the service on KHAREJ has to listen on 0.0.0.0,"
-        dim "not only on 127.0.0.1."
         say ""
         local fw=""
         pick fw "select" 1 2
@@ -1326,12 +1317,6 @@ new_tunnel() {
         choice 2 "Direct" "IRAN opens it to KHAREJ - when inbound to IRAN will not hold"
         CHOICE_DEF=""
         say ""
-        dim "Reverse needs the tunnel port reachable on IRAN. If carriers come"
-        dim "up and then go quiet, that is the one to turn around."
-        say ""
-        dim "The same on both servers. The token carries it, so the second"
-        dim "server is not asked."
-        say ""
         local dir=""
         ask dir "select" "1"
         if [ "$dir" = "2" ]; then
@@ -1368,7 +1353,7 @@ new_tunnel() {
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
     else
         say ""
-        dim "ICMP needs no port on either server."
+
     fi
 
     # -- name, derived ------------------------------------------------------
@@ -1418,15 +1403,11 @@ new_tunnel() {
     done
     say ""
     ok "fingerprint  ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
-    dim "the other server must show these same eight characters"
 
     # -- ports: the IRAN side owns them ------------------------------------
     if [ "$T_ROLE" = "server" ]; then
         wiz "Ports" "The ports your clients will connect to, here on IRAN."
-        dim "443           the same port on both servers"
-        dim "443=8443      clients hit 443 here, it lands on 8443 there"
-        dim "udp:500       a UDP port"
-        dim "8000-8010     a range"
+        dim "443   443=8443   443=10.0.0.5:443   udp:500   8000-8010"
         say ""
         local raw=""
         ask raw "ports, comma separated" "443"
@@ -1510,41 +1491,20 @@ new_tunnel() {
     ok "$T_NAME is running"
     dim "$file"
 
-    # -- what to do on the other server ------------------------------------
+    # -- the other server --------------------------------------------------
+    # One line to carry across. The panel of values this used to print is
+    # what the token is for, and printing both invited somebody to copy the
+    # long way round and get one field wrong.
     local other
     other="$( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN )"
-    head2 "Setup token for the other server"
-    dim "On the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server: New tunnel ${BX_ARR} Paste a token"
+    head2 "Now the $other server"
+    dim "New tunnel ${BX_ARR} Paste a token"
     say ""
     rule
-    printf '%s
-' "${C_YEL}$(cfg_setup_token)${C_OFF}"
+    printf '%s\n' "${C_YEL}$(cfg_setup_token)${C_OFF}"
     rule
     say ""
     warn "treat it like a password - it carries the security token"
-    say ""
-    head2 "Or set it up by hand"
-    dim "Run Pingify on the $other server, choose New tunnel, and answer:"
-    say ""
-    panel "on $other"
-    field "This server" "$other"
-    if [ "$T_KIND" = "tun" ]; then
-        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
-    else
-        field "Type" "$(transport_label "$T_TRANSPORT")"
-    fi
-    [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
-    field "Direction" "$( [ "$T_ACCEPTS" = "server" ] && echo "Reverse - KHAREJ dials IRAN" || echo "Direct - IRAN dials KHAREJ" )"
-    field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
-    if cfg_needs_link; then
-        field "Its address" "$T_TUNPEER"
-        field "Peer address" "$T_TUNLOCAL"
-    fi
-    field "Token" "the same one"
-    field "Fingerprint" "$(token_print "$T_TOKEN")"
-    panel_end
-    say ""
-    dim "The fingerprint there must read $(token_print "$T_TOKEN") too."
     say ""
     tunnel_status_block "$T_NAME"
     pause
@@ -4379,7 +4339,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.4.0"
+const version = "5.4.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
