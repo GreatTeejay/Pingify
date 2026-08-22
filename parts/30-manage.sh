@@ -175,12 +175,13 @@ tunnel_menu() {
         item 1 "Restart"
         item 2 "Stop"
         item 3 "Start"
-        item 4 "Live log"
-        item 5 "Edit forwarded ports"
-        item 6 "Performance settings"
-        item 7 "Traffic shaping" "$(shaping_label "$name") - must match the other server"
-        item 8 "Scheduled restart"
-        item 9 "Delete this tunnel"
+        item 4 "Test the path" "go through the tunnel and say where it stops"
+        item 5 "Live log"
+        item 6 "Edit forwarded ports"
+        item 7 "Performance settings"
+        item 8 "Traffic shaping" "$(shaping_label "$name") - must match the other server"
+        item 9 "Scheduled restart"
+        item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
@@ -189,16 +190,43 @@ tunnel_menu() {
             1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
             2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
             3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            4) say ""; dim "ctrl-c to stop following"; say ""
+            4) probe_path "$name" ;;
+            5) say ""; dim "ctrl-c to stop following"; say ""
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            5) edit_forwards "$name" ;;
-            6) edit_tuning "$name" ;;
-            7) edit_shaping "$name" ;;
-            8) recycle_menu "$name" ;;
-            9) delete_tunnel "$name" && return ;;
+            6) edit_forwards "$name" ;;
+            7) edit_tuning "$name" ;;
+            8) edit_shaping "$name" ;;
+            9) recycle_menu "$name" ;;
+            d|D) delete_tunnel "$name" && return ;;
             0|"") return ;;
         esac
     done
+}
+
+# Connecting to a forwarded port proves nothing on its own: this server accepts
+# before it has said a word to the tunnel. The core's probe goes the whole way
+# and reports where it stopped.
+probe_path() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    cfg_load "$name" || return 1
+    banner
+    head2 "Testing the path for: $name"
+    say ""
+    if [ "$T_ROLE" != "server" ]; then
+        warn "this is the KHAREJ end - the ports live on the IRAN server"
+        dim "run this from the menu over there instead"
+        pause; return
+    fi
+    if ! systemctl is-active --quiet "pingify@$name"; then
+        fail "the tunnel is not running; start it first"
+        pause; return
+    fi
+    "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
+    say ""
+    dim "A port that fails is one the other server could not reach. The service"
+    dim "there must be listening on the address after the arrow."
+    pause
 }
 
 shaping_label() {
