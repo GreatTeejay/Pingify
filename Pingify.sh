@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.2.1"
+PINGIFY_VERSION="4.3.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -255,6 +255,16 @@ toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:s
 
 # toml_get <file> <section> <key> - reads a value out of one [section].
 # Values keep their quotes off and numeric underscores stripped.
+# The public name of a security token: eight characters derived from it, safe
+# to read aloud. Both servers print the same one when the token matches, which
+# is the only way to tell a wrong token apart from a broken network.
+TOKEN_MIN=16
+token_print() {
+    local t
+    t="$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$t" ] && printf '%s' "$t" | sha256sum | cut -c1-8 || printf 'none'
+}
+
 toml_get() {
     [ -f "$1" ] || return 0
     awk -v want="$2" -v key="$3" '
@@ -1025,17 +1035,27 @@ new_tunnel() {
 
     # -- security ----------------------------------------------------------
     head2 "Security token"
-    dim "type the same token on both servers - anything you like, 8 characters"
-    dim "or more. It is what the two ends use to recognise each other."
+    dim "One secret, typed by hand on BOTH servers, exactly the same. It is the"
+    dim "only thing standing between this tunnel and anyone who finds the port,"
+    dim "so treat it like a password: at least $TOKEN_MIN characters, and not a word."
     say ""
     while :; do
         ask T_TOKEN "token"
-        if [ "${#T_TOKEN}" -lt 8 ]; then
-            fail "too short - use at least 8 characters"
-        else
-            break
+        T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        if [ "${#T_TOKEN}" -lt "$TOKEN_MIN" ]; then
+            fail "too short - ${#T_TOKEN} characters, the minimum is $TOKEN_MIN"
+            continue
         fi
+        case "$T_TOKEN" in
+            *[!a-zA-Z0-9]*) break ;;
+            *[a-zA-Z]*[0-9]*|*[0-9]*[a-zA-Z]*) break ;;
+            *) warn "letters only - mix in digits or punctuation to make it worth typing" ; break ;;
+        esac
     done
+    say ""
+    ok "token fingerprint: ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
+    dim "the other server must show these same eight characters. If it does not,"
+    dim "the tokens differ - fix that before looking at anything else."
 
     # -- ports: the IRAN side owns them ------------------------------------
     if [ "$T_ROLE" = "server" ]; then
@@ -1131,7 +1151,7 @@ new_tunnel() {
         box_row "$(pad_to "Its private addr" 18)${T_TUNPEER}"
         box_row "$(pad_to "Peer private addr" 18)${T_TUNLOCAL}"
     fi
-    box_row "$(pad_to "Security token" 18)${C_YEL}the same one${C_OFF}"
+    box_row "$(pad_to "Token fingerprint" 18)${C_YEL}$(token_print "$T_TOKEN")${C_OFF} ${C_DIM}(must match the other server)${C_OFF}"
     box_bot
     say ""
     tunnel_status_block "$T_NAME"
@@ -1325,8 +1345,9 @@ tunnel_status_block() {
 
     local colour="$C_RED"
     [ "$state" = "active" ] && colour="$C_GRN"
-    printf '  %s%s%s  service %s%s%s\n' \
-        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF"
+    printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
+        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
     if [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
         "$CORE_BIN" -status "$addr" 2>/dev/null || true
     fi
@@ -1507,6 +1528,7 @@ edit_tuning() {
     ask car "carriers" "$T_CARRIERS"
     ask win "window (KB)" "$T_WINDOW"
     ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
+    dim "these are local: the two servers may differ without breaking the link"
     case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
 
     cp -f "$f" "$f.bak"
@@ -3571,7 +3593,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.2.1"
+const version = "4.3.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -3732,6 +3754,23 @@ func (c *Config) Local() string { return c.TUN.Local }
 
 // key is the 32 bytes everything else is derived from. A token of any length
 // is stretched to it; a legacy hex psk is used as-is.
+// tokenPrint is a short public name for the shared secret: the same token
+// gives the same eight characters on both servers, and a different token
+// gives different ones. It is safe to print, paste into a chat, and compare
+// by eye - which is the only way to tell "the tokens differ" apart from
+// "the network ate it" when a tunnel will not come up.
+func (c *Config) tokenPrint() string {
+	secret := strings.TrimSpace(c.Token)
+	if secret == "" {
+		secret = strings.TrimSpace(c.PSK)
+	}
+	if secret == "" {
+		return "none"
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:4])
+}
+
 func (c *Config) key() []byte {
 	if c.Token != "" {
 		return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
@@ -3797,8 +3836,9 @@ func main() {
 	}
 
 	setLogLevel(cfg.LogLevel)
-	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
-		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
+	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d keepalive=%ds token=%s",
+		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
+		cfg.KeepaliveSec, cfg.tokenPrint())
 
 	p := newPool(cfg)
 	if err := p.start(); err != nil {
@@ -4234,6 +4274,10 @@ func serverHandshake(conn net.Conn, cfg *Config, g *replayGuard) (*sessionKeys, 
 // ---------------------------------------------------------------------------
 
 const maxCarriers = 64
+
+// No carrier is declared dead before this much true silence, whatever the
+// local keepalive is set to. See link.idleLimit.
+const minIdle = 60 * time.Second
 
 type recordHandler interface {
 	onRecord(l *link, cmd byte, id uint32, body []byte)
@@ -5034,7 +5078,7 @@ func (l *link) readLoop() {
 	var hdr [4]byte
 	ct := make([]byte, 0, maxFrame)
 	plain := make([]byte, 0, maxPlain)
-	idle := time.Duration(l.cfg.KeepaliveSec) * time.Second * 3
+	idle := l.idleLimit()
 	for {
 		l.conn.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
@@ -5127,15 +5171,32 @@ func (l *link) dispatch(p []byte) error {
 	return nil
 }
 
+// idleLimit is how long a carrier waits before declaring the peer gone.
+//
+// It cannot simply be three of our own keepalives. Our keepalive says how
+// often WE speak; what keeps this carrier alive is how often the PEER speaks,
+// and the peer is configured separately, by hand, on another machine. A field
+// tunnel built with "gaming" on one end and "balanced" on the other had one
+// side hanging up every nine seconds while the other was still perfectly
+// happy. The floor makes that impossible: however impatient this end is
+// configured to be, it waits a full minute of real silence before giving up.
+func (l *link) idleLimit() time.Duration {
+	d := time.Duration(l.cfg.KeepaliveSec) * time.Second * 3
+	if d < minIdle {
+		return minIdle
+	}
+	return d
+}
+
 func (l *link) keepaliveLoop() {
 	t := time.NewTicker(time.Duration(l.cfg.KeepaliveSec) * time.Second)
 	defer t.Stop()
-	idle := int64(l.cfg.KeepaliveSec) * 3 * int64(time.Second)
+	idle := int64(l.idleLimit())
 	for {
 		select {
 		case <-t.C:
 			if time.Now().UnixNano()-atomic.LoadInt64(&l.lastRx) > idle {
-				l.died("silent for %ds - no keepalive came back", l.cfg.KeepaliveSec*3)
+				l.died("silent for %s - nothing came back from the peer", l.idleLimit())
 				return
 			}
 			var b [8]byte

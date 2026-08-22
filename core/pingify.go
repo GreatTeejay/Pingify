@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.2.1"
+const version = "4.3.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -213,6 +213,23 @@ func (c *Config) Local() string { return c.TUN.Local }
 
 // key is the 32 bytes everything else is derived from. A token of any length
 // is stretched to it; a legacy hex psk is used as-is.
+// tokenPrint is a short public name for the shared secret: the same token
+// gives the same eight characters on both servers, and a different token
+// gives different ones. It is safe to print, paste into a chat, and compare
+// by eye - which is the only way to tell "the tokens differ" apart from
+// "the network ate it" when a tunnel will not come up.
+func (c *Config) tokenPrint() string {
+	secret := strings.TrimSpace(c.Token)
+	if secret == "" {
+		secret = strings.TrimSpace(c.PSK)
+	}
+	if secret == "" {
+		return "none"
+	}
+	sum := sha256.Sum256([]byte(secret))
+	return hex.EncodeToString(sum[:4])
+}
+
 func (c *Config) key() []byte {
 	if c.Token != "" {
 		return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
@@ -278,8 +295,9 @@ func main() {
 	}
 
 	setLogLevel(cfg.LogLevel)
-	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d",
-		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers)
+	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d keepalive=%ds token=%s",
+		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
+		cfg.KeepaliveSec, cfg.tokenPrint())
 
 	p := newPool(cfg)
 	if err := p.start(); err != nil {
@@ -715,6 +733,10 @@ func serverHandshake(conn net.Conn, cfg *Config, g *replayGuard) (*sessionKeys, 
 // ---------------------------------------------------------------------------
 
 const maxCarriers = 64
+
+// No carrier is declared dead before this much true silence, whatever the
+// local keepalive is set to. See link.idleLimit.
+const minIdle = 60 * time.Second
 
 type recordHandler interface {
 	onRecord(l *link, cmd byte, id uint32, body []byte)
@@ -1515,7 +1537,7 @@ func (l *link) readLoop() {
 	var hdr [4]byte
 	ct := make([]byte, 0, maxFrame)
 	plain := make([]byte, 0, maxPlain)
-	idle := time.Duration(l.cfg.KeepaliveSec) * time.Second * 3
+	idle := l.idleLimit()
 	for {
 		l.conn.SetReadDeadline(time.Now().Add(idle))
 		if _, err := io.ReadFull(l.conn, hdr[:]); err != nil {
@@ -1608,15 +1630,32 @@ func (l *link) dispatch(p []byte) error {
 	return nil
 }
 
+// idleLimit is how long a carrier waits before declaring the peer gone.
+//
+// It cannot simply be three of our own keepalives. Our keepalive says how
+// often WE speak; what keeps this carrier alive is how often the PEER speaks,
+// and the peer is configured separately, by hand, on another machine. A field
+// tunnel built with "gaming" on one end and "balanced" on the other had one
+// side hanging up every nine seconds while the other was still perfectly
+// happy. The floor makes that impossible: however impatient this end is
+// configured to be, it waits a full minute of real silence before giving up.
+func (l *link) idleLimit() time.Duration {
+	d := time.Duration(l.cfg.KeepaliveSec) * time.Second * 3
+	if d < minIdle {
+		return minIdle
+	}
+	return d
+}
+
 func (l *link) keepaliveLoop() {
 	t := time.NewTicker(time.Duration(l.cfg.KeepaliveSec) * time.Second)
 	defer t.Stop()
-	idle := int64(l.cfg.KeepaliveSec) * 3 * int64(time.Second)
+	idle := int64(l.idleLimit())
 	for {
 		select {
 		case <-t.C:
 			if time.Now().UnixNano()-atomic.LoadInt64(&l.lastRx) > idle {
-				l.died("silent for %ds - no keepalive came back", l.cfg.KeepaliveSec*3)
+				l.died("silent for %s - nothing came back from the peer", l.idleLimit())
 				return
 			}
 			var b [8]byte

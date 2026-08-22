@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.2.1"
+PINGIFY_VERSION="4.3.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -255,6 +255,16 @@ toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:s
 
 # toml_get <file> <section> <key> - reads a value out of one [section].
 # Values keep their quotes off and numeric underscores stripped.
+# The public name of a security token: eight characters derived from it, safe
+# to read aloud. Both servers print the same one when the token matches, which
+# is the only way to tell a wrong token apart from a broken network.
+TOKEN_MIN=16
+token_print() {
+    local t
+    t="$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$t" ] && printf '%s' "$t" | sha256sum | cut -c1-8 || printf 'none'
+}
+
 toml_get() {
     [ -f "$1" ] || return 0
     awk -v want="$2" -v key="$3" '
