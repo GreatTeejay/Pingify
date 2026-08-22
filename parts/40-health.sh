@@ -14,7 +14,7 @@ run_health_check() {
     local n f addr fails
     for n in $(tunnel_names); do
         systemctl is-enabled --quiet "pingify@$n" 2>/dev/null || continue
-        f="$CFG_DIR/$n.json"
+        f="$(cfg_file "$n")"
 
         if ! systemctl is-active --quiet "pingify@$n"; then
             echo "pingify: $n is not running, starting it"
@@ -23,7 +23,7 @@ run_health_check() {
             continue
         fi
 
-        addr="$(json_str "$f" status_addr)"
+        addr="$(toml_get "$f" status addr)"
         if [ -z "$addr" ] || [ ! -x "$CORE_BIN" ]; then
             continue
         fi

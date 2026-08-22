@@ -8,14 +8,17 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.10.0"
+PINGIFY_VERSION="3.11.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
-CFG_DIR="/etc/pingify"
-STATE_DIR="/var/lib/pingify"
-SRC_DIR="/usr/local/src/pingify"
-CORE_BIN="/usr/local/bin/pingify-core"
-SELF_BIN="/usr/local/bin/pingify"
+# Everything Pingify owns lives in one directory, so it is obvious what is
+# installed and trivial to back up or delete.
+BASE_DIR="/root/Pingify"
+CFG_DIR="$BASE_DIR"
+STATE_DIR="$BASE_DIR/.state"
+SRC_DIR="$BASE_DIR/.build"
+CORE_BIN="$BASE_DIR/pingify-core"
+SELF_BIN="/usr/local/bin/pingify"   # has to be on PATH for the "pingify" command
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
 GO_MIN_MINOR=19          # the core needs Go 1.19 or newer
@@ -80,9 +83,42 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
-box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
-box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
-box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
+# A panel carries its title in the top border, so a screen full of them reads
+# as a list of labelled blocks rather than a wall of rules.
+panel() {
+    local t="${1:-}" n
+    if [ -z "$t" ]; then
+        printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        return
+    fi
+    # corner + one rule + " title " ; the rest of the line is rule + corner
+    n=$(( ${#t} + 3 ))
+    printf '  %s%s%s %s%s%s %s%s%s\n' \
+        "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF" \
+        "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+}
+
+panel_end() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+
+row() {
+    printf '  %s%s%s %s %s%s%s\n' \
+        "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# field <label> <value> [label2] [value2] - two aligned columns in one row.
+field() {
+    local s
+    s="$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}"
+    if [ -n "${3:-}" ]; then
+        s="$(pad_to "$s" 32)$(pad_to "${C_DIM}$3${C_OFF}" 12)${C_B}$4${C_OFF}"
+    fi
+    row "$s"
+}
+
+# kept so older call sites keep working
+box_top() { panel; }
+box_bot() { panel_end; }
+box_row() { row "$1"; }
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s%s%s %s\n' "$C_CYN" "$BX_ARR" "$C_OFF" "$*"; }
@@ -96,23 +132,78 @@ rule() { printf '  %s%s%s\n' "$C_GRY" "$(repeat "$BX_H" $((UI_W + 2)))" "$C_OFF"
 head2() {
     local t=" $1 " n; n="$(vislen "$t")"
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_B" "$t" "$C_OFF$C_GRY" \
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
         "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
 }
+
+# A label above a run of related menu entries.
+group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 
 # item <key> <label> [hint]
 #
 # The label column grows if a label outruns it, so a long one can never end up
 # glued to its hint.
 item() {
-    local w=28 n
+    local w=24 n
     n="$(vislen "$2")"
     [ "$n" -ge "$w" ] && w=$((n + 2))
     if [ -n "${3:-}" ]; then
-        printf '    %s%s%s  %s%s%s%s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$(pad_to "$2" "$w")" "$C_DIM" "$3" "$C_OFF"
+        printf '    %s%s%s %s%s%s %s%s%s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
+            "$(pad_to "$2" "$w")" "$C_DIM" "$3$C_OFF"
     else
-        printf '    %s%s%s  %s\n' "$C_CYN$C_B" "$1" "$C_OFF" "$2"
+        printf '    %s%s%s %s%s%s %s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$2"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# the wizard
+#
+# The steps run down one page. Nothing is cleared between them, so the answers
+# already given stay on screen above the question being asked - which is what
+# you want when you are copying the same numbers onto a second server.
+# ---------------------------------------------------------------------------
+
+WIZ_STEP=0
+
+wiz_reset() { WIZ_STEP=0; }
+
+# Kept so the wizard can note a decision without the page having to redraw.
+wiz_add() { :; }
+
+# wiz <title> [subtitle] - open a step.
+wiz() {
+    WIZ_STEP=$((WIZ_STEP + 1))
+    local t="$WIZ_STEP $BX_DOT $1 " n; n="$(vislen " $t")"
+    printf '\n  %s%s%s%s%s%s%s\n\n' \
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
+        "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
+    [ -n "${2:-}" ] && { dim "$2"; say ""; }
+    return 0
+}
+
+# choice <key> <name> <hint> - one option, name and reason on the same line.
+#
+# CHOICE_DEF marks the one enter picks, on the line itself. Having to read the
+# prompt underneath to work out which number that is, is a step nobody should
+# have to take.
+CHOICE_DEF=""
+choice() {
+    local mark="  "
+    [ "$1" = "$CHOICE_DEF" ] && mark="${C_GRN}${BX_ARR}${C_OFF} "
+    printf '   %s%s%s%s  %s  %s%s%s\n' \
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
+        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
+        "$C_DIM" "${3:-}" "$C_OFF"
+}
+
+# state <on|off> - a coloured on/off badge for toggles.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
     fi
 }
 
@@ -195,10 +286,53 @@ require_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# These configs are written by this script, one key per line, so a targeted
-# sed is enough and Pingify stays free of a jq dependency.
-json_str() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
-json_num() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
+# fetch <url> <dest> [timeout] - download one file with whatever this machine
+# has. The install line is written with wget, so wget is the tool most likely
+# to be present and curl the one most likely to be missing; assuming curl left
+# servers quietly running an old script while the core updated around them.
+fetch() {
+    local url="$1" dest="$2" t="${3:-120}"
+    if have curl; then
+        curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
+    fi
+    if have wget; then
+        wget -q --tries=2 --timeout="$t" -O "$dest" "$url" && return 0
+    fi
+    return 1
+}
+
+# Config files are TOML written by this script, one key per line, so a
+# targeted sed reads them back and Pingify needs no parser of its own.
+CFG_EXT="toml"
+
+cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
+
+toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
+
+# toml_get <file> <section> <key> - reads a value out of one [section].
+# Values keep their quotes off and numeric underscores stripped.
+toml_get() {
+    [ -f "$1" ] || return 0
+    awk -v want="$2" -v key="$3" '
+        /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); cur = s; next }
+        cur == want {
+            line = $0
+            sub(/[[:space:]]*#.*$/, "", line)
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                v = substr(line, RSTART + RLENGTH)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v ~ /^"/) { gsub(/^"|"$/, "", v) }
+                else if (v ~ /^[0-9_]+$/) { gsub(/_/, "", v) }
+                print v
+                exit
+            }
+        }' "$1"
+}
+
+
+# Only used to convert a config left behind by 3.2 or earlier.
+json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
+json_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
 port_free() {
     local p="$1"
@@ -231,10 +365,31 @@ public_ip() {
 tunnel_names() {
     [ -d "$CFG_DIR" ] || return 0
     local f
-    for f in "$CFG_DIR"/*.json; do
+    for f in "$CFG_DIR"/*."$CFG_EXT"; do
         [ -e "$f" ] || continue
-        basename "$f" .json
+        basename "$f" ".$CFG_EXT"
     done
+}
+
+# Where this server sits, for the panel on the front page. Best effort: an
+# Iranian box may not reach the lookup service, in which case the local route
+# still gives us the address.
+server_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
+    if have curl; then
+        local j
+        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
+        if [ -n "$j" ]; then
+            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
+            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
+        fi
+    fi
+    [ -n "$SRV_IP" ] || SRV_IP="$(public_ip)"
+    [ -n "$SRV_IP" ] || SRV_IP="unknown"
+    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
+    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
 }
 
 tunnel_count() { tunnel_names | grep -c . ; }
@@ -291,8 +446,8 @@ ensure_deps() {
             warn "please install manually: ${missing[*]}"
         fi
     fi
-    mkdir -p "$CFG_DIR" "$STATE_DIR"
-    chmod 700 "$CFG_DIR"
+    mkdir -p "$BASE_DIR" "$STATE_DIR"
+    chmod 700 "$BASE_DIR"
 }
 
 # Prints the minor version of a Go toolchain, e.g. 22 for go1.22.2, or 0 when

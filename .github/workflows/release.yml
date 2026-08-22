@@ -38,6 +38,14 @@ jobs:
             exit 1
           fi
 
+      # These drive the manager's own functions, so a wizard that stops
+      # producing a config the core accepts fails the release rather than
+      # reaching a server.
+      - name: Test the manager
+        run: |
+          bash tests/manager_test.sh
+          bash tests/matrix_test.sh
+
       - name: Build the engine
         run: |
           mkdir -p dist
@@ -60,7 +68,7 @@ jobs:
           Install or update on either server:
 
           ```bash
-          sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/OWNER_REPO/main/install.sh)"
+          bash <(wget -qO- https://github.com/OWNER_REPO/releases/latest/download/Pingify.sh)
           ```
 
           Check a download against `SHA256SUMS`.
