@@ -10,6 +10,12 @@ cfg_load() {
     cfg_reset
     T_NAME="$(toml_get "$f" tunnel name)"
     T_ROLE="$(toml_get "$f" tunnel role)"
+    T_MODE="$(toml_get "$f" tunnel mode)";                  : "${T_MODE:=forward}"
+    T_KIND="$(toml_get "$f" tunnel kind)"
+    if [ -z "$T_KIND" ]; then
+        # written before the kind was recorded
+        [ "$(toml_get "$f" transport type)" = "icmp" ] && T_KIND="tun" || T_KIND="tcp"
+    fi
     T_TRANSPORT="$(toml_get "$f" transport type)";          : "${T_TRANSPORT:=tcp}"
     T_TOKEN="$(toml_get "$f" security token)"
     T_STATUS="$(toml_get "$f" status addr)"

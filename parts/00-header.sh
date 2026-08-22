@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.1.0"
+PINGIFY_VERSION="4.2.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -251,8 +251,6 @@ CFG_EXT="toml"
 
 cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
 
-toml_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
-toml_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
 
 # toml_get <file> <section> <key> - reads a value out of one [section].
@@ -275,9 +273,6 @@ toml_get() {
         }' "$1"
 }
 
-# Same, but only inside the [tun] table, so "name" there does not collide with
-# the tunnel's own name at the top of the file.
-toml_tun() { [ -f "$1" ] || return 0; sed -n '/^\[tun\]/,$p' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\"\{0,1\}\([^\"]*\)\"\{0,1\}.*/\1/p" | head -n1; }
 
 # Only used to convert a config left behind by 3.2 or earlier.
 json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }

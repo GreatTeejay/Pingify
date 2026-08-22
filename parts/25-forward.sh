@@ -55,7 +55,8 @@ nat_rules_for() {
     local name="$1"
     cfg_load "$name" || return 1
     [ "$T_FORWARDER" = "iptables" ] || return 0
-    [ "$T_MODE" = "tun" ] || return 0
+    # a private link is what the rules route onto; forward-only has none
+    [ "$T_MODE" != "forward" ] || return 0
 
     local peer_ip local_ip
     peer_ip="${T_TUNPEER%%/*}"
@@ -78,21 +79,18 @@ nat_rules_for() {
         [ "$rport" = "$spec" ] && rport="$lport"
         case "$lport$rport" in *[!0-9-]*) continue ;; esac
 
+        # Only the IRAN side has rules: it sends the traffic straight to the
+        # other server's private address. Nothing is needed over there, as
+        # long as the service listens on 0.0.0.0 rather than loopback alone.
         if [ "$T_ROLE" = "server" ]; then
-            # Arriving from a client: send it down the private link.
             target="$peer_ip:$rport"
             iptables -t nat -A PINGIFY_NAT -p "$proto" --dport "$lport" \
                      ! -s "$peer_ip" -j DNAT --to-destination "$target" 2>/dev/null
-        else
-            # Arriving over the private link: hand it to the local service.
-            iptables -t nat -A PINGIFY_NAT -p "$proto" -d "$local_ip" --dport "$rport" \
-                     -j DNAT --to-destination "127.0.0.1:$rport" 2>/dev/null
         fi
     done
 
     # Replies have to come back the way they came.
     iptables -t nat -A PINGIFY_POST -o "$T_TUNIF" -j MASQUERADE 2>/dev/null
-    iptables -t nat -A PINGIFY_POST -s 127.0.0.0/8 -d "$local_ip" -j MASQUERADE 2>/dev/null
     return 0
 }
 

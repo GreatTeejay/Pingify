@@ -2,22 +2,21 @@
 # ---------------------------------------------------------------------------
 # tunnel configuration
 #
-# There are two kinds of tunnel, and everything else follows from which one
-# you pick.
+# Two things decide the shape of a tunnel, and both are asked on both servers
+# because both ends have to agree.
 #
-#   TCP   The two servers talk over their own public addresses. Ports are
-#         forwarded by the core: it accepts the connection on IRAN, carries it
-#         over the parallel connections, and opens the far side on KHAREJ.
-#         Nothing else exists - no extra interface, no routing.
+#   kind        TCP  - the servers talk over their own public addresses
+#               TUN  - a private layer-3 link, carried over ICMP today
 #
-#   TUN   The two servers get a private layer-3 link with an address range of
-#         their own, and ports are forwarded onto it by the kernel. The link
-#         itself can be carried in different ways; ICMP is the one that exists
-#         today, GRE and others slot in beside it.
+#   forwarder   only meaningful under TUN, where a local tunnel exists:
+#               PINGIFY  - the core carries each connection itself
+#               IPTABLES - the kernel NATs onto the local tunnel
 #
-# The questions then divide by which server you are standing on: IRAN owns the
-# ports clients reach, KHAREJ knows where IRAN is, and both are told the same
-# security token by hand.
+# A TCP tunnel has no local tunnel and adds no interface, so the core is the
+# only thing that can forward on it and there is nothing to ask.
+#
+# Ports are asked for on the IRAN server alone - that is the end clients
+# reach. The security token is typed by hand on both.
 # ---------------------------------------------------------------------------
 
 cfg_reset() {
@@ -34,6 +33,22 @@ cfg_reset() {
 }
 
 this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
+
+# A local tunnel belongs to the TUN kind and nowhere else. A TCP tunnel runs
+# over the two public addresses and leaves the machine as it found it, so the
+# core is the only thing that can forward on it.
+cfg_mode() {
+    if [ "$T_KIND" = "tun" ]; then
+        # both forwarders work here: the kernel can NAT onto the local tunnel,
+        # or the core can carry the ports over the same carriers.
+        [ "$T_FORWARDER" = "iptables" ] && T_MODE="tun" || T_MODE="both"
+    else
+        T_FORWARDER="pingify"
+        T_MODE="forward"
+    fi
+}
+
+cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 
 # listen and connect are derived, never stored anywhere shared: they are the
 # one part of a tunnel that differs between the two servers.
@@ -110,6 +125,7 @@ cfg_render() {
     printf '\n[tunnel]\n'
     printf 'name             = "%s"\n' "$T_NAME"
     printf 'role             = "%s"\n' "$T_ROLE"
+    printf 'kind             = "%s"\n' "$T_KIND"
     printf 'mode             = "%s"\n' "$T_MODE"
     printf '\n[transport]\n'
     printf 'type             = "%s"\n' "$T_TRANSPORT"
@@ -184,7 +200,6 @@ parse_forwards() {
 }
 
 side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
-role_label()      { [ "$1" = "server" ] && printf 'server' || printf 'client'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'ICMP' ;;
@@ -216,16 +231,15 @@ new_tunnel() {
     item 1 "TCP" "straight over the public addresses - the fast one"
     item 2 "TUN" "a private layer-3 link between the two servers"
     say ""
-    dim "TCP forwards ports through the core and adds nothing to the machine."
-    dim "TUN gives the servers a private network and lets the kernel forward"
-    dim "onto it - use it when TCP will not pass, or when you want the servers"
-    dim "to reach each other directly."
+    dim "TCP carries the tunnel over ordinary connections between the two"
+    dim "public addresses. TUN gives the servers a private network instead,"
+    dim "carried inside something that is not TCP."
     say ""
     local kind=""
     ask kind "select" "1"
 
     if [ "$kind" = "2" ]; then
-        T_KIND="tun"; T_MODE="tun"; T_FORWARDER="iptables"
+        T_KIND="tun"
         head2 "How the link is carried"
         item 1 "ICMP" "inside ping packets - needs no port at all"
         say ""
@@ -234,15 +248,31 @@ new_tunnel() {
         local sub=""
         ask sub "select" "1"
         T_TRANSPORT="icmp"
-        if ! have iptables; then
-            warn "iptables is not installed - a TUN tunnel forwards with it"
-            dim "install iptables, or choose TCP instead"
-            pause
-            return 1
+
+        # Both forwarders are available here, because a local tunnel exists
+        # for the kernel to route onto.
+        head2 "Forwarder"
+        item 1 "PINGIFY" "the core carries each connection - TCP and UDP"
+        item 2 "IPTABLES" "the kernel NATs onto the local tunnel - least CPU"
+        say ""
+        dim "PINGIFY needs nothing from the kernel and keeps every byte inside"
+        dim "the tunnel. IPTABLES is lighter on a busy link, but the service on"
+        dim "KHAREJ must listen on 0.0.0.0 rather than only on 127.0.0.1."
+        say ""
+        local fw=""
+        ask fw "select" "1"
+        if [ "$fw" = "2" ] && have iptables; then
+            T_FORWARDER="iptables"
+        else
+            [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
+            T_FORWARDER="pingify"
         fi
     else
-        T_KIND="tcp"; T_MODE="forward"; T_TRANSPORT="tcp"; T_FORWARDER="pingify"
+        T_KIND="tcp"; T_TRANSPORT="tcp"
+        # Nothing to choose: with no local tunnel the core is what forwards.
+        T_FORWARDER="pingify"
     fi
+    cfg_mode
 
     # -- name --------------------------------------------------------------
     head2 "Name"
@@ -283,8 +313,8 @@ new_tunnel() {
         this_side_accepts && dim "open $T_PORT in this server's firewall"
     fi
 
-    # -- the private link, TUN only ----------------------------------------
-    if [ "$T_MODE" = "tun" ]; then
+    # -- the private link, whenever one is needed --------------------------
+    if cfg_needs_link; then
         head2 "Private link"
         dim "both servers get an address on a small network of their own"
         say ""
@@ -363,11 +393,9 @@ new_tunnel() {
     else
         box_row "$(pad_to "Link" 16)connects to ${CFG_CONNECT}"
     fi
-    [ "$T_MODE" = "tun" ] && box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
-    if [ "$T_ROLE" = "server" ]; then
-        box_row "$(pad_to "Forwarder" 16)$(forwarder_label "$T_FORWARDER")"
-        box_row "$(pad_to "Ports" 16)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
-    fi
+    cfg_needs_link && box_row "$(pad_to "Private link" 16)${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    box_row "$(pad_to "Forwarder" 16)$(forwarder_label "$T_FORWARDER")"
+    [ -n "$T_FORWARDS" ] && box_row "$(pad_to "Ports" 16)$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     box_row "$(pad_to "Performance" 16)${T_PRESET}  ${C_DIM}${T_CARRIERS} connections, ${T_WINDOW} KB window${C_OFF}"
     box_bot
     say ""
@@ -409,7 +437,8 @@ new_tunnel() {
     fi
     [ "$T_TRANSPORT" = "tcp" ] && box_row "$(pad_to "Tunnel port" 18)${T_PORT}"
     box_row "$(pad_to "IRAN address" 18)$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
-    if [ "$T_MODE" = "tun" ]; then
+    box_row "$(pad_to "Forwarder" 18)$(forwarder_label "$T_FORWARDER")"
+    if cfg_needs_link; then
         box_row "$(pad_to "Its private addr" 18)${T_TUNPEER}"
         box_row "$(pad_to "Peer private addr" 18)${T_TUNLOCAL}"
     fi
