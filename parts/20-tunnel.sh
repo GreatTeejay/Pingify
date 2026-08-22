@@ -88,12 +88,14 @@ apply_preset() {
 }
 
 preset_menu() {
+    CHOICE_DEF="3"
     choice 1 "Gaming" "lowest ping, small bursts"
     choice 2 "Latency" "browsing, calls, anything interactive"
     choice 3 "Balanced" "a good default"
     choice 4 "Download" "large files"
     choice 5 "Extreme" "fastest, uses the most memory"
     choice 6 "Custom" "set the numbers yourself"
+    CHOICE_DEF=""
     say ""
     local p=""
     ask p "select" "3"
@@ -208,7 +210,7 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'ICMP' ;;
-        *)           printf 'TCP BRAID' ;;
+        *)           printf 'TCP' ;;
     esac
 }
 
@@ -226,8 +228,10 @@ new_tunnel() {
 
     # -- which server is this ----------------------------------------------
     wiz "Which server is this?"
+    CHOICE_DEF="1"
     choice 1 "IRAN" "clients connect here"
     choice 2 "KHAREJ" "your panel and inbounds run here"
+    CHOICE_DEF=""
     say ""
     local side=""
     ask side "select" "1"
@@ -236,8 +240,10 @@ new_tunnel() {
 
     # -- kind --------------------------------------------------------------
     wiz "Tunnel type"
-    choice 1 "TCP BRAID" "several connections woven into one - the fast one"
+    CHOICE_DEF="1"
+    choice 1 "TCP" "over the two public addresses - several connections at once"
     choice 2 "TUN" "a private network between the servers"
+    CHOICE_DEF=""
     say ""
     local kind=""
     ask kind "select" "1"
@@ -246,7 +252,9 @@ new_tunnel() {
         T_KIND="tun"
 
         wiz "What carries the link?"
+        CHOICE_DEF="1"
         choice 1 "ICMP" "inside ping packets - no port needed"
+        CHOICE_DEF=""
         say ""
         dim "GRE and others will land here later."
         say ""
@@ -256,8 +264,10 @@ new_tunnel() {
         wiz_add "TUN over ICMP"
 
         wiz "Who forwards the ports?"
+        CHOICE_DEF="1"
         choice 1 "PINGIFY" "the core carries every connection itself"
         choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
+        CHOICE_DEF=""
         say ""
         dim "With IPTABLES the service on KHAREJ has to listen on 0.0.0.0,"
         dim "not only on 127.0.0.1."
@@ -274,7 +284,7 @@ new_tunnel() {
     else
         T_KIND="tcp"; T_TRANSPORT="tcp"
         T_FORWARDER="pingify"
-        wiz_add "TCP BRAID"
+        wiz_add "TCP"
     fi
     cfg_mode
 
@@ -299,31 +309,22 @@ new_tunnel() {
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
     fi
 
-    # -- name --------------------------------------------------------------
-    # iran9443 / kharej9443: which end this is, and which tunnel. Two servers
-    # side by side then say what they are without opening either file.
-    local suggested
-    suggested="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    # -- name, derived ------------------------------------------------------
+    # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
+    # tunnel. Two servers side by side say what they are without either file
+    # being opened, and there is nothing to answer.
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
     if [ "$T_TRANSPORT" = "icmp" ]; then
-        suggested="${suggested}icmp"
+        T_NAME="${T_NAME}-icmp"
     else
-        suggested="${suggested}${T_PORT}"
+        T_NAME="${T_NAME}-${T_PORT}"
     fi
-    [ -f "$(cfg_file "$suggested")" ] && suggested="${suggested}-$(( $(tunnel_count) + 1 ))"
-    wiz "Name it" "Names the service, the log and the config file."
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$(cfg_file "$T_NAME")" ]; then
-                    fail "a tunnel named $T_NAME already exists here"
-                else
-                    break
-                fi ;;
-        esac
-    done
-    wiz_add "$T_NAME"
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+    fi
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
 
     # -- the private link, whenever one is needed --------------------------
     if cfg_needs_link; then
@@ -377,11 +378,13 @@ new_tunnel() {
 
     # -- logging -----------------------------------------------------------
     wiz "How much to log" "Each level includes the ones above it."
+    CHOICE_DEF="3"
     choice 1 "error" "only what is broken"
     choice 2 "warn" "and what is wrong but survivable"
     choice 3 "info" "and what a healthy tunnel does"
     choice 4 "debug" "and why each carrier and stream did what it did"
     choice 5 "trace" "and every packet - slows a busy tunnel down"
+    CHOICE_DEF=""
     say ""
     local lg=""
     ask lg "select" "3"

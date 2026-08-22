@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.0.0"
+PINGIFY_VERSION="5.0.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -184,10 +184,17 @@ wiz() {
 }
 
 # choice <key> <name> <hint> - one option, name and reason on the same line.
+#
+# CHOICE_DEF marks the one enter picks, on the line itself. Having to read the
+# prompt underneath to work out which number that is, is a step nobody should
+# have to take.
+CHOICE_DEF=""
 choice() {
-    printf '    %s%s%s  %s  %s%s%s\n' \
-        "$C_CYN$C_B" "$1" "$C_OFF" \
-        "$(pad_to "${C_B}$2${C_OFF}" 12)" \
+    local mark="  "
+    [ "$1" = "$CHOICE_DEF" ] && mark="${C_GRN}${BX_ARR}${C_OFF} "
+    printf '   %s%s%s%s  %s  %s%s%s\n' \
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
+        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
         "$C_DIM" "${3:-}" "$C_OFF"
 }
 
@@ -835,12 +842,14 @@ apply_preset() {
 }
 
 preset_menu() {
+    CHOICE_DEF="3"
     choice 1 "Gaming" "lowest ping, small bursts"
     choice 2 "Latency" "browsing, calls, anything interactive"
     choice 3 "Balanced" "a good default"
     choice 4 "Download" "large files"
     choice 5 "Extreme" "fastest, uses the most memory"
     choice 6 "Custom" "set the numbers yourself"
+    CHOICE_DEF=""
     say ""
     local p=""
     ask p "select" "3"
@@ -955,7 +964,7 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'ICMP' ;;
-        *)           printf 'TCP BRAID' ;;
+        *)           printf 'TCP' ;;
     esac
 }
 
@@ -973,8 +982,10 @@ new_tunnel() {
 
     # -- which server is this ----------------------------------------------
     wiz "Which server is this?"
+    CHOICE_DEF="1"
     choice 1 "IRAN" "clients connect here"
     choice 2 "KHAREJ" "your panel and inbounds run here"
+    CHOICE_DEF=""
     say ""
     local side=""
     ask side "select" "1"
@@ -983,8 +994,10 @@ new_tunnel() {
 
     # -- kind --------------------------------------------------------------
     wiz "Tunnel type"
-    choice 1 "TCP BRAID" "several connections woven into one - the fast one"
+    CHOICE_DEF="1"
+    choice 1 "TCP" "over the two public addresses - several connections at once"
     choice 2 "TUN" "a private network between the servers"
+    CHOICE_DEF=""
     say ""
     local kind=""
     ask kind "select" "1"
@@ -993,7 +1006,9 @@ new_tunnel() {
         T_KIND="tun"
 
         wiz "What carries the link?"
+        CHOICE_DEF="1"
         choice 1 "ICMP" "inside ping packets - no port needed"
+        CHOICE_DEF=""
         say ""
         dim "GRE and others will land here later."
         say ""
@@ -1003,8 +1018,10 @@ new_tunnel() {
         wiz_add "TUN over ICMP"
 
         wiz "Who forwards the ports?"
+        CHOICE_DEF="1"
         choice 1 "PINGIFY" "the core carries every connection itself"
         choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
+        CHOICE_DEF=""
         say ""
         dim "With IPTABLES the service on KHAREJ has to listen on 0.0.0.0,"
         dim "not only on 127.0.0.1."
@@ -1021,7 +1038,7 @@ new_tunnel() {
     else
         T_KIND="tcp"; T_TRANSPORT="tcp"
         T_FORWARDER="pingify"
-        wiz_add "TCP BRAID"
+        wiz_add "TCP"
     fi
     cfg_mode
 
@@ -1046,31 +1063,22 @@ new_tunnel() {
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
     fi
 
-    # -- name --------------------------------------------------------------
-    # iran9443 / kharej9443: which end this is, and which tunnel. Two servers
-    # side by side then say what they are without opening either file.
-    local suggested
-    suggested="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    # -- name, derived ------------------------------------------------------
+    # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
+    # tunnel. Two servers side by side say what they are without either file
+    # being opened, and there is nothing to answer.
+    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
     if [ "$T_TRANSPORT" = "icmp" ]; then
-        suggested="${suggested}icmp"
+        T_NAME="${T_NAME}-icmp"
     else
-        suggested="${suggested}${T_PORT}"
+        T_NAME="${T_NAME}-${T_PORT}"
     fi
-    [ -f "$(cfg_file "$suggested")" ] && suggested="${suggested}-$(( $(tunnel_count) + 1 ))"
-    wiz "Name it" "Names the service, the log and the config file."
-    while :; do
-        ask T_NAME "name" "$suggested"
-        case "$T_NAME" in
-            "" | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore only" ;;
-            *)
-                if [ -f "$(cfg_file "$T_NAME")" ]; then
-                    fail "a tunnel named $T_NAME already exists here"
-                else
-                    break
-                fi ;;
-        esac
-    done
-    wiz_add "$T_NAME"
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+    fi
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
 
     # -- the private link, whenever one is needed --------------------------
     if cfg_needs_link; then
@@ -1124,11 +1132,13 @@ new_tunnel() {
 
     # -- logging -----------------------------------------------------------
     wiz "How much to log" "Each level includes the ones above it."
+    CHOICE_DEF="3"
     choice 1 "error" "only what is broken"
     choice 2 "warn" "and what is wrong but survivable"
     choice 3 "info" "and what a healthy tunnel does"
     choice 4 "debug" "and why each carrier and stream did what it did"
     choice 5 "trace" "and every packet - slows a busy tunnel down"
+    CHOICE_DEF=""
     say ""
     local lg=""
     ask lg "select" "3"
@@ -4007,7 +4017,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.0.0"
+const version = "5.0.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -5578,6 +5588,8 @@ func (l *link) writeLoop() {
 			return
 		}
 		atomic.AddUint64(&l.wireTx, uint64(len(out)))
+		logTrace("carrier %d tx frame %d: %d bytes on the wire, %d of records",
+			l.idx, ctr, len(out), len(frame))
 		out = out[:0]
 	}
 }
@@ -5629,6 +5641,7 @@ func (l *link) readLoop() {
 			return
 		}
 		atomic.AddUint64(&l.wireRx, uint64(len(hdr)+n))
+		logTrace("carrier %d rx frame %d: %d bytes on the wire", l.idx, l.rxCtr, len(hdr)+n)
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
 		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
@@ -5683,13 +5696,15 @@ func (l *link) dispatch(p []byte) error {
 				s.reset()
 			}
 		case cmdPad:
-			// deliberately ignored
+			logTrace("carrier %d rx pad %d bytes", l.idx, n)
 		case cmdPing:
+			logTrace("carrier %d rx ping, answering", l.idx)
 			// Never block the read loop: if the send queue is momentarily
 			// full, drop the pong rather than risk both ends stalling on
 			// each other's socket buffers.
 			l.trySend(ctrlRec(cmdPong, 0, body))
 		case cmdPong:
+			logTrace("carrier %d rx pong", l.idx)
 			if n == 8 {
 				sent := int64(binary.BigEndian.Uint64(body))
 				atomic.StoreInt64(&l.rttUS, (time.Now().UnixNano()-sent)/1000)
@@ -5748,6 +5763,8 @@ func (l *link) keepaliveLoop() {
 			}
 			var b [8]byte
 			binary.BigEndian.PutUint64(b[:], uint64(time.Now().UnixNano()))
+			logTrace("carrier %d tx ping (last heard %s ago)", l.idx,
+				time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Millisecond))
 			l.send(ctrlRec(cmdPing, 0, b[:]))
 		case <-l.closed:
 			return
