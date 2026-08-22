@@ -8,15 +8,17 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.13.2"
+PINGIFY_VERSION="5.1.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
+# Everything Pingify owns lives in one directory, so it is obvious what is
+# installed and trivial to back up or delete.
 BASE_DIR="/root/Pingify"
 CFG_DIR="$BASE_DIR"
 STATE_DIR="$BASE_DIR/.state"
 SRC_DIR="$BASE_DIR/.build"
 CORE_BIN="$BASE_DIR/pingify-core"
-SELF_BIN="/usr/local/bin/pingify"
+SELF_BIN="/usr/local/bin/pingify"   # has to be on PATH for the "pingify" command
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
 GO_MIN_MINOR=19          # the core needs Go 1.19 or newer
@@ -81,46 +83,42 @@ pad_to() {
     [ "$n" -lt "$w" ] && repeat ' ' $((w - n))
 }
 
-# A panel carries its title in the top border, so a page of them reads as a
-# list of labelled blocks rather than a wall of rules.
+# A panel carries its title in the top border, so a screen full of them reads
+# as a list of labelled blocks rather than a wall of rules.
 panel() {
     local t="${1:-}" n
     if [ -z "$t" ]; then
-        printf '  %s%s%s%s%s
-' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
+        printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"
         return
     fi
+    # corner + one rule + " title " ; the rest of the line is rule + corner
     n=$(( ${#t} + 3 ))
-    printf '  %s%s%s %s%s%s %s%s%s
-'         "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF"         "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
+    printf '  %s%s%s %s%s%s %s%s%s\n' \
+        "$C_GRY" "$BX_TL$BX_H" "$C_OFF" "$C_CYN$C_B" "$t" "$C_OFF" \
+        "$C_GRY" "$(repeat "$BX_H" $((UI_W - n)))$BX_TR" "$C_OFF"
 }
 
-panel_end() { printf '  %s%s%s%s%s
-' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
+panel_end() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
 
-# field <label> <value> - one labelled line inside a panel, values aligned.
+row() {
+    printf '  %s%s%s %s %s%s%s\n' \
+        "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"
+}
+
+# field <label> <value> [label2] [value2] - two aligned columns in one row.
 field() {
-    printf '  %s%s%s %s %s%s%s
-'         "$C_GRY" "$BX_V" "$C_OFF"         "$(pad_to "$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}" $((UI_W - 2)))"         "$C_GRY" "$BX_V" "$C_OFF"
-}
-
-# A label above a run of related menu entries.
-group() { printf '
-  %s%s%s
-' "$C_DIM$C_B" "$1" "$C_OFF"; }
-
-# state <on|off> - a coloured badge for a toggle.
-state_badge() {
-    if [ "$1" = "on" ]; then
-        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
-    else
-        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
+    local s
+    s="$(pad_to "${C_DIM}$1${C_OFF}" 13)${C_B}$2${C_OFF}"
+    if [ -n "${3:-}" ]; then
+        s="$(pad_to "$s" 32)$(pad_to "${C_DIM}$3${C_OFF}" 12)${C_B}$4${C_OFF}"
     fi
+    row "$s"
 }
 
-box_top() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_TL" "$(repeat "$BX_H" "$UI_W")" "$BX_TR" "$C_OFF"; }
-box_bot() { printf '  %s%s%s%s%s\n' "$C_GRY" "$BX_BL" "$(repeat "$BX_H" "$UI_W")" "$BX_BR" "$C_OFF"; }
-box_row() { printf '  %s%s%s %s %s%s%s\n' "$C_GRY" "$BX_V" "$C_OFF" "$(pad_to "$1" $((UI_W - 2)))" "$C_GRY" "$BX_V" "$C_OFF"; }
+# kept so older call sites keep working
+box_top() { panel; }
+box_bot() { panel_end; }
+box_row() { row "$1"; }
 
 say()  { printf '%s\n' "$*"; }
 info() { printf '  %s%s%s %s\n' "$C_CYN" "$BX_ARR" "$C_OFF" "$*"; }
@@ -134,76 +132,109 @@ rule() { printf '  %s%s%s\n' "$C_GRY" "$(repeat "$BX_H" $((UI_W + 2)))" "$C_OFF"
 head2() {
     local t=" $1 " n; n="$(vislen "$t")"
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_B" "$t" "$C_OFF$C_GRY" \
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
         "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
 }
+
+# A label above a run of related menu entries.
+group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 
 # item <key> <label> [hint]
 #
 # The label column grows if a label outruns it, so a long one can never end up
 # glued to its hint.
 item() {
-    local w=28 n
+    local w=24 n
     n="$(vislen "$2")"
     [ "$n" -ge "$w" ] && w=$((n + 2))
     if [ -n "${3:-}" ]; then
-        printf '    %s%s%s  %s%s%s%s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$(pad_to "$2" "$w")" "$C_DIM" "$3" "$C_OFF"
+        printf '    %s%s%s %s%s%s %s%s%s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
+            "$(pad_to "$2" "$w")" "$C_DIM" "$3$C_OFF"
     else
-        printf '    %s%s%s  %s\n' "$C_CYN$C_B" "$1" "$C_OFF" "$2"
+        printf '    %s%s%s %s%s%s %s\n' \
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$2"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# the wizard
+#
+# The steps run down one page. Nothing is cleared between them, so the answers
+# already given stay on screen above the question being asked - which is what
+# you want when you are copying the same numbers onto a second server.
+# ---------------------------------------------------------------------------
+
+WIZ_STEP=0
+
+wiz_reset() { WIZ_STEP=0; }
+
+# Kept so the wizard can note a decision without the page having to redraw.
+wiz_add() { :; }
+
+# wiz <title> [subtitle] - open a step.
+wiz() {
+    WIZ_STEP=$((WIZ_STEP + 1))
+    local t="$WIZ_STEP $BX_DOT $1 " n; n="$(vislen " $t")"
+    printf '\n  %s%s%s%s%s%s%s\n\n' \
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
+        "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
+    [ -n "${2:-}" ] && { dim "$2"; say ""; }
+    return 0
+}
+
+# choice <key> <name> <hint> - one option, name and reason on the same line.
+#
+# CHOICE_DEF marks the one enter picks, on the line itself. Having to read the
+# prompt underneath to work out which number that is, is a step nobody should
+# have to take.
+CHOICE_DEF=""
+choice() {
+    local mark="  "
+    [ "$1" = "$CHOICE_DEF" ] && mark="${C_GRN}${BX_ARR}${C_OFF} "
+    printf '   %s%s%s%s  %s  %s%s%s\n' \
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
+        "$(pad_to "${C_B}$2${C_OFF}" 11)" \
+        "$C_DIM" "${3:-}" "$C_OFF"
+}
+
+# state <on|off> - a coloured on/off badge for toggles.
+state_badge() {
+    if [ "$1" = "on" ]; then
+        printf '%s%s on%s' "$C_GRN" "$BX_ON" "$C_OFF"
+    else
+        printf '%s%s off%s' "$C_GRY" "$BX_OFF" "$C_OFF"
     fi
 }
 
 banner() {
     clear 2>/dev/null || true
     printf '\n'
-    local l w pad
+    local l
     if [ "$PINGIFY_UTF8" = "1" ]; then
-        set -- \
+        for l in \
             '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
             '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
             '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
             '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
             '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
             '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
+        do
+            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
+        done
     else
-        set -- \
-            ' ___  _                 _   __     ' \
-            '| _ \(_)_ _  __ _ (_) / _|_  _     ' \
-            '|  _/| | | \| | (_| | | ||  _| || |' \
-            '|_|  |_|_||_|\__, | |_||_|   \_, |ذ' \
-            '             |___/          |__/   '
+        for l in \
+            ' ___  _                 _   __       ' \
+            '| _ \(_)_ _   __ _   (_) / _|_  _  ' \
+            '|  _/| |  \ \ / _` |  | ||  _| || | ' \
+            '|_|  |_|_||_|\__, |  |_||_|   \_, | ' \
+            '             |___/           |__/  '
+        do
+            printf '  %s%s%s\n' "$C_CYN" "$l" "$C_OFF"
+        done
     fi
-
-    # The name sits in its own frame, centred, so the page opens with one
-    # object rather than six lines floating above a rule.
-    w=0
-    for l in "$@"; do
-        [ "$(vislen "$l")" -gt "$w" ] && w="$(vislen "$l")"
-    done
-    local inner=$((UI_W))
-    pad=$(( (inner - w) / 2 ))
-    [ "$pad" -lt 0 ] && pad=0
-
-    printf '  %s%s%s%s%s\n' "$C_CYN$C_DIM" "$BX_TL" "$(repeat "$BX_H" "$inner")" "$BX_TR" "$C_OFF"
-    for l in "$@"; do
-        printf '  %s%s%s%s%s%s%s%s\n' \
-            "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
-            "$(repeat ' ' "$pad")" "$C_CYN$C_B$l$C_OFF" \
-            "$(repeat ' ' $((inner - pad - $(vislen "$l"))))" \
-            "$C_CYN$C_DIM$BX_V" "$C_OFF"
-    done
-
-    # and the one line that says what it is, centred under it
-    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel"
-    pad=$(( (inner - ${#sub}) / 2 ))
-    [ "$pad" -lt 0 ] && pad=0
-    printf '  %s%s%s%s%s%s%s%s\n' \
-        "$C_CYN$C_DIM" "$BX_V" "$C_OFF" \
-        "$(repeat ' ' "$pad")" "$C_DIM$sub$C_OFF" \
-        "$(repeat ' ' $((inner - pad - ${#sub})))" \
-        "$C_CYN$C_DIM$BX_V" "$C_OFF"
-    printf '  %s%s%s%s%s\n\n' "$C_CYN$C_DIM" "$BX_BL" "$(repeat "$BX_H" "$inner")" "$BX_BR" "$C_OFF"
+    printf '  %s%sby Teejay%s   %sIran %s Kharej tunnel   %s   v%s%s\n\n' \
+        "$C_CYN" "$C_DIM" "$C_OFF" "$C_DIM" "$BX_ARR" "$BX_DOT" "$PINGIFY_VERSION" "$C_OFF"
 }
 
 pause() { printf '\n'; read -rsp "  ${C_DIM}press enter${C_OFF}" _; printf '\n'; }
@@ -255,20 +286,11 @@ require_root() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
-# fetch <url> [timeout] - print a URL's body using whatever this box has.
+# fetch <url> <dest> [timeout] - download one file with whatever this machine
+# has. The install line is written with wget, so wget is the tool most likely
+# to be present and curl the one most likely to be missing; assuming curl left
+# servers quietly running an old script while the core updated around them.
 fetch() {
-    local url="$1" t="${2:-10}"
-    if have curl; then
-        curl -fsS --max-time "$t" "$url" 2>/dev/null && return 0
-    fi
-    if have wget; then
-        wget -qO- --timeout="$t" "$url" 2>/dev/null && return 0
-    fi
-    return 1
-}
-
-# fetch_to <url> <file> [timeout] - the same, into a file.
-fetch_to() {
     local url="$1" dest="$2" t="${3:-120}"
     if have curl; then
         curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
@@ -279,49 +301,47 @@ fetch_to() {
     return 1
 }
 
-# These configs are written by this script, one key per line, so a targeted
-# sed is enough and Pingify stays free of a jq dependency.
+# Config files are TOML written by this script, one key per line, so a
+# targeted sed reads them back and Pingify needs no parser of its own.
 CFG_EXT="toml"
+
 cfg_file() { printf '%s/%s.%s' "$CFG_DIR" "$1" "$CFG_EXT"; }
 
-# toml_get <file> <section> <key> - one value out of one section.
-#
-# A key sitting outside any section matches too: that is the shape the flat
-# JSON era wrote, and a config that has been migrated should not need a second
-# reader. Done in one awk pass because the tunnel list calls this per field and
-# a subshell per value adds up on a small VPS.
+toml_arr() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1; }
+
+# toml_get <file> <section> <key> - reads a value out of one [section].
+# Values keep their quotes off and numeric underscores stripped.
+# The public name of a security token: eight characters derived from it, safe
+# to read aloud. Both servers print the same one when the token matches, which
+# is the only way to tell a wrong token apart from a broken network.
+token_print() {
+    local t
+    t="$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -n "$t" ] && printf '%s' "$t" | sha256sum | cut -c1-8 || printf 'none'
+}
+
 toml_get() {
     [ -f "$1" ] || return 0
     awk -v want="$2" -v key="$3" '
-        /^[[:space:]]*\[/ {
-            sec = $0
-            gsub(/^[[:space:]]*\[|\][[:space:]]*$/, "", sec)
-            next
-        }
-        {
+        /^[[:space:]]*\[/ { s = $0; gsub(/[][[:space:]]/, "", s); cur = s; next }
+        cur == want {
             line = $0
-            sub(/#.*$/, "", line)
-            if (index(line, "=") == 0) next
-            k = substr(line, 1, index(line, "=") - 1)
-            gsub(/[[:space:]]/, "", k)
-            if (k != key) next
-            if (sec != want && sec != "") next
-            v = substr(line, index(line, "=") + 1)
-            gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
-            gsub(/^"|"$/, "", v)
-            print v
-            exit
-        }
-    ' "$1"
+            sub(/[[:space:]]*#.*$/, "", line)
+            if (match(line, "^[[:space:]]*" key "[[:space:]]*=")) {
+                v = substr(line, RSTART + RLENGTH)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+                if (v ~ /^"/) { gsub(/^"|"$/, "", v) }
+                else if (v ~ /^[0-9_]+$/) { gsub(/_/, "", v) }
+                print v
+                exit
+            }
+        }' "$1"
 }
 
-# toml_arr <file> <key> - the inside of  ports = ["443", "udp:500"]
-toml_arr() {
-    [ -f "$1" ] || return 0
-    sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*\[\(.*\)\].*/\1/p" "$1" | head -n1
-}
-json_str() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
-json_num() { sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
+
+# Only used to convert a config left behind by 3.2 or earlier.
+json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
+json_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
 port_free() {
     local p="$1"
@@ -340,28 +360,11 @@ pick_free_port() {
     printf '%s' "$1"
 }
 
-# Where this server is, for the front page. Looked up once per run: the
-# answer does not change while the menu is open, and a small VPS should not
-# spend a round trip redrawing it.
-server_info() {
-    [ -n "${SRV_IP:-}" ] && return 0
-    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
-    local j
-    j="$(fetch 'http://ip-api.com/json/?fields=query,country,isp' 6)"
-    if [ -n "$j" ]; then
-        SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
-        SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
-        SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
-    fi
-    [ -n "$SRV_IP" ]  || SRV_IP="$(public_ip)"
-    [ -n "$SRV_IP" ]  || SRV_IP="unknown"
-    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
-    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
-}
-
 public_ip() {
     local ip=""
-    ip="$(fetch https://api.ipify.org 5)"
+    if have curl; then
+        ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null)
+    fi
     if [ -z "$ip" ] && have ip; then
         ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
     fi
@@ -375,6 +378,27 @@ tunnel_names() {
         [ -e "$f" ] || continue
         basename "$f" ".$CFG_EXT"
     done
+}
+
+# Where this server sits, for the panel on the front page. Best effort: an
+# Iranian box may not reach the lookup service, in which case the local route
+# still gives us the address.
+server_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    SRV_IP=""; SRV_LOC=""; SRV_ORG=""
+    if have curl; then
+        local j
+        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
+        if [ -n "$j" ]; then
+            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
+            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
+        fi
+    fi
+    [ -n "$SRV_IP" ] || SRV_IP="$(public_ip)"
+    [ -n "$SRV_IP" ] || SRV_IP="unknown"
+    [ -n "$SRV_LOC" ] || SRV_LOC="unknown"
+    [ -n "$SRV_ORG" ] || SRV_ORG="unknown"
 }
 
 tunnel_count() { tunnel_names | grep -c . ; }
@@ -418,7 +442,7 @@ apt_install() {
 
 ensure_deps() {
     local missing=()
-    have curl || have wget || missing+=(curl)
+    have curl   || missing+=(curl)
     have tar    || missing+=(tar)
     have ip     || missing+=(iproute2)
     have ss     || missing+=(iproute2)
@@ -431,8 +455,8 @@ ensure_deps() {
             warn "please install manually: ${missing[*]}"
         fi
     fi
-    mkdir -p "$CFG_DIR" "$STATE_DIR"
-    chmod 700 "$CFG_DIR"
+    mkdir -p "$BASE_DIR" "$STATE_DIR"
+    chmod 700 "$BASE_DIR"
 }
 
 # Prints the minor version of a Go toolchain, e.g. 22 for go1.22.2, or 0 when
@@ -469,11 +493,11 @@ find_go() {
 install_go_tarball() {
     [ -n "$GOARCH" ] || { fail "unsupported CPU architecture: $ARCH"; return 1; }
     local ver=""
-    ver=$(fetch "https://go.dev/VERSION?m=text" 8 | head -n1)
+    ver=$(curl -fsS --max-time 8 "https://go.dev/VERSION?m=text" 2>/dev/null | head -n1)
     case "$ver" in go1.*) ;; *) ver="$GO_FALLBACK" ;; esac
     info "downloading $ver for $GOARCH"
-    if ! fetch_to "https://go.dev/dl/${ver}.linux-${GOARCH}.tar.gz" /tmp/pingify-go.tgz 300 \
-         ; then
+    if ! curl -fL --retry 2 --max-time 300 -o /tmp/pingify-go.tgz \
+         "https://go.dev/dl/${ver}.linux-${GOARCH}.tar.gz"; then
         fail "could not download the Go toolchain"
         dim "this is only the fallback path - see Update Core for other options"
         return 1
