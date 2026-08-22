@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.2.1"
+const version = "5.3.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -899,7 +899,9 @@ func (p *pool) start() error {
 	// The echo transport owns a single raw socket for every carrier, so it is
 	// set up once here rather than per connection.
 	if p.cfg.Transport == "icmp" {
-		t, err := newICMPTransport(p.cfg.key())
+		// The listening side stores the address to answer from; the dialling
+		// side has none and takes the default.
+		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen)
 		if err != nil {
 			return err
 		}

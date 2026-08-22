@@ -100,10 +100,19 @@ type icmpTransport struct {
 	done     chan struct{}
 }
 
-func newICMPTransport(psk []byte) (*icmpTransport, error) {
-	pc, err := net.ListenPacket("ip4:icmp", "0.0.0.0")
+// newICMPTransport opens the one raw socket every carrier shares.
+//
+// bind is the local address to answer from. Empty means every address, which
+// is right on a server with one. On a server with several the kernel picks
+// the source itself, and a reply that leaves from an address the far end is
+// not expecting is a reply the far end throws away - so the wizard asks.
+func newICMPTransport(psk []byte, bind string) (*icmpTransport, error) {
+	if bind == "" || bind == "0.0.0.0" {
+		bind = "0.0.0.0"
+	}
+	pc, err := net.ListenPacket("ip4:icmp", bind)
 	if err != nil {
-		return nil, fmt.Errorf("raw ICMP socket: %v (needs CAP_NET_RAW; are you root?)", err)
+		return nil, fmt.Errorf("raw ICMP socket on %s: %v (needs CAP_NET_RAW; are you root?)", bind, err)
 	}
 	t := &icmpTransport{
 		pc:       pc,

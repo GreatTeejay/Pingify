@@ -60,8 +60,8 @@ check "role"                  "$(toml_get "$iran" tunnel role)"       "server"
 check "no private link"       "$(toml_get "$iran" tunnel mode)"       "forward"
 check "and no [tun] section"  "$(grep -c '^\[tun\]' "$iran")"         "0"
 check "protocol"              "$(toml_get "$iran" transport type)"    "tcp"
-check "IRAN dials out"        "$(toml_get "$iran" transport connect)" "198.51.100.4:9443"
-check "and never listens"     "$(toml_get "$iran" transport listen)"  ""
+check "IRAN accepts the link" "$(toml_get "$iran" transport listen)"  "0.0.0.0:9443"
+check "and does not dial"     "$(toml_get "$iran" transport connect)" ""
 check "token, not a key"      "$(toml_get "$iran" security token)"    "$TOKEN"
 check "no psk is written"     "$(grep -c '^psk' "$iran")"             "0"
 check "forwarded by the core" "$(toml_get "$iran" forward forwarder)" "pingify"
@@ -75,7 +75,7 @@ check "cfg_load token"     "$T_TOKEN"     "$TOKEN"
 check "cfg_load forwarder" "$T_FORWARDER" "pingify"
 check "cfg_load ports"     "$T_FORWARDS"  '"443","udp:500"'
 check "cfg_load port"      "$T_PORT"      "9443"
-check "cfg_load accepts"   "$T_ACCEPTS"   "client"
+check "cfg_load accepts"   "$T_ACCEPTS"   "server"
 
 # ---------------------------------------------------------------------------
 note "a TUN tunnel - the private link"
@@ -90,7 +90,10 @@ tun="$(cfg_save)"
 
 check "mode is tun"           "$(toml_get "$tun" tunnel mode)"        "tun"
 check "carried over ICMP"     "$(toml_get "$tun" transport type)"     "icmp"
-check "dials without a port" "$(toml_get "$tun" transport connect)"  "198.51.100.4"
+# ICMP has no port, so listen carries the address to answer from. On a
+# server with several addresses the kernel would otherwise pick one, and a
+# reply from an address the far end is not expecting is thrown away.
+check "listens on its own address" "$(toml_get "$tun" transport listen)"  "203.0.113.9"
 check "private address"       "$(toml_get "$tun" tun local_addr)"     "10.10.10.1/24"
 check "peer private address"  "$(toml_get "$tun" tun remote_addr)"    "10.10.10.2/24"
 check "forwarded by iptables" "$(toml_get "$tun" forward forwarder)"  "iptables"
@@ -104,34 +107,34 @@ note "the KHAREJ side"
 # ---------------------------------------------------------------------------
 cfg_reset
 T_NAME="kh"; T_ROLE="client"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_MODE="forward"
-T_PORT=9443; T_PUBLIC_IP="198.51.100.4"; T_TOKEN="$TOKEN"
+T_PORT=9443; T_PEER_IP="203.0.113.9"; T_PUBLIC_IP="198.51.100.4"; T_TOKEN="$TOKEN"
 T_STATUS="127.0.0.1:9701"
 kharej="$(cfg_save)"
 
-check "KHAREJ accepts"      "$(toml_get "$kharej" transport listen)"  "0.0.0.0:9443"
-check "and does not dial"   "$(toml_get "$kharej" transport connect)" ""
+check "KHAREJ dials IRAN"   "$(toml_get "$kharej" transport connect)" "203.0.113.9:9443"
+check "and does not listen" "$(toml_get "$kharej" transport listen)"  ""
 check "same token"          "$(toml_get "$kharej" security token)"    "$TOKEN"
 check "no ports on KHAREJ"  "$(grep -c '^ports' "$kharej")"           "0"
 
 cfg_load kh
-check "cfg_load accepts" "$T_ACCEPTS" "client"
+check "cfg_load accepts" "$T_ACCEPTS" "server"
 
 # ---------------------------------------------------------------------------
 note "ICMP needs no port"
 # ---------------------------------------------------------------------------
 cfg_reset
 T_NAME="ic"; T_ROLE="server"; T_TRANSPORT="icmp"; T_TOKEN="$TOKEN"
-T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"
+T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_PUBLIC_IP="203.0.113.9"
 T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9702"
-T_PEER_IP="198.51.100.4"
 cfg_endpoints
-check "IRAN dials without a port" "$CFG_CONNECT" "198.51.100.4"
+check "IRAN answers from its own address" "$CFG_LISTEN" "203.0.113.9"
 
 cfg_reset
 T_NAME="ic2"; T_ROLE="client"; T_TRANSPORT="icmp"; T_TOKEN="$TOKEN"
+T_PEER_IP="203.0.113.9"
 cfg_endpoints
-check "KHAREJ listens without a port" "$CFG_LISTEN" "0.0.0.0"
-check "and nothing is appended"       "$CFG_CONNECT"  ""
+check "KHAREJ sends without a port" "$CFG_CONNECT" "203.0.113.9"
+check "and nothing is appended"     "$CFG_LISTEN"  ""
 
 # ---------------------------------------------------------------------------
 note "an incomplete tunnel names what is missing"

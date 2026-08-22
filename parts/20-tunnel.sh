@@ -25,7 +25,7 @@ cfg_reset() {
     T_KIND="tcp"; T_TRANSPORT="tcp"; T_MODE="forward"; T_FORWARDER="pingify"
     T_TOKEN=""
     T_PORT=9443          # the tunnel's own port, TCP only
-    T_ACCEPTS="client"   # KHAREJ accepts the link, IRAN dials out to it
+    T_ACCEPTS="server"   # reverse: IRAN accepts, KHAREJ comes to it
     T_PUBLIC_IP=""; T_PEER_IP=""
     T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
@@ -57,7 +57,8 @@ cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 cfg_endpoints() {
     CFG_LISTEN=""; CFG_CONNECT=""
     if this_side_accepts; then
-        if [ "$T_TRANSPORT" = "icmp" ]; then CFG_LISTEN="0.0.0.0"
+        # ICMP has no port, so listen carries the address to answer from.
+        if [ "$T_TRANSPORT" = "icmp" ]; then CFG_LISTEN="${T_PUBLIC_IP:-0.0.0.0}"
         else CFG_LISTEN="0.0.0.0:$T_PORT"; fi
     else
         if [ "$T_TRANSPORT" = "icmp" ]; then CFG_CONNECT="$T_PEER_IP"
@@ -242,7 +243,7 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 # still plain TCP - the name describes the weave, not a new protocol.
 transport_label() {
     case "$1" in
-        icmp | echo) printf 'ICMP' ;;
+        icmp | echo) printf 'TUN-ICMP' ;;
         *)           printf 'TCP' ;;
     esac
 }
@@ -271,30 +272,20 @@ new_tunnel() {
     if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
     wiz_add "$(side_label "$T_ROLE")"
 
-    # -- kind --------------------------------------------------------------
-    wiz "Tunnel type"
+    # -- protocol -----------------------------------------------------------
+    # One flat list. TUN-ICMP is not a category with something inside it: it
+    # is a protocol you pick, and picking it is what brings up the local link.
+    wiz "Protocol"
     CHOICE_DEF="1"
     choice 1 "TCP" "over the two public addresses - several connections at once"
-    choice 2 "TUN" "a private network between the servers"
+    choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
     CHOICE_DEF=""
     say ""
-    local kind=""
-    ask kind "select" "1"
+    local proto=""
+    ask proto "select" "1"
 
-    if [ "$kind" = "2" ]; then
-        T_KIND="tun"
-
-        wiz "What carries the link?"
-        CHOICE_DEF="1"
-        choice 1 "ICMP" "inside ping packets - no port needed"
-        CHOICE_DEF=""
-        say ""
-        dim "GRE and others will land here later."
-        say ""
-        local sub=""
-        ask sub "select" "1"
-        T_TRANSPORT="icmp"
-        wiz_add "TUN over ICMP"
+    if [ "$proto" = "2" ]; then
+        T_KIND="tun"; T_TRANSPORT="icmp"
 
         wiz "Who forwards the ports?"
         CHOICE_DEF="1"
@@ -313,12 +304,9 @@ new_tunnel() {
             [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
             T_FORWARDER="pingify"
         fi
-        wiz_add "$(forwarder_label "$T_FORWARDER")"
-        T_ACCEPTS="server"
     else
         T_KIND="tcp"; T_TRANSPORT="tcp"
         T_FORWARDER="pingify"
-        wiz_add "TCP"
     fi
     cfg_mode
 
@@ -331,15 +319,24 @@ new_tunnel() {
     # accepts it and then loses the flow a few kilobytes in. If one direction
     # will not stay up, the other usually will.
     #
-    # ICMP is not asked. It has no port to be reachable on, so there is
-    # nothing to choose - IRAN accepts the echoes and KHAREJ sends them, which
-    # is what every working ICMP tunnel has done.
+    # Reverse is what a Pingify tunnel is. IRAN accepts and KHAREJ comes to
+    # it, which is the arrangement ICMP has always used and the one every
+    # other transport starts from.
+    #
+    # TCP is asked because there it can fail: an Iranian server that will not
+    # hold an inbound connection has no way to be reached, and turning the
+    # link around is the only thing that helps. ICMP is not asked - it has no
+    # port to be reachable on, so there is nothing to choose.
+    T_ACCEPTS="server"
     if [ "$T_TRANSPORT" = "tcp" ]; then
         wiz "Link direction"
         CHOICE_DEF="1"
-        choice 1 "Direct" "IRAN opens the connection to KHAREJ"
-        choice 2 "Reverse" "KHAREJ opens it to IRAN - IRAN needs the port reachable"
+        choice 1 "Reverse" "KHAREJ opens the connection to IRAN - the usual one"
+        choice 2 "Direct" "IRAN opens it to KHAREJ - when inbound to IRAN will not hold"
         CHOICE_DEF=""
+        say ""
+        dim "Reverse needs the tunnel port reachable on IRAN. If carriers come"
+        dim "up and then go quiet, that is the one to turn around."
         say ""
         dim "The same on both servers. The token carries it, so the second"
         dim "server is not asked."
@@ -347,32 +344,40 @@ new_tunnel() {
         local dir=""
         ask dir "select" "1"
         if [ "$dir" = "2" ]; then
-            T_ACCEPTS="server"      # IRAN accepts; KHAREJ dials in
-        else
             T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
+        else
+            T_ACCEPTS="server"      # IRAN accepts; KHAREJ dials in
         fi
     fi
 
     # -- where the servers are ---------------------------------------------
+    #
+    # Both addresses, always. The far one is obvious - somebody has to be
+    # dialled or answered. The near one matters on a server with more than one
+    # address: ICMP answers from whatever the kernel picks otherwise, and a
+    # reply that leaves from an address the far end is not expecting is a reply
+    # the far end throws away.
     wiz "Addresses"
     if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
         T_PUBLIC_IP="$SRV_IP"
-        dim "this machine reports $SRV_IP"
+        dim "this machine reports ${C_OFF}${SRV_IP}${C_DIM} - press enter to take it"
         say ""
     fi
-    ask T_PUBLIC_IP "this server" "$T_PUBLIC_IP"
+    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP"
+    [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if ! this_side_accepts; then
-        say ""
-        ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server"
-        [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
-    fi
+    say ""
+    ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
+    [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
     if [ "$T_TRANSPORT" = "tcp" ]; then
         say ""
         ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
         case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
+    else
+        say ""
+        dim "ICMP needs no port on either server."
     fi
 
     # -- name, derived ------------------------------------------------------
