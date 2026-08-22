@@ -336,22 +336,14 @@ new_tunnel() {
 
     # -- security ----------------------------------------------------------
     head2 "Security token"
-    dim "One secret, typed by hand on BOTH servers, exactly the same. It is the"
-    dim "only thing standing between this tunnel and anyone who finds the port,"
-    dim "so treat it like a password: at least $TOKEN_MIN characters, and not a word."
+    dim "One secret, typed by hand on BOTH servers, exactly the same. Any length"
+    dim "you like - it is what the two ends use to recognise each other."
     say ""
     while :; do
         ask T_TOKEN "token"
         T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-        if [ "${#T_TOKEN}" -lt "$TOKEN_MIN" ]; then
-            fail "too short - ${#T_TOKEN} characters, the minimum is $TOKEN_MIN"
-            continue
-        fi
-        case "$T_TOKEN" in
-            *[!a-zA-Z0-9]*) break ;;
-            *[a-zA-Z]*[0-9]*|*[0-9]*[a-zA-Z]*) break ;;
-            *) warn "letters only - mix in digits or punctuation to make it worth typing" ; break ;;
-        esac
+        [ -n "$T_TOKEN" ] && break
+        fail "a token is required"
     done
     say ""
     ok "token fingerprint: ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
