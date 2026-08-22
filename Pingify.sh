@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.3.0"
+PINGIFY_VERSION="5.3.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -274,6 +274,38 @@ ask() {
         read -rp "  ${C_CYN}${BX_ARR}${C_OFF} ${__prompt}${C_B}:${C_OFF} " __in
     fi
     printf -v "$__var" '%s' "$__in"
+}
+
+# pick <var> <prompt> <valid>... - insist on one of the listed answers.
+#
+# Some questions have no sensible default. Which server this is, what protocol
+# to speak, who forwards - an empty enter that quietly means "the first one" is
+# how somebody ends up with a tunnel they did not choose and cannot explain.
+pick() {
+    local __var="$1" __prompt="$2"; shift 2
+    local __in="" __v
+    while :; do
+        ask __in "$__prompt"
+        if [ -z "$__in" ]; then
+            fail "this one has no default - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
+            continue
+        fi
+        for __v in "$@"; do
+            if [ "$__in" = "$__v" ]; then
+                printf -v "$__var" '%s' "$__in"
+                return 0
+            fi
+        done
+        fail "not one of the options - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
+    done
+}
+
+# confirm_yes is confirm with the answer already leaning the right way: by the
+# time it is asked, everything has been reviewed and the expected reply is yes.
+confirm_yes() {
+    local reply=""
+    read -rp "  ${C_YEL}?${C_OFF} $1 ${C_DIM}[Y/n]${C_OFF}${C_B}:${C_OFF} " reply
+    case "$reply" in [nN] | [nN][oO]) return 1 ;; *) return 0 ;; esac
 }
 
 confirm() {
@@ -580,7 +612,7 @@ adopt_core() {
     fi
     install -m 0755 "$tmp" "$CORE_BIN" || return 1
     rm -f "$tmp"
-    ok "core ready: $("$CORE_BIN" -version)"
+    ok "core $("$CORE_BIN" -version | awk '{print $2}') installed"
     return 0
 }
 
@@ -608,7 +640,6 @@ download_core() {
             rm -f "$tmp"
             return 1
         fi
-        [ -n "$want" ] && dim "checksum verified"
     fi
 
     adopt_core "$tmp"
@@ -660,10 +691,7 @@ import_core_binary() {
 # install_core is the full ladder; ensure_core only runs it when needed.
 install_core() {
     if download_core; then return 0; fi
-    say ""
-    warn "could not fetch the prebuilt core from GitHub"
-    dim "compiling it here instead - this needs Go but downloads nothing"
-    say ""
+    warn "GitHub is not reachable - compiling the core here instead"
     build_core
 }
 
@@ -1041,13 +1069,11 @@ new_tunnel() {
 
     # -- which server is this ----------------------------------------------
     wiz "Which server is this?"
-    CHOICE_DEF="1"
-    choice 1 "IRAN" "clients connect here"
+    choice 1 "IRAN" "clients connect here, and the ports live here"
     choice 2 "KHAREJ" "your panel and inbounds run here"
-    CHOICE_DEF=""
     say ""
     local side=""
-    ask side "select" "1"
+    pick side "select" 1 2
     if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
     wiz_add "$(side_label "$T_ROLE")"
 
@@ -1055,28 +1081,24 @@ new_tunnel() {
     # One flat list. TUN-ICMP is not a category with something inside it: it
     # is a protocol you pick, and picking it is what brings up the local link.
     wiz "Protocol"
-    CHOICE_DEF="1"
     choice 1 "TCP" "over the two public addresses - several connections at once"
     choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
-    CHOICE_DEF=""
     say ""
     local proto=""
-    ask proto "select" "1"
+    pick proto "select" 1 2
 
     if [ "$proto" = "2" ]; then
         T_KIND="tun"; T_TRANSPORT="icmp"
 
         wiz "Who forwards the ports?"
-        CHOICE_DEF="1"
         choice 1 "PINGIFY" "the core carries every connection itself"
         choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
-        CHOICE_DEF=""
         say ""
         dim "With IPTABLES the service on KHAREJ has to listen on 0.0.0.0,"
         dim "not only on 127.0.0.1."
         say ""
         local fw=""
-        ask fw "select" "1"
+        pick fw "select" 1 2
         if [ "$fw" = "2" ] && have iptables; then
             T_FORWARDER="iptables"
         else
@@ -1271,7 +1293,7 @@ new_tunnel() {
     field "Logging" "$T_LOG"
     panel_end
     say ""
-    if ! confirm "create it?"; then
+    if ! confirm_yes "create the tunnel ${C_B}${T_NAME}${C_OFF}?"; then
         warn "cancelled, nothing was written"
         pause
         return 1
@@ -1744,6 +1766,38 @@ level            = "%s"
     pause
 }
 
+# The health port is where -status and the watchdog ask how a tunnel is doing.
+# It is picked automatically and bound to loopback, so it is not reachable from
+# anywhere and cannot collide with another tunnel - but a fixed one is easier
+# to point a monitor at, so it can be set.
+edit_health() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    cfg_load "$name" || return 1
+    banner
+    head2 "Health port: $name"
+    say ""
+    dim "Bound to 127.0.0.1, so nothing outside this server can reach it."
+    dim "Used by -status and by the watchdog. Local to this server: the two"
+    dim "ends do not have to match."
+    say ""
+    local p=""
+    ask p "port" "${T_STATUS##*:}"
+    case "$p" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
+
+    cp -f "$f" "$f.bak"
+    sed -i "s#^addr .*#addr             = \"127.0.0.1:$p\"#" "$f"
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "health port is now $p"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
+}
+
 shaping_label() {
     case "$(toml_get "$(cfg_file "$1")" transport obfuscate)" in
         true) printf 'on' ;;
@@ -1850,6 +1904,7 @@ tuning_menu() {
         field "Profile" "$T_PRESET"
         field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
         field "Keepalive" "${T_KEEPALIVE} s"
+        field "Health port" "$T_STATUS"
         panel_end
         say ""
         dim "Read the top box on the other server and make it read the same."
@@ -1862,6 +1917,7 @@ tuning_menu() {
         item 4 "Keepalive" "$T_KEEPALIVE seconds"
         item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
         item 6 "Logging" "$T_LOG"
+        item 7 "Health port" "$T_STATUS"
         item 0 "Back"
         say ""
         local c=""
@@ -1877,6 +1933,7 @@ tuning_menu() {
                tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
             5) edit_shaping "$name" ;;
             6) edit_logging "$name" ;;
+            7) edit_health "$name" ;;
             0|"") return ;;
         esac
     done
@@ -4122,7 +4179,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.3.0"
+const version = "5.3.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -7389,19 +7446,15 @@ info_panel() {
 first_run() {
     [ -x "$CORE_BIN" ] && return 0
     banner
-    head2 "First run"
-    dim "installing the core into $BASE_DIR"
-    say ""
+    head2 "Setting up"
     if install_core; then
-        say ""
-        ok "ready"
         sleep 1
-    else
-        say ""
-        fail "the core could not be installed"
-        dim "Update core has the other ways to get it"
-        pause
+        return 0
     fi
+    say ""
+    fail "the core could not be installed"
+    dim "Core in the menu has the other ways to get it"
+    pause
 }
 
 main_menu() {

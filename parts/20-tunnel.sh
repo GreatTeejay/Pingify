@@ -262,13 +262,11 @@ new_tunnel() {
 
     # -- which server is this ----------------------------------------------
     wiz "Which server is this?"
-    CHOICE_DEF="1"
-    choice 1 "IRAN" "clients connect here"
+    choice 1 "IRAN" "clients connect here, and the ports live here"
     choice 2 "KHAREJ" "your panel and inbounds run here"
-    CHOICE_DEF=""
     say ""
     local side=""
-    ask side "select" "1"
+    pick side "select" 1 2
     if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
     wiz_add "$(side_label "$T_ROLE")"
 
@@ -276,28 +274,24 @@ new_tunnel() {
     # One flat list. TUN-ICMP is not a category with something inside it: it
     # is a protocol you pick, and picking it is what brings up the local link.
     wiz "Protocol"
-    CHOICE_DEF="1"
     choice 1 "TCP" "over the two public addresses - several connections at once"
     choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
-    CHOICE_DEF=""
     say ""
     local proto=""
-    ask proto "select" "1"
+    pick proto "select" 1 2
 
     if [ "$proto" = "2" ]; then
         T_KIND="tun"; T_TRANSPORT="icmp"
 
         wiz "Who forwards the ports?"
-        CHOICE_DEF="1"
         choice 1 "PINGIFY" "the core carries every connection itself"
         choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
-        CHOICE_DEF=""
         say ""
         dim "With IPTABLES the service on KHAREJ has to listen on 0.0.0.0,"
         dim "not only on 127.0.0.1."
         say ""
         local fw=""
-        ask fw "select" "1"
+        pick fw "select" 1 2
         if [ "$fw" = "2" ] && have iptables; then
             T_FORWARDER="iptables"
         else
@@ -492,7 +486,7 @@ new_tunnel() {
     field "Logging" "$T_LOG"
     panel_end
     say ""
-    if ! confirm "create it?"; then
+    if ! confirm_yes "create the tunnel ${C_B}${T_NAME}${C_OFF}?"; then
         warn "cancelled, nothing was written"
         pause
         return 1

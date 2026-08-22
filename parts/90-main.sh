@@ -170,19 +170,15 @@ info_panel() {
 first_run() {
     [ -x "$CORE_BIN" ] && return 0
     banner
-    head2 "First run"
-    dim "installing the core into $BASE_DIR"
-    say ""
+    head2 "Setting up"
     if install_core; then
-        say ""
-        ok "ready"
         sleep 1
-    else
-        say ""
-        fail "the core could not be installed"
-        dim "Update core has the other ways to get it"
-        pause
+        return 0
     fi
+    say ""
+    fail "the core could not be installed"
+    dim "Core in the menu has the other ways to get it"
+    pause
 }
 
 main_menu() {

@@ -286,6 +286,38 @@ level            = "%s"
     pause
 }
 
+# The health port is where -status and the watchdog ask how a tunnel is doing.
+# It is picked automatically and bound to loopback, so it is not reachable from
+# anywhere and cannot collide with another tunnel - but a fixed one is easier
+# to point a monitor at, so it can be set.
+edit_health() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    cfg_load "$name" || return 1
+    banner
+    head2 "Health port: $name"
+    say ""
+    dim "Bound to 127.0.0.1, so nothing outside this server can reach it."
+    dim "Used by -status and by the watchdog. Local to this server: the two"
+    dim "ends do not have to match."
+    say ""
+    local p=""
+    ask p "port" "${T_STATUS##*:}"
+    case "$p" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
+
+    cp -f "$f" "$f.bak"
+    sed -i "s#^addr .*#addr             = \"127.0.0.1:$p\"#" "$f"
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "health port is now $p"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
+}
+
 shaping_label() {
     case "$(toml_get "$(cfg_file "$1")" transport obfuscate)" in
         true) printf 'on' ;;
@@ -392,6 +424,7 @@ tuning_menu() {
         field "Profile" "$T_PRESET"
         field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
         field "Keepalive" "${T_KEEPALIVE} s"
+        field "Health port" "$T_STATUS"
         panel_end
         say ""
         dim "Read the top box on the other server and make it read the same."
@@ -404,6 +437,7 @@ tuning_menu() {
         item 4 "Keepalive" "$T_KEEPALIVE seconds"
         item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
         item 6 "Logging" "$T_LOG"
+        item 7 "Health port" "$T_STATUS"
         item 0 "Back"
         say ""
         local c=""
@@ -419,6 +453,7 @@ tuning_menu() {
                tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
             5) edit_shaping "$name" ;;
             6) edit_logging "$name" ;;
+            7) edit_health "$name" ;;
             0|"") return ;;
         esac
     done
