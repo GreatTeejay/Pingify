@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.7.1"
+PINGIFY_VERSION="5.8.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -21,6 +21,9 @@ CORE_BIN="$BASE_DIR/pingify-core"
 SELF_BIN="/usr/local/bin/pingify"   # has to be on PATH for the "pingify" command
 UNIT_DIR="/etc/systemd/system"
 SYSCTL_FILE="/etc/sysctl.d/99-pingify.conf"
+# AmneziaWG reads its interface config from a file, and awg-quick names the
+# interface after that file, so ours live under Pingify's own directory.
+AWG_DIR="$BASE_DIR/awg"
 GO_MIN_MINOR=19          # the core needs Go 1.19 or newer
 GO_FALLBACK="go1.22.12"  # used only when the version index is unreachable
 
@@ -881,6 +884,10 @@ cfg_reset() {
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
+    # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
+    # the obfuscation values both ends have to agree on
+    T_GRE_TTL=255
+    T_AWG_PORT=51820; T_AWG_PRIV=""; T_AWG_PUB=""; T_AWG_OBF=""
 }
 
 this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
@@ -889,6 +896,14 @@ this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
 # over the two public addresses and leaves the machine as it found it, so the
 # core is the only thing that can forward on it.
 cfg_mode() {
+    # GRE and AmneziaWG are the kernel's own tunnels. They always build a
+    # private link, and the kernel is the only thing that can forward on it -
+    # our core is not in the path at all.
+    if kernel_transport; then
+        T_KIND="tun"; T_MODE="tun"; T_FORWARDER="iptables"
+        T_TUNIF="$(link_iface "$T_NAME")"
+        return
+    fi
     if [ "$T_KIND" = "tun" ]; then
         # both forwarders work here: the kernel can NAT onto the local tunnel,
         # or the core can carry the ports over the same carriers.
@@ -905,6 +920,9 @@ cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 # one part of a tunnel that differs between the two servers.
 cfg_endpoints() {
     CFG_LISTEN=""; CFG_CONNECT=""
+    # A kernel tunnel names both addresses in its own section; there is no
+    # socket here for anything to listen on or dial.
+    kernel_transport && return
     if this_side_accepts; then
         # ICMP has no port, so listen carries the address to answer from.
         if [ "$T_TRANSPORT" = "icmp" ]; then CFG_LISTEN="${T_PUBLIC_IP:-0.0.0.0}"
@@ -1042,6 +1060,21 @@ cfg_render() {
         printf 'remote_addr      = "%s"\n' "$T_TUNPEER"
         printf 'mtu              = %s\n' "$T_TUNMTU"
     fi
+    if [ "$T_TRANSPORT" = "gre" ]; then
+        printf '\n[gre]\n'
+        printf 'ttl              = %s\n' "$T_GRE_TTL"
+        printf 'local_public     = "%s"\n' "$T_PUBLIC_IP"
+        printf 'peer_public      = "%s"\n' "$T_PEER_IP"
+    fi
+    if [ "$T_TRANSPORT" = "awg" ]; then
+        printf '\n[awg]\n'
+        printf 'listen_port      = %s\n' "$T_AWG_PORT"
+        printf 'private_key      = "%s"\n' "$T_AWG_PRIV"
+        printf 'peer_key         = "%s"\n' "$T_AWG_PUB"
+        printf 'obfuscation      = "%s"\n' "$T_AWG_OBF"
+        printf 'local_public     = "%s"\n' "$T_PUBLIC_IP"
+        printf 'peer_public      = "%s"\n' "$T_PEER_IP"
+    fi
     printf '\n[tuning]\n'
     printf 'profile          = "%s"\n' "$T_PRESET"
     printf 'window_kb        = %s\n' "$T_WINDOW"
@@ -1069,6 +1102,17 @@ cfg_check_complete() {
     fi
     if ! this_side_accepts && [ -z "$T_PEER_IP" ]; then
         missing="$missing peer-address"
+    fi
+    if kernel_transport; then
+        # Both ends of a kernel tunnel name both public addresses: the kernel
+        # builds the link from the pair, not from whoever dialled first.
+        [ -n "$T_PUBLIC_IP" ] || missing="$missing this-address"
+        [ -n "$T_PEER_IP" ]   || missing="$missing peer-address"
+        [ -n "$T_TUNPEER" ]   || missing="$missing peer-private-address"
+        if [ "$T_TRANSPORT" = "awg" ]; then
+            [ -n "$T_AWG_PRIV" ] || missing="$missing private-key"
+            [ -n "$T_AWG_PUB" ]  || missing="$missing peer-key"
+        fi
     fi
     if [ -n "$missing" ]; then
         fail "these are still missing:$missing"
@@ -1105,6 +1149,8 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'TUN-ICMP' ;;
+        gre)         printf 'TUN-GRE' ;;
+        awg)         printf 'TUN-AWG' ;;
         *)           printf 'TCP' ;;
     esac
 }
@@ -1134,6 +1180,7 @@ transport_label() {
 
 cfg_setup_token() {
     local dial host="" port="" tl="" tp="" mtu=""
+    local ttl="" awgport="" awgpriv="" awgpub="" awgobf=""
     if this_side_accepts; then
         dial=1; host="$T_PUBLIC_IP"
     else
@@ -1147,11 +1194,25 @@ cfg_setup_token() {
         tp="${T_TUNLOCAL}"
         mtu="$T_TUNMTU"
     fi
-    printf 'p2|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    if kernel_transport; then
+        # The kernel builds its link from a pair of public addresses, so both
+        # ends need both of them - not just whichever one dials.
+        host="$T_PUBLIC_IP"
+        if [ "$T_TRANSPORT" = "gre" ]; then
+            ttl="$T_GRE_TTL"
+        else
+            awgport="$T_AWG_PORT"
+            awgpriv="$awg_peer_priv"   # the half the other server keeps
+            awgpub="$awg_self_pub"     # ours, which it lists as its peer
+            awgobf="$T_AWG_OBF"
+        fi
+    fi
+    printf 'p3|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$T_KIND" "$T_TRANSPORT" "$T_MODE" "$T_FORWARDER" \
         "$dial" "$host" "$port" "$T_TOKEN" \
         "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
         "$tl" "$tp" "$mtu" \
+        "$ttl" "$awgport" "$awgpriv" "$awgpub" "$awgobf" \
         | base64 | tr -d '\n'
 }
 
@@ -1168,12 +1229,15 @@ import_tunnel() {
     local raw
     raw="$(printf '%s' "$token" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)"
     case "$raw" in
-        p2\|*) ;;
+        p2\|* | p3\|*) ;;
         *) fail "that is not a Pingify setup token"; pause; return 1 ;;
     esac
 
+    # p3 added the five kernel-tunnel fields on the end. A p2 token simply
+    # leaves them empty, which is what it meant.
     local v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu
-    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu <<TOKEN
+    local ttl awgport awgpriv awgpub awgobf
+    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu ttl awgport awgpriv awgpub awgobf <<TOKEN
 $raw
 TOKEN
     if [ -z "$tok" ] || [ -z "$tr" ]; then
@@ -1189,6 +1253,16 @@ TOKEN
     T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
     T_PRESET="$(preset_name "$car" "$win")"
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
+    if kernel_transport; then
+        # The kernel needs both public addresses whichever end this is, and
+        # the token carries the sender's regardless of who dials.
+        T_PEER_IP="$host"
+        T_GRE_TTL="${ttl:-255}"
+        T_AWG_PORT="${awgport:-51820}"
+        T_AWG_PRIV="$awgpriv"   # made on the other server, for this one
+        T_AWG_PUB="$awgpub"     # the other server's public half
+        T_AWG_OBF="$awgobf"
+    fi
 
     # The other end told us which side it is by telling us what to do about
     # the connection, so our own role follows from that plus who owns ports.
@@ -1239,18 +1313,23 @@ TOKEN
     fi
 
     T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
-    if [ "$T_TRANSPORT" = "icmp" ]; then
-        T_NAME="${T_NAME}-icmp"
-    else
-        T_NAME="${T_NAME}-${T_PORT}"
-    fi
+    case "$T_TRANSPORT" in
+        # A tunnel that builds a private link says so in its own name, so a
+        # list of them reads as what they are without a column being consulted.
+        icmp) T_NAME="tun-${T_NAME}-icmp" ;;
+        gre)  T_NAME="tun-${T_NAME}-gre" ;;
+        awg)  T_NAME="tun-${T_NAME}-awg" ;;
+        *)    T_NAME="${T_NAME}-${T_PORT}" ;;
+    esac
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         say ""
         warn "a tunnel named $T_NAME already exists on this server"
         confirm "replace it?" || return 1
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
-    T_STATUS="127.0.0.1:$(pick_status_port 9700)"
+    # A kernel tunnel runs no process of ours, so there is nothing to serve a
+    # status endpoint and nothing that would read one.
+    kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:$(pick_status_port 9700)"
 
     banner
     head2 "Ready to create"
@@ -1320,29 +1399,43 @@ new_tunnel() {
     wiz "Protocol"
     choice 1 "TCP" "over the two public addresses - several connections at once"
     choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
+    choice 3 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
+    choice 4 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
     local proto=""
-    pick proto "select" 1 2
+    pick proto "select" 1 2 3 4
 
-    if [ "$proto" = "2" ]; then
-        T_KIND="tun"; T_TRANSPORT="icmp"
-
-        wiz "Who forwards the ports?"
-        choice 1 "PINGIFY" "the core carries every connection itself"
-        choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
-        say ""
-        local fw=""
-        pick fw "select" 1 2
-        if [ "$fw" = "2" ] && have iptables; then
-            T_FORWARDER="iptables"
-        else
-            [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
-            T_FORWARDER="pingify"
-        fi
-    else
-        T_KIND="tcp"; T_TRANSPORT="tcp"
-        T_FORWARDER="pingify"
-    fi
+    case "$proto" in
+        2)  T_KIND="tun"; T_TRANSPORT="icmp"
+            wiz "Who forwards the ports?"
+            choice 1 "PINGIFY" "the core carries every connection itself"
+            choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
+            say ""
+            local fw=""
+            pick fw "select" 1 2
+            if [ "$fw" = "2" ] && have iptables; then
+                T_FORWARDER="iptables"
+            else
+                [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
+                T_FORWARDER="pingify"
+            fi ;;
+        3)  T_TRANSPORT="gre"
+            # GRE is protocol 47 with no encryption and no disguise. It is the
+            # fastest thing here by a distance, and the easiest to recognise,
+            # so say so before rather than after.
+            say ""
+            warn "GRE carries nothing secret and hides nothing"
+            dim "it is the kernel moving packets with no encryption and no"
+            dim "obfuscation, so anything watching the path can see what it is."
+            dim "Fast, and worth it where the path still allows it."
+            say ""
+            confirm_yes "use TUN-GRE?" || return 0
+            gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
+        4)  T_TRANSPORT="awg"
+            awg_install || { pause; return 1; } ;;
+        *)  T_KIND="tcp"; T_TRANSPORT="tcp"
+            T_FORWARDER="pingify" ;;
+    esac
     cfg_mode
 
     # -- which way the link is opened, TCP only ----------------------------
@@ -1404,10 +1497,13 @@ new_tunnel() {
         ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
         case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
         this_side_accepts && dim "leave $T_PORT open in this server's firewall"
-    else
+    elif [ "$T_TRANSPORT" = "awg" ]; then
         say ""
-
+        ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT"
+        case "$T_AWG_PORT" in "" | *[!0-9]*) T_AWG_PORT=51820 ;; esac
+        dim "leave ${T_AWG_PORT}/udp open in this server's firewall"
     fi
+    say ""
 
     # -- name, derived ------------------------------------------------------
     # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
@@ -1425,8 +1521,19 @@ new_tunnel() {
         T_NAME="${T_NAME}-${n}"
     fi
     ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
+    # The interface is named after the tunnel, and the tunnel only got its
+    # name just now - cfg_mode ran back when it had none.
+    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
 
     # -- the private link, whenever one is needed --------------------------
+    #
+    # Each transport pays a different tax on every packet, so the starting MTU
+    # follows the transport: GRE adds 24 bytes, AmneziaWG adds its own header
+    # plus the junk it pads with, and ICMP carries ours.
+    case "$T_TRANSPORT" in
+        gre) T_TUNMTU=1400 ;;
+        awg) T_TUNMTU=1320 ;;
+    esac
     if cfg_needs_link; then
         wiz "Private link" "Both servers get an address on a small network of their own."
         local octet=""
@@ -1441,9 +1548,31 @@ new_tunnel() {
         ask T_TUNLOCAL "this server" "$T_TUNLOCAL"
         ask T_TUNPEER  "the other server" "$T_TUNPEER"
         say ""
-        ask T_TUNIF    "device name" "$T_TUNIF"
+        # A kernel tunnel's interface is named after the tunnel, so there is
+        # nothing to answer; ours is ours to choose.
+        kernel_transport || ask T_TUNIF "device name" "$T_TUNIF"
         ask T_TUNMTU   "MTU" "$T_TUNMTU"
         case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
+    fi
+
+    # -- AmneziaWG keys -----------------------------------------------------
+    #
+    # WireGuard needs a real keypair on each side, and each side needs the
+    # other's public half. Normally that is two visits to two servers with a
+    # key carried between them, and the script this came from asks for exactly
+    # that. Both pairs are made here instead and the other server's half rides
+    # in the setup token with everything else, because the token is already
+    # the secret that carries the tunnel and one trip is better than three.
+    local awg_peer_priv="" awg_self_pub=""
+    if [ "$T_TRANSPORT" = "awg" ]; then
+        local mine theirs
+        mine="$(awg_keypair)"   || { fail "awg genkey failed"; pause; return 1; }
+        theirs="$(awg_keypair)" || { fail "awg genkey failed"; pause; return 1; }
+        T_AWG_PRIV="${mine%% *}"          # ours, kept here
+        T_AWG_PUB="${theirs##* }"         # the other server's, listed as peer
+        awg_peer_priv="${theirs%% *}"     # the other server's, travels
+        awg_self_pub="${mine##* }"        # ours, travels
+        T_AWG_OBF="$(awg_new_obf)"
     fi
 
     # -- security ----------------------------------------------------------
@@ -1490,7 +1619,9 @@ new_tunnel() {
         *) T_LOG="info" ;;
     esac
 
-    T_STATUS="127.0.0.1:$(pick_status_port 9700)"
+    # A kernel tunnel runs no process of ours, so there is nothing to serve a
+    # status endpoint and nothing that would read one.
+    kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:$(pick_status_port 9700)"
 
     # -- review ------------------------------------------------------------
     banner
@@ -1527,15 +1658,23 @@ new_tunnel() {
     say ""
     local file
     file="$(cfg_save)" || { pause; return 1; }
-    if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
-        fail "the core rejected this configuration"
-        core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
-        "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
-        rm -f "$file"
-        pause; return 1
+    # The core only judges configs it is going to run. A kernel tunnel has no
+    # core in the path at all, so asking it would be asking the wrong program.
+    if ! kernel_transport; then
+        if ! "$CORE_BIN" -c "$file" -check >/dev/null 2>&1; then
+            fail "the core rejected this configuration"
+            core_matches_script || dim "the core is $(core_version) and this script is $PINGIFY_VERSION - update the core"
+            "$CORE_BIN" -c "$file" -check 2>&1 | sed 's/^/      /'
+            rm -f "$file"
+            pause; return 1
+        fi
     fi
 
     write_units
+    if kernel_transport; then
+        [ "$T_TRANSPORT" = "awg" ] && awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
+        write_link_unit "$T_NAME" || { fail "could not write the unit"; pause; return 1; }
+    fi
     service_enable_start "$T_NAME"
     enable_watchdog quiet
     # Unconditional: apply_nat tears the chains down when no tunnel needs
@@ -1547,7 +1686,7 @@ new_tunnel() {
     # kernel copies to us regardless, and both ends send echo *replies*, which
     # the kernel never answers by itself - but a tunnel hiding inside ping is
     # not helped by a host that cheerfully answers every scanner that asks.
-    if [ "$T_TRANSPORT" = "icmp" ] && [ "$T_ROLE" = "server" ]        && [ "$(block_state icmp)" != "on" ]; then
+    if [ "$T_TRANSPORT" = "icmp" ] && [ "$T_ROLE" = "server" ] && [ "$(block_state icmp)" != "on" ]; then
         mkdir -p "$STATE_DIR"
         : > "$STATE_DIR/block-icmp"
         apply_blocking quiet
@@ -1706,6 +1845,347 @@ show_nat() {
 }
 
 # ---------------------------------------------------------------------------
+# kernel tunnels: GRE and AmneziaWG
+#
+# Everything up to here is carried by our own engine: a Go process holds the
+# carriers open and moves the bytes. These two are not. The kernel carries
+# them, and Pingify's job is to describe the link, write the unit that brings
+# it up, and then answer the same questions about it that it answers about
+# every other tunnel - is it up, how far away is the other end, what is wrong.
+#
+# Both build a private link between the two servers, so both wear the TUN
+# label, and both hand their forwarding to the iptables forwarder that already
+# exists for that case: DNAT onto the other server's private address, and
+# masquerade back out of the tunnel interface.
+#
+# The instance unit is a concrete pingify@<name>.service, which systemd
+# prefers over the pingify@.service template. That is deliberate: every place
+# in this manager that starts, stops, watches or deletes a tunnel keeps
+# working without knowing which kind it is holding.
+# ---------------------------------------------------------------------------
+
+# The kernel carries these; there is no core process and no status endpoint.
+kernel_transport() {
+    case "${1:-$T_TRANSPORT}" in
+        gre | awg) return 0 ;;
+        *)         return 1 ;;
+    esac
+}
+
+# One interface name per tunnel, derived so two tunnels never collide and a
+# person can still read it. Linux stops at 15 characters, and the tunnel's own
+# name already carries the transport at both ends - tun-iran-gre - so strip
+# what the prefix is about to say again and the result is gre-iran.
+link_iface() {
+    local name="$1" pfx short
+    case "$T_TRANSPORT" in
+        gre) pfx="gre" ;;
+        awg) pfx="awg" ;;
+        *)   pfx="pfy" ;;
+    esac
+    short="${name#tun-}"
+    short="${short%-$pfx}"
+    if [ -n "$short" ] && [ "${#short}" -le 11 ]; then
+        printf '%s-%s' "$pfx" "$short"
+    else
+        # Nothing readable left that fits: a hash keeps them apart, which is
+        # the one thing the name has to do.
+        printf '%s-%s' "$pfx" "$(printf '%s' "$name" | cksum | cut -d' ' -f1)"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# what the kernel needs to have
+# ---------------------------------------------------------------------------
+
+gre_ready() {
+    have ip || return 1
+    # ip_gre is usually a module and usually not loaded until something asks.
+    modprobe ip_gre >/dev/null 2>&1
+    return 0
+}
+
+awg_ready() { have awg && have awg-quick; }
+
+# The install is a best effort: an Iran server with no route to the PPA cannot
+# do this, and saying so plainly beats a unit that fails at boot.
+awg_install() {
+    awg_ready && return 0
+    say ""
+    dim "installing amneziawg-tools"
+    if have add-apt-repository; then
+        add-apt-repository -y ppa:amnezia/ppa >/dev/null 2>&1
+    fi
+    if have apt-get; then
+        apt-get update >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y amneziawg amneziawg-tools >/dev/null 2>&1
+    fi
+    awg_ready && { ok "amneziawg-tools installed"; return 0; }
+
+    fail "amneziawg could not be installed on this server"
+    dim "it needs the Amnezia PPA, which an Iran server often cannot reach."
+    dim "install it from a server that can, or use TUN-GRE, which needs nothing."
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# AmneziaWG keys and obfuscation
+# ---------------------------------------------------------------------------
+
+# One keypair, printed as "private public". WireGuard needs a real asymmetric
+# pair on each side, and each side needs the other's public half.
+awg_keypair() {
+    local priv pub
+    priv="$(awg genkey 2>/dev/null)" || return 1
+    pub="$(printf '%s' "$priv" | awg pubkey 2>/dev/null)" || return 1
+    printf '%s %s' "$priv" "$pub"
+}
+
+# The obfuscation parameters, as one comma-separated field:
+#
+#   Jc          how many junk packets go before the handshake
+#   Jmin Jmax   how big each of them is
+#   S1 S2       padding added to the two handshake messages
+#   H1..H4      what the four WireGuard message types are called on the wire
+#
+# Jc/Jmin/Jmax/S1/S2 are the values that were measured stable on this path and
+# are kept. H1..H4 are not: the script this idea came from hardcodes four
+# numbers, which means every tunnel built by it answers to the same four
+# values - a signature, and a better one than the plain WireGuard header it
+# was meant to hide. Ours are drawn per tunnel and travel in the setup token,
+# so the two servers agree and no two tunnels look alike.
+awg_new_obf() {
+    local h1 h2 h3 h4
+    h1="$(awg_rand_header)"; h2="$(awg_rand_header)"
+    h3="$(awg_rand_header)"; h4="$(awg_rand_header)"
+    printf '5,50,1000,68,91,%s,%s,%s,%s' "$h1" "$h2" "$h3" "$h4"
+}
+
+# A header value has to be above 4, because 1-4 are what real WireGuard uses
+# and reusing one would make the tunnel answer to its own obfuscation.
+awg_rand_header() {
+    local n
+    n="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    case "$n" in '' | *[!0-9]*) n="$(( ($$ * 2654435761) % 2147483647 ))" ;; esac
+    printf '%s' "$(( (n % 2147483600) + 5 ))"
+}
+
+# obf_field N FIELDS - pull one value out of that comma-separated list
+obf_field() { printf '%s' "$2" | cut -d, -f"$1"; }
+
+awg_write_conf() {
+    local name="$1" iface="$2" conf="$3"
+    local obf="$T_AWG_OBF"
+    mkdir -p "$(dirname "$conf")"
+    {
+        printf '# Pingify %s - written by the manager\n' "$name"
+        printf '[Interface]\n'
+        printf 'PrivateKey = %s\n' "$T_AWG_PRIV"
+        printf 'Address = %s\n' "$T_TUNLOCAL"
+        printf 'ListenPort = %s\n' "$T_AWG_PORT"
+        printf 'MTU = %s\n' "$T_TUNMTU"
+        printf 'Jc = %s\n'   "$(obf_field 1 "$obf")"
+        printf 'Jmin = %s\n' "$(obf_field 2 "$obf")"
+        printf 'Jmax = %s\n' "$(obf_field 3 "$obf")"
+        printf 'S1 = %s\n'   "$(obf_field 4 "$obf")"
+        printf 'S2 = %s\n'   "$(obf_field 5 "$obf")"
+        printf 'H1 = %s\n'   "$(obf_field 6 "$obf")"
+        printf 'H2 = %s\n'   "$(obf_field 7 "$obf")"
+        printf 'H3 = %s\n'   "$(obf_field 8 "$obf")"
+        printf 'H4 = %s\n'   "$(obf_field 9 "$obf")"
+        printf '\n[Peer]\n'
+        printf 'PublicKey = %s\n' "$T_AWG_PUB"
+        # Only the end that dials needs an endpoint. The other one learns the
+        # address from the first handshake that arrives, which is what lets
+        # the listening side sit behind whatever the path does to it.
+        if ! this_side_accepts && [ -n "$T_PEER_IP" ]; then
+            printf 'Endpoint = %s:%s\n' "$T_PEER_IP" "$T_AWG_PORT"
+        fi
+        printf 'AllowedIPs = %s/32\n' "${T_TUNPEER%%/*}"
+        printf 'PersistentKeepalive = 25\n'
+    } > "$conf"
+    chmod 600 "$conf"
+}
+
+awg_conf_path() { printf '%s/%s.conf' "$AWG_DIR" "$1"; }
+
+# ---------------------------------------------------------------------------
+# the units
+#
+# A concrete instance unit, so systemd uses it in place of the template and
+# the rest of the manager never has to know the difference.
+# ---------------------------------------------------------------------------
+
+write_link_unit() {
+    local name="$1" iface unit
+    iface="$(link_iface "$name")"
+    unit="$UNIT_DIR/pingify@$name.service"
+
+    case "$T_TRANSPORT" in
+        gre) write_gre_unit "$name" "$iface" "$unit" ;;
+        awg) write_awg_unit "$name" "$iface" "$unit" ;;
+        *)   return 1 ;;
+    esac
+    systemctl daemon-reload
+}
+
+write_gre_unit() {
+    local name="$1" iface="$2" unit="$3"
+    # One shot, held open: the interface is the state, so systemd has nothing
+    # to supervise once it exists. ExecStart deletes any leftover first, which
+    # is what makes a restart work rather than fail on "file exists".
+    cat > "$unit" <<UNIT
+[Unit]
+Description=Pingify tunnel $name (GRE)
+Documentation=https://github.com/GreatTeejay/Pingify
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '\\
+  ip link del $iface 2>/dev/null; \\
+  ip tunnel add $iface mode gre local $T_PUBLIC_IP remote $T_PEER_IP ttl $T_GRE_TTL; \\
+  ip link set $iface mtu $T_TUNMTU; \\
+  ip addr add $T_TUNLOCAL dev $iface; \\
+  ip link set $iface up; \\
+  sysctl -w net.ipv4.conf.$iface.rp_filter=0 >/dev/null 2>&1 || true'
+ExecStop=/bin/sh -c 'ip link del $iface 2>/dev/null || true'
+SyslogIdentifier=pingify-$name
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+write_awg_unit() {
+    local name="$1" iface="$2" unit="$3" conf
+    conf="$(awg_conf_path "$iface")"
+    cat > "$unit" <<UNIT
+[Unit]
+Description=Pingify tunnel $name (AmneziaWG)
+Documentation=https://github.com/GreatTeejay/Pingify
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=WG_QUICK_USERSPACE_IMPLEMENTATION=amneziawg-go
+ExecStart=/usr/bin/env awg-quick up $conf
+ExecStop=/usr/bin/env awg-quick down $conf
+SyslogIdentifier=pingify-$name
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# ---------------------------------------------------------------------------
+# what the manager asks about any tunnel
+# ---------------------------------------------------------------------------
+
+# link_up NAME - the interface exists and is up
+link_up() {
+    local iface; iface="$(link_iface "$1")"
+    ip link show "$iface" 2>/dev/null | grep -q 'state \(UP\|UNKNOWN\)'
+}
+
+# link_rtt NAME - milliseconds to the other end of the private link, or "-".
+# One packet, one second: this is called from a list that redraws often.
+link_rtt() {
+    local peer="${T_TUNPEER%%/*}" out
+    [ -n "$peer" ] || { printf '%s' '-'; return 1; }
+    out="$(ping -c1 -W1 -n "$peer" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p')"
+    [ -n "$out" ] || { printf '%s' '-'; return 1; }
+    printf '%s' "$out"
+}
+
+# The same five-field line the core prints for -brief, so the tunnel list and
+# the health check can read one shape for every kind of tunnel:
+#   state up total rtt streams uptime
+kernel_brief() {
+    local name="$1" rtt
+    if ! link_up "$name"; then
+        printf 'down 0 1 0.0 0 0'
+        return
+    fi
+    rtt="$(link_rtt "$name")"
+    if [ "$rtt" = "-" ]; then
+        # The interface is up but nothing answers on it, which for a kernel
+        # tunnel is the same news as a carrier that will not connect.
+        printf 'down 0 1 0.0 0 0'
+        return
+    fi
+    printf 'up 1 1 %s 0 0' "$rtt"
+}
+
+# ---------------------------------------------------------------------------
+# health
+#
+# The questions are different from an engine tunnel's. There is no handshake
+# to fail and no carrier to count: either the kernel built the interface or it
+# did not, and either the other end answers on it or it does not.
+# ---------------------------------------------------------------------------
+
+# Can this kernel still do what the config asks for at all?
+kernel_ready_check() {
+    case "$T_TRANSPORT" in
+        gre)
+            if gre_ready; then
+                hc_ok "the kernel has GRE"
+            else
+                hc_bad "this kernel cannot do GRE"
+                hc_note "the ip_gre module is missing, which some VPS kernels ship without"
+                hc_fix "modprobe ip_gre     (and ask the provider if it fails)"
+            fi ;;
+        awg)
+            if awg_ready; then
+                hc_ok "amneziawg is installed"
+            else
+                hc_bad "amneziawg is not installed here"
+                hc_note "the tunnel cannot come up without awg and awg-quick"
+                hc_fix "add-apt-repository -y ppa:amnezia/ppa && apt install -y amneziawg amneziawg-tools"
+            fi ;;
+    esac
+}
+
+# The link is not carrying: say which half of it is missing.
+kernel_link_check() {
+    local name="$1" iface="$T_TUNIF" peer="${T_TUNPEER%%/*}"
+
+    if ! ip link show "$iface" >/dev/null 2>&1; then
+        hc_bad "the interface $iface does not exist"
+        hc_note "the unit ran but the kernel did not build the link"
+        hc_fix "journalctl -u pingify@$name -n 20 --no-pager -o cat"
+        return
+    fi
+    if ! link_up "$name"; then
+        hc_bad "$iface exists but is down"
+        hc_fix "systemctl restart pingify@$name"
+        return
+    fi
+
+    # Up, addressed, and silent. For GRE that is almost always the other end
+    # not built yet or the path dropping protocol 47; for AmneziaWG it is a
+    # handshake that never completed, which has its own reasons.
+    hc_bad "$iface is up but ${peer:-the other end} does not answer"
+    if [ "$T_TRANSPORT" = "gre" ]; then
+        hc_note "GRE is IP protocol 47, not a port - a firewall that only"
+        hc_note "knows about ports will drop it without saying so"
+        hc_fix "on the other server:  ip a show $iface     (it must exist there too)"
+        hc_note "and check both public addresses match what each side was told"
+    else
+        hc_note "no handshake has completed with the other server"
+        hc_fix "awg show $iface     (look for a recent handshake)"
+        hc_note "the two ends must agree on the token, the port, and the"
+        hc_note "obfuscation values - all of which travel in the setup token"
+        hc_fix "check ${T_AWG_PORT}/udp is open here and on the other server"
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # reading an existing tunnel back
 # ---------------------------------------------------------------------------
 
@@ -1736,6 +2216,28 @@ cfg_load() {
     T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
     T_TUNPEER="$(toml_get "$f" tun remote_addr)"
     T_TUNMTU="$(toml_get "$f" tun mtu)";                    : "${T_TUNMTU:=1380}"
+
+    # A kernel tunnel keeps its own section, and both public addresses in it:
+    # nothing about it is derived from a listen or connect line.
+    if kernel_transport; then
+        T_GRE_TTL="$(toml_get "$f" gre ttl)";               : "${T_GRE_TTL:=255}"
+        T_AWG_PORT="$(toml_get "$f" awg listen_port)";      : "${T_AWG_PORT:=51820}"
+        T_AWG_PRIV="$(toml_get "$f" awg private_key)"
+        T_AWG_PUB="$(toml_get "$f" awg peer_key)"
+        T_AWG_OBF="$(toml_get "$f" awg obfuscation)"
+        if [ "$T_TRANSPORT" = "gre" ]; then
+            T_PUBLIC_IP="$(toml_get "$f" gre local_public)"
+            T_PEER_IP="$(toml_get "$f" gre peer_public)"
+        else
+            T_PUBLIC_IP="$(toml_get "$f" awg local_public)"
+            T_PEER_IP="$(toml_get "$f" awg peer_public)"
+        fi
+        # Reverse, like every other Pingify tunnel: IRAN is the end that
+        # waits. T_ACCEPTS names the role that waits, not this machine, so it
+        # reads the same on both servers.
+        T_ACCEPTS="server"
+        return 0
+    fi
 
     # The endpoint is derived, so recover what it was built from.
     local l c
@@ -1796,17 +2298,26 @@ tunnel_row() {
     state="$(svc_state "$name")"
 
     up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"
-    if [ "$state" = "active" ] && [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
-        brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
-        if [ -n "$brief" ]; then
-            # state up total rtt streams uptime
-            set -- $brief
-            up="$2"
-            # An unreachable endpoint reports zeroes; keep the configured
-            # carrier count so the column still says what was asked for.
-            [ "$3" != "0" ] && total="$3"
-            if [ "$1" = "up" ]; then rtt="${4}ms"; else rtt="-"; fi
+    if [ "$state" = "active" ]; then
+        if kernel_transport "$(toml_get "$f" transport type)"; then
+            # No core and no status endpoint: the kernel holds the link, and
+            # the answer comes from the interface plus one ping across it.
+            # In a subshell, because cfg_load writes every T_ variable and
+            # this runs once per tunnel inside somebody else's loop.
+            total=1
+            brief="$(cfg_load "$name" >/dev/null 2>&1 && kernel_brief "$name")"
+        elif [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
+            brief="$("$CORE_BIN" -status "$addr" -brief 2>/dev/null)"
         fi
+    fi
+    if [ -n "$brief" ]; then
+        # state up total rtt streams uptime - one shape for every kind
+        set -- $brief
+        up="$2"
+        # An unreachable endpoint reports zeroes; keep the configured carrier
+        # count so the column still says what was asked for.
+        [ "$3" != "0" ] && total="$3"
+        if [ "$1" = "up" ]; then rtt="${4}ms"; else rtt="-"; fi
     fi
 
     # Green only when the tunnel is running *and* a carrier is actually up:
@@ -2223,9 +2734,25 @@ delete_tunnel() {
     local name="$1"
     say ""
     confirm "really delete tunnel $name?" || return 1
+
+    # Read it before the file goes, so the kernel leftovers can be named.
+    local was_kernel=0 iface=""
+    if cfg_load "$name" >/dev/null 2>&1 && kernel_transport; then
+        was_kernel=1; iface="$T_TUNIF"
+    fi
+
     systemctl disable --now "pingify@$name" >/dev/null 2>&1
     systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
+    if [ "$was_kernel" = "1" ]; then
+        # The instance unit is a real file for these, not the shared template,
+        # and the interface outlives the unit if the stop did not run.
+        rm -f "$UNIT_DIR/pingify@$name.service"
+        [ -n "$iface" ] && {
+            ip link del "$iface" 2>/dev/null
+            rm -f "$(awg_conf_path "$iface")"
+        }
+    fi
     rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
     # Its forwarding rules outlive the config unless something removes them,
@@ -2343,7 +2870,12 @@ health_check() {
     esac
 
     # --- the config itself -------------------------------------------------
-    if [ -x "$CORE_BIN" ]; then
+    # A kernel tunnel has no core in the path, so the core has no opinion on
+    # it. What can be checked instead is whether the kernel can still do what
+    # the config asks for.
+    if kernel_transport; then
+        kernel_ready_check
+    elif [ -x "$CORE_BIN" ]; then
         if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
             hc_ok "the config is valid"
         else
@@ -2353,10 +2885,15 @@ health_check() {
         fi
     fi
 
-    # --- carriers ----------------------------------------------------------
+    # --- carriers, or the one link a kernel tunnel has ---------------------
     local up=0 total="$T_CARRIERS" rtt="-" brief=""
-    if [ "$state" = "active" ] && [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ]; then
-        brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    if [ "$state" = "active" ]; then
+        if kernel_transport; then
+            total=1
+            brief="$(kernel_brief "$name")"
+        elif [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ]; then
+            brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+        fi
     fi
     if [ -n "$brief" ]; then
         set -- $brief
@@ -2365,6 +2902,8 @@ health_check() {
 
     if [ "$state" != "active" ]; then
         :
+    elif kernel_transport && [ "$up" = "0" ]; then
+        kernel_link_check "$name"
     elif [ -z "$brief" ]; then
         hc_bad "the status endpoint is not answering on $T_STATUS"
         hc_note "the core is running but has not opened it, or has just started"
@@ -3072,6 +3611,12 @@ remove_menu() {
             confirm "delete every tunnel on this server?" || return
             local n
             for n in $(tunnel_names); do
+                # A kernel tunnel leaves an interface and a unit file of its
+                # own behind; read it before the config goes.
+                if cfg_load "$n" >/dev/null 2>&1 && kernel_transport; then
+                    ip link del "$T_TUNIF" 2>/dev/null
+                    rm -f "$UNIT_DIR/pingify@$n.service" "$(awg_conf_path "$T_TUNIF")"
+                fi
                 systemctl disable --now "pingify@$n" >/dev/null 2>&1
                 systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
                 rm -f "$UNIT_DIR/pingify-recycle@$n.timer" "$(cfg_file "$n")"
@@ -3098,12 +3643,19 @@ full_uninstall() {
     dim "    the forwarding rules (iptables chains PINGIFY_NAT, PINGIFY_POST)"
     dim "    the blocking rules (chains PINGIFY_IN, PINGIFY_OUT, PINGIFY_FWD)"
     dim "    the ICMP block in /etc/sysctl.d and the speedtest lines in /etc/hosts"
+    dim "    every GRE and AmneziaWG interface it created"
     dim "    the core binary, the state directory and this script"
     say ""
     confirm "go ahead?" || return
 
     local n
     for n in $(tunnel_names); do
+        # The kernel tunnels hold an interface that outlives their unit if
+        # the stop never ran, and a unit file that is not the shared template.
+        if cfg_load "$n" >/dev/null 2>&1 && kernel_transport; then
+            ip link del "$T_TUNIF" 2>/dev/null
+            rm -f "$UNIT_DIR/pingify@$n.service"
+        fi
         systemctl disable --now "pingify@$n" >/dev/null 2>&1
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
@@ -4605,7 +5157,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.7.1"
+const version = "5.8.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

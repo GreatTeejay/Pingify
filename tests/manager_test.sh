@@ -313,9 +313,7 @@ note "the setup token carries a whole tunnel"
 decode() {
     local raw
     raw="$(printf '%s' "$1" | base64 -d)"
-    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST \
-                   TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV \
-                   TOK_TL TOK_TP TOK_MTU <<EOF
+    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV TOK_TL TOK_TP TOK_MTU TOK_TTL TOK_AWGPORT TOK_AWGPRIV TOK_AWGPUB TOK_AWGOBF <<EOF
 $raw
 EOF
 }
@@ -328,7 +326,7 @@ T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"
 T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_SNDBUF=1024; T_RCVBUF=1024
 T_FORWARDS='"6526"'; T_STATUS="127.0.0.1:9700"
 decode "$(cfg_setup_token)"
-check "token version"           "$TOK_V"      "p2"
+check "token version"           "$TOK_V"      "p3"
 check "transport travels"       "$TOK_TR"     "tcp"
 check "forwarder travels"       "$TOK_FWD"    "pingify"
 check "the peer is told to dial" "$TOK_DIAL"  "1"
@@ -621,6 +619,163 @@ note "two tunnels never share a status port"
 read -r first second < "$WORK/ports.out"
 check "the first tunnel takes 9700" "$first"  "9700"
 check "the second moves along"      "$second" "9701"
+
+
+# ---------------------------------------------------------------------------
+note "kernel tunnels: GRE and AmneziaWG"
+# ---------------------------------------------------------------------------
+# These two are not carried by our engine at all - the kernel carries them and
+# the manager only describes the link. Everything that used to ask the core a
+# question has to ask the kernel instead, and everything else has to keep
+# working without knowing which kind it is holding.
+check "gre is a kernel transport"  "$(T_TRANSPORT=gre;  kernel_transport && echo y)" "y"
+check "awg is one too"             "$(T_TRANSPORT=awg;  kernel_transport && echo y)" "y"
+check "tcp is not"                 "$(T_TRANSPORT=tcp;  kernel_transport && echo y)" ""
+check "and neither is icmp"        "$(T_TRANSPORT=icmp; kernel_transport && echo y)" ""
+
+# The label goes in front of the name, so a list reads as what it is
+check "gre wears the TUN label"    "$(transport_label gre)"  "TUN-GRE"
+check "awg too"                    "$(transport_label awg)"  "TUN-AWG"
+
+# The interface is named after the tunnel and has to stay readable and under
+# the fifteen characters Linux allows.
+check "the interface reads plainly" "$(T_TRANSPORT=gre; link_iface tun-iran-gre)"   "gre-iran"
+check "on both sides"               "$(T_TRANSPORT=awg; link_iface tun-kharej-awg)" "awg-kharej"
+long="$(T_TRANSPORT=gre; link_iface a-very-long-tunnel-name-indeed)"
+check "a long name still fits"      "$([ "${#long}" -le 15 ] && echo y)"            "y"
+
+# A kernel tunnel is always a private link, always forwarded by the kernel,
+# and never has a socket for anything to listen on.
+cfg_reset
+T_NAME="tun-iran-gre"; T_ROLE="server"; T_TRANSPORT="gre"
+cfg_mode
+check "it is a TUN kind"      "$T_KIND"      "tun"
+check "in tun mode"           "$T_MODE"      "tun"
+check "the kernel forwards"   "$T_FORWARDER" "iptables"
+cfg_endpoints
+check "nothing listens"       "$CFG_LISTEN"  ""
+check "and nothing dials"     "$CFG_CONNECT" ""
+
+# --- a GRE tunnel, written out and carried across ---------------------------
+T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"; T_TOKEN="$TOKEN"
+T_TUNIF="$(link_iface "$T_NAME")"
+T_TUNLOCAL="10.10.10.1/24"; T_TUNPEER="10.10.10.2/24"; T_TUNMTU=1400
+T_FORWARDS='"443"'
+gre_file="$(cfg_save)"
+check "the config is written"   "$(basename "$gre_file")"                 "tun-iran-gre.toml"
+check "with no status endpoint" "$(toml_get "$gre_file" status addr)"     ""
+check "the ttl is recorded"     "$(toml_get "$gre_file" gre ttl)"         "255"
+check "and both addresses"      "$(toml_get "$gre_file" gre peer_public)" "198.51.100.4"
+check "the interface is named"  "$(toml_get "$gre_file" tun name)"        "gre-iran"
+
+decode "$(cfg_setup_token)"
+check "the token is p3"          "$TOK_V"     "p3"
+check "gre travels"              "$TOK_TR"    "gre"
+check "the ttl travels"          "$TOK_TTL"   "255"
+check "and our address, always"  "$TOK_HOST"  "203.0.113.9"
+check "the link swaps over"      "$TOK_TL"    "10.10.10.2/24"
+check "and points back at us"    "$TOK_TP"    "10.10.10.1/24"
+
+# the far end builds itself from that
+cfg_reset
+T_KIND="$TOK_KIND"; T_TRANSPORT="$TOK_TR"; T_MODE="$TOK_MODE"; T_FORWARDER="$TOK_FWD"
+T_TOKEN="$TOK_TOKEN"; T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
+T_GRE_TTL="$TOK_TTL"; T_PEER_IP="$TOK_HOST"
+T_ROLE="client"; T_ACCEPTS="server"; T_PUBLIC_IP="198.51.100.4"
+T_NAME="tun-kharej-gre"; T_TUNIF="$(link_iface "$T_NAME")"
+kh_file="$(cfg_save)"
+check "the far end writes too"   "$(basename "$kh_file")"                   "tun-kharej-gre.toml"
+check "its own address"          "$(toml_get "$kh_file" gre local_public)"  "198.51.100.4"
+check "and ours as the peer"     "$(toml_get "$kh_file" gre peer_public)"   "203.0.113.9"
+check "its end of the link"      "$(toml_get "$kh_file" tun local_addr)"    "10.10.10.2/24"
+check "no ports over there"      "$(grep -c '^ports' "$kh_file")"           "0"
+
+# --- the unit, which is what actually builds the link -----------------------
+UNIT_DIR="$WORK/units"; mkdir -p "$UNIT_DIR"
+(
+    systemctl() { :; }
+    cfg_load tun-iran-gre >/dev/null 2>&1
+    write_link_unit tun-iran-gre
+)
+gre_unit="$UNIT_DIR/pingify@tun-iran-gre.service"
+check "a unit is written"          "$([ -f "$gre_unit" ] && echo y)"                    "y"
+check "it builds the tunnel"       "$(grep -c 'ip tunnel add gre-iran mode gre' "$gre_unit")" "1"
+check "from both addresses"        "$(grep -c 'local 203.0.113.9 remote 198.51.100.4' "$gre_unit")" "1"
+check "it clears a leftover first" "$(grep -c 'ip link del gre-iran' "$gre_unit")"      "2"
+check "and tears it down on stop"  "$(grep -c '^ExecStop' "$gre_unit")"                 "1"
+check "it holds the state"         "$(grep -c 'RemainAfterExit=yes' "$gre_unit")"       "1"
+
+# --- AmneziaWG: two keypairs made once, so one token still does it ----------
+# WireGuard needs a real pair on each side and each side needs the other's
+# public half. Making both here is what keeps this to a single trip.
+awgn="$WORK/awgn"; echo 0 > "$awgn"
+awg() {
+    local n k
+    case "$1" in
+        genkey) n=$(( $(cat "$awgn") + 1 )); echo "$n" > "$awgn"; printf 'PRIV%d\n' "$n" ;;
+        pubkey) read -r k; printf 'PUBof%s\n' "$k" ;;
+    esac
+}
+mine="$(awg_keypair)"; theirs="$(awg_keypair)"
+check "a pair is private then public" "$mine"   "PRIV1 PUBofPRIV1"
+check "and the second is distinct"    "$theirs" "PRIV2 PUBofPRIV2"
+
+obf="$(awg_new_obf)"
+check "the tested values are kept"  "$(printf '%s' "$obf" | cut -d, -f1-5)" "5,50,1000,68,91"
+check "and there are nine of them"  "$(printf '%s' "$obf" | tr ',' ' ' | wc -w | tr -d ' ')" "9"
+# H1..H4 are drawn per tunnel rather than hardcoded: four fixed numbers shared
+# by every install would be a better signature than the header they hide.
+other="$(awg_new_obf)"
+check "the headers differ per tunnel" \
+      "$([ "$(printf '%s' "$obf" | cut -d, -f6-9)" != "$(printf '%s' "$other" | cut -d, -f6-9)" ] && echo y)" "y"
+h1="$(obf_field 6 "$obf")"
+check "and never collide with real wireguard" "$([ "$h1" -gt 4 ] && echo y)" "y"
+
+AWG_DIR="$WORK/awg"
+cfg_reset
+T_NAME="tun-iran-awg"; T_ROLE="server"; T_TRANSPORT="awg"; cfg_mode
+T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"; T_TOKEN="$TOKEN"
+T_TUNIF="$(link_iface "$T_NAME")"
+T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_TUNMTU=1320
+T_FORWARDS='"443"'
+T_AWG_PRIV="${mine%% *}"; T_AWG_PUB="${theirs##* }"
+awg_peer_priv="${theirs%% *}"; awg_self_pub="${mine##* }"
+T_AWG_OBF="$obf"
+cfg_save >/dev/null
+awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
+ic="$(awg_conf_path "$T_TUNIF")"
+check "IRAN keeps its own key"     "$(grep -c 'PrivateKey = PRIV1' "$ic")"    "1"
+check "and lists the other's"      "$(grep -c 'PublicKey = PUBofPRIV2' "$ic")" "1"
+check "the obfuscation is written" "$(grep -c "H1 = $h1" "$ic")"              "1"
+# The end that waits has no endpoint to dial - it learns the address from the
+# first handshake, which is what lets it sit behind whatever the path does.
+check "the waiting end has no endpoint" "$(grep -c 'Endpoint' "$ic")"         "0"
+
+decode "$(cfg_setup_token)"
+check "the port travels"       "$TOK_AWGPORT" "51820"
+check "the other half travels" "$TOK_AWGPRIV" "PRIV2"
+check "with our public half"   "$TOK_AWGPUB"  "PUBofPRIV1"
+check "and the obfuscation"    "$TOK_AWGOBF"  "$obf"
+check "our own key never travels" \
+      "$(printf '%s' "$(cfg_setup_token)" | base64 -d | grep -c 'PRIV1 ')" "0"
+
+# and the far end builds a conf that matches it
+cfg_reset
+T_TRANSPORT="$TOK_TR"; T_MODE="$TOK_MODE"; T_KIND="$TOK_KIND"
+T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
+T_AWG_PORT="$TOK_AWGPORT"; T_AWG_PRIV="$TOK_AWGPRIV"; T_AWG_PUB="$TOK_AWGPUB"
+T_AWG_OBF="$TOK_AWGOBF"; T_PEER_IP="$TOK_HOST"
+T_ROLE="client"; T_ACCEPTS="server"
+T_NAME="tun-kharej-awg"; T_TUNIF="$(link_iface "$T_NAME")"
+awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
+kc="$(awg_conf_path "$T_TUNIF")"
+check "KHAREJ gets the other key"  "$(grep -c 'PrivateKey = PRIV2' "$kc")"     "1"
+check "and lists IRAN's"           "$(grep -c 'PublicKey = PUBofPRIV1' "$kc")" "1"
+check "the two agree on H1"        "$(grep -c "H1 = $h1" "$kc")"               "1"
+# reverse, like every other Pingify tunnel: KHAREJ is the end that dials
+check "KHAREJ dials IRAN"          "$(grep -c 'Endpoint = 203.0.113.9:51820' "$kc")" "1"
+check "at its end of the link"     "$(grep -c 'Address = 10.20.10.2/24' "$kc")"      "1"
+unset -f awg
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

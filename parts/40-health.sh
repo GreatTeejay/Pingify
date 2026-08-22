@@ -105,7 +105,12 @@ health_check() {
     esac
 
     # --- the config itself -------------------------------------------------
-    if [ -x "$CORE_BIN" ]; then
+    # A kernel tunnel has no core in the path, so the core has no opinion on
+    # it. What can be checked instead is whether the kernel can still do what
+    # the config asks for.
+    if kernel_transport; then
+        kernel_ready_check
+    elif [ -x "$CORE_BIN" ]; then
         if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
             hc_ok "the config is valid"
         else
@@ -115,10 +120,15 @@ health_check() {
         fi
     fi
 
-    # --- carriers ----------------------------------------------------------
+    # --- carriers, or the one link a kernel tunnel has ---------------------
     local up=0 total="$T_CARRIERS" rtt="-" brief=""
-    if [ "$state" = "active" ] && [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ]; then
-        brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    if [ "$state" = "active" ]; then
+        if kernel_transport; then
+            total=1
+            brief="$(kernel_brief "$name")"
+        elif [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ]; then
+            brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+        fi
     fi
     if [ -n "$brief" ]; then
         set -- $brief
@@ -127,6 +137,8 @@ health_check() {
 
     if [ "$state" != "active" ]; then
         :
+    elif kernel_transport && [ "$up" = "0" ]; then
+        kernel_link_check "$name"
     elif [ -z "$brief" ]; then
         hc_bad "the status endpoint is not answering on $T_STATUS"
         hc_note "the core is running but has not opened it, or has just started"
