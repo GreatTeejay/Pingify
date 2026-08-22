@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.0.1"
+PINGIFY_VERSION="5.0.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1042,6 +1042,23 @@ new_tunnel() {
     fi
     cfg_mode
 
+    # -- who opens the connection ------------------------------------------
+    #
+    # Ports are served from IRAN either way; this is only about which end
+    # makes the TCP connection. Reaching an Iranian server from outside is
+    # the part that tends not to survive, so out of Iran is the default.
+    wiz "Which server opens the connection?"
+    CHOICE_DEF="1"
+    choice 1 "IRAN dials" "out of Iran to KHAREJ - usually the one that lasts"
+    choice 2 "KHAREJ dials" "into Iran - needs the port reachable from outside"
+    CHOICE_DEF=""
+    say ""
+    dim "Either way clients connect to IRAN and the ports live there."
+    say ""
+    local dir=""
+    ask dir "select" "1"
+    if [ "$dir" = "2" ]; then T_ACCEPTS="server"; else T_ACCEPTS="client"; fi
+
     # -- where the servers are ---------------------------------------------
     wiz "Addresses"
     if [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ]; then
@@ -1052,7 +1069,8 @@ new_tunnel() {
     ask T_PUBLIC_IP "this server" "$T_PUBLIC_IP"
 
     if ! this_side_accepts; then
-        ask T_PEER_IP "the IRAN server"
+        say ""
+        ask T_PEER_IP "the server this one dials"
         [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
     fi
 
@@ -1216,7 +1234,13 @@ new_tunnel() {
         field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
-    field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
+    if [ "$T_ACCEPTS" = "server" ]; then
+        field "Direction" "KHAREJ dials IRAN"
+        field "IRAN address" "$( [ "$T_ROLE" = "server" ] && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
+    else
+        field "Direction" "IRAN dials KHAREJ"
+        field "KHAREJ address" "$( [ "$T_ROLE" = "client" ] && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
+    fi
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if cfg_needs_link; then
         field "Its address" "$T_TUNPEER"
@@ -4017,7 +4041,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.0.1"
+const version = "5.0.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -6916,6 +6940,18 @@ func runProbe(cfg *Config) int {
 	if before != nil {
 		after, err := fetchStatus(cfg.StatusAddr)
 		if err == nil {
+			// A carrier that dies mid-test resets every stream on it, and the
+			// near end cannot tell that apart from the far end refusing: both
+			// arrive as EOF. Saying "the other server could not reach it" when
+			// the carrier went out from under the test sends the reader to the
+			// wrong machine, which is exactly what happened.
+			if carrierRestarted(before, after) {
+				fmt.Println("\nA carrier restarted while this was running, so every stream on")
+				fmt.Println("it was reset. Any failure above may be that and not the service")
+				fmt.Println("on the other server - fix the carriers dropping first, then test")
+				fmt.Println("the ports again.")
+				return 1
+			}
 			sent := after.WireTx - before.WireTx
 			got := after.WireRx - before.WireRx
 			fmt.Printf("\nDuring this test we sent %s and the other server sent back %s.\n",
@@ -6987,6 +7023,28 @@ func probeOne(r fwdRule) bool {
 		return true
 	}
 	fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
+	return false
+}
+
+// carrierRestarted reports whether any carrier went away and came back while
+// the probe was running. A carrier's uptime only ever grows; a smaller number
+// than before means that index is a different connection now, and every stream
+// that was riding on the old one was reset when it closed.
+func carrierRestarted(before, after *statusDoc) bool {
+	if after.Up < before.Up {
+		return true
+	}
+	was := make(map[int]int64, len(before.Detail))
+	for _, c := range before.Detail {
+		if c.Up {
+			was[c.Index] = c.UptimeS
+		}
+	}
+	for _, c := range after.Detail {
+		if old, seen := was[c.Index]; seen && c.UptimeS < old {
+			return true
+		}
+	}
 	return false
 }
 PINGIFY_SRC_EOF

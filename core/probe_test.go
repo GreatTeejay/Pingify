@@ -91,3 +91,23 @@ func TestProbeSeparatesAReachableServiceFromADeadOne(t *testing.T) {
 		}
 	})
 }
+
+// A carrier dying under a probe resets its streams, and the near end sees EOF -
+// the same thing it sees when the far end refuses. Blaming the far server for
+// that sent a real investigation to the wrong machine for a day.
+func TestCarrierRestartIsNotBlamedOnTheFarServer(t *testing.T) {
+	up := func(idx int, uptime int64) carrierStatus {
+		return carrierStatus{Index: idx, Up: true, UptimeS: uptime}
+	}
+	steady := &statusDoc{Up: 2, Detail: []carrierStatus{up(0, 30), up(1, 30)}}
+
+	if carrierRestarted(steady, &statusDoc{Up: 2, Detail: []carrierStatus{up(0, 36), up(1, 36)}}) {
+		t.Error("carriers that only got older were called a restart")
+	}
+	if !carrierRestarted(steady, &statusDoc{Up: 2, Detail: []carrierStatus{up(0, 2), up(1, 36)}}) {
+		t.Error("carrier 0 went from 30s of uptime to 2s and that was not noticed")
+	}
+	if !carrierRestarted(steady, &statusDoc{Up: 1, Detail: []carrierStatus{up(0, 36)}}) {
+		t.Error("losing a carrier outright was not noticed")
+	}
+}

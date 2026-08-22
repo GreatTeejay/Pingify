@@ -56,6 +56,18 @@ func runProbe(cfg *Config) int {
 	if before != nil {
 		after, err := fetchStatus(cfg.StatusAddr)
 		if err == nil {
+			// A carrier that dies mid-test resets every stream on it, and the
+			// near end cannot tell that apart from the far end refusing: both
+			// arrive as EOF. Saying "the other server could not reach it" when
+			// the carrier went out from under the test sends the reader to the
+			// wrong machine, which is exactly what happened.
+			if carrierRestarted(before, after) {
+				fmt.Println("\nA carrier restarted while this was running, so every stream on")
+				fmt.Println("it was reset. Any failure above may be that and not the service")
+				fmt.Println("on the other server - fix the carriers dropping first, then test")
+				fmt.Println("the ports again.")
+				return 1
+			}
 			sent := after.WireTx - before.WireTx
 			got := after.WireRx - before.WireRx
 			fmt.Printf("\nDuring this test we sent %s and the other server sent back %s.\n",
@@ -127,5 +139,27 @@ func probeOne(r fwdRule) bool {
 		return true
 	}
 	fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
+	return false
+}
+
+// carrierRestarted reports whether any carrier went away and came back while
+// the probe was running. A carrier's uptime only ever grows; a smaller number
+// than before means that index is a different connection now, and every stream
+// that was riding on the old one was reset when it closed.
+func carrierRestarted(before, after *statusDoc) bool {
+	if after.Up < before.Up {
+		return true
+	}
+	was := make(map[int]int64, len(before.Detail))
+	for _, c := range before.Detail {
+		if c.Up {
+			was[c.Index] = c.UptimeS
+		}
+	}
+	for _, c := range after.Detail {
+		if old, seen := was[c.Index]; seen && c.UptimeS < old {
+			return true
+		}
+	}
 	return false
 }
