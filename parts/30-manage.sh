@@ -178,6 +178,7 @@ tunnel_menu() {
         item 4 "Live log"
         item 5 "Edit forwarded ports"
         item 6 "Performance settings"
+        item 7 "Traffic shaping" "$(shaping_label "$name") - must match the other server"
         item 8 "Scheduled restart"
         item 9 "Delete this tunnel"
         item 0 "Back"
@@ -192,11 +193,64 @@ tunnel_menu() {
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
             5) edit_forwards "$name" ;;
             6) edit_tuning "$name" ;;
+            7) edit_shaping "$name" ;;
             8) recycle_menu "$name" ;;
             9) delete_tunnel "$name" && return ;;
             0|"") return ;;
         esac
     done
+}
+
+shaping_label() {
+    case "$(toml_get "$(cfg_file "$1")" transport obfuscate)" in
+        false) printf 'off' ;;
+        *)     printf 'on' ;;
+    esac
+}
+
+# Not a performance knob: it decides what the tunnel looks like from outside,
+# and the two servers have to agree or nothing passes.
+edit_shaping() {
+    local name="$1" f="$(cfg_file "$1")" now
+    now="$(shaping_label "$name")"
+    banner
+    head2 "Traffic shaping - currently ${C_YEL}${now}${C_OFF}"
+    say ""
+    dim "ON   the frame length is masked and the opening frames carry random"
+    dim "     filler, so nothing on the wire sits at a fixed offset. The cost is"
+    dim "     that the stream then looks like nothing at all, and a filter that"
+    dim "     drops what it cannot identify will drop exactly that."
+    say ""
+    dim "OFF  each frame carries a plain length in front, so the tunnel looks"
+    dim "     like an ordinary length-prefixed protocol."
+    say ""
+    ok "the payload is AES-256-GCM either way - this changes the shape, not the secrecy"
+    say ""
+    warn "set it the SAME on both servers. If they differ, no traffic passes at all."
+    say ""
+    local want=""
+    ask want "shaping on? (yes/no)" "$([ "$now" = "on" ] && echo yes || echo no)"
+    case "$want" in
+        y|yes|true|on|1)  want="true" ;;
+        n|no|false|off|0) want="false" ;;
+        *) fail "answer yes or no"; pause; return ;;
+    esac
+
+    cp -f "$f" "$f.bak"
+    # Append rather than substitute: a replacement carrying a newline has to
+    # be escaped, and that escape does not survive every layer it passes
+    # through on the way into this file.
+    sed -i -e '/^obfuscate/d' \
+           -e "/^keepalive_sec/a obfuscate        = $want" "$f"
+    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+        rm -f "$f.bak"
+        systemctl restart "pingify@$name"
+        ok "shaping is $([ "$want" = "true" ] && echo on || echo off) - now do the same on the other server"
+    else
+        mv -f "$f.bak" "$f"
+        fail "the core rejected that; nothing was changed"
+    fi
+    pause
 }
 
 edit_forwards() {
@@ -241,36 +295,10 @@ edit_tuning() {
     ask car "carriers" "$T_CARRIERS"
     ask win "window (KB)" "$T_WINDOW"
     ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
-    dim "these three are local: the two servers may differ without breaking the link"
+    dim "these are local: the two servers may differ without breaking the link"
     case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
 
-    # Traffic shaping is the one setting here that is NOT local.
-    say ""
-    head2 "Traffic shaping"
-    dim "On, the frame length is masked and the opening frames carry filler, so"
-    dim "nothing on the wire has a fixed offset. The cost is that the stream then"
-    dim "looks like nothing at all, and a filter that drops what it cannot"
-    dim "identify will drop exactly that."
-    say ""
-    dim "Off, each frame carries a plain length in front, like an ordinary"
-    dim "protocol. The payload stays encrypted either way."
-    say ""
-    warn "this one must be the SAME on both servers, or no traffic will pass"
-    say ""
-    local obf=""
-    ask obf "shaping on? (true/false)" "$T_OBFUSCATE"
-    case "$obf" in
-        true|yes|on|1)    obf="true" ;;
-        false|no|off|0)   obf="false" ;;
-        *) fail "answer true or false"; pause; return ;;
-    esac
-
     cp -f "$f" "$f.bak"
-    if grep -q '^obfuscate' "$f"; then
-        sed -i "s#^obfuscate.*#obfuscate        = $obf#" "$f"
-    else
-        sed -i "s#^keepalive_sec.*#&\nobfuscate        = $obf#" "$f"
-    fi
     sed -i "s#^carriers.*#carriers         = $car#" "$f"
     sed -i "s#^window_kb.*#window_kb        = $win#" "$f"
     sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
