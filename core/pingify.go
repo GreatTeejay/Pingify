@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.5.0"
+const version = "4.5.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -261,6 +261,7 @@ func main() {
 		status  = flag.String("status", "", "print the status of a running tunnel (host:port) and exit")
 		healthz = flag.String("healthz", "", "probe a running tunnel (host:port); exit 0 only when a carrier is up")
 		brief   = flag.Bool("brief", false, "with -status, print one machine-readable line")
+		probe   = flag.Bool("probe", false, "with -c, try every forwarded port end to end and exit")
 	)
 	flag.Parse()
 
@@ -301,6 +302,9 @@ func main() {
 	if err := cfg.validate(); err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
+	}
+	if *probe {
+		os.Exit(runProbe(cfg))
 	}
 	if *check {
 		fmt.Println("config OK")

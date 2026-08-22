@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.5.0"
+PINGIFY_VERSION="4.5.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1456,12 +1456,13 @@ tunnel_menu() {
         item 1 "Restart"
         item 2 "Stop"
         item 3 "Start"
-        item 4 "Live log"
-        item 5 "Edit forwarded ports"
-        item 6 "Performance settings"
-        item 7 "Traffic shaping" "$(shaping_label "$name") - must match the other server"
-        item 8 "Scheduled restart"
-        item 9 "Delete this tunnel"
+        item 4 "Test the path" "go through the tunnel and say where it stops"
+        item 5 "Live log"
+        item 6 "Edit forwarded ports"
+        item 7 "Performance settings"
+        item 8 "Traffic shaping" "$(shaping_label "$name") - must match the other server"
+        item 9 "Scheduled restart"
+        item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
@@ -1470,16 +1471,43 @@ tunnel_menu() {
             1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
             2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
             3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            4) say ""; dim "ctrl-c to stop following"; say ""
+            4) probe_path "$name" ;;
+            5) say ""; dim "ctrl-c to stop following"; say ""
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            5) edit_forwards "$name" ;;
-            6) edit_tuning "$name" ;;
-            7) edit_shaping "$name" ;;
-            8) recycle_menu "$name" ;;
-            9) delete_tunnel "$name" && return ;;
+            6) edit_forwards "$name" ;;
+            7) edit_tuning "$name" ;;
+            8) edit_shaping "$name" ;;
+            9) recycle_menu "$name" ;;
+            d|D) delete_tunnel "$name" && return ;;
             0|"") return ;;
         esac
     done
+}
+
+# Connecting to a forwarded port proves nothing on its own: this server accepts
+# before it has said a word to the tunnel. The core's probe goes the whole way
+# and reports where it stopped.
+probe_path() {
+    local name="$1" f
+    f="$(cfg_file "$name")"
+    cfg_load "$name" || return 1
+    banner
+    head2 "Testing the path for: $name"
+    say ""
+    if [ "$T_ROLE" != "server" ]; then
+        warn "this is the KHAREJ end - the ports live on the IRAN server"
+        dim "run this from the menu over there instead"
+        pause; return
+    fi
+    if ! systemctl is-active --quiet "pingify@$name"; then
+        fail "the tunnel is not running; start it first"
+        pause; return
+    fi
+    "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
+    say ""
+    dim "A port that fails is one the other server could not reach. The service"
+    dim "there must be listening on the address after the arrow."
+    pause
 }
 
 shaping_label() {
@@ -3656,7 +3684,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.5.0"
+const version = "4.5.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -3865,6 +3893,7 @@ func main() {
 		status  = flag.String("status", "", "print the status of a running tunnel (host:port) and exit")
 		healthz = flag.String("healthz", "", "probe a running tunnel (host:port); exit 0 only when a carrier is up")
 		brief   = flag.Bool("brief", false, "with -status, print one machine-readable line")
+		probe   = flag.Bool("probe", false, "with -c, try every forwarded port end to end and exit")
 	)
 	flag.Parse()
 
@@ -3905,6 +3934,9 @@ func main() {
 	if err := cfg.validate(); err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		os.Exit(1)
+	}
+	if *probe {
+		os.Exit(runProbe(cfg))
 	}
 	if *check {
 		fmt.Println("config OK")
@@ -6381,6 +6413,105 @@ func printStatus(addr string, brief bool) int {
 		return 0
 	}
 	return 1
+}
+PINGIFY_SRC_EOF
+    cat > "$d/probe.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"time"
+)
+
+// runProbe answers the question a bare connection cannot.
+//
+// The near server accepts on a forwarded port before it has said a word to the
+// tunnel, so "it connected" proves only that something is listening here. What
+// separates a working path from a broken one is what happens next: if the far
+// server cannot reach the service it sends back a reset and the connection
+// dies within moments, and if it can, the connection simply stays open.
+func runProbe(cfg *Config) int {
+	if cfg.Role != "server" {
+		fmt.Println("Run this on the IRAN server: that is the end with the ports.")
+		return 2
+	}
+	if cfg.StatusAddr != "" {
+		d, err := fetchStatus(cfg.StatusAddr)
+		if err != nil {
+			fmt.Printf("No carrier is up (%v). Nothing can cross the tunnel yet.\n", err)
+			return 1
+		}
+		fmt.Printf("%d of %d carriers up, %.0f ms to the other server.\n\n",
+			d.Up, d.Carriers, d.RTTms)
+	}
+
+	bad := 0
+	for _, spec := range cfg.Forwards {
+		rules, err := parseForward(spec)
+		if err != nil {
+			fmt.Printf("  %-30s cannot be read: %v\n", spec, err)
+			bad++
+			continue
+		}
+		for _, r := range rules {
+			if r.proto != "tcp" {
+				fmt.Printf("  udp :%-25d not testable this way\n", r.lport)
+				continue
+			}
+			if !probeOne(r) {
+				bad++
+			}
+		}
+	}
+	if bad > 0 {
+		fmt.Println("\nA port that failed is one the other server could not reach.")
+		fmt.Println("Check that the service is listening there on the address after")
+		fmt.Println("the arrow, and read that server's log for the reason.")
+		return 1
+	}
+	fmt.Println("\nEvery port reached the service on the other server.")
+	return 0
+}
+
+func probeOne(r fwdRule) bool {
+	label := fmt.Sprintf(":%d -> %s", r.lport, r.target)
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", r.lport), 5*time.Second)
+	if err != nil {
+		fmt.Printf("  %-30s nothing listening on this server: %v\n", label, err)
+		return false
+	}
+	defer c.Close()
+
+	// One harmless line, purely so the stream carries a byte and gives the far
+	// side a reason either to answer or to hang up.
+	c.SetDeadline(time.Now().Add(6 * time.Second))
+	if _, err := c.Write([]byte("\r\n")); err != nil {
+		fmt.Printf("  %-30s the other server refused it: %v\n", label, err)
+		return false
+	}
+
+	buf := make([]byte, 256)
+	n, err := c.Read(buf)
+	if n > 0 {
+		fmt.Printf("  %-30s open, and the service answered %d bytes\n", label, n)
+		return true
+	}
+	if err == nil {
+		fmt.Printf("  %-30s open\n", label)
+		return true
+	}
+
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		// Held open for six seconds without a word. Plenty of services say
+		// nothing until spoken to properly - the path is what was on trial.
+		fmt.Printf("  %-30s open, service silent (normal for xray and the like)\n", label)
+		return true
+	}
+	fmt.Printf("  %-30s the other server could not reach it (%v)\n", label, err)
+	return false
 }
 PINGIFY_SRC_EOF
     cat > "$d/tun_linux.go" <<'PINGIFY_SRC_EOF'
