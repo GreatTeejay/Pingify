@@ -436,8 +436,28 @@ func setLogLevel(s string) {
 }
 
 // logSink is where a formatted line goes. Only the tests replace it, so they
-// can assert on what an operator would actually have seen.
-var logSink = func(line string) { fmt.Fprintln(os.Stderr, line) }
+// can assert on what an operator would actually have seen - but they replace
+// it while the tunnel they are watching is still running, and every goroutine
+// in the process reads it. A plain assignment there is a data race, and the
+// race detector is right about it, so the swap goes through atomic.Value.
+var logSink atomic.Value // holds a func(string)
+
+func stderrSink(line string) { fmt.Fprintln(os.Stderr, line) }
+
+func currentSink() func(string) {
+	if f, ok := logSink.Load().(func(string)); ok && f != nil {
+		return f
+	}
+	return stderrSink
+}
+
+// setLogSink installs a sink and hands back the one it replaced, so a caller
+// can put that one back when it is done listening.
+func setLogSink(f func(string)) func(string) {
+	prev := currentSink()
+	logSink.Store(f)
+	return prev
+}
 
 // Colour is decided once. journalctl keeps the escapes and renders them; a
 // file or a pipe gets none, so a log that is grepped later stays clean.
@@ -487,7 +507,7 @@ func logAt(lvl int32, format string, args ...interface{}) {
 		tag = logTags[lvl].coloured
 		stamp = "\033[90m" + stamp + "\033[0m"
 	}
-	logSink(fmt.Sprintf("%s  %s  %s", stamp, tag, fmt.Sprintf(format, args...)))
+	currentSink()(fmt.Sprintf("%s  %s  %s", stamp, tag, fmt.Sprintf(format, args...)))
 }
 
 func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }

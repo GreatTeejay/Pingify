@@ -13,13 +13,12 @@ import (
 func captureLog(fn func()) []string {
 	var mu sync.Mutex
 	var lines []string
-	prev := logSink
-	logSink = func(s string) {
+	prev := setLogSink(func(s string) {
 		mu.Lock()
 		lines = append(lines, s)
 		mu.Unlock()
-	}
-	defer func() { logSink = prev }()
+	})
+	defer setLogSink(prev)
 	fn()
 	mu.Lock()
 	defer mu.Unlock()
