@@ -125,6 +125,35 @@ awg_rand_header() {
     printf '%s' "$(( (n % 2147483600) + 5 ))"
 }
 
+# ---------------------------------------------------------------------------
+# what the security token buys here
+#
+# The kernel has never heard of our token, so it cannot key a GRE or an
+# AmneziaWG tunnel the way it keys our own transports. What it can do is
+# become the one secret each of them does understand, derived the same way on
+# both servers from the same answer:
+#
+#   AmneziaWG   a pre-shared key, mixed into every handshake on top of the
+#               keypair. Real: without a matching one the tunnel does not form.
+#
+#   GRE         the 32-bit key GRE stamps on each packet. Not protection - it
+#               travels in the clear - but two tunnels built from different
+#               tokens will not talk to each other by accident.
+#
+# Derived rather than carried, so neither ever enters the setup token.
+# ---------------------------------------------------------------------------
+
+# kernel_keys TOKEN - "presharedkey grekey", or nothing if the core cannot
+# be asked. Both servers reach the same values from the same token.
+kernel_keys() {
+    [ -n "$1" ] || return 1
+    [ -x "$CORE_BIN" ] || return 1
+    "$CORE_BIN" -derivekey "$1" 2>/dev/null
+}
+
+awg_psk_for() { kernel_keys "$1" | awk '{print $1}'; }
+gre_key_for() { kernel_keys "$1" | awk '{print $2}'; }
+
 # obf_field N FIELDS - pull one value out of that comma-separated list
 obf_field() { printf '%s' "$2" | cut -d, -f"$1"; }
 
@@ -157,6 +186,11 @@ awg_write_conf() {
             printf 'Endpoint = %s:%s\n' "$T_PEER_IP" "$T_AWG_PORT"
         fi
         printf 'AllowedIPs = %s/32\n' "${T_TUNPEER%%/*}"
+        # The security token, as the one secret WireGuard understands.
+        # Without a matching one the handshake never completes, so the
+        # answer to that question is doing real work here.
+        local psk; psk="$(awg_psk_for "$T_TOKEN")"
+        [ -n "$psk" ] && printf 'PresharedKey = %s\n' "$psk"
         printf 'PersistentKeepalive = 25\n'
     } > "$conf"
     chmod 600 "$conf"
@@ -185,7 +219,12 @@ write_link_unit() {
 }
 
 write_gre_unit() {
-    local name="$1" iface="$2" unit="$3"
+    local name="$1" iface="$2" unit="$3" gkey keyarg=""
+    # GRE's own key: two tunnels built from different tokens then refuse to
+    # talk to each other. It rides in the clear, so it is not protection -
+    # but it is the only thing GRE has, and it makes the token mean something.
+    gkey="$(gre_key_for "$T_TOKEN")"
+    case "$gkey" in '' | *[!0-9]*) : ;; *) keyarg=" key $gkey" ;; esac
     # One shot, held open: the interface is the state, so systemd has nothing
     # to supervise once it exists. ExecStart deletes any leftover first, which
     # is what makes a restart work rather than fail on "file exists".
@@ -201,7 +240,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c '\\
   ip link del $iface 2>/dev/null; \\
-  ip tunnel add $iface mode gre local $T_PUBLIC_IP remote $T_PEER_IP ttl $T_GRE_TTL; \\
+  ip tunnel add $iface mode gre local $T_PUBLIC_IP remote $T_PEER_IP ttl $T_GRE_TTL$keyarg; \\
   ip link set $iface mtu $T_TUNMTU; \\
   ip addr add $T_TUNLOCAL dev $iface; \\
   ip link set $iface up; \\
@@ -257,15 +296,49 @@ link_rtt() {
     printf '%s' "$out"
 }
 
+# awg_handshake_age IFACE - seconds since the last completed handshake, or
+# nothing when it cannot be asked. AmneziaWG knows for itself whether the far
+# end is there, without a packet being sent - and unlike a ping, it still
+# knows on a server that has been told to stop answering them.
+awg_handshake_age() {
+    local iface="$1" last now
+    have awg || return 1
+    last="$(awg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}')"
+    case "$last" in '' | 0 | *[!0-9]*) return 1 ;; esac
+    now="$(date +%s 2>/dev/null)"
+    case "$now" in '' | *[!0-9]*) return 1 ;; esac
+    printf '%s' "$((now - last))"
+}
+
+# A WireGuard peer keeps talking every 25 seconds, so anything older than a
+# few minutes of silence is a link that has stopped.
+AWG_STALE_AFTER=180
+
 # The same five-field line the core prints for -brief, so the tunnel list and
 # the health check can read one shape for every kind of tunnel:
 #   state up total rtt streams uptime
 kernel_brief() {
-    local name="$1" rtt
+    local name="$1" rtt age
     if ! link_up "$name"; then
         printf 'down 0 1 0.0 0 0'
         return
     fi
+
+    # AmneziaWG is asked directly. This is both faster than a ping and more
+    # honest: a peer that has been told to stop answering pings - which is
+    # exactly what an ICMP tunnel on the same server turns on - is still a
+    # peer that is handshaking.
+    if [ "$T_TRANSPORT" = "awg" ] && age="$(awg_handshake_age "$T_TUNIF")"; then
+        if [ "$age" -gt "$AWG_STALE_AFTER" ]; then
+            printf 'down 0 1 0.0 0 0'
+            return
+        fi
+        rtt="$(link_rtt "$name")"
+        [ "$rtt" = "-" ] && rtt="0.0"
+        printf 'up 1 1 %s 0 0' "$rtt"
+        return
+    fi
+
     rtt="$(link_rtt "$name")"
     if [ "$rtt" = "-" ]; then
         # The interface is up but nothing answers on it, which for a kernel
@@ -274,6 +347,24 @@ kernel_brief() {
         return
     fi
     printf 'up 1 1 %s 0 0' "$rtt"
+}
+
+# tunnel_is_up NAME - one answer for every kind of tunnel, so the list and the
+# status panel cannot disagree. The panel used to ask the core's status
+# endpoint, which a kernel tunnel does not have, so GRE and AmneziaWG could
+# never be counted and "3 of 4 up" read as 2.
+tunnel_is_up() {
+    local name="$1" f addr brief
+    f="$(cfg_file "$name")"
+    [ -f "$f" ] || return 1
+    [ "$(svc_state "$name")" = "active" ] || return 1
+    if kernel_transport "$(toml_get "$f" transport type)"; then
+        brief="$(cfg_load "$name" >/dev/null 2>&1 && kernel_brief "$name")"
+        case "$brief" in up\ *) return 0 ;; *) return 1 ;; esac
+    fi
+    addr="$(toml_get "$f" status addr)"
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 1
+    "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -326,6 +417,18 @@ kernel_link_check() {
     # not built yet or the path dropping protocol 47; for AmneziaWG it is a
     # handshake that never completed, which has its own reasons.
     hc_bad "$iface is up but ${peer:-the other end} does not answer"
+    # The one false alarm this check can raise, and it is easy to walk into:
+    # building an ICMP tunnel on either server turns the ping block on, and a
+    # server that answers no pings answers none on the private link either.
+    # GRE has nothing else to ask, so say so rather than send somebody hunting
+    # a fault that is not there.
+    if [ "$T_TRANSPORT" = "gre" ] && [ "$(block_state icmp)" = "on" ]; then
+        hc_note "this server is set to ignore all ICMP echo, and so, most"
+        hc_note "likely, is the other one - a GRE link is tested by pinging"
+        hc_note "across it, so it can read as down while carrying traffic"
+        hc_fix "test it by hand instead:  curl --interface $iface -sI http://$peer"
+        hc_note "or turn the block off on the far server while you check"
+    fi
     if [ "$T_TRANSPORT" = "gre" ]; then
         hc_note "GRE is IP protocol 47, not a port - a firewall that only"
         hc_note "knows about ports will drop it without saying so"

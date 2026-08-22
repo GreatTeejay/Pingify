@@ -64,6 +64,24 @@ cfg_mode() {
 
 cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 
+# The name says which server this is and what the tunnel runs on, so two
+# servers side by side read as what they are without either file being opened.
+# A tunnel that builds a private link wears the TUN label in front of it.
+#
+# Both the wizard and the importer name tunnels, and they used to do it with
+# two copies of this - which drifted the moment one of them was edited, and
+# left an AmneziaWG tunnel called iran-9443 after a TCP port it does not use.
+tunnel_default_name() {
+    local base
+    base="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    case "$T_TRANSPORT" in
+        icmp) printf 'tun-%s-icmp' "$base" ;;
+        gre)  printf 'tun-%s-gre' "$base" ;;
+        awg)  printf 'tun-%s-awg' "$base" ;;
+        *)    printf '%s-%s' "$base" "$T_PORT" ;;
+    esac
+}
+
 # listen and connect are derived, never stored anywhere shared: they are the
 # one part of a tunnel that differs between the two servers.
 cfg_endpoints() {
@@ -441,15 +459,7 @@ TOKEN
     # The ports live on IRAN, which already has them - there is nothing to ask
     # for here, and nothing on this side to answer with.
 
-    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
-    case "$T_TRANSPORT" in
-        # A tunnel that builds a private link says so in its own name, so a
-        # list of them reads as what they are without a column being consulted.
-        icmp) T_NAME="tun-${T_NAME}-icmp" ;;
-        gre)  T_NAME="tun-${T_NAME}-gre" ;;
-        awg)  T_NAME="tun-${T_NAME}-awg" ;;
-        *)    T_NAME="${T_NAME}-${T_PORT}" ;;
-    esac
+    T_NAME="$(tunnel_default_name)"
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         say ""
         warn "a tunnel named $T_NAME already exists on this server"
@@ -467,15 +477,15 @@ TOKEN
     cfg_endpoints
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
-    field "Address" "$T_PUBLIC_IP"
+    field "Address" "$(addr_tint "$T_PUBLIC_IP")"
     field "Protocol" "$(transport_label "$T_TRANSPORT")"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
-        field "Link" "accepts on $CFG_LISTEN"
+        field "Link" "accepts on $(addr_tint "$CFG_LISTEN")"
     else
-        field "Link" "dials $CFG_CONNECT"
+        field "Link" "dials $(addr_tint "$CFG_CONNECT")"
     fi
-    cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    cfg_needs_link && field "Private link" "$(addr_tint "$T_TUNLOCAL") ${BX_ARR} $(addr_tint "$T_TUNPEER")"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Carriers" "$T_CARRIERS"
@@ -648,12 +658,7 @@ new_tunnel() {
     # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
     # tunnel. Two servers side by side say what they are without either file
     # being opened, and there is nothing to answer.
-    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
-    if [ "$T_TRANSPORT" = "icmp" ]; then
-        T_NAME="${T_NAME}-icmp"
-    else
-        T_NAME="${T_NAME}-${T_PORT}"
-    fi
+    T_NAME="$(tunnel_default_name)"
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         local n=2
         while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
@@ -738,6 +743,18 @@ new_tunnel() {
 
     # -- security ----------------------------------------------------------
     wiz "Security token" "One secret, typed the same on BOTH servers. Any length."
+    # What it actually does differs by transport, and saying so is better than
+    # letting somebody assume GRE is encrypted because they were asked for a
+    # password.
+    case "$T_TRANSPORT" in
+        awg) dim "here it becomes the pre-shared key WireGuard mixes into every"
+             dim "handshake: without a matching one, the tunnel does not form." ;;
+        gre) dim "GRE has no encryption. Here the token becomes the key GRE"
+             dim "stamps on each packet, which keeps two tunnels apart - it"
+             dim "does not hide anything, because GRE cannot." ;;
+        *)   dim "it keys the encryption on every frame this tunnel carries." ;;
+    esac
+    say ""
     while :; do
         ask T_TOKEN "token"
         T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -804,7 +821,7 @@ new_tunnel() {
     head2 "Ready to create"
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
-    field "Address" "$T_PUBLIC_IP"
+    field "Address" "$(addr_tint "$T_PUBLIC_IP")"
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
@@ -812,11 +829,11 @@ new_tunnel() {
     fi
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
-        field "Link" "accepts on $CFG_LISTEN"
+        field "Link" "accepts on $(addr_tint "$CFG_LISTEN")"
     else
-        field "Link" "connects to $CFG_CONNECT"
+        field "Link" "connects to $(addr_tint "$CFG_CONNECT")"
     fi
-    cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    cfg_needs_link && field "Private link" "$(addr_tint "$T_TUNLOCAL") ${BX_ARR} $(addr_tint "$T_TUNPEER")"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Tuning" "$T_PRESET"
