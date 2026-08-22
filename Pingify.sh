@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.6.0"
+PINGIFY_VERSION="4.7.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -944,10 +944,13 @@ parse_forwards() {
 }
 
 side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
+# BRAID is what the TCP transport does: several carriers woven together, each
+# flow pinned to one strand so nothing arrives out of order. The protocol is
+# still plain TCP - the name describes the weave, not a new protocol.
 transport_label() {
     case "$1" in
         icmp | echo) printf 'ICMP' ;;
-        *)           printf 'TCP' ;;
+        *)           printf 'TCP BRAID' ;;
     esac
 }
 
@@ -974,7 +977,7 @@ new_tunnel() {
 
     # -- kind --------------------------------------------------------------
     wiz "Tunnel type"
-    choice 1 "TCP" "over the two public addresses - fast, adds nothing"
+    choice 1 "TCP BRAID" "several connections woven into one - the fast one"
     choice 2 "TUN" "a private network between the servers"
     say ""
     local kind=""
@@ -1012,7 +1015,7 @@ new_tunnel() {
     else
         T_KIND="tcp"; T_TRANSPORT="tcp"
         T_FORWARDER="pingify"
-        wiz_add "TCP"
+        wiz_add "TCP BRAID"
     fi
     cfg_mode
 
@@ -1116,7 +1119,7 @@ new_tunnel() {
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        field "Type" "TCP BRAID" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     fi
     if [ -n "$CFG_LISTEN" ]; then
         field "Link" "accepts on $CFG_LISTEN"
@@ -1149,7 +1152,9 @@ new_tunnel() {
     write_units
     service_enable_start "$T_NAME"
     enable_watchdog quiet
-    [ "$T_FORWARDER" = "iptables" ] && apply_nat quiet
+    # Unconditional: apply_nat tears the chains down when no tunnel needs
+    # them, so this is also what cleans up after a forwarder that changed.
+    apply_nat quiet
     ok "$T_NAME is running"
     dim "$file"
 
@@ -1164,7 +1169,7 @@ new_tunnel() {
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP"
+        field "Type" "TCP BRAID"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
     field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
@@ -1418,7 +1423,7 @@ tunnel_row() {
         "$dot" \
         "$(pad_to "${C_B}${name}${C_OFF}" 13)" \
         "$(pad_to "$role" 8)" \
-        "$(pad_to "$proto" 6)" \
+        "$(pad_to "$proto" 10)" \
         "$(pad_to "$fwder" 9)" \
         "$(pad_to "$up/$total" 6)" \
         "$C_DIM" "$rtt" "$C_OFF"
@@ -1434,7 +1439,7 @@ list_tunnels() {
         "$C_DIM" \
         "$(pad_to "NAME" 13)" \
         "$(pad_to "SIDE" 8)" \
-        "$(pad_to "PROTO" 6)" \
+        "$(pad_to "PROTO" 10)" \
         "$(pad_to "FORWARDER" 9)" \
         "$(pad_to "LINKS" 6)" \
         "RTT" "$C_OFF"
@@ -1483,31 +1488,33 @@ tunnel_menu() {
         head2 "Tunnel: $name"
         tunnel_status_block "$name"
         rule
-        item 1 "Restart"
-        item 2 "Stop"
-        item 3 "Start"
-        item 4 "Test the path" "go through the tunnel and say where it stops"
-        item 5 "Live log"
-        item 6 "Edit forwarded ports"
-        item 7 "Performance settings"
-        item 8 "Traffic shaping" "$(shaping_label "$name") - must match the other server"
-        item 9 "Scheduled restart"
+        group "Check"
+        item 1 "Test the path" "go through the tunnel and say where it stops"
+        item 2 "Live log"
+        group "Settings"
+        item 3 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
+        item 4 "Tuning" "carriers, window, keepalive, shaping"
+        item 5 "Scheduled restart"
+        group "Service"
+        item 6 "Restart"
+        item 7 "Stop"
+        item 8 "Start"
+        say ""
         item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
-            2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
-            3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            4) probe_path "$name" ;;
-            5) say ""; dim "ctrl-c to stop following"; say ""
+            1) probe_path "$name" ;;
+            2) say ""; dim "ctrl-c to stop following"; say ""
                journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            6) edit_forwards "$name" ;;
-            7) edit_tuning "$name" ;;
-            8) edit_shaping "$name" ;;
-            9) recycle_menu "$name" ;;
+            3) edit_forwards "$name" ;;
+            4) tuning_menu "$name" ;;
+            5) recycle_menu "$name" ;;
+            6) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
+            7) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
+            8) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
             d|D) delete_tunnel "$name" && return ;;
             0|"") return ;;
         esac
@@ -1626,16 +1633,62 @@ edit_forwards() {
     pause
 }
 
-edit_tuning() {
-    local name="$1" f="$(cfg_file "$1")"
-    cfg_load "$name" || return 1
-    say ""
-    local car win ka
-    ask car "carriers" "$T_CARRIERS"
-    ask win "window (KB)" "$T_WINDOW"
-    ask ka  "keepalive (seconds)" "$T_KEEPALIVE"
-    dim "these are local: the two servers may differ without breaking the link"
-    case "$car$win$ka" in *[!0-9]*) fail "numbers only"; pause; return ;; esac
+# Every number that shapes a tunnel, on one screen, split by the only
+# distinction that matters when two servers disagree: the settings that have to
+# match, and the ones that are nobody's business but this machine's.
+tuning_menu() {
+    local name="$1" f v
+    f="$(cfg_file "$name")"
+    while :; do
+        cfg_load "$name" || return 1
+        banner
+        head2 "Tuning: $name"
+
+        panel "both servers must agree"
+        field "Token" "$(token_print "$T_TOKEN")" "Shaping" "$(shaping_label "$name")"
+        field "Type" "$(transport_label "$T_TRANSPORT")" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        panel_end
+        say ""
+        panel "local to this server"
+        field "Profile" "$T_PRESET"
+        field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
+        field "Keepalive" "${T_KEEPALIVE} s"
+        panel_end
+        say ""
+        dim "Read the top box on the other server and make it read the same."
+        dim "The bottom box may differ; it will not break the link."
+
+        rule
+        item 1 "Profile" "pick a preset and set all three at once"
+        item 2 "Carriers" "$T_CARRIERS - parallel connections"
+        item 3 "Window" "$T_WINDOW KB per connection"
+        item 4 "Keepalive" "$T_KEEPALIVE seconds"
+        item 5 "Traffic shaping" "$(shaping_label "$name") - must match"
+        item 0 "Back"
+        say ""
+        local c=""
+        ask c "select"
+        case "$c" in
+            1) say ""; preset_menu
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" ;;
+            2) say ""; ask v "parallel connections" "$T_CARRIERS"
+               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" ;;
+            3) say ""; ask v "window per connection, KB" "$T_WINDOW"
+               tuning_write "$name" "$T_CARRIERS" "$v" "$T_KEEPALIVE" ;;
+            4) say ""; ask v "keepalive seconds" "$T_KEEPALIVE"
+               tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$v" ;;
+            5) edit_shaping "$name" ;;
+            0|"") return ;;
+        esac
+    done
+}
+
+# tuning_write <name> <carriers> <window> <keepalive>
+tuning_write() {
+    local name="$1" car="$2" win="$3" ka="$4" f
+    f="$(cfg_file "$name")"
+    case "$car$win$ka" in *[!0-9]*|"") fail "numbers only"; pause; return ;; esac
+    [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
 
     cp -f "$f" "$f.bak"
     sed -i "s#^carriers.*#carriers         = $car#" "$f"
@@ -1644,14 +1697,14 @@ edit_tuning() {
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"
-        ok "updated and restarted"
-        warn "set the same carrier count on the other server too"
+        ok "saved and restarted"
     else
         mv -f "$f.bak" "$f"
-        fail "rejected, nothing changed"
+        fail "the core rejected that; nothing was changed"
     fi
-    pause
+    sleep 1
 }
+
 
 
 recycle_menu() {
@@ -1701,6 +1754,10 @@ delete_tunnel() {
     rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
     rm -f "$(cfg_file "$name")" "$(cfg_file "$name").bak" "$STATE_DIR/$name.fail"
     systemctl daemon-reload
+    # Its forwarding rules outlive the config unless something removes them,
+    # and a DNAT rule pointing at an address that no longer exists swallows
+    # every packet for that port - which looks exactly like a broken tunnel.
+    apply_nat quiet
     ok "tunnel $name removed"
     sleep 1
     return 0
@@ -3716,7 +3773,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.6.0"
+const version = "4.7.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -6517,6 +6574,17 @@ func probeOne(r fwdRule) bool {
 	label := fmt.Sprintf(":%d -> %s", r.lport, r.target)
 	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", r.lport), 5*time.Second)
 	if err != nil {
+		// These two look alike and mean opposite things. Refused is an empty
+		// port: the tunnel is not listening. A timeout on loopback is not -
+		// the kernel answers its own sockets instantly - so something between
+		// the dial and the socket swallowed it, and on this tool that is
+		// almost always a leftover DNAT rule from an iptables tunnel.
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			fmt.Printf("  %-30s no answer on loopback - something is intercepting this port\n", label)
+			fmt.Printf("  %-30s   check:  iptables -t nat -S\n", "")
+			return false
+		}
 		fmt.Printf("  %-30s nothing listening on this server: %v\n", label, err)
 		return false
 	}

@@ -193,7 +193,27 @@ cfg_save >/dev/null
 : > "$RULES"; nat_rules_for map
 check "443=8443 maps across"           "$(grep -c 'dport 443 .* --to-destination 10.10.10.2:8443' "$RULES")" "1"
 
-unset -f iptables sysctl have
+# ---------------------------------------------------------------------------
+note "a deleted tunnel takes its forwarding rules with it"
+# ---------------------------------------------------------------------------
+# A DNAT rule left pointing at an address that no longer exists swallows every
+# packet for that port. The symptom - connecting to a socket that is plainly
+# listening, and timing out instead of being answered - looks nothing like its
+# cause, and cost a real afternoon.
+systemctl() { return 0; }
+confirm() { return 0; }
+_say() { :; }
+
+: > "$RULES"; apply_nat quiet
+check "an iptables tunnel has rules"  "$(grep -c 'PINGIFY_NAT -p' "$RULES")" "3"
+
+rm -f "$(cfg_file tun-iptables-server)" "$(cfg_file tun-iptables-client)" \
+      "$(cfg_file map)"
+: > "$RULES"; apply_nat quiet
+check "and none once it is deleted"   "$(grep -c 'PINGIFY_NAT -p' "$RULES")" "0"
+check "the chains are torn down too"  "$(grep -c 'X PINGIFY_NAT' "$RULES")" "1"
+
+unset -f iptables sysctl have systemctl confirm _say
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
