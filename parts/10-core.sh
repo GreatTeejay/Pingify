@@ -40,14 +40,14 @@ download_core() {
     base="$(release_base)"
 
     if ! spin "downloading the core for $GOARCH" \
-         curl -fsSL --retry 2 --max-time 180 -o "$tmp" "$base/$(core_asset)"; then
+         fetch "$base/$(core_asset)" "$tmp" 180; then
         rm -f "$tmp"
         return 1
     fi
 
     # The checksum file is published alongside the binaries. A missing one is
     # not fatal, a wrong one is.
-    if curl -fsSL --max-time 30 -o "$sums" "$base/SHA256SUMS" 2>/dev/null; then
+    if fetch "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
         want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
@@ -97,7 +97,7 @@ import_core_binary() {
     local tmp="/tmp/pingify-core.import"
     case "$src" in
         http://* | https://*)
-            spin "downloading" curl -fsSL --max-time 300 -o "$tmp" "$src" \
+            spin "downloading" fetch "$src" "$tmp" 300 \
                 || { fail "download failed"; return 1; } ;;
         *)
             [ -f "$src" ] || { fail "no such file: $src"; return 1; }
@@ -121,12 +121,41 @@ ensure_core() {
     install_core
 }
 
+# The script and the core share the config format, so a core left behind by an
+# older install reads a newer config as if half of it were not there. 3.4 moved
+# configs into sections; a 3.3 core reads one of those and reports every field
+# as empty - which surfaced as "role must be \"server\" or \"client\", got \"\""
+# with nothing to point at the real cause. They are kept in step here instead.
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
+}
+
+ensure_core_current() {
+    [ -x "$CORE_BIN" ] || return 0
+    core_matches_script && return 0
+    banner
+    head2 "Core update"
+    warn "the core is $(core_version), this script is $PINGIFY_VERSION"
+    dim "they have to match - the config format is shared between them"
+    say ""
+    if download_core; then
+        restart_all "the core was updated"
+    else
+        say ""
+        fail "the core could not be updated"
+        dim "until it matches, new tunnels will be rejected"
+        dim "Update core in the menu has the other ways to install it"
+    fi
+    pause
+}
+
 # ---------------------------------------------------------------------------
 # systemd
 # ---------------------------------------------------------------------------
 
 write_units() {
-    cat > "$UNIT_DIR/pingify@.service" <<'UNIT'
+    cat > "$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
 Documentation=https://github.com/GreatTeejay/Pingify
@@ -136,7 +165,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/pingify-core -c /etc/pingify/%i.json
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.$CFG_EXT
+WorkingDirectory=$BASE_DIR
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -144,7 +174,8 @@ TasksMax=infinity
 NoNewPrivileges=yes
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-ProtectHome=yes
+# ProtectHome is deliberately off: the core and its config live under /root.
+ProtectHome=no
 ProtectSystem=full
 StandardOutput=journal
 StandardError=journal
