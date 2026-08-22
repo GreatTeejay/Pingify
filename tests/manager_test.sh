@@ -300,5 +300,88 @@ fetch "http://example.invalid/x" "$WORK/none" 5
 check "and fails when neither is here" "$?" "1"
 unset -f have wget
 
+
+# ---------------------------------------------------------------------------
+note "the setup token carries a whole tunnel"
+# ---------------------------------------------------------------------------
+# Build one end, decode the token the way the other end decodes it, and check
+# the second config comes out right. Both transports, because the endpoint is
+# the part that differs and an earlier token silently mangled ICMP - it has no
+# port, and the builder was slicing one off the address.
+
+# decode <token> ; fills the TOK_* variables
+decode() {
+    local raw
+    raw="$(printf '%s' "$1" | base64 -d)"
+    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST \
+                   TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV \
+                   TOK_TL TOK_TP TOK_MTU <<EOF
+$raw
+EOF
+}
+
+# --- TCP, reverse: IRAN accepts, so the peer is told to dial us -------------
+cfg_reset
+T_NAME="ir"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="server"
+cfg_mode
+T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"
+T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_SNDBUF=1024; T_RCVBUF=1024
+T_FORWARDS='"6526"'; T_STATUS="127.0.0.1:9700"
+decode "$(cfg_setup_token)"
+check "token version"           "$TOK_V"      "p2"
+check "transport travels"       "$TOK_TR"     "tcp"
+check "forwarder travels"       "$TOK_FWD"    "pingify"
+check "the peer is told to dial" "$TOK_DIAL"  "1"
+check "and where"               "$TOK_HOST"   "203.0.113.9"
+check "with the port"           "$TOK_PORT"   "9443"
+check "the secret travels"      "$TOK_TOKEN"  "$TOKEN"
+check "carriers travel"         "$TOK_CAR"    "14"
+check "buffers travel"          "$TOK_SND"    "1024"
+check "no ports in the token"   "$(printf '%s' "$(cfg_setup_token)" | base64 -d | grep -c 6526)" "0"
+check "and it is one line"      "$(cfg_setup_token | wc -l)" "0"
+
+# --- TCP, direct: IRAN dials, so the peer is told to accept -----------------
+T_ACCEPTS="client"
+decode "$(cfg_setup_token)"
+check "direct: peer accepts"    "$TOK_DIAL"   "0"
+check "and needs no address"    "$TOK_HOST"   ""
+
+# --- ICMP: no port anywhere -------------------------------------------------
+cfg_reset
+T_NAME="ic"; T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; T_ACCEPTS="server"
+cfg_mode
+T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"
+T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_SNDBUF=1024; T_RCVBUF=1024
+T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_TUNMTU=1380
+T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9701"
+decode "$(cfg_setup_token)"
+check "icmp transport travels"  "$TOK_TR"     "icmp"
+check "icmp carries no port"    "$TOK_PORT"   ""
+check "the address is intact"   "$TOK_HOST"   "203.0.113.9"
+check "the private link swaps"  "$TOK_TL"     "10.20.10.2/24"
+check "and points back at us"   "$TOK_TP"     "10.20.10.1/24"
+check "mtu travels"             "$TOK_MTU"    "1380"
+
+# --- and the config the far end builds from it ------------------------------
+cfg_reset
+T_KIND="$TOK_KIND"; T_TRANSPORT="$TOK_TR"; T_MODE="$TOK_MODE"
+T_FORWARDER="$TOK_FWD"; T_TOKEN="$TOK_TOKEN"
+T_CARRIERS="$TOK_CAR"; T_WINDOW="$TOK_WIN"; T_KEEPALIVE="$TOK_KA"
+T_SNDBUF="$TOK_SND"; T_RCVBUF="$TOK_RCV"
+T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
+T_ROLE="client"; T_ACCEPTS="server"; T_PEER_IP="$TOK_HOST"
+T_NAME="kharej-icmp"; T_PUBLIC_IP="198.51.100.4"; T_STATUS="127.0.0.1:9702"
+kh="$(cfg_save)"
+check "the peer file is written" "$(basename "$kh")"                    "kharej-icmp.toml"
+check "it sends to IRAN"         "$(toml_get "$kh" transport connect)"  "203.0.113.9"
+check "it does not listen"       "$(toml_get "$kh" transport listen)"   ""
+check "same secret both ends"    "$(toml_get "$kh" security token)"     "$TOKEN"
+check "its end of the link"      "$(toml_get "$kh" tun local_addr)"     "10.20.10.2/24"
+check "no ports on KHAREJ"       "$(grep -c '^ports' "$kh")"            "0"
+if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
+    "$CORE_BIN" -c "$kh" -check >/dev/null 2>&1
+    check "the core accepts it"  "$?"                                   "0"
+fi
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
