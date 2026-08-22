@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.5.0"
+PINGIFY_VERSION="5.6.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -672,26 +672,6 @@ build_core() {
     adopt_core "$SRC_DIR/pingify-core"
 }
 
-import_core_binary() {
-    local src=""
-    say ""
-    dim "Point Pingify at a pingify-core binary you built or downloaded elsewhere."
-    dim "A local path or an https URL both work."
-    say ""
-    ask src "path or URL"
-    [ -n "$src" ] || return 1
-    local tmp="/tmp/pingify-core.import"
-    case "$src" in
-        http://* | https://*)
-            spin "downloading" fetch "$src" "$tmp" 300 \
-                || { fail "download failed"; return 1; } ;;
-        *)
-            [ -f "$src" ] || { fail "no such file: $src"; return 1; }
-            cp -f "$src" "$tmp" || return 1 ;;
-    esac
-    adopt_core "$tmp"
-}
-
 # install_core is the full ladder; ensure_core only runs it when needed.
 install_core() {
     if download_core; then return 0; fi
@@ -918,6 +898,21 @@ apply_preset() {
     return 0
 }
 
+# The tuning arrives in the token as bare numbers, so name the preset they
+# match. Writing "from token" put a string in the profile field that is not a
+# profile, and told a reader on this server nothing about what the tuning is -
+# while the other server, with the identical numbers, called it Extreme.
+preset_name() {
+    case "$1/$2" in
+        8/256)   printf 'gaming' ;;
+        10/512)  printf 'latency' ;;
+        14/1024) printf 'balanced' ;;
+        20/2048) printf 'throughput' ;;
+        24/4096) printf 'extreme' ;;
+        *)       printf 'custom' ;;
+    esac
+}
+
 preset_menu() {
     CHOICE_DEF="3"
     choice 1 "Gaming" "8 carriers - lowest ping, small bursts"
@@ -1134,7 +1129,7 @@ TOKEN
     T_TOKEN="$tok"; T_PORT="${port:-9443}"
     T_CARRIERS="$car"; T_WINDOW="$win"; T_KEEPALIVE="$ka"
     T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
-    T_PRESET="from token"
+    T_PRESET="$(preset_name "$car" "$win")"
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
 
     # The other end told us which side it is by telling us what to do about
@@ -1488,6 +1483,19 @@ new_tunnel() {
     # Unconditional: apply_nat tears the chains down when no tunnel needs
     # them, so this is also what cleans up after a forwarder that changed.
     apply_nat quiet
+
+    # An ICMP tunnel wants this server quiet. The kernel answering ordinary
+    # pings never touches our own traffic - the transport is a raw socket the
+    # kernel copies to us regardless, and both ends send echo *replies*, which
+    # the kernel never answers by itself - but a tunnel hiding inside ping is
+    # not helped by a host that cheerfully answers every scanner that asks.
+    if [ "$T_TRANSPORT" = "icmp" ] && [ "$T_ROLE" = "server" ]        && [ "$(block_state icmp)" != "on" ]; then
+        mkdir -p "$STATE_DIR"
+        : > "$STATE_DIR/block-icmp"
+        apply_blocking quiet
+        ok "this server no longer answers pings (Blocking ${BX_ARR} ICMP, to undo)"
+    fi
+
     ok "$T_NAME is running"
     dim "$file"
 
@@ -1825,37 +1833,50 @@ tunnel_menu() {
         head2 "Tunnel: $name"
         tunnel_status_block "$name"
         rule
-        group "Check"
-        item 1 "Health check" "what is wrong, and what to do about it"
-        item 2 "Live log"
-        group "Settings"
-        item 3 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
-        item 4 "Tuning" "carriers, window, keepalive, shaping"
-        item 5 "Scheduled restart"
         group "Service"
-        item 6 "Restart"
-        item 7 "Stop"
-        item 8 "Start"
+        item 1 "Restart"
+        item 2 "Stop"
+        item 3 "Start"
+        item 4 "Delete this tunnel"
+        group "Check"
+        item 5 "Health check" "what is wrong, and what to do about it"
+        item 6 "Live log"
+        group "Settings"
+        item 7 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
+        item 8 "Tuning" "carriers, window, keepalive, shaping"
+        item 9 "Scheduled restart"
         say ""
-        item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) health_check "$name" ;;
-            2) say ""; dim "ctrl-c to stop following"; say ""
-               journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            3) edit_forwards "$name" ;;
-            4) tuning_menu "$name" ;;
-            5) recycle_menu "$name" ;;
-            6) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
-            7) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
-            8) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            d|D) delete_tunnel "$name" && return ;;
+            1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
+            2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
+            3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
+            4) delete_tunnel "$name" && return ;;
+            5) health_check "$name" ;;
+            6) live_log "$name" ;;
+            7) edit_forwards "$name" ;;
+            8) tuning_menu "$name" ;;
+            9) recycle_menu "$name" ;;
             0|"") return ;;
         esac
     done
+}
+
+# journald puts its own timestamp, the hostname and unit[pid] in front of
+# every line. Our line already carries a timestamp, so all that prefix bought
+# was half the terminal width - on a 24-carrier tunnel it pushed the actual
+# message off the right edge. -o cat prints only what the core wrote.
+live_log() {
+    local name="$1"
+    banner
+    head2 "Live log: $name"
+    say ""
+    dim "ctrl-c to stop following"
+    say ""
+    journalctl -u "pingify@$name" -n 60 -f --no-pager -o cat || true
 }
 
 edit_logging() {
@@ -2255,7 +2276,7 @@ health_check() {
             hc_fix "systemctl start pingify@$name" ;;
         *)
             hc_bad "the service is $state"
-            hc_fix "journalctl -u pingify@$name -n 40 --no-pager" ;;
+            hc_fix "journalctl -u pingify@$name -n 40 --no-pager -o cat" ;;
     esac
 
     # --- the config itself -------------------------------------------------
@@ -2284,7 +2305,7 @@ health_check() {
     elif [ -z "$brief" ]; then
         hc_bad "the status endpoint is not answering on $T_STATUS"
         hc_note "the core is running but has not opened it, or has just started"
-        hc_fix "journalctl -u pingify@$name -n 20 --no-pager"
+        hc_fix "journalctl -u pingify@$name -n 20 --no-pager -o cat"
     elif [ "$up" = "0" ]; then
         hc_bad "no carrier is up (0 of $total)"
         if this_side_accepts; then
@@ -2340,22 +2361,43 @@ health_check() {
         fi
     fi
 
-    # --- ICMP needs the kernel to leave ping alone -------------------------
+    # --- ICMP echo, on a tunnel that rides in it ---------------------------
+    # The kernel answering an ordinary ping costs nothing, but it answers
+    # every scanner on the internet, and this server is meant to look quiet.
+    # It never touches our own traffic: the transport is a raw socket, which
+    # the kernel copies to us regardless, and both ends send echo *replies*,
+    # which the kernel never answers by itself. So the block is wanted here.
     if [ "$T_TRANSPORT" = "icmp" ]; then
         if [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = "1" ]; then
-            hc_bad "this server is set to ignore all ICMP echo"
-            hc_note "the tunnel rides in echo packets, so nothing can arrive"
-            hc_fix "main menu ${BX_ARR} Blocking, and turn the ICMP block off"
+            hc_ok "the kernel is not answering pings, which is what we want"
         else
-            hc_ok "ICMP echo is not blocked here"
+            hc_warn "this server still answers ordinary pings"
+            hc_note "the tunnel keeps working either way, but the server is"
+            hc_note "louder than it needs to be and answers every scanner"
+            hc_fix "main menu ${BX_ARR} Blocking ${BX_ARR} turn the ICMP block on"
         fi
     fi
 
     # --- the far side ------------------------------------------------------
+    # The probe is the only check here that reaches past this machine, and
+    # its verdict has to reach the summary: a report that lists a port the
+    # other server could not reach and then says nothing is wrong is worse
+    # than no report at all.
     if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && [ -n "$T_FORWARDS" ]; then
         say ""
         head2 "Through the tunnel"
-        "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
+        local out rc
+        out="$("$CORE_BIN" -c "$f" -probe 2>&1)"; rc=$?
+        # the carrier line is already above, in this report's own words
+        printf '%s\n' "$out" | sed '/carriers up,/d' | sed 's/^/  /'
+        if [ "$rc" != "0" ]; then
+            say ""
+            hc_bad "a forwarded port did not reach the service on the other server"
+            hc_note "this end is fine - the tunnel carried the test across"
+            hc_note "and the far end is where it stopped"
+            hc_fix "on the KHAREJ server:  ss -ltnp | grep <the port after the arrow>"
+            hc_note "whatever should answer there is not listening on that address"
+        fi
     fi
 
     # --- what it comes to --------------------------------------------------
@@ -2400,8 +2442,15 @@ live_dashboard() {
         list_tunnels
         rule
         say "  ${C_DIM}watchdog: $(watchdog_state)   $(uptime | sed 's/^ *//')${C_OFF}"
-        read -rsn1 -t 2 key
-        case "$key" in q|Q) return ;; esac
+        say ""
+        dim "  refreshing every 2s - enter or q to go back"
+        # read returns 0 only when a key actually arrived, and non-zero when
+        # the two seconds ran out. Without that test an empty key means both
+        # "the user pressed enter" and "nothing happened", so enter did
+        # nothing and the only way out of here was to kill the script.
+        if read -rsn1 -t 2 key; then
+            case "$key" in q|Q|0|"") return ;; esac
+        fi
     done
 }
 
@@ -2426,7 +2475,7 @@ health_menu() {
             2) live_dashboard ;;
             3) enable_watchdog; pause ;;
             4) disable_watchdog; pause ;;
-            5) say ""; journalctl -u pingify-health.service -n 40 --no-pager | sed 's/^/  /'; pause ;;
+            5) say ""; journalctl -u pingify-health.service -n 40 --no-pager -o cat | sed 's/^/  /'; pause ;;
             6) local n
                for n in $(tunnel_names); do systemctl restart "pingify@$n"; ok "restarted $n"; done
                pause ;;
@@ -2834,7 +2883,7 @@ blocking_menu() {
         row "$(pad_to "${C_DIM}UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
         panel_end
         say ""
-        item 1 "Ping / ICMP" "stop this server answering pings"
+        item 1 "Ping / ICMP" "stop this server answering pings - wanted on an ICMP tunnel"
         item 2 "Speedtest sites" "block benchmark sites and their CDNs"
         item 3 "Block UDP 443" "rejects QUIC, so browsers fall back to TCP"
         say ""
@@ -2845,7 +2894,24 @@ blocking_menu() {
         local c=""
         ask c "select"
         case "$c" in
-            1) say ""; block_toggle icmp; pause ;;
+            1) say ""
+               # The question people arrive with is whether this breaks an
+               # ICMP tunnel. It does not, and the reason is worth stating
+               # once here rather than being rediscovered on a live server.
+               if [ "$(block_state icmp)" != "on" ]; then
+                   dim "Safe with an ICMP tunnel running. The tunnel reads from a raw"
+                   dim "socket, which the kernel copies to us whatever this is set to,"
+                   dim "and both ends send echo replies, which the kernel never answers"
+                   dim "by itself. This only stops it answering other people's pings."
+                   say ""
+               fi
+               block_toggle icmp
+               if [ "$(block_state icmp)" = "on" ]; then
+                   ok "this server no longer answers pings"
+               else
+                   ok "this server answers pings again"
+               fi
+               pause ;;
             2) say ""
                dim "This works on traffic leaving in the clear, so it belongs on"
                dim "the KHAREJ server - that is where the proxy talks to the site."
@@ -2874,32 +2940,6 @@ blocking_menu() {
 # ---------------------------------------------------------------------------
 
 RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/Pingify/main"
-
-update_menu() {
-    while :; do
-        banner
-        head2 "Core"
-        printf '  %-22s %s\n' "core" "$(core_version)"
-        printf '  %-22s %s\n' "manager" "$PINGIFY_VERSION"
-        printf '  %-22s %s\n' "Go toolchain" "$(find_go >/dev/null 2>&1 && "$GO_BIN" version || echo 'not installed')"
-        rule
-        item 1 "Download the latest core" "prebuilt, from GitHub Releases"
-        item 2 "Compile the core here" "from the sources inside this script"
-        item 3 "Import a core binary" "path or URL"
-        item 4 "Export this core binary" "to copy to the other server"
-        item 0 "Back"
-        say ""
-        local c=""
-        ask c "select"
-        case "$c" in
-            1) say ""; if download_core; then restart_all "the core was updated"; fi; pause ;;
-            2) say ""; if build_core; then restart_all "the core was rebuilt"; fi; pause ;;
-            3) say ""; if import_core_binary; then restart_all "the core was replaced"; fi; pause ;;
-            4) export_core; pause ;;
-            0|"") return ;;
-        esac
-    done
-}
 
 restart_all() {
     local n any=0
@@ -2940,24 +2980,12 @@ self_update() {
     ok "Pingify updated to ${newver:-unknown}"
 }
 
-export_core() {
-    say ""
-    [ -x "$CORE_BIN" ] || { fail "no core is installed here"; return 1; }
-    local dest="/root/pingify-core-$(uname -m)"
-    cp -f "$CORE_BIN" "$dest"
-    ok "copied to $dest"
-    dim "Copy it to the other server, then Update core -> 3 there."
-    dim "Example, run this on the other server:"
-    say ""
-    say "    ${C_DIM}scp root@$(public_ip):$dest /root/pingify-core${C_OFF}"
-}
-
 remove_menu() {
     banner
     head2 "Remove"
     item 1 "Remove the core only" "tunnels and configs stay"
     item 2 "Remove every tunnel" "configs and services, core stays"
-    item 3 "Full uninstall" "everything Pingify ever wrote"
+    item 3 "Full uninstall" "every tunnel, unit, rule and file it wrote"
     item 0 "Back"
     say ""
     local c=""
@@ -2969,7 +2997,7 @@ remove_menu() {
             for n in $(tunnel_names); do systemctl stop "pingify@$n" >/dev/null 2>&1; done
             rm -f "$CORE_BIN"
             rm -rf "$SRC_DIR"
-            ok "core removed; rebuild it from Update Core when you need it"
+            ok "core removed; the next run downloads it again"
             pause ;;
         2)  say ""
             confirm "delete every tunnel on this server?" || return
@@ -2987,25 +3015,49 @@ remove_menu() {
     esac
 }
 
+# Everything this tool ever wrote, in one pass. The firewall rules matter
+# most: a DNAT rule pointing at an address that no longer exists swallows
+# every packet for that port silently, and an uninstall that leaves one
+# behind hands the next person a server that is broken in a way nothing on
+# it explains.
 full_uninstall() {
     say ""
-    warn "this removes the core, every tunnel, the units and the tuning"
+    warn "this removes, on this server:"
+    say ""
+    dim "    every tunnel and its config in $CFG_DIR"
+    dim "    the systemd units, timers and the boot-time firewall unit"
+    dim "    the forwarding rules (iptables chains PINGIFY_NAT, PINGIFY_POST)"
+    dim "    the blocking rules (chains PINGIFY_IN, PINGIFY_OUT, PINGIFY_FWD)"
+    dim "    the ICMP block in /etc/sysctl.d and the speedtest lines in /etc/hosts"
+    dim "    the core binary, the state directory and this script"
+    say ""
     confirm "go ahead?" || return
+
     local n
     for n in $(tunnel_names); do
         systemctl disable --now "pingify@$n" >/dev/null 2>&1
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
     systemctl disable --now pingify-health.timer >/dev/null 2>&1
+
+    # both sets of chains, unhooked from the built-in ones and deleted
     remove_blocking
+    have iptables && nat_drop_chains
+
     rm -f "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-health.service \
           "$UNIT_DIR"/pingify-health.timer "$UNIT_DIR"/pingify-recycle@*.service \
-          "$UNIT_DIR"/pingify-recycle@*.timer
+          "$UNIT_DIR"/pingify-recycle@*.timer "$UNIT_DIR"/pingify-firewall.service
     systemctl daemon-reload
+
     if confirm "also revert the sysctl and file-limit tuning?"; then revert_tuning; fi
     rm -rf "$CFG_DIR" "$STATE_DIR" "$SRC_DIR"
     rm -f "$CORE_BIN"
-    ok "Pingify is gone. Removing the manager itself now."
+
+    say ""
+    ok "every rule and unit is gone; nothing of Pingify is left running"
+    dim "check for yourself:  iptables -t nat -S | grep PINGIFY   (should print nothing)"
+    say ""
+    ok "removing the manager itself now"
     rm -f "$SELF_BIN"
     say ""
     exit 0
@@ -3174,7 +3226,7 @@ diagnostics_menu() {
             2) diag_ping ;;
             3) if pick_tunnel; then
                    say ""; dim "ctrl-c to stop"; say ""
-                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager || true
+                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager -o cat || true
                fi ;;
             4) diag_system ;;
             5) show_nat; pause ;;
@@ -4487,7 +4539,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.5.0"
+const version = "5.6.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -5310,6 +5362,16 @@ type pool struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
+	// what the log was last told the strength was, so it can be told again
+	// only when that changed
+	reported int
+
+	// when each kind of failure was last written down. Every carrier fails
+	// the same way at the same moment, so without this the log is the same
+	// sentence twenty-four times a second and the reader learns nothing.
+	errMu   sync.Mutex
+	errSeen map[string]time.Time
+
 	startedAt time.Time
 }
 
@@ -5413,10 +5475,19 @@ func (p *pool) serveInbound(conn net.Conn) {
 	tuneSocket(conn, p.cfg)
 	keys, idx, err := serverHandshakeFor(p.cfg, conn, p.guard)
 	if err != nil {
-		// Stay quiet: a probe should learn nothing from timing or content.
+		// Stay quiet on the wire: a probe should learn nothing from timing
+		// or content. The local log is a different audience entirely - an
+		// operator whose two servers disagree about the token could read it
+		// all day and find nothing, because this is the only place that
+		// knows the other end is knocking and being turned away.
+		ra := conn.RemoteAddr()
 		time.Sleep(time.Duration(200+mrand.Intn(600)) * time.Millisecond)
 		conn.Close()
-		logDebug("rejected %s: %v", conn.RemoteAddr(), err)
+		logDebug("rejected %s: %v", ra, err)
+		if p.firstIn("rejected", time.Minute) {
+			logWarn("turned away a connection from %s: %v", ra, err)
+			logWarn("if that address is the other server, the two security tokens differ")
+		}
 		return
 	}
 	if idx < 0 || idx >= maxCarriers {
@@ -5432,7 +5503,8 @@ func (p *pool) serveInbound(conn net.Conn) {
 	}
 	l := newLink(idx, p.cfg, conn, keys, p)
 	p.install(idx, l)
-	logInfo("carrier %d up from %s", idx, conn.RemoteAddr())
+	logDebug("carrier %d up from %s", idx, conn.RemoteAddr())
+	p.noteStrength()
 	l.run()
 }
 
@@ -5446,7 +5518,11 @@ func (p *pool) dialLoop(idx int) {
 		}
 		conn, err := p.dialCarrier(idx)
 		if err != nil {
-			logWarn("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
+			if p.firstIn("dial", time.Minute) {
+				logWarn("cannot reach the other server at %s: %v", p.cfg.Connect, err)
+				logWarn("nothing is listening on that port there, or a firewall is dropping it")
+			}
+			logDebug("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
 			p.sleepBackoff(&backoff)
 			continue
 		}
@@ -5454,14 +5530,19 @@ func (p *pool) dialLoop(idx int) {
 		keys, err := clientHandshakeFor(p.cfg, conn, idx)
 		if err != nil {
 			conn.Close()
-			logWarn("carrier %d handshake: %v (check the key on both servers)", idx, err)
+			if p.firstIn("handshake", time.Minute) {
+				logWarn("reached %s but the handshake failed: %v", p.cfg.Connect, err)
+				logWarn("the two servers disagree - almost always a different security token")
+			}
+			logDebug("carrier %d handshake: %v", idx, err)
 			p.sleepBackoff(&backoff)
 			continue
 		}
 		backoff = 500 * time.Millisecond
 		l := newLink(idx, p.cfg, conn, keys, p)
 		p.install(idx, l)
-		logInfo("carrier %d up to %s", idx, p.cfg.Connect)
+		logDebug("carrier %d up to %s", idx, p.cfg.Connect)
+		p.noteStrength()
 		l.run() // blocks until the carrier dies
 		select {
 		case <-p.closed:
@@ -5479,6 +5560,59 @@ func (p *pool) sleepBackoff(b *time.Duration) {
 	}
 	if *b < 8*time.Second {
 		*b *= 2
+	}
+}
+
+// A 24-carrier tunnel used to write 24 near-identical lines every time it
+// came up, and the same again every time the far end restarted, which buried
+// the one line a reader was looking for. Report the strength instead, and
+// only when it changes something worth acting on.
+// firstIn reports whether this kind of failure is worth a line right now:
+// the first one, and then at most one a minute.
+func (p *pool) firstIn(kind string, every time.Duration) bool {
+	p.errMu.Lock()
+	defer p.errMu.Unlock()
+	if p.errSeen == nil {
+		p.errSeen = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := p.errSeen[kind]; ok && now.Sub(last) < every {
+		return false
+	}
+	p.errSeen[kind] = now
+	return true
+}
+
+func (p *pool) noteStrength() {
+	select {
+	case <-p.closed:
+		// stopping on purpose: the strength going to zero is the point,
+		// not news
+		return
+	default:
+	}
+	p.mu.Lock()
+	n := 0
+	for _, l := range p.links {
+		if l != nil && l.alive() {
+			n++
+		}
+	}
+	was := p.reported
+	p.reported = n
+	p.mu.Unlock()
+
+	switch {
+	case was == n:
+		// nothing a reader would act on
+	case was == 0 && n > 0:
+		logInfo("tunnel up: %d of %d carriers", n, p.cfg.Carriers)
+	case n >= p.cfg.Carriers:
+		logInfo("all %d carriers up", n)
+	case n == 0:
+		logWarn("every carrier is down: nothing can cross the tunnel now")
+	case n < was:
+		logWarn("%d of %d carriers up, %d went down", n, p.cfg.Carriers, was-n)
 	}
 }
 
@@ -6283,8 +6417,14 @@ func (l *link) close() {
 		if why == "" {
 			why = "closed locally"
 		}
-		logInfo("carrier %d down: %s (up %s)", l.idx, why,
+		// The reason belongs in the log every time - it is the only place
+		// that says *why* - but at debug, because noteStrength below turns a
+		// whole braid dropping at once into one line instead of twenty-four.
+		logDebug("carrier %d down: %s (up %s)", l.idx, why,
 			time.Since(time.Unix(0, atomic.LoadInt64(&l.upSince))).Round(time.Second))
+		if l.pool != nil {
+			l.pool.noteStrength()
+		}
 	})
 }
 
@@ -7761,7 +7901,7 @@ first_run() {
     fi
     say ""
     fail "the core could not be installed"
-    dim "Core in the menu has the other ways to get it"
+    dim "this server could not reach GitHub and has no Go toolchain to build with"
     pause
 }
 
@@ -7779,8 +7919,7 @@ main_menu() {
         item 6 "Diagnostics"     "connectivity and configs"
         group "MAINTENANCE"
         item 7 "Update Pingify"  "script and core together, to the same version"
-        item 8 "Core options"    "build here, import, export"
-        item 9 "Remove"          "uninstall part of it, or all of it"
+        item 8 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
         say ""
@@ -7794,8 +7933,7 @@ main_menu() {
             5) blocking_menu ;;
             6) diagnostics_menu ;;
             7) update_pingify ;;
-            8) update_menu ;;
-            9) remove_menu ;;
+            8) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
         esac

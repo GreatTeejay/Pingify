@@ -85,26 +85,6 @@ build_core() {
     adopt_core "$SRC_DIR/pingify-core"
 }
 
-import_core_binary() {
-    local src=""
-    say ""
-    dim "Point Pingify at a pingify-core binary you built or downloaded elsewhere."
-    dim "A local path or an https URL both work."
-    say ""
-    ask src "path or URL"
-    [ -n "$src" ] || return 1
-    local tmp="/tmp/pingify-core.import"
-    case "$src" in
-        http://* | https://*)
-            spin "downloading" fetch "$src" "$tmp" 300 \
-                || { fail "download failed"; return 1; } ;;
-        *)
-            [ -f "$src" ] || { fail "no such file: $src"; return 1; }
-            cp -f "$src" "$tmp" || return 1 ;;
-    esac
-    adopt_core "$tmp"
-}
-
 # install_core is the full ladder; ensure_core only runs it when needed.
 install_core() {
     if download_core; then return 0; fi

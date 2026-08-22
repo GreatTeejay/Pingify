@@ -5,32 +5,6 @@
 
 RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/Pingify/main"
 
-update_menu() {
-    while :; do
-        banner
-        head2 "Core"
-        printf '  %-22s %s\n' "core" "$(core_version)"
-        printf '  %-22s %s\n' "manager" "$PINGIFY_VERSION"
-        printf '  %-22s %s\n' "Go toolchain" "$(find_go >/dev/null 2>&1 && "$GO_BIN" version || echo 'not installed')"
-        rule
-        item 1 "Download the latest core" "prebuilt, from GitHub Releases"
-        item 2 "Compile the core here" "from the sources inside this script"
-        item 3 "Import a core binary" "path or URL"
-        item 4 "Export this core binary" "to copy to the other server"
-        item 0 "Back"
-        say ""
-        local c=""
-        ask c "select"
-        case "$c" in
-            1) say ""; if download_core; then restart_all "the core was updated"; fi; pause ;;
-            2) say ""; if build_core; then restart_all "the core was rebuilt"; fi; pause ;;
-            3) say ""; if import_core_binary; then restart_all "the core was replaced"; fi; pause ;;
-            4) export_core; pause ;;
-            0|"") return ;;
-        esac
-    done
-}
-
 restart_all() {
     local n any=0
     for n in $(tunnel_names); do any=1; systemctl restart "pingify@$n"; done
@@ -70,24 +44,12 @@ self_update() {
     ok "Pingify updated to ${newver:-unknown}"
 }
 
-export_core() {
-    say ""
-    [ -x "$CORE_BIN" ] || { fail "no core is installed here"; return 1; }
-    local dest="/root/pingify-core-$(uname -m)"
-    cp -f "$CORE_BIN" "$dest"
-    ok "copied to $dest"
-    dim "Copy it to the other server, then Update core -> 3 there."
-    dim "Example, run this on the other server:"
-    say ""
-    say "    ${C_DIM}scp root@$(public_ip):$dest /root/pingify-core${C_OFF}"
-}
-
 remove_menu() {
     banner
     head2 "Remove"
     item 1 "Remove the core only" "tunnels and configs stay"
     item 2 "Remove every tunnel" "configs and services, core stays"
-    item 3 "Full uninstall" "everything Pingify ever wrote"
+    item 3 "Full uninstall" "every tunnel, unit, rule and file it wrote"
     item 0 "Back"
     say ""
     local c=""
@@ -99,7 +61,7 @@ remove_menu() {
             for n in $(tunnel_names); do systemctl stop "pingify@$n" >/dev/null 2>&1; done
             rm -f "$CORE_BIN"
             rm -rf "$SRC_DIR"
-            ok "core removed; rebuild it from Update Core when you need it"
+            ok "core removed; the next run downloads it again"
             pause ;;
         2)  say ""
             confirm "delete every tunnel on this server?" || return
@@ -117,25 +79,49 @@ remove_menu() {
     esac
 }
 
+# Everything this tool ever wrote, in one pass. The firewall rules matter
+# most: a DNAT rule pointing at an address that no longer exists swallows
+# every packet for that port silently, and an uninstall that leaves one
+# behind hands the next person a server that is broken in a way nothing on
+# it explains.
 full_uninstall() {
     say ""
-    warn "this removes the core, every tunnel, the units and the tuning"
+    warn "this removes, on this server:"
+    say ""
+    dim "    every tunnel and its config in $CFG_DIR"
+    dim "    the systemd units, timers and the boot-time firewall unit"
+    dim "    the forwarding rules (iptables chains PINGIFY_NAT, PINGIFY_POST)"
+    dim "    the blocking rules (chains PINGIFY_IN, PINGIFY_OUT, PINGIFY_FWD)"
+    dim "    the ICMP block in /etc/sysctl.d and the speedtest lines in /etc/hosts"
+    dim "    the core binary, the state directory and this script"
+    say ""
     confirm "go ahead?" || return
+
     local n
     for n in $(tunnel_names); do
         systemctl disable --now "pingify@$n" >/dev/null 2>&1
         systemctl disable --now "pingify-recycle@$n.timer" >/dev/null 2>&1
     done
     systemctl disable --now pingify-health.timer >/dev/null 2>&1
+
+    # both sets of chains, unhooked from the built-in ones and deleted
     remove_blocking
+    have iptables && nat_drop_chains
+
     rm -f "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-health.service \
           "$UNIT_DIR"/pingify-health.timer "$UNIT_DIR"/pingify-recycle@*.service \
-          "$UNIT_DIR"/pingify-recycle@*.timer
+          "$UNIT_DIR"/pingify-recycle@*.timer "$UNIT_DIR"/pingify-firewall.service
     systemctl daemon-reload
+
     if confirm "also revert the sysctl and file-limit tuning?"; then revert_tuning; fi
     rm -rf "$CFG_DIR" "$STATE_DIR" "$SRC_DIR"
     rm -f "$CORE_BIN"
-    ok "Pingify is gone. Removing the manager itself now."
+
+    say ""
+    ok "every rule and unit is gone; nothing of Pingify is left running"
+    dim "check for yourself:  iptables -t nat -S | grep PINGIFY   (should print nothing)"
+    say ""
+    ok "removing the manager itself now"
     rm -f "$SELF_BIN"
     say ""
     exit 0
@@ -304,7 +290,7 @@ diagnostics_menu() {
             2) diag_ping ;;
             3) if pick_tunnel; then
                    say ""; dim "ctrl-c to stop"; say ""
-                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager || true
+                   journalctl -u "pingify@$PICKED" -n 40 -f --no-pager -o cat || true
                fi ;;
             4) diag_system ;;
             5) show_nat; pause ;;

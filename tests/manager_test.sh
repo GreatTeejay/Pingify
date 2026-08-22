@@ -475,5 +475,92 @@ check "a healthy tunnel says nothing is wrong" "$(grep -c 'nothing wrong on this
 check "and prints no fixes"                    "$(grep -c 'fix:' "$HC")"                         "0"
 check "it names the carriers and the rtt"      "$(grep -c '14 of 14 carriers up' "$HC")"         "1"
 
+
+# ---------------------------------------------------------------------------
+note "the shape of the menus"
+# ---------------------------------------------------------------------------
+# Nine entries is the cap, service first: the things done most often should
+# not be below the things done once.
+menu_block() { awk '/^tunnel_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the tunnel menu leads with service" \
+      "$(menu_block | grep -m1 -o 'group "[A-Za-z]*"')" 'group "Service"'
+check "restart is 1"     "$(menu_block | grep -c 'item 1 "Restart"')"            "1"
+check "delete is 4"      "$(menu_block | grep -c 'item 4 "Delete this tunnel"')" "1"
+check "and nine at most" "$(menu_block | grep -cE '^        item [1-9] ')"       "9"
+check "no letter keys"   "$(menu_block | grep -c 'item d ')"                     "0"
+check "the core menu is gone"     "$(grep -c 'Core options' Pingify.sh)"         "0"
+check "and nothing still calls it" "$(grep -c 'update_menu' Pingify.sh)"         "0"
+
+# ---------------------------------------------------------------------------
+note "the tuning a token carries has a name"
+# ---------------------------------------------------------------------------
+# "from token" is not a profile. The numbers came from a preset on the other
+# server and this one should call it what that one calls it.
+check "extreme"  "$(preset_name 24 4096)" "extreme"
+check "balanced" "$(preset_name 14 1024)" "balanced"
+check "gaming"   "$(preset_name 8 256)"   "gaming"
+check "hand-set numbers are custom" "$(preset_name 11 700)" "custom"
+check "nothing assigns it" "$(grep -c 'T_PRESET="from token"' Pingify.sh)" "0"
+
+# ---------------------------------------------------------------------------
+note "an ICMP tunnel wants the kernel quiet, not loud"
+# ---------------------------------------------------------------------------
+# This was backwards: the check called a blocked ping a fault and told people
+# to turn it off. The transport reads a raw socket, which the kernel copies to
+# us whatever icmp_echo_ignore_all says, and both ends send echo replies,
+# which the kernel never answers by itself. So the block is wanted.
+cfg_reset
+T_NAME="ic"; T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; T_ACCEPTS="server"
+cfg_mode
+T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"; T_STATUS="127.0.0.1:9701"
+T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_TUNMTU=1380
+T_FORWARDS='"443"'
+cfg_save >/dev/null
+(
+    banner() { :; }; pause() { :; }
+    svc_state() { printf 'stopped'; }
+    core_matches_script() { return 0; }
+    have() { return 1; }
+    port_free() { return 1; }
+    sysctl() { printf '1'; }
+    CORE_BIN=/bin/true
+    health_check ic
+) > "$HC" 2>&1
+check "a blocked ping is not a fault" "$(grep -c 'which is what we want' "$HC")" "1"
+check "and never asks to undo it"     "$(grep -c 'turn the ICMP block off' "$HC")" "0"
+(
+    banner() { :; }; pause() { :; }
+    svc_state() { printf 'stopped'; }
+    core_matches_script() { return 0; }
+    have() { return 1; }
+    port_free() { return 1; }
+    sysctl() { printf '0'; }
+    CORE_BIN=/bin/true
+    health_check ic
+) > "$HC" 2>&1
+check "an answering server is only a warning" "$(grep -c 'still answers ordinary pings' "$HC")" "1"
+check "with the switch that fixes it"         "$(grep -c 'Blocking' "$HC")"                     "1"
+
+# ---------------------------------------------------------------------------
+note "a full uninstall takes the rules with it"
+# ---------------------------------------------------------------------------
+# A DNAT rule pointing at an address that has gone swallows every packet for
+# that port in silence, so leaving one behind is worse than leaving a file.
+un() { awk '/^full_uninstall\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it drops the forwarding chains" "$(un | grep -c 'nat_drop_chains')"   "1"
+check "and the blocking ones"          "$(un | grep -c 'remove_blocking')"   "1"
+check "and the boot-time unit"         "$(un | grep -c 'pingify-firewall')"  "1"
+check "and says so before asking"      "$(un | grep -c 'PINGIFY_NAT')"       "1"
+
+# ---------------------------------------------------------------------------
+note "the live dashboard lets go"
+# ---------------------------------------------------------------------------
+# read -n1 returns an empty key both when enter is pressed and when the two
+# seconds run out, so without testing its exit status enter did nothing and
+# the only way out was to kill the script.
+db() { awk '/^live_dashboard\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it tests whether a key arrived" "$(db | grep -c 'if read -rsn1')" "1"
+check "and enter is one of the ways out" "$(db | grep -c 'q|Q|0|""')"    "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

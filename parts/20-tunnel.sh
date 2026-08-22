@@ -107,6 +107,21 @@ apply_preset() {
     return 0
 }
 
+# The tuning arrives in the token as bare numbers, so name the preset they
+# match. Writing "from token" put a string in the profile field that is not a
+# profile, and told a reader on this server nothing about what the tuning is -
+# while the other server, with the identical numbers, called it Extreme.
+preset_name() {
+    case "$1/$2" in
+        8/256)   printf 'gaming' ;;
+        10/512)  printf 'latency' ;;
+        14/1024) printf 'balanced' ;;
+        20/2048) printf 'throughput' ;;
+        24/4096) printf 'extreme' ;;
+        *)       printf 'custom' ;;
+    esac
+}
+
 preset_menu() {
     CHOICE_DEF="3"
     choice 1 "Gaming" "8 carriers - lowest ping, small bursts"
@@ -323,7 +338,7 @@ TOKEN
     T_TOKEN="$tok"; T_PORT="${port:-9443}"
     T_CARRIERS="$car"; T_WINDOW="$win"; T_KEEPALIVE="$ka"
     T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
-    T_PRESET="from token"
+    T_PRESET="$(preset_name "$car" "$win")"
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
 
     # The other end told us which side it is by telling us what to do about
@@ -677,6 +692,19 @@ new_tunnel() {
     # Unconditional: apply_nat tears the chains down when no tunnel needs
     # them, so this is also what cleans up after a forwarder that changed.
     apply_nat quiet
+
+    # An ICMP tunnel wants this server quiet. The kernel answering ordinary
+    # pings never touches our own traffic - the transport is a raw socket the
+    # kernel copies to us regardless, and both ends send echo *replies*, which
+    # the kernel never answers by itself - but a tunnel hiding inside ping is
+    # not helped by a host that cheerfully answers every scanner that asks.
+    if [ "$T_TRANSPORT" = "icmp" ] && [ "$T_ROLE" = "server" ]        && [ "$(block_state icmp)" != "on" ]; then
+        mkdir -p "$STATE_DIR"
+        : > "$STATE_DIR/block-icmp"
+        apply_blocking quiet
+        ok "this server no longer answers pings (Blocking ${BX_ARR} ICMP, to undo)"
+    fi
+
     ok "$T_NAME is running"
     dim "$file"
 

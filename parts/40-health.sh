@@ -101,7 +101,7 @@ health_check() {
             hc_fix "systemctl start pingify@$name" ;;
         *)
             hc_bad "the service is $state"
-            hc_fix "journalctl -u pingify@$name -n 40 --no-pager" ;;
+            hc_fix "journalctl -u pingify@$name -n 40 --no-pager -o cat" ;;
     esac
 
     # --- the config itself -------------------------------------------------
@@ -130,7 +130,7 @@ health_check() {
     elif [ -z "$brief" ]; then
         hc_bad "the status endpoint is not answering on $T_STATUS"
         hc_note "the core is running but has not opened it, or has just started"
-        hc_fix "journalctl -u pingify@$name -n 20 --no-pager"
+        hc_fix "journalctl -u pingify@$name -n 20 --no-pager -o cat"
     elif [ "$up" = "0" ]; then
         hc_bad "no carrier is up (0 of $total)"
         if this_side_accepts; then
@@ -186,22 +186,43 @@ health_check() {
         fi
     fi
 
-    # --- ICMP needs the kernel to leave ping alone -------------------------
+    # --- ICMP echo, on a tunnel that rides in it ---------------------------
+    # The kernel answering an ordinary ping costs nothing, but it answers
+    # every scanner on the internet, and this server is meant to look quiet.
+    # It never touches our own traffic: the transport is a raw socket, which
+    # the kernel copies to us regardless, and both ends send echo *replies*,
+    # which the kernel never answers by itself. So the block is wanted here.
     if [ "$T_TRANSPORT" = "icmp" ]; then
         if [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = "1" ]; then
-            hc_bad "this server is set to ignore all ICMP echo"
-            hc_note "the tunnel rides in echo packets, so nothing can arrive"
-            hc_fix "main menu ${BX_ARR} Blocking, and turn the ICMP block off"
+            hc_ok "the kernel is not answering pings, which is what we want"
         else
-            hc_ok "ICMP echo is not blocked here"
+            hc_warn "this server still answers ordinary pings"
+            hc_note "the tunnel keeps working either way, but the server is"
+            hc_note "louder than it needs to be and answers every scanner"
+            hc_fix "main menu ${BX_ARR} Blocking ${BX_ARR} turn the ICMP block on"
         fi
     fi
 
     # --- the far side ------------------------------------------------------
+    # The probe is the only check here that reaches past this machine, and
+    # its verdict has to reach the summary: a report that lists a port the
+    # other server could not reach and then says nothing is wrong is worse
+    # than no report at all.
     if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && [ -n "$T_FORWARDS" ]; then
         say ""
         head2 "Through the tunnel"
-        "$CORE_BIN" -c "$f" -probe 2>&1 | sed 's/^/  /'
+        local out rc
+        out="$("$CORE_BIN" -c "$f" -probe 2>&1)"; rc=$?
+        # the carrier line is already above, in this report's own words
+        printf '%s\n' "$out" | sed '/carriers up,/d' | sed 's/^/  /'
+        if [ "$rc" != "0" ]; then
+            say ""
+            hc_bad "a forwarded port did not reach the service on the other server"
+            hc_note "this end is fine - the tunnel carried the test across"
+            hc_note "and the far end is where it stopped"
+            hc_fix "on the KHAREJ server:  ss -ltnp | grep <the port after the arrow>"
+            hc_note "whatever should answer there is not listening on that address"
+        fi
     fi
 
     # --- what it comes to --------------------------------------------------
@@ -246,8 +267,15 @@ live_dashboard() {
         list_tunnels
         rule
         say "  ${C_DIM}watchdog: $(watchdog_state)   $(uptime | sed 's/^ *//')${C_OFF}"
-        read -rsn1 -t 2 key
-        case "$key" in q|Q) return ;; esac
+        say ""
+        dim "  refreshing every 2s - enter or q to go back"
+        # read returns 0 only when a key actually arrived, and non-zero when
+        # the two seconds ran out. Without that test an empty key means both
+        # "the user pressed enter" and "nothing happened", so enter did
+        # nothing and the only way out of here was to kill the script.
+        if read -rsn1 -t 2 key; then
+            case "$key" in q|Q|0|"") return ;; esac
+        fi
     done
 }
 
@@ -272,7 +300,7 @@ health_menu() {
             2) live_dashboard ;;
             3) enable_watchdog; pause ;;
             4) disable_watchdog; pause ;;
-            5) say ""; journalctl -u pingify-health.service -n 40 --no-pager | sed 's/^/  /'; pause ;;
+            5) say ""; journalctl -u pingify-health.service -n 40 --no-pager -o cat | sed 's/^/  /'; pause ;;
             6) local n
                for n in $(tunnel_names); do systemctl restart "pingify@$n"; ok "restarted $n"; done
                pause ;;
