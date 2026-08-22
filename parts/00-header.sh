@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.10.0"
+PINGIFY_VERSION="5.11.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -101,6 +101,11 @@ pad_to() {
 # A tunnel that is down has no round trip at all, and that is dim, not red -
 # red here should mean "this path is slow", not "there is no path".
 # ---------------------------------------------------------------------------
+# An address is the thing on these screens people copy, compare and mistype,
+# so it gets a colour of its own rather than sitting in the same weight as the
+# words around it.
+addr_tint() { printf '%s%s%s' "$C_CYN" "$1" "$C_OFF"; }
+
 rtt_colour() {
     local ms="${1%ms}"; ms="${ms%%.*}"
     case "$ms" in

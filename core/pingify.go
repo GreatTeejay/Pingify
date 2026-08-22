@@ -27,6 +27,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -52,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.10.0"
+const version = "5.11.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -277,6 +278,7 @@ func main() {
 		healthz = flag.String("healthz", "", "probe a running tunnel (host:port); exit 0 only when a carrier is up")
 		brief   = flag.Bool("brief", false, "with -status, print one machine-readable line")
 		probe   = flag.Bool("probe", false, "with -c, try every forwarded port end to end and exit")
+		derive  = flag.String("derivekey", "", "print the keys a kernel tunnel derives from a security token, and exit")
 	)
 	flag.Parse()
 
@@ -292,6 +294,23 @@ func main() {
 
 	if *showVer {
 		fmt.Println("pingify-core " + version)
+		return
+	}
+	// GRE and AmneziaWG are carried by the kernel, so the security token
+	// cannot protect them the way it protects our own transports - the kernel
+	// has never heard of it. What it can do is be turned into the one secret
+	// each of them does understand, so that answering the token question
+	// still means something on both:
+	//
+	//	the base64 pre-shared key WireGuard mixes into every handshake
+	//	the 32-bit key GRE stamps on every packet
+	//
+	// Both are derived, not stored, so the two servers reach the same values
+	// from the same token without either one carrying them across.
+	if *derive != "" {
+		sum := sha256.Sum256([]byte("pingify-kernel-tunnel\x00" + *derive))
+		greKey := binary.BigEndian.Uint32(sum[:4])
+		fmt.Printf("%s %d\n", base64.StdEncoding.EncodeToString(sum[:]), greKey)
 		return
 	}
 	if *genPSK {

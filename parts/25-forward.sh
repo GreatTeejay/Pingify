@@ -37,7 +37,23 @@ nat_chains() {
     iptables -t nat -C POSTROUTING -j PINGIFY_POST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j PINGIFY_POST
 }
 
+# The mangle chain, for the one rule that decides whether a tunnel is quick
+# or merely connected.
+mss_chain() {
+    iptables -t mangle -N PINGIFY_MSS 2>/dev/null || iptables -t mangle -F PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -C FORWARD -j PINGIFY_MSS 2>/dev/null || iptables -t mangle -I FORWARD 1 -j PINGIFY_MSS
+    iptables -t mangle -C OUTPUT  -j PINGIFY_MSS 2>/dev/null || iptables -t mangle -I OUTPUT 1  -j PINGIFY_MSS
+}
+
+mss_drop_chain() {
+    iptables -t mangle -D FORWARD -j PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -D OUTPUT  -j PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -F PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -X PINGIFY_MSS 2>/dev/null
+}
+
 nat_drop_chains() {
+    mss_drop_chain
     iptables -t nat -D PREROUTING  -j PINGIFY_NAT  2>/dev/null
     iptables -t nat -D OUTPUT      -j PINGIFY_NAT  2>/dev/null
     iptables -t nat -D POSTROUTING -j PINGIFY_POST 2>/dev/null
@@ -91,6 +107,25 @@ nat_rules_for() {
 
     # Replies have to come back the way they came.
     iptables -t nat -A PINGIFY_POST -o "$T_TUNIF" -j MASQUERADE 2>/dev/null
+
+    # And the rule that decides whether this is quick or merely connected.
+    #
+    # A tunnel carries a smaller packet than the path it rides on. Two ends
+    # setting up a TCP session through it agree a segment size from what their
+    # own interfaces can take, which is larger than the tunnel - so the first
+    # real transfer sends a packet that will not fit and the session stalls
+    # while both sides patiently retry it. It looks exactly like a slow link,
+    # and no amount of tuning on either end helps, because nothing on either
+    # end is wrong.
+    #
+    # Clamping the announced size to what the tunnel actually carries is the
+    # fix, and it costs one rule.
+    iptables -t mangle -A PINGIFY_MSS -o "$T_TUNIF" -p tcp --syn -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+
+    # Asymmetric routing is normal on a tunnel - the reply comes back on a
+    # different interface than the kernel would have chosen - and the reverse
+    # path filter drops exactly that.
+    sysctl -w "net.ipv4.conf.${T_TUNIF}.rp_filter=0" >/dev/null 2>&1
     return 0
 }
 
@@ -109,7 +144,14 @@ apply_nat() {
         return 0
     fi
     nat_chains
-    for n in $(tunnel_names); do nat_rules_for "$n"; done
+    mss_chain
+    # Each in its own shell. nat_rules_for reads a config with cfg_load, which
+    # writes every T_ variable there is - and this is called from the middle of
+    # the wizard, where those variables are the tunnel being built. It was
+    # overwriting them with whichever config happened to be read last, so the
+    # setup token described a different tunnel and the "is running" line named
+    # one too.
+    for n in $(tunnel_names); do ( nat_rules_for "$n" ); done
     [ "$quiet" = quiet ] || ok "forwarding rules applied"
     return 0
 }

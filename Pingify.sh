@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.10.0"
+PINGIFY_VERSION="5.11.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -101,6 +101,11 @@ pad_to() {
 # A tunnel that is down has no round trip at all, and that is dim, not red -
 # red here should mean "this path is slow", not "there is no path".
 # ---------------------------------------------------------------------------
+# An address is the thing on these screens people copy, compare and mistype,
+# so it gets a colour of its own rather than sitting in the same weight as the
+# words around it.
+addr_tint() { printf '%s%s%s' "$C_CYN" "$1" "$C_OFF"; }
+
 rtt_colour() {
     local ms="${1%ms}"; ms="${ms%%.*}"
     case "$ms" in
@@ -916,6 +921,24 @@ cfg_mode() {
 
 cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 
+# The name says which server this is and what the tunnel runs on, so two
+# servers side by side read as what they are without either file being opened.
+# A tunnel that builds a private link wears the TUN label in front of it.
+#
+# Both the wizard and the importer name tunnels, and they used to do it with
+# two copies of this - which drifted the moment one of them was edited, and
+# left an AmneziaWG tunnel called iran-9443 after a TCP port it does not use.
+tunnel_default_name() {
+    local base
+    base="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    case "$T_TRANSPORT" in
+        icmp) printf 'tun-%s-icmp' "$base" ;;
+        gre)  printf 'tun-%s-gre' "$base" ;;
+        awg)  printf 'tun-%s-awg' "$base" ;;
+        *)    printf '%s-%s' "$base" "$T_PORT" ;;
+    esac
+}
+
 # listen and connect are derived, never stored anywhere shared: they are the
 # one part of a tunnel that differs between the two servers.
 cfg_endpoints() {
@@ -1293,15 +1316,7 @@ TOKEN
     # The ports live on IRAN, which already has them - there is nothing to ask
     # for here, and nothing on this side to answer with.
 
-    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
-    case "$T_TRANSPORT" in
-        # A tunnel that builds a private link says so in its own name, so a
-        # list of them reads as what they are without a column being consulted.
-        icmp) T_NAME="tun-${T_NAME}-icmp" ;;
-        gre)  T_NAME="tun-${T_NAME}-gre" ;;
-        awg)  T_NAME="tun-${T_NAME}-awg" ;;
-        *)    T_NAME="${T_NAME}-${T_PORT}" ;;
-    esac
+    T_NAME="$(tunnel_default_name)"
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         say ""
         warn "a tunnel named $T_NAME already exists on this server"
@@ -1319,15 +1334,15 @@ TOKEN
     cfg_endpoints
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
-    field "Address" "$T_PUBLIC_IP"
+    field "Address" "$(addr_tint "$T_PUBLIC_IP")"
     field "Protocol" "$(transport_label "$T_TRANSPORT")"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
-        field "Link" "accepts on $CFG_LISTEN"
+        field "Link" "accepts on $(addr_tint "$CFG_LISTEN")"
     else
-        field "Link" "dials $CFG_CONNECT"
+        field "Link" "dials $(addr_tint "$CFG_CONNECT")"
     fi
-    cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    cfg_needs_link && field "Private link" "$(addr_tint "$T_TUNLOCAL") ${BX_ARR} $(addr_tint "$T_TUNPEER")"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Carriers" "$T_CARRIERS"
@@ -1500,12 +1515,7 @@ new_tunnel() {
     # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
     # tunnel. Two servers side by side say what they are without either file
     # being opened, and there is nothing to answer.
-    T_NAME="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
-    if [ "$T_TRANSPORT" = "icmp" ]; then
-        T_NAME="${T_NAME}-icmp"
-    else
-        T_NAME="${T_NAME}-${T_PORT}"
-    fi
+    T_NAME="$(tunnel_default_name)"
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         local n=2
         while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
@@ -1590,6 +1600,18 @@ new_tunnel() {
 
     # -- security ----------------------------------------------------------
     wiz "Security token" "One secret, typed the same on BOTH servers. Any length."
+    # What it actually does differs by transport, and saying so is better than
+    # letting somebody assume GRE is encrypted because they were asked for a
+    # password.
+    case "$T_TRANSPORT" in
+        awg) dim "here it becomes the pre-shared key WireGuard mixes into every"
+             dim "handshake: without a matching one, the tunnel does not form." ;;
+        gre) dim "GRE has no encryption. Here the token becomes the key GRE"
+             dim "stamps on each packet, which keeps two tunnels apart - it"
+             dim "does not hide anything, because GRE cannot." ;;
+        *)   dim "it keys the encryption on every frame this tunnel carries." ;;
+    esac
+    say ""
     while :; do
         ask T_TOKEN "token"
         T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
@@ -1656,7 +1678,7 @@ new_tunnel() {
     head2 "Ready to create"
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
-    field "Address" "$T_PUBLIC_IP"
+    field "Address" "$(addr_tint "$T_PUBLIC_IP")"
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
@@ -1664,11 +1686,11 @@ new_tunnel() {
     fi
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
-        field "Link" "accepts on $CFG_LISTEN"
+        field "Link" "accepts on $(addr_tint "$CFG_LISTEN")"
     else
-        field "Link" "connects to $CFG_CONNECT"
+        field "Link" "connects to $(addr_tint "$CFG_CONNECT")"
     fi
-    cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
+    cfg_needs_link && field "Private link" "$(addr_tint "$T_TUNLOCAL") ${BX_ARR} $(addr_tint "$T_TUNPEER")"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Tuning" "$T_PRESET"
@@ -1786,7 +1808,23 @@ nat_chains() {
     iptables -t nat -C POSTROUTING -j PINGIFY_POST 2>/dev/null || iptables -t nat -I POSTROUTING 1 -j PINGIFY_POST
 }
 
+# The mangle chain, for the one rule that decides whether a tunnel is quick
+# or merely connected.
+mss_chain() {
+    iptables -t mangle -N PINGIFY_MSS 2>/dev/null || iptables -t mangle -F PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -C FORWARD -j PINGIFY_MSS 2>/dev/null || iptables -t mangle -I FORWARD 1 -j PINGIFY_MSS
+    iptables -t mangle -C OUTPUT  -j PINGIFY_MSS 2>/dev/null || iptables -t mangle -I OUTPUT 1  -j PINGIFY_MSS
+}
+
+mss_drop_chain() {
+    iptables -t mangle -D FORWARD -j PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -D OUTPUT  -j PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -F PINGIFY_MSS 2>/dev/null
+    iptables -t mangle -X PINGIFY_MSS 2>/dev/null
+}
+
 nat_drop_chains() {
+    mss_drop_chain
     iptables -t nat -D PREROUTING  -j PINGIFY_NAT  2>/dev/null
     iptables -t nat -D OUTPUT      -j PINGIFY_NAT  2>/dev/null
     iptables -t nat -D POSTROUTING -j PINGIFY_POST 2>/dev/null
@@ -1840,6 +1878,25 @@ nat_rules_for() {
 
     # Replies have to come back the way they came.
     iptables -t nat -A PINGIFY_POST -o "$T_TUNIF" -j MASQUERADE 2>/dev/null
+
+    # And the rule that decides whether this is quick or merely connected.
+    #
+    # A tunnel carries a smaller packet than the path it rides on. Two ends
+    # setting up a TCP session through it agree a segment size from what their
+    # own interfaces can take, which is larger than the tunnel - so the first
+    # real transfer sends a packet that will not fit and the session stalls
+    # while both sides patiently retry it. It looks exactly like a slow link,
+    # and no amount of tuning on either end helps, because nothing on either
+    # end is wrong.
+    #
+    # Clamping the announced size to what the tunnel actually carries is the
+    # fix, and it costs one rule.
+    iptables -t mangle -A PINGIFY_MSS -o "$T_TUNIF" -p tcp --syn -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
+
+    # Asymmetric routing is normal on a tunnel - the reply comes back on a
+    # different interface than the kernel would have chosen - and the reverse
+    # path filter drops exactly that.
+    sysctl -w "net.ipv4.conf.${T_TUNIF}.rp_filter=0" >/dev/null 2>&1
     return 0
 }
 
@@ -1858,7 +1915,14 @@ apply_nat() {
         return 0
     fi
     nat_chains
-    for n in $(tunnel_names); do nat_rules_for "$n"; done
+    mss_chain
+    # Each in its own shell. nat_rules_for reads a config with cfg_load, which
+    # writes every T_ variable there is - and this is called from the middle of
+    # the wizard, where those variables are the tunnel being built. It was
+    # overwriting them with whichever config happened to be read last, so the
+    # setup token described a different tunnel and the "is running" line named
+    # one too.
+    for n in $(tunnel_names); do ( nat_rules_for "$n" ); done
     [ "$quiet" = quiet ] || ok "forwarding rules applied"
     return 0
 }
@@ -1897,6 +1961,24 @@ cfg_files() {
         [ -f "$f" ] && printf '%s\n' "$f"
     done
     return 0
+}
+
+# list_has LIST ITEM - is ITEM one whole line of LIST?
+#
+# Written without a pipe on purpose. "generator | grep -q" is a race whenever
+# pipefail is set: grep exits at the first match, the generator takes a
+# SIGPIPE, and the pipeline then reports 141 instead of 0 - so the answer
+# depends on which of the two got there first. It is intermittent, it is
+# invisible, and it is exactly the kind of wrong answer this file exists to
+# stop being given.
+list_has() {
+    local list="$1" item="$2" nl='
+'
+    [ -n "$item" ] || return 1
+    case "$nl$list$nl" in
+        *"$nl$item$nl"*) return 0 ;;
+    esac
+    return 1
 }
 
 # cfg_name FILE - the tunnel's own name, falling back to the filename
@@ -1954,7 +2036,7 @@ host_nets() {
 
 host_has_net() {
     local want="$1"
-    host_nets | grep -qxF "$want"
+    list_has "$(host_nets)" "$want"
 }
 
 # free_link_octet [EXCEPT] - the first x where 10.x.10.0/24 is free, so the
@@ -2007,7 +2089,7 @@ port_owner() {
     cfg_files | while read -r f; do
         name="$(cfg_name "$f")"
         [ -n "$except" ] && [ "$name" = "$except" ] && continue
-        if ports_of "$f" | grep -qxF "$want"; then
+        if list_has "$(ports_of "$f")" "$want"; then
             printf '%s' "$name"
             break
         fi
@@ -2053,9 +2135,9 @@ forwards_clash() {
             if [ -n "$who" ]; then
                 printf 'port %s is already forwarded by %s\n' "$pt" "$who"
                 bad=1
-            elif printf '%s\n' "$mine" | grep -qxF "$pt"; then
+            elif list_has "$mine" "$pt"; then
                 : # its own port, bound by its own service
-            elif printf '%s\n' "$bound" | grep -qxF "$pt"; then
+            elif list_has "$bound" "$pt"; then
                 printf 'port %s already has something listening on it\n' "$pt"
                 bad=1
             fi
@@ -2229,6 +2311,35 @@ awg_rand_header() {
     printf '%s' "$(( (n % 2147483600) + 5 ))"
 }
 
+# ---------------------------------------------------------------------------
+# what the security token buys here
+#
+# The kernel has never heard of our token, so it cannot key a GRE or an
+# AmneziaWG tunnel the way it keys our own transports. What it can do is
+# become the one secret each of them does understand, derived the same way on
+# both servers from the same answer:
+#
+#   AmneziaWG   a pre-shared key, mixed into every handshake on top of the
+#               keypair. Real: without a matching one the tunnel does not form.
+#
+#   GRE         the 32-bit key GRE stamps on each packet. Not protection - it
+#               travels in the clear - but two tunnels built from different
+#               tokens will not talk to each other by accident.
+#
+# Derived rather than carried, so neither ever enters the setup token.
+# ---------------------------------------------------------------------------
+
+# kernel_keys TOKEN - "presharedkey grekey", or nothing if the core cannot
+# be asked. Both servers reach the same values from the same token.
+kernel_keys() {
+    [ -n "$1" ] || return 1
+    [ -x "$CORE_BIN" ] || return 1
+    "$CORE_BIN" -derivekey "$1" 2>/dev/null
+}
+
+awg_psk_for() { kernel_keys "$1" | awk '{print $1}'; }
+gre_key_for() { kernel_keys "$1" | awk '{print $2}'; }
+
 # obf_field N FIELDS - pull one value out of that comma-separated list
 obf_field() { printf '%s' "$2" | cut -d, -f"$1"; }
 
@@ -2261,6 +2372,11 @@ awg_write_conf() {
             printf 'Endpoint = %s:%s\n' "$T_PEER_IP" "$T_AWG_PORT"
         fi
         printf 'AllowedIPs = %s/32\n' "${T_TUNPEER%%/*}"
+        # The security token, as the one secret WireGuard understands.
+        # Without a matching one the handshake never completes, so the
+        # answer to that question is doing real work here.
+        local psk; psk="$(awg_psk_for "$T_TOKEN")"
+        [ -n "$psk" ] && printf 'PresharedKey = %s\n' "$psk"
         printf 'PersistentKeepalive = 25\n'
     } > "$conf"
     chmod 600 "$conf"
@@ -2289,7 +2405,12 @@ write_link_unit() {
 }
 
 write_gre_unit() {
-    local name="$1" iface="$2" unit="$3"
+    local name="$1" iface="$2" unit="$3" gkey keyarg=""
+    # GRE's own key: two tunnels built from different tokens then refuse to
+    # talk to each other. It rides in the clear, so it is not protection -
+    # but it is the only thing GRE has, and it makes the token mean something.
+    gkey="$(gre_key_for "$T_TOKEN")"
+    case "$gkey" in '' | *[!0-9]*) : ;; *) keyarg=" key $gkey" ;; esac
     # One shot, held open: the interface is the state, so systemd has nothing
     # to supervise once it exists. ExecStart deletes any leftover first, which
     # is what makes a restart work rather than fail on "file exists".
@@ -2305,7 +2426,7 @@ Type=oneshot
 RemainAfterExit=yes
 ExecStart=/bin/sh -c '\\
   ip link del $iface 2>/dev/null; \\
-  ip tunnel add $iface mode gre local $T_PUBLIC_IP remote $T_PEER_IP ttl $T_GRE_TTL; \\
+  ip tunnel add $iface mode gre local $T_PUBLIC_IP remote $T_PEER_IP ttl $T_GRE_TTL$keyarg; \\
   ip link set $iface mtu $T_TUNMTU; \\
   ip addr add $T_TUNLOCAL dev $iface; \\
   ip link set $iface up; \\
@@ -2361,15 +2482,49 @@ link_rtt() {
     printf '%s' "$out"
 }
 
+# awg_handshake_age IFACE - seconds since the last completed handshake, or
+# nothing when it cannot be asked. AmneziaWG knows for itself whether the far
+# end is there, without a packet being sent - and unlike a ping, it still
+# knows on a server that has been told to stop answering them.
+awg_handshake_age() {
+    local iface="$1" last now
+    have awg || return 1
+    last="$(awg show "$iface" latest-handshakes 2>/dev/null | awk '{print $2; exit}')"
+    case "$last" in '' | 0 | *[!0-9]*) return 1 ;; esac
+    now="$(date +%s 2>/dev/null)"
+    case "$now" in '' | *[!0-9]*) return 1 ;; esac
+    printf '%s' "$((now - last))"
+}
+
+# A WireGuard peer keeps talking every 25 seconds, so anything older than a
+# few minutes of silence is a link that has stopped.
+AWG_STALE_AFTER=180
+
 # The same five-field line the core prints for -brief, so the tunnel list and
 # the health check can read one shape for every kind of tunnel:
 #   state up total rtt streams uptime
 kernel_brief() {
-    local name="$1" rtt
+    local name="$1" rtt age
     if ! link_up "$name"; then
         printf 'down 0 1 0.0 0 0'
         return
     fi
+
+    # AmneziaWG is asked directly. This is both faster than a ping and more
+    # honest: a peer that has been told to stop answering pings - which is
+    # exactly what an ICMP tunnel on the same server turns on - is still a
+    # peer that is handshaking.
+    if [ "$T_TRANSPORT" = "awg" ] && age="$(awg_handshake_age "$T_TUNIF")"; then
+        if [ "$age" -gt "$AWG_STALE_AFTER" ]; then
+            printf 'down 0 1 0.0 0 0'
+            return
+        fi
+        rtt="$(link_rtt "$name")"
+        [ "$rtt" = "-" ] && rtt="0.0"
+        printf 'up 1 1 %s 0 0' "$rtt"
+        return
+    fi
+
     rtt="$(link_rtt "$name")"
     if [ "$rtt" = "-" ]; then
         # The interface is up but nothing answers on it, which for a kernel
@@ -2378,6 +2533,24 @@ kernel_brief() {
         return
     fi
     printf 'up 1 1 %s 0 0' "$rtt"
+}
+
+# tunnel_is_up NAME - one answer for every kind of tunnel, so the list and the
+# status panel cannot disagree. The panel used to ask the core's status
+# endpoint, which a kernel tunnel does not have, so GRE and AmneziaWG could
+# never be counted and "3 of 4 up" read as 2.
+tunnel_is_up() {
+    local name="$1" f addr brief
+    f="$(cfg_file "$name")"
+    [ -f "$f" ] || return 1
+    [ "$(svc_state "$name")" = "active" ] || return 1
+    if kernel_transport "$(toml_get "$f" transport type)"; then
+        brief="$(cfg_load "$name" >/dev/null 2>&1 && kernel_brief "$name")"
+        case "$brief" in up\ *) return 0 ;; *) return 1 ;; esac
+    fi
+    addr="$(toml_get "$f" status addr)"
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 1
+    "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -2430,6 +2603,18 @@ kernel_link_check() {
     # not built yet or the path dropping protocol 47; for AmneziaWG it is a
     # handshake that never completed, which has its own reasons.
     hc_bad "$iface is up but ${peer:-the other end} does not answer"
+    # The one false alarm this check can raise, and it is easy to walk into:
+    # building an ICMP tunnel on either server turns the ping block on, and a
+    # server that answers no pings answers none on the private link either.
+    # GRE has nothing else to ask, so say so rather than send somebody hunting
+    # a fault that is not there.
+    if [ "$T_TRANSPORT" = "gre" ] && [ "$(block_state icmp)" = "on" ]; then
+        hc_note "this server is set to ignore all ICMP echo, and so, most"
+        hc_note "likely, is the other one - a GRE link is tested by pinging"
+        hc_note "across it, so it can read as down while carrying traffic"
+        hc_fix "test it by hand instead:  curl --interface $iface -sI http://$peer"
+        hc_note "or turn the block off on the far server while you check"
+    fi
     if [ "$T_TRANSPORT" = "gre" ]; then
         hc_note "GRE is IP protocol 47, not a port - a firewall that only"
         hc_note "knows about ports will drop it without saying so"
@@ -5513,6 +5698,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -5538,7 +5724,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.10.0"
+const version = "5.11.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -5763,6 +5949,7 @@ func main() {
 		healthz = flag.String("healthz", "", "probe a running tunnel (host:port); exit 0 only when a carrier is up")
 		brief   = flag.Bool("brief", false, "with -status, print one machine-readable line")
 		probe   = flag.Bool("probe", false, "with -c, try every forwarded port end to end and exit")
+		derive  = flag.String("derivekey", "", "print the keys a kernel tunnel derives from a security token, and exit")
 	)
 	flag.Parse()
 
@@ -5778,6 +5965,23 @@ func main() {
 
 	if *showVer {
 		fmt.Println("pingify-core " + version)
+		return
+	}
+	// GRE and AmneziaWG are carried by the kernel, so the security token
+	// cannot protect them the way it protects our own transports - the kernel
+	// has never heard of it. What it can do is be turned into the one secret
+	// each of them does understand, so that answering the token question
+	// still means something on both:
+	//
+	//	the base64 pre-shared key WireGuard mixes into every handshake
+	//	the 32-bit key GRE stamps on every packet
+	//
+	// Both are derived, not stored, so the two servers reach the same values
+	// from the same token without either one carrying them across.
+	if *derive != "" {
+		sum := sha256.Sum256([]byte("pingify-kernel-tunnel\x00" + *derive))
+		greKey := binary.BigEndian.Uint32(sum[:4])
+		fmt.Printf("%s %d\n", base64.StdEncoding.EncodeToString(sum[:]), greKey)
 		return
 	}
 	if *genPSK {
@@ -8918,13 +9122,12 @@ USAGE
 # ---------------------------------------------------------------------------
 
 info_panel() {
-    local name addr up=0 total=0
+    local name up=0 total=0
     for name in $(tunnel_names); do
         total=$((total + 1))
-        addr="$(toml_get "$(cfg_file "$name")" status addr)"
-        if [ -n "$addr" ] && [ -x "$CORE_BIN" ] && "$CORE_BIN" -healthz "$addr" >/dev/null 2>&1; then
-            up=$((up + 1))
-        fi
+        # In a subshell: the answer for a kernel tunnel comes from reading its
+        # config, and this runs on every draw of the main menu.
+        ( tunnel_is_up "$name" ) && up=$((up + 1))
     done
 
     panel "SERVER"

@@ -935,5 +935,143 @@ check "and refuses a clash"                   "$(wz | grep -c 'forwards_clash')"
 ef() { awk '/^edit_forwards\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "changing ports later checks too"       "$(ef | grep -c 'forwards_clash')"   "1"
 
+
+# ---------------------------------------------------------------------------
+note "the wizard's own state survives what it calls"
+# ---------------------------------------------------------------------------
+# apply_nat reads every config with cfg_load, which writes every T_ variable
+# there is - and it is called from the middle of the wizard, where those
+# variables are the tunnel being built. It was overwriting them with whichever
+# config happened to be read last, so the setup token described a different
+# tunnel, the private link came out as somebody else's, and the line that said
+# which tunnel was running named the wrong one.
+STA="$WORK/state"; mkdir -p "$STA"
+(
+    CFG_DIR="$STA"
+    have() { case "$1" in iptables) return 0 ;; ip | ss) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    iptables() { return 0; }
+    sysctl() { return 0; }
+    nat_chains() { :; }; mss_chain() { :; }; nat_drop_chains() { :; }
+
+    # a tunnel already here, which apply_nat will read
+    cfg_reset
+    T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
+    T_NAME="tun-iran-icmp"; T_TOKEN="somebody-elses"; T_PUBLIC_IP="203.0.113.9"
+    T_PEER_IP="198.51.100.4"; T_TUNLOCAL="10.99.10.1/24"; T_TUNPEER="10.99.10.2/24"
+    T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"; T_FORWARDER="iptables"
+    cfg_save >/dev/null
+
+    # and now one being built, on a different network with a different secret
+    cfg_reset
+    T_ROLE="server"; T_TRANSPORT="gre"; cfg_mode
+    T_NAME="$(tunnel_default_name)"; T_TUNIF="$(link_iface "$T_NAME")"
+    T_TOKEN="mine"; T_PUBLIC_IP="185.31.8.93"; T_PEER_IP="2.26.26.37"
+    T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_TUNMTU=1400
+    T_FORWARDS='"8007"'
+    cfg_save >/dev/null
+
+    apply_nat quiet
+    echo "name=$T_NAME"
+    echo "net=$T_TUNLOCAL"
+    echo "token=$T_TOKEN"
+    printf 'carried=%s\n' "$(cfg_setup_token | base64 -d | cut -d'|' -f15)"
+) > "$WORK/state.out" 2>&1
+st() { grep -m1 "^$1=" "$WORK/state.out" | cut -d= -f2-; }
+
+check "the name survives"        "$(st name)"    "tun-iran-gre"
+check "the private link too"     "$(st net)"     "10.20.10.1/24"
+check "and the secret"           "$(st token)"   "mine"
+check "so the token is its own"  "$(st carried)" "10.20.10.2/24"
+
+# ---------------------------------------------------------------------------
+note "one name, derived one way"
+# ---------------------------------------------------------------------------
+# The wizard and the importer both name tunnels, and each had its own copy of
+# how. They drifted the moment one was edited, and an AmneziaWG tunnel came
+# out called iran-9443 - after a TCP port it does not use.
+nm() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT="${3:-9443}"; tunnel_default_name ); }
+check "tcp is named for its port" "$(nm server tcp 9443)"  "iran-9443"
+check "on the other side too"     "$(nm client tcp 9443)"  "kharej-9443"
+check "icmp wears the label"      "$(nm server icmp)"      "tun-iran-icmp"
+check "gre as well"               "$(nm server gre)"       "tun-iran-gre"
+check "and awg"                   "$(nm client awg)"       "tun-kharej-awg"
+check "no port sneaks into a udp tunnel" \
+      "$(printf '%s' "$(nm server awg)" | grep -c 9443)" "0"
+check "both callers use the one function" \
+      "$(grep -c 'T_NAME="\$(tunnel_default_name)"' Pingify.sh)" "2"
+
+# ---------------------------------------------------------------------------
+note "the security token does something on a kernel tunnel"
+# ---------------------------------------------------------------------------
+# The kernel has never heard of our token, so it cannot key a GRE or an
+# AmneziaWG tunnel the way it keys our own. It can become the one secret each
+# of those does understand - and it is derived on both servers rather than
+# carried, so it never enters the setup token at all.
+if [ -x "$CORE_BIN" ]; then
+    k1="$("$CORE_BIN" -derivekey "one")"
+    k2="$("$CORE_BIN" -derivekey "one")"
+    k3="$("$CORE_BIN" -derivekey "two")"
+    check "the same token gives the same keys" "$k1" "$k2"
+    check "a different one does not"           "$([ "$k1" != "$k3" ] && echo y)" "y"
+    check "a wireguard key is 32 bytes"        "$(printf '%s' "${k1%% *}" | base64 -d | wc -c | tr -d ' ')" "32"
+    check "and the gre key is a number"        "$(printf '%s' "${k1##* }" | tr -d '0-9' )" ""
+fi
+
+# --- and both transports actually use them ---------------------------------
+AWG_DIR="$WORK/awg2"
+awgn2="$WORK/awgn2"; echo 0 > "$awgn2"
+awg() {
+    local n k
+    case "$1" in
+        genkey) n=$(( $(cat "$awgn2") + 1 )); echo "$n" > "$awgn2"; printf 'PRIV%d\n' "$n" ;;
+        pubkey) read -r k; printf 'PUBof%s\n' "$k" ;;
+    esac
+}
+cfg_reset
+T_NAME="tun-iran-awg"; T_ROLE="server"; T_TRANSPORT="awg"; cfg_mode
+T_TOKEN="a-real-secret"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+T_TUNIF="$(link_iface "$T_NAME")"
+T_TUNLOCAL="10.40.10.1/24"; T_TUNPEER="10.40.10.2/24"; T_TUNMTU=1320
+T_AWG_PRIV="PRIV1"; T_AWG_PUB="PUBofPRIV2"; T_AWG_OBF="$(awg_new_obf)"
+awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
+ac="$(awg_conf_path "$T_TUNIF")"
+if [ -x "$CORE_BIN" ]; then
+    want_psk="$("$CORE_BIN" -derivekey "a-real-secret" | awk '{print $1}')"
+    check "wireguard gets a pre-shared key" "$(grep -c "PresharedKey = $want_psk" "$ac")" "1"
+fi
+# it is derived on both ends, so it must never travel
+check "and it never enters the token" \
+      "$(printf '%s' "$(cfg_setup_token)" | base64 -d | grep -c 'PresharedKey')" "0"
+
+UNIT_DIR="$WORK/units2"; mkdir -p "$UNIT_DIR"
+cfg_reset
+T_NAME="tun-iran-gre"; T_ROLE="server"; T_TRANSPORT="gre"; cfg_mode
+T_TOKEN="a-real-secret"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+T_TUNIF="$(link_iface "$T_NAME")"
+T_TUNLOCAL="10.41.10.1/24"; T_TUNPEER="10.41.10.2/24"; T_TUNMTU=1400
+( systemctl() { :; }; write_link_unit tun-iran-gre )
+gu="$UNIT_DIR/pingify@tun-iran-gre.service"
+if [ -x "$CORE_BIN" ]; then
+    want_gre="$("$CORE_BIN" -derivekey "a-real-secret" | awk '{print $2}')"
+    check "gre stamps the derived key" "$(grep -c "key $want_gre" "$gu")" "1"
+fi
+unset -f awg
+
+# ---------------------------------------------------------------------------
+note "the forwarding does the one thing that makes it quick"
+# ---------------------------------------------------------------------------
+# A tunnel carries a smaller packet than the path it rides on, so two ends
+# setting up a TCP session through it agree a segment size the tunnel cannot
+# take - and then stall on the first real transfer while both patiently retry
+# a packet that never fits. It reads as a slow link with nothing wrong at
+# either end.
+fw() { awk '/^nat_rules_for\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the announced segment is clamped" "$(fw | grep -c 'clamp-mss-to-pmtu')" "1"
+check "only on the tunnel interface"     "$(fw | grep -c 'PINGIFY_MSS -o "\$T_TUNIF"')" "1"
+check "and only on the handshake"        "$(fw | grep -c 'tcp --syn')" "1"
+check "the reverse path filter is off"   "$(fw | grep -c 'rp_filter=0')" "1"
+check "the chain is hooked in"           "$(grep -c 'mangle -I FORWARD 1 -j PINGIFY_MSS' Pingify.sh)" "1"
+check "and taken out again on uninstall" "$(grep -c 'mss_drop_chain' Pingify.sh)" "2"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

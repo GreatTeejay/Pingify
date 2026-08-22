@@ -21,6 +21,24 @@ cfg_files() {
     return 0
 }
 
+# list_has LIST ITEM - is ITEM one whole line of LIST?
+#
+# Written without a pipe on purpose. "generator | grep -q" is a race whenever
+# pipefail is set: grep exits at the first match, the generator takes a
+# SIGPIPE, and the pipeline then reports 141 instead of 0 - so the answer
+# depends on which of the two got there first. It is intermittent, it is
+# invisible, and it is exactly the kind of wrong answer this file exists to
+# stop being given.
+list_has() {
+    local list="$1" item="$2" nl='
+'
+    [ -n "$item" ] || return 1
+    case "$nl$list$nl" in
+        *"$nl$item$nl"*) return 0 ;;
+    esac
+    return 1
+}
+
 # cfg_name FILE - the tunnel's own name, falling back to the filename
 cfg_name() {
     local n
@@ -76,7 +94,7 @@ host_nets() {
 
 host_has_net() {
     local want="$1"
-    host_nets | grep -qxF "$want"
+    list_has "$(host_nets)" "$want"
 }
 
 # free_link_octet [EXCEPT] - the first x where 10.x.10.0/24 is free, so the
@@ -129,7 +147,7 @@ port_owner() {
     cfg_files | while read -r f; do
         name="$(cfg_name "$f")"
         [ -n "$except" ] && [ "$name" = "$except" ] && continue
-        if ports_of "$f" | grep -qxF "$want"; then
+        if list_has "$(ports_of "$f")" "$want"; then
             printf '%s' "$name"
             break
         fi
@@ -175,9 +193,9 @@ forwards_clash() {
             if [ -n "$who" ]; then
                 printf 'port %s is already forwarded by %s\n' "$pt" "$who"
                 bad=1
-            elif printf '%s\n' "$mine" | grep -qxF "$pt"; then
+            elif list_has "$mine" "$pt"; then
                 : # its own port, bound by its own service
-            elif printf '%s\n' "$bound" | grep -qxF "$pt"; then
+            elif list_has "$bound" "$pt"; then
                 printf 'port %s already has something listening on it\n' "$pt"
                 bad=1
             fi
