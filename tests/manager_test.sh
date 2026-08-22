@@ -74,27 +74,66 @@ check "cfg_load carriers"  "$T_CARRIERS"  "6"
 check "cfg_load transport" "$T_TRANSPORT" "direct"
 
 # ---------------------------------------------------------------------------
-note "peer token mirrors the tunnel"
+note "the peer token"
 # ---------------------------------------------------------------------------
+# It is a short list of values, not a config document. Encoding the document
+# tied the token to whatever format that document was in, and changing the
+# format to TOML broke every token silently: the far end decoded it, read it
+# with a JSON reader, found nothing, and said "the token is incomplete".
 peer="$(cfg_peer_token | base64 -d)"
-printf '%s\n' "$peer" > "$WORK/peer.toml"
-check "role flips"           "$(toml_get "$WORK/peer.toml" tunnel role)"       "client"
-check "dialler becomes host" "$(toml_get "$WORK/peer.toml" transport listen)"  "0.0.0.0:9443"
-check "peer does not dial"   "$(toml_get "$WORK/peer.toml" transport connect)" ""
-check "key is carried over"  "$(toml_get "$WORK/peer.toml" security psk)"      "$saved_psk"
-check "transport mirrored"   "$(toml_get "$WORK/peer.toml" transport type)"    "direct"
-check "ports stay on IRAN"   "$(grep -c '^ports' "$WORK/peer.toml")"           "0"
+check "token is the short form"  "${peer%%|*}"                        "p1"
+check "the far end accepts"      "$(printf '%s' "$peer" | cut -d'|' -f4)" "l=0.0.0.0:9443"
+check "the key travels"          "$(printf '%s' "$peer" | cut -d'|' -f5)" "$saved_psk"
+check "mode travels"             "$(printf '%s' "$peer" | cut -d'|' -f2)" "forward"
+check "transport travels"        "$(printf '%s' "$peer" | cut -d'|' -f3)" "direct"
+check "carriers travel"          "$(printf '%s' "$peer" | cut -d'|' -f6)" "6"
+check "ports stay on IRAN"       "$(printf '%s' "$peer" | grep -c '443')" "1"
+check "and it is short"          "$([ "$(cfg_peer_token | wc -c)" -lt 200 ] && echo yes || echo no)" "yes"
 
 # a tun tunnel must hand the peer the other end of the /30
 cfg_reset
 T_NAME="t2"; T_ROLE="server"; T_MODE="tun"; T_LISTEN="0.0.0.0:9500"
 T_PSK="$saved_psk"; T_STATUS="127.0.0.1:9701"; T_PUBLIC_IP="198.51.100.4"
 T_TUNIF="pfy1"; T_TUNLOCAL="10.71.1.1/30"; T_TUNPEER="10.71.1.2"; T_TUNMTU=1380
-cfg_peer_token | base64 -d > "$WORK/peer2.toml"
-check "peer dials us"      "$(toml_get "$WORK/peer2.toml" transport connect)" "198.51.100.4:9500"
-check "peer takes .2/30"   "$(toml_get "$WORK/peer2.toml" tun local_addr)"     "10.71.1.2/30"
-check "peer points at .1"  "$(toml_get "$WORK/peer2.toml" tun remote_addr)"    "10.71.1.1"
-check "a tun tunnel has one" "$(grep -c '^\[tun\]' "$WORK/peer2.toml")"        "1"
+peer2="$(cfg_peer_token | base64 -d)"
+check "peer dials us"      "$(printf '%s' "$peer2" | cut -d'|' -f4)"  "c=198.51.100.4:9500"
+check "peer takes .2/30"   "$(printf '%s' "$peer2" | cut -d'|' -f9)"  "10.71.1.2/30"
+check "peer points at .1"  "$(printf '%s' "$peer2" | cut -d'|' -f10)" "10.71.1.1"
+
+# ---------------------------------------------------------------------------
+note "a token becomes a working config on the other server"
+# ---------------------------------------------------------------------------
+# The round trip nobody was testing: build a token on one end, read it on the
+# other, and check the file that comes out is one the core will accept.
+cfg_reset
+T_NAME="ir"; T_ROLE="server"; T_MODE="forward"; T_TRANSPORT="direct"
+T_LISTEN="0.0.0.0:9443"; T_PUBLIC_IP="203.0.113.9"; T_PSK="$saved_psk"
+T_CARRIERS=8; T_WINDOW=2048; T_KEEPALIVE=15
+T_FORWARDS='"6526"'; T_STATUS="127.0.0.1:9700"
+tok="$(cfg_peer_token)"
+
+# what import_tunnel does with it, without the prompts
+raw="$(printf '%s' "$tok" | base64 -d)"
+IFS='|' read -r _v _mode _tr _ep _psk _car _win _ka _tl _tp _mtu <<TOKEN
+$raw
+TOKEN
+cfg_reset
+T_MODE="$_mode"; T_TRANSPORT="$_tr"; T_PSK="$_psk"
+T_CARRIERS="$_car"; T_WINDOW="$_win"; T_KEEPALIVE="$_ka"
+T_CONNECT="${_ep#c=}"; T_ROLE="client"
+T_NAME="kharej-${_ep##*:}"; T_STATUS="127.0.0.1:9702"
+kh="$(cfg_save)"
+
+check "the peer file is named"  "$(basename "$kh")"                        "kharej-9443.toml"
+check "it dials IRAN"           "$(toml_get "$kh" transport connect)"      "203.0.113.9:9443"
+check "it does not listen"      "$(toml_get "$kh" transport listen)"       ""
+check "same key both ends"      "$(toml_get "$kh" security psk)"           "$saved_psk"
+check "tuning came across"      "$(toml_get "$kh" transport carriers)"     "8"
+check "no ports on KHAREJ"      "$(grep -c '^ports' "$kh")"                "0"
+if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
+    "$CORE_BIN" -c "$kh" -check >/dev/null 2>&1
+    check "the core accepts it"  "$?"                                      "0"
+fi
 
 # ---------------------------------------------------------------------------
 note "the engine accepts what the manager writes"
@@ -120,12 +159,28 @@ else
     T_STATUS="127.0.0.1:$(( 50000 + RANDOM % 5000 ))"
     edge_cfg="$(cfg_save)"
 
-    # decode the token exactly as the peer server would
-    cfg_peer_token | base64 -d > "$WORK/origin.json"
-    sed -i "s#\"status_addr\": \"[^\"]*\"#\"status_addr\": \"127.0.0.1:$(( 55000 + RANDOM % 5000 ))\"#" "$WORK/origin.json"
+    # Build the peer's config the way the far server would: read the token,
+    # set the same variables import_tunnel sets, and render through cfg_save.
+    tok="$(cfg_peer_token)"
+    saved_forwards="$T_FORWARDS"; saved_edge_name="$T_NAME"
+    raw="$(printf '%s' "$tok" | base64 -d)"
+    IFS='|' read -r _v _mode _tr _ep _psk _car _win _ka _tl _tp _mtu <<TOKEN
+$raw
+TOKEN
+    cfg_reset
+    T_MODE="$_mode"; T_TRANSPORT="$_tr"; T_PSK="$_psk"
+    T_CARRIERS="$_car"; T_WINDOW="$_win"; T_KEEPALIVE="$_ka"
+    case "$_ep" in
+        c=*) T_CONNECT="${_ep#c=}" ;;
+        l=*) T_LISTEN="${_ep#l=}" ;;
+    esac
+    T_ROLE="client"; T_NAME="origin"
+    T_STATUS="127.0.0.1:$(( 55000 + RANDOM % 5000 ))"
+    origin_cfg="$(cfg_save)"
+    origin_status="$T_STATUS"
 
-    "$CORE_BIN" -c "$edge_cfg"          -check >/dev/null 2>&1; check "edge config validates"   "$?" "0"
-    "$CORE_BIN" -c "$WORK/origin.json"  -check >/dev/null 2>&1; check "origin config validates" "$?" "0"
+    "$CORE_BIN" -c "$edge_cfg"    -check >/dev/null 2>&1; check "edge config validates"   "$?" "0"
+    "$CORE_BIN" -c "$origin_cfg"  -check >/dev/null 2>&1; check "origin config validates" "$?" "0"
 
     python - "$EP" "$WORK/echo.ready" <<'PYEOF' &
 import socket, sys, threading
@@ -146,7 +201,7 @@ PYEOF
     ECHO_PID=$!
     for _ in $(seq 1 50); do [ -f "$WORK/echo.ready" ] && break; sleep 0.1; done
 
-    "$CORE_BIN" -c "$WORK/origin.json" >"$WORK/origin.log" 2>&1 &
+    "$CORE_BIN" -c "$origin_cfg" >"$WORK/origin.log" 2>&1 &
     ORIGIN_PID=$!
     "$CORE_BIN" -c "$edge_cfg" >"$WORK/edge.log" 2>&1 &
     EDGE_PID=$!

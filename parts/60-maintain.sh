@@ -41,10 +41,9 @@ restart_all() {
 
 self_update() {
     say ""
-    have curl || { fail "curl is needed for this"; return 1; }
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! curl -fsSL --max-time 60 "$RAW_BASE/Pingify.sh" -o "$tmp"; then
+    if ! fetch_to "$RAW_BASE/Pingify.sh" "$tmp" 60; then
         fail "could not reach GitHub"
         dim "on an Iranian server this often fails; update from the Kharej box"
         dim "and copy the file across instead."

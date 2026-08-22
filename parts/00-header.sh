@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="3.13.1"
+PINGIFY_VERSION="3.13.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 BASE_DIR="/root/Pingify"
@@ -195,7 +195,7 @@ banner() {
     done
 
     # and the one line that says what it is, centred under it
-    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel   ${BX_DOT}   v${PINGIFY_VERSION}"
+    local sub="by Teejay   ${BX_DOT}   Iran ${BX_ARR} Kharej tunnel"
     pad=$(( (inner - ${#sub}) / 2 ))
     [ "$pad" -lt 0 ] && pad=0
     printf '  %s%s%s%s%s%s%s%s\n' \
@@ -254,6 +254,30 @@ require_root() {
 }
 
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# fetch <url> [timeout] - print a URL's body using whatever this box has.
+fetch() {
+    local url="$1" t="${2:-10}"
+    if have curl; then
+        curl -fsS --max-time "$t" "$url" 2>/dev/null && return 0
+    fi
+    if have wget; then
+        wget -qO- --timeout="$t" "$url" 2>/dev/null && return 0
+    fi
+    return 1
+}
+
+# fetch_to <url> <file> [timeout] - the same, into a file.
+fetch_to() {
+    local url="$1" dest="$2" t="${3:-120}"
+    if have curl; then
+        curl -fsSL --retry 2 --max-time "$t" -o "$dest" "$url" && return 0
+    fi
+    if have wget; then
+        wget -q --tries=2 --timeout="$t" -O "$dest" "$url" && return 0
+    fi
+    return 1
+}
 
 # These configs are written by this script, one key per line, so a targeted
 # sed is enough and Pingify stays free of a jq dependency.
@@ -322,14 +346,12 @@ pick_free_port() {
 server_info() {
     [ -n "${SRV_IP:-}" ] && return 0
     SRV_IP=""; SRV_LOC=""; SRV_ORG=""
-    if have curl; then
-        local j
-        j="$(curl -fsS --max-time 6 'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)"
-        if [ -n "$j" ]; then
-            SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*//p')"
-            SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*//p')"
-            SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*//p')"
-        fi
+    local j
+    j="$(fetch 'http://ip-api.com/json/?fields=query,country,isp' 6)"
+    if [ -n "$j" ]; then
+        SRV_IP="$(printf  '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')"
+        SRV_LOC="$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')"
+        SRV_ORG="$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')"
     fi
     [ -n "$SRV_IP" ]  || SRV_IP="$(public_ip)"
     [ -n "$SRV_IP" ]  || SRV_IP="unknown"
@@ -339,9 +361,7 @@ server_info() {
 
 public_ip() {
     local ip=""
-    if have curl; then
-        ip=$(curl -4 -fsS --max-time 5 https://api.ipify.org 2>/dev/null)
-    fi
+    ip="$(fetch https://api.ipify.org 5)"
     if [ -z "$ip" ] && have ip; then
         ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
     fi
@@ -398,7 +418,7 @@ apt_install() {
 
 ensure_deps() {
     local missing=()
-    have curl   || missing+=(curl)
+    have curl || have wget || missing+=(curl)
     have tar    || missing+=(tar)
     have ip     || missing+=(iproute2)
     have ss     || missing+=(iproute2)
@@ -449,11 +469,11 @@ find_go() {
 install_go_tarball() {
     [ -n "$GOARCH" ] || { fail "unsupported CPU architecture: $ARCH"; return 1; }
     local ver=""
-    ver=$(curl -fsS --max-time 8 "https://go.dev/VERSION?m=text" 2>/dev/null | head -n1)
+    ver=$(fetch "https://go.dev/VERSION?m=text" 8 | head -n1)
     case "$ver" in go1.*) ;; *) ver="$GO_FALLBACK" ;; esac
     info "downloading $ver for $GOARCH"
-    if ! curl -fL --retry 2 --max-time 300 -o /tmp/pingify-go.tgz \
-         "https://go.dev/dl/${ver}.linux-${GOARCH}.tar.gz"; then
+    if ! fetch_to "https://go.dev/dl/${ver}.linux-${GOARCH}.tar.gz" /tmp/pingify-go.tgz 300 \
+         ; then
         fail "could not download the Go toolchain"
         dim "this is only the fallback path - see Update Core for other options"
         return 1

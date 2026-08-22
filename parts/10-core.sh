@@ -35,19 +35,18 @@ adopt_core() {
 
 download_core() {
     [ -n "$GOARCH" ] || { warn "no prebuilt core for $ARCH"; return 1; }
-    have curl || return 1
     local base tmp="/tmp/pingify-core.dl" sums="/tmp/pingify-core.sums"
     base="$(release_base)"
 
     if ! spin "downloading the core for $GOARCH" \
-         curl -fsSL --retry 2 --max-time 180 -o "$tmp" "$base/$(core_asset)"; then
+         fetch_to "$base/$(core_asset)" "$tmp" 180; then
         rm -f "$tmp"
         return 1
     fi
 
     # The checksum file is published alongside the binaries. A missing one is
     # not fatal, a wrong one is.
-    if curl -fsSL --max-time 30 -o "$sums" "$base/SHA256SUMS" 2>/dev/null; then
+    if fetch_to "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
         want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
@@ -97,7 +96,7 @@ import_core_binary() {
     local tmp="/tmp/pingify-core.import"
     case "$src" in
         http://* | https://*)
-            spin "downloading" curl -fsSL --max-time 300 -o "$tmp" "$src" \
+            spin "downloading" fetch_to "$src" "$tmp" 300 \
                 || { fail "download failed"; return 1; } ;;
         *)
             [ -f "$src" ] || { fail "no such file: $src"; return 1; }
