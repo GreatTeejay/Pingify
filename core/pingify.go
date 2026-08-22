@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.8.0"
+const version = "4.9.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -117,7 +117,15 @@ type Config struct {
 	// in front of each frame, which is what an ordinary length-prefixed
 	// protocol looks like. The payload stays encrypted either way.
 	//
-	// It must be the same on both servers. Nil means on.
+	// It must be the same on both servers. Nil means off.
+	//
+	// Off is the default because on did not survive the field. A tunnel
+	// between Iran and Europe carried its opening frames - the padded ones -
+	// and then stopped, in both directions, within seconds of the padding
+	// running out. That is the moment every frame on an idle carrier becomes
+	// exactly the same size on exactly the same schedule across eight
+	// connections at once. Whatever removed that traffic, masking the lengths
+	// did not help, and v2.1.1 without any of it worked on the same path.
 	Obfuscate   *bool  `json:"obfuscate,omitempty"`
 	DialTimeout int    `json:"dial_timeout_sec,omitempty"`
 	SndBufKB    int    `json:"sndbuf_kb,omitempty"`
@@ -247,7 +255,8 @@ func (c *Config) tokenPrint() string {
 }
 
 // obfuscated reports whether this tunnel hides the shape of its traffic.
-func (c *Config) obfuscated() bool { return c.Obfuscate == nil || *c.Obfuscate }
+// Off unless asked for: see the note on Config.Obfuscate.
+func (c *Config) obfuscated() bool { return c.Obfuscate != nil && *c.Obfuscate }
 
 func (c *Config) key() []byte {
 	if c.Token != "" {

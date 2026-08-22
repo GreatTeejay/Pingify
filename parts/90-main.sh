@@ -53,6 +53,18 @@ migrate_layout() {
         [ -e "$f" ] || continue
         json_to_toml "$f" && moved=1
     done
+
+    # 4.4 to 4.8 shaped the traffic by default, and on a real Iran<->Europe
+    # path that stopped carrying anything a few seconds after each carrier
+    # came up. Existing tunnels are put back on the wire shape that works.
+    # Both servers have to be updated, but they were both already broken.
+    for f in "$CFG_DIR"/*.toml; do
+        [ -e "$f" ] || continue
+        if grep -q '^obfuscate *= *true' "$f"; then
+            sed -i 's/^obfuscate *= *true.*/obfuscate        = false/' "$f"
+            moved=1
+        fi
+    done
     if [ "$moved" = "1" ]; then
         write_units
         for f in $(tunnel_names); do systemctl restart "pingify@$f" >/dev/null 2>&1; done
