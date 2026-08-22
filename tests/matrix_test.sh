@@ -38,6 +38,10 @@ build() {
     T_NAME="$1"; T_ROLE="$2"; T_KIND="$3"; T_FORWARDER="$4"
     [ "$T_KIND" = "tun" ] && T_TRANSPORT="icmp" || T_TRANSPORT="tcp"
     cfg_mode   # a TCP tunnel forces pingify: there is nothing to NAT onto
+    # ICMP has no port to be reachable on, so its direction is fixed: IRAN
+    # accepts the echoes. Only TCP is asked which way to open the link, and
+    # this suite builds TCP tunnels the way the wizard's default does.
+    [ "$T_TRANSPORT" = "icmp" ] && T_ACCEPTS="server" || T_ACCEPTS="client"
     T_TOKEN="$TOKEN"; T_PORT=9443
     T_PUBLIC_IP="203.0.113.9"
     this_side_accepts || T_PEER_IP="198.51.100.4"
@@ -97,15 +101,24 @@ for kind in tcp tun; do
               "$(toml_get "$s" tunnel mode)" "$(toml_get "$c" tunnel mode)"
         check "$kind/$fwd same token" \
               "$(toml_get "$s" security token)" "$(toml_get "$c" security token)"
-        # KHAREJ accepts, IRAN dials out to it. Reaching an Iranian server
-        # from outside is the half that gets filtered; reaching out of one
-        # does not, which is why the link is opened from that side.
-        check "$kind/$fwd KHAREJ listens" \
-              "$([ -n "$(toml_get "$c" transport listen)" ] && echo yes || echo no)" "yes"
-        check "$kind/$fwd IRAN dials out" \
-              "$([ -n "$(toml_get "$s" transport connect)" ] && echo yes || echo no)" "yes"
-        check "$kind/$fwd IRAN never listens" \
-              "$([ -n "$(toml_get "$s" transport listen)" ] && echo yes || echo no)" "no"
+        # Each protocol opens the link its own way, and the suite says which
+        # rather than assuming one arrangement for both.
+        #
+        #   TCP   asked. The wizard's default is Direct: IRAN dials out.
+        #   ICMP  fixed. No port to be reachable on, so IRAN accepts.
+        if [ "$kind" = "tun" ]; then
+            check "$kind/$fwd IRAN accepts the echoes" \
+                  "$([ -n "$(toml_get "$s" transport listen)" ] && echo yes || echo no)" "yes"
+            check "$kind/$fwd KHAREJ sends them" \
+                  "$([ -n "$(toml_get "$c" transport connect)" ] && echo yes || echo no)" "yes"
+        else
+            check "$kind/$fwd KHAREJ listens" \
+                  "$([ -n "$(toml_get "$c" transport listen)" ] && echo yes || echo no)" "yes"
+            check "$kind/$fwd IRAN dials out" \
+                  "$([ -n "$(toml_get "$s" transport connect)" ] && echo yes || echo no)" "yes"
+            check "$kind/$fwd IRAN never listens" \
+                  "$([ -n "$(toml_get "$s" transport listen)" ] && echo yes || echo no)" "no"
+        fi
         check "$kind/$fwd ports on IRAN only" \
               "$(grep -c '^ports' "$s")$(grep -c '^ports' "$c")" "10"
         if [ "$(grep -c '^\[tun\]' "$s")" = "1" ]; then

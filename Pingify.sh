@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.2.0"
+PINGIFY_VERSION="5.2.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1090,6 +1090,7 @@ new_tunnel() {
             T_FORWARDER="pingify"
         fi
         wiz_add "$(forwarder_label "$T_FORWARDER")"
+        T_ACCEPTS="server"
     else
         T_KIND="tcp"; T_TRANSPORT="tcp"
         T_FORWARDER="pingify"
@@ -1097,31 +1098,36 @@ new_tunnel() {
     fi
     cfg_mode
 
-    # -- which way the link is opened --------------------------------------
+    # -- which way the link is opened, TCP only ----------------------------
     #
     # Ports live on IRAN either way and clients always arrive there. This is
     # only about which end makes the TCP connection, and it matters because
-    # the two are not equally reachable: one Iranian server here refuses
-    # nothing and runs at 100 Mbit/s with no retransmits, another accepts the
-    # connection and then loses the flow a few kilobytes in. If one direction
+    # the two are not equally reachable: one Iranian server here takes an
+    # inbound connection and runs at 100 Mbit/s with no retransmits, another
+    # accepts it and then loses the flow a few kilobytes in. If one direction
     # will not stay up, the other usually will.
-    wiz "Link direction"
-    CHOICE_DEF="1"
-    choice 1 "Direct" "IRAN opens the connection to KHAREJ"
-    choice 2 "Reverse" "KHAREJ opens it to IRAN - IRAN needs the port reachable"
-    CHOICE_DEF=""
-    say ""
-    dim "The same on both servers. The token carries it, so the second"
-    dim "server is not asked."
-    say ""
-    local dir=""
-    ask dir "select" "1"
-    if [ "$dir" = "2" ]; then
-        T_ACCEPTS="server"      # IRAN accepts; KHAREJ dials in
-    else
-        T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
+    #
+    # ICMP is not asked. It has no port to be reachable on, so there is
+    # nothing to choose - IRAN accepts the echoes and KHAREJ sends them, which
+    # is what every working ICMP tunnel has done.
+    if [ "$T_TRANSPORT" = "tcp" ]; then
+        wiz "Link direction"
+        CHOICE_DEF="1"
+        choice 1 "Direct" "IRAN opens the connection to KHAREJ"
+        choice 2 "Reverse" "KHAREJ opens it to IRAN - IRAN needs the port reachable"
+        CHOICE_DEF=""
+        say ""
+        dim "The same on both servers. The token carries it, so the second"
+        dim "server is not asked."
+        say ""
+        local dir=""
+        ask dir "select" "1"
+        if [ "$dir" = "2" ]; then
+            T_ACCEPTS="server"      # IRAN accepts; KHAREJ dials in
+        else
+            T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
+        fi
     fi
-    T_DIRECTION="$( [ "$T_ACCEPTS" = "server" ] && printf 'reverse' || printf 'direct' )"
 
     # -- where the servers are ---------------------------------------------
     wiz "Addresses"
@@ -4099,7 +4105,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.2.0"
+const version = "5.2.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
