@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.7.0"
+PINGIFY_VERSION="4.7.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -160,35 +160,25 @@ item() {
 # ---------------------------------------------------------------------------
 # the wizard
 #
-# One question per screen, the screen says which step it is, and a breadcrumb
-# carries the answers already given. Nothing scrolls, so the question is always
-# at eye level instead of at the bottom of a page of explanation.
+# The steps run down one page. Nothing is cleared between them, so the answers
+# already given stay on screen above the question being asked - which is what
+# you want when you are copying the same numbers onto a second server.
 # ---------------------------------------------------------------------------
 
 WIZ_STEP=0
-WIZ_TRAIL=""
 
-wiz_reset() { WIZ_STEP=0; WIZ_TRAIL=""; }
+wiz_reset() { WIZ_STEP=0; }
 
-# wiz_add <what> - remember a decision for the breadcrumb.
-wiz_add() {
-    if [ -z "$WIZ_TRAIL" ]; then
-        WIZ_TRAIL="$1"
-    else
-        WIZ_TRAIL="$WIZ_TRAIL  $BX_DOT  $1"
-    fi
-}
+# Kept so the wizard can note a decision without the page having to redraw.
+wiz_add() { :; }
 
 # wiz <title> [subtitle] - open a step.
 wiz() {
     WIZ_STEP=$((WIZ_STEP + 1))
-    banner
-    printf '  %s%sNew tunnel%s   %sstep %d%s\n' \
-        "$C_CYN" "$C_B" "$C_OFF" "$C_DIM" "$WIZ_STEP" "$C_OFF"
-    if [ -n "$WIZ_TRAIL" ]; then
-        printf '  %s%s%s\n' "$C_GRN" "$WIZ_TRAIL" "$C_OFF"
-    fi
-    head2 "$1"
+    local t="$WIZ_STEP $BX_DOT $1 " n; n="$(vislen " $t")"
+    printf '\n  %s%s%s%s%s%s%s\n\n' \
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
+        "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
     [ -n "${2:-}" ] && { dim "$2"; say ""; }
     return 0
 }
@@ -960,6 +950,7 @@ transport_label() {
 
 new_tunnel() {
     banner
+    head2 "New tunnel"
     ensure_core || { pause; return 1; }
     cfg_reset
     wiz_reset
@@ -1115,12 +1106,14 @@ new_tunnel() {
     cfg_endpoints
     head2 "Ready to create"
     panel "$T_NAME"
-    field "This server" "$(side_label "$T_ROLE")" "Address" "$T_PUBLIC_IP"
+    field "This server" "$(side_label "$T_ROLE")"
+    field "Address" "$T_PUBLIC_IP"
     if [ "$T_KIND" = "tun" ]; then
-        field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
+        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP BRAID" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
+    field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
         field "Link" "accepts on $CFG_LISTEN"
     else
@@ -1128,7 +1121,8 @@ new_tunnel() {
     fi
     cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
-    field "Token" "$(token_print "$T_TOKEN")" "Tuning" "$T_PRESET"
+    field "Token" "$(token_print "$T_TOKEN")"
+    field "Tuning" "$T_PRESET"
     panel_end
     say ""
     if ! confirm "create it?"; then
@@ -1167,17 +1161,19 @@ new_tunnel() {
     panel "on $other"
     field "This server" "$other"
     if [ "$T_KIND" = "tun" ]; then
-        field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
+        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP BRAID"
+        field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
     field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if cfg_needs_link; then
-        field "Its address" "$T_TUNPEER" "Peer" "$T_TUNLOCAL"
+        field "Its address" "$T_TUNPEER"
+        field "Peer address" "$T_TUNLOCAL"
     fi
-    field "Token" "the same one" "Fingerprint" "$(token_print "$T_TOKEN")"
+    field "Token" "the same one"
+    field "Fingerprint" "$(token_print "$T_TOKEN")"
     panel_end
     say ""
     dim "The fingerprint there must read $(token_print "$T_TOKEN") too."
@@ -1377,9 +1373,22 @@ tunnel_status_block() {
     printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
         "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
         "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
-    if [ -n "$addr" ] && [ -x "$CORE_BIN" ]; then
-        "$CORE_BIN" -status "$addr" 2>/dev/null || true
+
+    # A stopped tunnel has no status endpoint to ask, and printing the raw
+    # "connection refused" from trying anyway reads like a fault when it is
+    # only the consequence of the line above.
+    if [ "$state" != "active" ]; then
+        dim "not running - nothing to report"
+        return 0
     fi
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 0
+    if ! "$CORE_BIN" -status "$addr" 2>/dev/null; then
+        # Either it is still coming up, or no carrier has arrived. The status
+        # server answers within a second of starting, so a refusal this soon
+        # after a start is the former.
+        dim "starting up, or the other server has not connected yet"
+    fi
+    return 0
 }
 
 # One line per tunnel, for the overview table.
@@ -3773,7 +3782,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "4.7.0"
+const version = "4.7.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -6477,6 +6486,16 @@ func printStatus(addr string, brief bool) int {
 	}
 	fmt.Printf("  tunnel     %s  (%s, %s, %s)\n", d.Name, d.Role, d.Mode, d.Transport)
 	fmt.Printf("  state      %s  -  %d of %d carriers\n", state, d.Up, d.Carriers)
+	if d.Up == 0 {
+		// The usual reason, by a wide margin, is that only one of the two
+		// servers has been set up so far. Saying so beats leaving DOWN on
+		// screen looking like a fault.
+		if d.Role == "server" {
+			fmt.Println("             nothing has connected yet - set the tunnel up on KHAREJ too")
+		} else {
+			fmt.Println("             cannot reach IRAN yet - check it is set up, and the port is open")
+		}
+	}
 	fmt.Printf("  peer       %s\n", d.Peer)
 	fmt.Printf("  rtt        %.1f ms\n", d.RTTms)
 	fmt.Printf("  streams    %d open\n", d.Streams)

@@ -218,6 +218,7 @@ transport_label() {
 
 new_tunnel() {
     banner
+    head2 "New tunnel"
     ensure_core || { pause; return 1; }
     cfg_reset
     wiz_reset
@@ -373,12 +374,14 @@ new_tunnel() {
     cfg_endpoints
     head2 "Ready to create"
     panel "$T_NAME"
-    field "This server" "$(side_label "$T_ROLE")" "Address" "$T_PUBLIC_IP"
+    field "This server" "$(side_label "$T_ROLE")"
+    field "Address" "$T_PUBLIC_IP"
     if [ "$T_KIND" = "tun" ]; then
-        field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
+        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP BRAID" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
+        field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
+    field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
         field "Link" "accepts on $CFG_LISTEN"
     else
@@ -386,7 +389,8 @@ new_tunnel() {
     fi
     cfg_needs_link && field "Private link" "${T_TUNLOCAL} ${BX_ARR} ${T_TUNPEER}"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
-    field "Token" "$(token_print "$T_TOKEN")" "Tuning" "$T_PRESET"
+    field "Token" "$(token_print "$T_TOKEN")"
+    field "Tuning" "$T_PRESET"
     panel_end
     say ""
     if ! confirm "create it?"; then
@@ -425,17 +429,19 @@ new_tunnel() {
     panel "on $other"
     field "This server" "$other"
     if [ "$T_KIND" = "tun" ]; then
-        field "Type" "TUN" "Carried by" "$(transport_label "$T_TRANSPORT")"
+        field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
-        field "Type" "TCP BRAID"
+        field "Type" "$(transport_label "$T_TRANSPORT")"
     fi
     [ "$T_TRANSPORT" = "tcp" ] && field "Tunnel port" "$T_PORT"
     field "IRAN address" "$( this_side_accepts && printf '%s' "$T_PUBLIC_IP" || printf '%s' "$T_PEER_IP" )"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if cfg_needs_link; then
-        field "Its address" "$T_TUNPEER" "Peer" "$T_TUNLOCAL"
+        field "Its address" "$T_TUNPEER"
+        field "Peer address" "$T_TUNLOCAL"
     fi
-    field "Token" "the same one" "Fingerprint" "$(token_print "$T_TOKEN")"
+    field "Token" "the same one"
+    field "Fingerprint" "$(token_print "$T_TOKEN")"
     panel_end
     say ""
     dim "The fingerprint there must read $(token_print "$T_TOKEN") too."

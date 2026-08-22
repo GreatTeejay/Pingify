@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="4.7.0"
+PINGIFY_VERSION="4.7.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -160,35 +160,25 @@ item() {
 # ---------------------------------------------------------------------------
 # the wizard
 #
-# One question per screen, the screen says which step it is, and a breadcrumb
-# carries the answers already given. Nothing scrolls, so the question is always
-# at eye level instead of at the bottom of a page of explanation.
+# The steps run down one page. Nothing is cleared between them, so the answers
+# already given stay on screen above the question being asked - which is what
+# you want when you are copying the same numbers onto a second server.
 # ---------------------------------------------------------------------------
 
 WIZ_STEP=0
-WIZ_TRAIL=""
 
-wiz_reset() { WIZ_STEP=0; WIZ_TRAIL=""; }
+wiz_reset() { WIZ_STEP=0; }
 
-# wiz_add <what> - remember a decision for the breadcrumb.
-wiz_add() {
-    if [ -z "$WIZ_TRAIL" ]; then
-        WIZ_TRAIL="$1"
-    else
-        WIZ_TRAIL="$WIZ_TRAIL  $BX_DOT  $1"
-    fi
-}
+# Kept so the wizard can note a decision without the page having to redraw.
+wiz_add() { :; }
 
 # wiz <title> [subtitle] - open a step.
 wiz() {
     WIZ_STEP=$((WIZ_STEP + 1))
-    banner
-    printf '  %s%sNew tunnel%s   %sstep %d%s\n' \
-        "$C_CYN" "$C_B" "$C_OFF" "$C_DIM" "$WIZ_STEP" "$C_OFF"
-    if [ -n "$WIZ_TRAIL" ]; then
-        printf '  %s%s%s\n' "$C_GRN" "$WIZ_TRAIL" "$C_OFF"
-    fi
-    head2 "$1"
+    local t="$WIZ_STEP $BX_DOT $1 " n; n="$(vislen " $t")"
+    printf '\n  %s%s%s%s%s%s%s\n\n' \
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
+        "$(repeat "$BX_H" $((UI_W - n)))" "$C_OFF"
     [ -n "${2:-}" ] && { dim "$2"; say ""; }
     return 0
 }
