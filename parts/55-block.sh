@@ -179,7 +179,7 @@ blocking_menu() {
         row "$(pad_to "${C_DIM}UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
         panel_end
         say ""
-        item 1 "Ping / ICMP" "stop this server answering pings"
+        item 1 "Ping / ICMP" "stop this server answering pings - wanted on an ICMP tunnel"
         item 2 "Speedtest sites" "block benchmark sites and their CDNs"
         item 3 "Block UDP 443" "rejects QUIC, so browsers fall back to TCP"
         say ""
@@ -190,7 +190,24 @@ blocking_menu() {
         local c=""
         ask c "select"
         case "$c" in
-            1) say ""; block_toggle icmp; pause ;;
+            1) say ""
+               # The question people arrive with is whether this breaks an
+               # ICMP tunnel. It does not, and the reason is worth stating
+               # once here rather than being rediscovered on a live server.
+               if [ "$(block_state icmp)" != "on" ]; then
+                   dim "Safe with an ICMP tunnel running. The tunnel reads from a raw"
+                   dim "socket, which the kernel copies to us whatever this is set to,"
+                   dim "and both ends send echo replies, which the kernel never answers"
+                   dim "by itself. This only stops it answering other people's pings."
+                   say ""
+               fi
+               block_toggle icmp
+               if [ "$(block_state icmp)" = "on" ]; then
+                   ok "this server no longer answers pings"
+               else
+                   ok "this server answers pings again"
+               fi
+               pause ;;
             2) say ""
                dim "This works on traffic leaving in the clear, so it belongs on"
                dim "the KHAREJ server - that is where the proxy talks to the site."

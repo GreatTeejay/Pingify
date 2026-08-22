@@ -177,7 +177,7 @@ first_run() {
     fi
     say ""
     fail "the core could not be installed"
-    dim "Core in the menu has the other ways to get it"
+    dim "this server could not reach GitHub and has no Go toolchain to build with"
     pause
 }
 
@@ -195,8 +195,7 @@ main_menu() {
         item 6 "Diagnostics"     "connectivity and configs"
         group "MAINTENANCE"
         item 7 "Update Pingify"  "script and core together, to the same version"
-        item 8 "Core options"    "build here, import, export"
-        item 9 "Remove"          "uninstall part of it, or all of it"
+        item 8 "Remove"          "uninstall part of it, or all of it"
         say ""
         item 0 "Exit"
         say ""
@@ -210,8 +209,7 @@ main_menu() {
             5) blocking_menu ;;
             6) diagnostics_menu ;;
             7) update_pingify ;;
-            8) update_menu ;;
-            9) remove_menu ;;
+            8) remove_menu ;;
             0) clear 2>/dev/null || true; exit 0 ;;
             *) ;;
         esac

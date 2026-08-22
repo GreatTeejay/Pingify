@@ -185,37 +185,50 @@ tunnel_menu() {
         head2 "Tunnel: $name"
         tunnel_status_block "$name"
         rule
-        group "Check"
-        item 1 "Health check" "what is wrong, and what to do about it"
-        item 2 "Live log"
-        group "Settings"
-        item 3 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
-        item 4 "Tuning" "carriers, window, keepalive, shaping"
-        item 5 "Scheduled restart"
         group "Service"
-        item 6 "Restart"
-        item 7 "Stop"
-        item 8 "Start"
+        item 1 "Restart"
+        item 2 "Stop"
+        item 3 "Start"
+        item 4 "Delete this tunnel"
+        group "Check"
+        item 5 "Health check" "what is wrong, and what to do about it"
+        item 6 "Live log"
+        group "Settings"
+        item 7 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
+        item 8 "Tuning" "carriers, window, keepalive, shaping"
+        item 9 "Scheduled restart"
         say ""
-        item d "Delete this tunnel"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
-            1) health_check "$name" ;;
-            2) say ""; dim "ctrl-c to stop following"; say ""
-               journalctl -u "pingify@$name" -n 60 -f --no-pager || true ;;
-            3) edit_forwards "$name" ;;
-            4) tuning_menu "$name" ;;
-            5) recycle_menu "$name" ;;
-            6) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
-            7) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
-            8) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
-            d|D) delete_tunnel "$name" && return ;;
+            1) systemctl restart "pingify@$name"; ok "restarted"; sleep 1 ;;
+            2) systemctl stop "pingify@$name"; ok "stopped"; sleep 1 ;;
+            3) systemctl start "pingify@$name"; ok "started"; sleep 1 ;;
+            4) delete_tunnel "$name" && return ;;
+            5) health_check "$name" ;;
+            6) live_log "$name" ;;
+            7) edit_forwards "$name" ;;
+            8) tuning_menu "$name" ;;
+            9) recycle_menu "$name" ;;
             0|"") return ;;
         esac
     done
+}
+
+# journald puts its own timestamp, the hostname and unit[pid] in front of
+# every line. Our line already carries a timestamp, so all that prefix bought
+# was half the terminal width - on a 24-carrier tunnel it pushed the actual
+# message off the right edge. -o cat prints only what the core wrote.
+live_log() {
+    local name="$1"
+    banner
+    head2 "Live log: $name"
+    say ""
+    dim "ctrl-c to stop following"
+    say ""
+    journalctl -u "pingify@$name" -n 60 -f --no-pager -o cat || true
 }
 
 edit_logging() {

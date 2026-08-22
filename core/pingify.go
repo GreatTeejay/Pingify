@@ -52,7 +52,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.5.0"
+const version = "5.6.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -875,6 +875,16 @@ type pool struct {
 	closed    chan struct{}
 	closeOnce sync.Once
 
+	// what the log was last told the strength was, so it can be told again
+	// only when that changed
+	reported int
+
+	// when each kind of failure was last written down. Every carrier fails
+	// the same way at the same moment, so without this the log is the same
+	// sentence twenty-four times a second and the reader learns nothing.
+	errMu   sync.Mutex
+	errSeen map[string]time.Time
+
 	startedAt time.Time
 }
 
@@ -978,10 +988,19 @@ func (p *pool) serveInbound(conn net.Conn) {
 	tuneSocket(conn, p.cfg)
 	keys, idx, err := serverHandshakeFor(p.cfg, conn, p.guard)
 	if err != nil {
-		// Stay quiet: a probe should learn nothing from timing or content.
+		// Stay quiet on the wire: a probe should learn nothing from timing
+		// or content. The local log is a different audience entirely - an
+		// operator whose two servers disagree about the token could read it
+		// all day and find nothing, because this is the only place that
+		// knows the other end is knocking and being turned away.
+		ra := conn.RemoteAddr()
 		time.Sleep(time.Duration(200+mrand.Intn(600)) * time.Millisecond)
 		conn.Close()
-		logDebug("rejected %s: %v", conn.RemoteAddr(), err)
+		logDebug("rejected %s: %v", ra, err)
+		if p.firstIn("rejected", time.Minute) {
+			logWarn("turned away a connection from %s: %v", ra, err)
+			logWarn("if that address is the other server, the two security tokens differ")
+		}
 		return
 	}
 	if idx < 0 || idx >= maxCarriers {
@@ -997,7 +1016,8 @@ func (p *pool) serveInbound(conn net.Conn) {
 	}
 	l := newLink(idx, p.cfg, conn, keys, p)
 	p.install(idx, l)
-	logInfo("carrier %d up from %s", idx, conn.RemoteAddr())
+	logDebug("carrier %d up from %s", idx, conn.RemoteAddr())
+	p.noteStrength()
 	l.run()
 }
 
@@ -1011,7 +1031,11 @@ func (p *pool) dialLoop(idx int) {
 		}
 		conn, err := p.dialCarrier(idx)
 		if err != nil {
-			logWarn("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
+			if p.firstIn("dial", time.Minute) {
+				logWarn("cannot reach the other server at %s: %v", p.cfg.Connect, err)
+				logWarn("nothing is listening on that port there, or a firewall is dropping it")
+			}
+			logDebug("carrier %d dial %s: %v", idx, p.cfg.Connect, err)
 			p.sleepBackoff(&backoff)
 			continue
 		}
@@ -1019,14 +1043,19 @@ func (p *pool) dialLoop(idx int) {
 		keys, err := clientHandshakeFor(p.cfg, conn, idx)
 		if err != nil {
 			conn.Close()
-			logWarn("carrier %d handshake: %v (check the key on both servers)", idx, err)
+			if p.firstIn("handshake", time.Minute) {
+				logWarn("reached %s but the handshake failed: %v", p.cfg.Connect, err)
+				logWarn("the two servers disagree - almost always a different security token")
+			}
+			logDebug("carrier %d handshake: %v", idx, err)
 			p.sleepBackoff(&backoff)
 			continue
 		}
 		backoff = 500 * time.Millisecond
 		l := newLink(idx, p.cfg, conn, keys, p)
 		p.install(idx, l)
-		logInfo("carrier %d up to %s", idx, p.cfg.Connect)
+		logDebug("carrier %d up to %s", idx, p.cfg.Connect)
+		p.noteStrength()
 		l.run() // blocks until the carrier dies
 		select {
 		case <-p.closed:
@@ -1044,6 +1073,59 @@ func (p *pool) sleepBackoff(b *time.Duration) {
 	}
 	if *b < 8*time.Second {
 		*b *= 2
+	}
+}
+
+// A 24-carrier tunnel used to write 24 near-identical lines every time it
+// came up, and the same again every time the far end restarted, which buried
+// the one line a reader was looking for. Report the strength instead, and
+// only when it changes something worth acting on.
+// firstIn reports whether this kind of failure is worth a line right now:
+// the first one, and then at most one a minute.
+func (p *pool) firstIn(kind string, every time.Duration) bool {
+	p.errMu.Lock()
+	defer p.errMu.Unlock()
+	if p.errSeen == nil {
+		p.errSeen = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := p.errSeen[kind]; ok && now.Sub(last) < every {
+		return false
+	}
+	p.errSeen[kind] = now
+	return true
+}
+
+func (p *pool) noteStrength() {
+	select {
+	case <-p.closed:
+		// stopping on purpose: the strength going to zero is the point,
+		// not news
+		return
+	default:
+	}
+	p.mu.Lock()
+	n := 0
+	for _, l := range p.links {
+		if l != nil && l.alive() {
+			n++
+		}
+	}
+	was := p.reported
+	p.reported = n
+	p.mu.Unlock()
+
+	switch {
+	case was == n:
+		// nothing a reader would act on
+	case was == 0 && n > 0:
+		logInfo("tunnel up: %d of %d carriers", n, p.cfg.Carriers)
+	case n >= p.cfg.Carriers:
+		logInfo("all %d carriers up", n)
+	case n == 0:
+		logWarn("every carrier is down: nothing can cross the tunnel now")
+	case n < was:
+		logWarn("%d of %d carriers up, %d went down", n, p.cfg.Carriers, was-n)
 	}
 }
 
@@ -1848,8 +1930,14 @@ func (l *link) close() {
 		if why == "" {
 			why = "closed locally"
 		}
-		logInfo("carrier %d down: %s (up %s)", l.idx, why,
+		// The reason belongs in the log every time - it is the only place
+		// that says *why* - but at debug, because noteStrength below turns a
+		// whole braid dropping at once into one line instead of twenty-four.
+		logDebug("carrier %d down: %s (up %s)", l.idx, why,
 			time.Since(time.Unix(0, atomic.LoadInt64(&l.upSince))).Round(time.Second))
+		if l.pool != nil {
+			l.pool.noteStrength()
+		}
 	})
 }
 
