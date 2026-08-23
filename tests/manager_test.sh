@@ -1103,16 +1103,21 @@ check "and says where to look"       "$(kp | grep -c 'ss -ltnp')"               
 check "including the 0.0.0.0 trap"   "$(kp | grep -c '0.0.0.0, not on 127.0.0.1')"  "1"
 
 # ---------------------------------------------------------------------------
-note "two tunnels never share a device either"
+note "a device is named after its tunnel, and never twice"
 # ---------------------------------------------------------------------------
-# GRE and AmneziaWG name their interface after the tunnel, so they cannot
-# collide. The core's TUN device is answered for, and the answer offered was
-# pfy0 every time - so a second ICMP tunnel took the first one's name and then
-# could not create its interface.
+# pfy0 said nothing: not which tunnel it belonged to, not what it carried, and
+# on a server with two of them not even which was which. It was also the same
+# answer every time, so a second ICMP tunnel took the first one's name and
+# then could not create its interface.
 DEV="$WORK/dev"; mkdir -p "$DEV"
 (
     CFG_DIR="$DEV"
     have() { case "$1" in ip | ss | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    nmi() { ( T_ROLE="$1"; T_TRANSPORT="$2"; link_iface "$3" ); }
+    echo "icmp=$(nmi server icmp tun-iran-icmp)"
+    echo "gre=$(nmi server gre tun-iran-gre)"
+    echo "awg=$(nmi client awg tun-kharej-awg)"
+
     mkd() {
         cfg_reset
         T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
@@ -1122,24 +1127,24 @@ DEV="$WORK/dev"; mkdir -p "$DEV"
         T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
         cfg_save >/dev/null
     }
-    echo "first=$(free_tun_iface)"
-    mkd tun-a pfy0 10
-    echo "second=$(free_tun_iface)"
-    mkd tun-b pfy1 20
-    echo "third=$(free_tun_iface)"
-    echo "owner0=$(iface_owner pfy0)"
-    echo "own=$(iface_owner pfy0 tun-a)"
-    echo "spare=$(iface_owner pfy9)"
+    T_TRANSPORT="icmp"
+    echo "first=$(free_tun_iface tun-iran-icmp)"
+    mkd tun-iran-icmp icmp-iran 10
+    echo "second=$(free_tun_iface tun-iran-icmp)"
+    echo "owner=$(iface_owner icmp-iran)"
+    echo "own=$(iface_owner icmp-iran tun-iran-icmp)"
+    echo "spare=$(iface_owner icmp-nobody)"
 ) > "$WORK/dev.out" 2>&1
 dv() { grep -m1 "^$1=" "$WORK/dev.out" | cut -d= -f2-; }
-check "the first device offered is free" "$(dv first)"  "pfy0"
-check "the next one moves along"         "$(dv second)" "pfy1"
-check "and the next"                     "$(dv third)"  "pfy2"
-check "a taken device names its owner"   "$(dv owner0)" "tun-a"
-check "a tunnel may keep its own"        "$(dv own)"    ""
-check "an unused one is free"            "$(dv spare)"  ""
-check "the wizard refuses a taken device" \
-      "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'iface_owner "')" "1"
+check "an icmp device says so"          "$(dv icmp)"   "icmp-iran"
+check "and a gre one"                   "$(dv gre)"    "gre-iran"
+check "and an awg one, on its own side" "$(dv awg)"    "awg-kharej"
+check "the name is offered when free"   "$(dv first)"  "icmp-iran"
+check "and counted up when taken"       "$(dv second)" "icmp-iran2"
+check "a taken device names its owner"  "$(dv owner)"  "tun-iran-icmp"
+check "a tunnel may keep its own"       "$(dv own)"    ""
+check "an unused one is free"           "$(dv spare)"  ""
+check "the wizard refuses a taken device"       "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'iface_owner "')" "1"
 
 # ---------------------------------------------------------------------------
 note "the queue on a tunnel is not one deep pipe"
