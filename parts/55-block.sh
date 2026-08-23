@@ -96,14 +96,39 @@ apply_blocking() {
     block_reset_chains
 
     # --- ICMP -------------------------------------------------------------
+    #
+    # Dropped in the firewall rather than switched off in the kernel, because
+    # icmp_echo_ignore_all is global and a private link is not public.
+    #
+    # A server told to ignore every echo also ignores the one its own tunnel's
+    # health check sends across the private link - so building an ICMP tunnel,
+    # which turns this on, made every GRE tunnel on the same pair of servers
+    # read as down while it was carrying traffic perfectly well.
+    #
+    # A rule can tell the two apart. Echo requests arriving on a tunnel
+    # interface are answered; everything else is dropped, which is the whole
+    # point of the switch. Our own ICMP transport is untouched either way:
+    # it rides in echo *replies*, which nothing here matches.
     if [ "$(block_state icmp)" = "on" ]; then
-        printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > /etc/sysctl.d/99-pingify-block.conf
+        if have iptables; then
+            rm -f /etc/sysctl.d/99-pingify-block.conf
+            sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+            local ifc
+            for ifc in $(tun_ifaces | awk '{print $1}'); do
+                [ -n "$ifc" ] || continue
+                ipt -A PINGIFY_IN -i "$ifc" -p icmp --icmp-type echo-request -j ACCEPT
+            done
+            ipt -A PINGIFY_IN -p icmp --icmp-type echo-request -j DROP
+        else
+            # No firewall to be selective with: the blunt switch, and the
+            # health check knows to expect it.
+            printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > /etc/sysctl.d/99-pingify-block.conf
+        fi
     else
         rm -f /etc/sysctl.d/99-pingify-block.conf
         sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
     fi
     sysctl --system >/dev/null 2>&1
-
     # --- speedtest --------------------------------------------------------
     if [ "$(block_state speedtest)" = "on" ]; then
         hosts_block_on
