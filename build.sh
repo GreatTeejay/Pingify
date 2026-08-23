@@ -30,7 +30,17 @@ if command -v "$GO_BIN" >/dev/null 2>&1; then
     ( cd core && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 "$GO_BIN" build -o /dev/null . )
 
     info "test"
-    ( cd core && "$GO_BIN" test -count=1 -short -timeout 120s . >/dev/null )
+    # Kept, not discarded. A build that fails without saying which test failed
+    # is a build you have to reproduce somewhere else before you can read it,
+    # and the place it failed is usually the place you do not have.
+    testlog="$(mktemp)"
+    if ! ( cd core && "$GO_BIN" test -count=1 -short -timeout 120s . ) >"$testlog" 2>&1; then
+        red "the engine's own tests failed"
+        cat "$testlog"
+        rm -f "$testlog"
+        exit 1
+    fi
+    rm -f "$testlog"
 else
     red "warning: no Go toolchain here, bundling the sources unchecked"
 fi
