@@ -164,6 +164,9 @@ apply_nat() {
     # setup token described a different tunnel and the "is running" line named
     # one too.
     for n in $(tunnel_names); do ( nat_rules_for "$n" ); done
+    # The ping block exempts each tunnel's own interface by name, so the set
+    # of tunnels changing means those rules have to be rebuilt too.
+    [ "$(block_state icmp)" = "on" ] && apply_blocking quiet
     [ "$quiet" = quiet ] || ok "forwarding rules applied"
     return 0
 }

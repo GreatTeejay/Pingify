@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.15.0"
+PINGIFY_VERSION="5.16.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1989,6 +1989,9 @@ apply_nat() {
     # setup token described a different tunnel and the "is running" line named
     # one too.
     for n in $(tunnel_names); do ( nat_rules_for "$n" ); done
+    # The ping block exempts each tunnel's own interface by name, so the set
+    # of tunnels changing means those rules have to be rebuilt too.
+    [ "$(block_state icmp)" = "on" ] && apply_blocking quiet
     [ "$quiet" = quiet ] || ok "forwarding rules applied"
     return 0
 }
@@ -2785,17 +2788,18 @@ kernel_link_check() {
     # not built yet or the path dropping protocol 47; for AmneziaWG it is a
     # handshake that never completed, which has its own reasons.
     hc_bad "$iface is up but ${peer:-the other end} does not answer"
-    # The one false alarm this check can raise, and it is easy to walk into:
-    # building an ICMP tunnel on either server turns the ping block on, and a
-    # server that answers no pings answers none on the private link either.
-    # GRE has nothing else to ask, so say so rather than send somebody hunting
-    # a fault that is not there.
-    if [ "$T_TRANSPORT" = "gre" ] && [ "$(block_state icmp)" = "on" ]; then
-        hc_note "this server is set to ignore all ICMP echo, and so, most"
-        hc_note "likely, is the other one - a GRE link is tested by pinging"
-        hc_note "across it, so it can read as down while carrying traffic"
+    # The false alarm this used to raise, and it was easy to walk into:
+    # building an ICMP tunnel turns the ping block on, and a server answering
+    # no pings answers none on its private links either - so a GRE tunnel
+    # carrying traffic perfectly well read as down.
+    #
+    # The block exempts tunnel interfaces now, so this only survives where
+    # there is no firewall to be selective with. The far server is the one
+    # that has to answer, and it may be older than this fix.
+    if [ "$T_TRANSPORT" = "gre" ] && [ "$(block_state icmp)" = "on" ] && ! have iptables; then
+        hc_note "this server has no iptables, so its ping block is the blunt"
+        hc_note "kind - and a GRE link is tested by pinging across it"
         hc_fix "test it by hand instead:  curl --interface $iface -sI http://$peer"
-        hc_note "or turn the block off on the far server while you check"
     fi
     if [ "$T_TRANSPORT" = "gre" ]; then
         hc_note "GRE is IP protocol 47, not a port - a firewall that only"
@@ -3833,8 +3837,8 @@ health_check() {
     # the kernel copies to us regardless, and both ends send echo *replies*,
     # which the kernel never answers by itself. So the block is wanted here.
     if [ "$T_TRANSPORT" = "icmp" ]; then
-        if [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = "1" ]; then
-            hc_ok "the kernel is not answering pings, which is what we want"
+        if [ "$(block_state icmp)" = "on" ]; then
+            hc_ok "this server is not answering pings, which is what we want"
         else
             hc_warn "this server still answers ordinary pings"
             hc_note "the tunnel keeps working either way, but the server is"
@@ -4280,14 +4284,39 @@ apply_blocking() {
     block_reset_chains
 
     # --- ICMP -------------------------------------------------------------
+    #
+    # Dropped in the firewall rather than switched off in the kernel, because
+    # icmp_echo_ignore_all is global and a private link is not public.
+    #
+    # A server told to ignore every echo also ignores the one its own tunnel's
+    # health check sends across the private link - so building an ICMP tunnel,
+    # which turns this on, made every GRE tunnel on the same pair of servers
+    # read as down while it was carrying traffic perfectly well.
+    #
+    # A rule can tell the two apart. Echo requests arriving on a tunnel
+    # interface are answered; everything else is dropped, which is the whole
+    # point of the switch. Our own ICMP transport is untouched either way:
+    # it rides in echo *replies*, which nothing here matches.
     if [ "$(block_state icmp)" = "on" ]; then
-        printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > /etc/sysctl.d/99-pingify-block.conf
+        if have iptables; then
+            rm -f /etc/sysctl.d/99-pingify-block.conf
+            sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
+            local ifc
+            for ifc in $(tun_ifaces | awk '{print $1}'); do
+                [ -n "$ifc" ] || continue
+                ipt -A PINGIFY_IN -i "$ifc" -p icmp --icmp-type echo-request -j ACCEPT
+            done
+            ipt -A PINGIFY_IN -p icmp --icmp-type echo-request -j DROP
+        else
+            # No firewall to be selective with: the blunt switch, and the
+            # health check knows to expect it.
+            printf 'net.ipv4.icmp_echo_ignore_all = 1\n' > /etc/sysctl.d/99-pingify-block.conf
+        fi
     else
         rm -f /etc/sysctl.d/99-pingify-block.conf
         sysctl -w net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1
     fi
     sysctl --system >/dev/null 2>&1
-
     # --- speedtest --------------------------------------------------------
     if [ "$(block_state speedtest)" = "on" ]; then
         hosts_block_on
@@ -6233,7 +6262,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.15.0"
+const version = "5.16.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

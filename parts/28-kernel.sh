@@ -422,17 +422,18 @@ kernel_link_check() {
     # not built yet or the path dropping protocol 47; for AmneziaWG it is a
     # handshake that never completed, which has its own reasons.
     hc_bad "$iface is up but ${peer:-the other end} does not answer"
-    # The one false alarm this check can raise, and it is easy to walk into:
-    # building an ICMP tunnel on either server turns the ping block on, and a
-    # server that answers no pings answers none on the private link either.
-    # GRE has nothing else to ask, so say so rather than send somebody hunting
-    # a fault that is not there.
-    if [ "$T_TRANSPORT" = "gre" ] && [ "$(block_state icmp)" = "on" ]; then
-        hc_note "this server is set to ignore all ICMP echo, and so, most"
-        hc_note "likely, is the other one - a GRE link is tested by pinging"
-        hc_note "across it, so it can read as down while carrying traffic"
+    # The false alarm this used to raise, and it was easy to walk into:
+    # building an ICMP tunnel turns the ping block on, and a server answering
+    # no pings answers none on its private links either - so a GRE tunnel
+    # carrying traffic perfectly well read as down.
+    #
+    # The block exempts tunnel interfaces now, so this only survives where
+    # there is no firewall to be selective with. The far server is the one
+    # that has to answer, and it may be older than this fix.
+    if [ "$T_TRANSPORT" = "gre" ] && [ "$(block_state icmp)" = "on" ] && ! have iptables; then
+        hc_note "this server has no iptables, so its ping block is the blunt"
+        hc_note "kind - and a GRE link is tested by pinging across it"
         hc_fix "test it by hand instead:  curl --interface $iface -sI http://$peer"
-        hc_note "or turn the block off on the far server while you check"
     fi
     if [ "$T_TRANSPORT" = "gre" ]; then
         hc_note "GRE is IP protocol 47, not a port - a firewall that only"

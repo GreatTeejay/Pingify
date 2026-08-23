@@ -526,7 +526,9 @@ cfg_save >/dev/null
     core_matches_script() { return 0; }
     have() { return 1; }
     port_free() { return 1; }
-    sysctl() { printf '1'; }
+    # the switch is the source of truth now, not the kernel flag: the block
+    # is done with a rule so the private links can be exempted from it
+    block_state() { [ "$1" = "icmp" ] && printf 'on' || printf 'off'; }
     CORE_BIN=/bin/true
     health_check ic
 ) > "$HC" 2>&1
@@ -538,7 +540,7 @@ check "and never asks to undo it"     "$(grep -c 'turn the ICMP block off' "$HC"
     core_matches_script() { return 0; }
     have() { return 1; }
     port_free() { return 1; }
-    sysctl() { printf '0'; }
+    block_state() { printf 'off'; }
     CORE_BIN=/bin/true
     health_check ic
 ) > "$HC" 2>&1
@@ -1274,6 +1276,62 @@ check "and the listing shows them"           "$(hp lines)" "1"
 eh() { awk '/^edit_health\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "changing one lists the others"        "$(eh | grep -c 'show_taken_health')" "1"
 check "and refuses a taken one"              "$(eh | grep -c 'health_owner')"      "1"
+
+
+# ---------------------------------------------------------------------------
+note "blocking ping does not blind the tunnels to each other"
+# ---------------------------------------------------------------------------
+# icmp_echo_ignore_all is global, and a private link is not public. A server
+# told to ignore every echo also ignored the one its own health check sent
+# across the link - so building an ICMP tunnel, which turns the block on, made
+# every GRE tunnel on the same pair read as down while carrying traffic.
+#
+# A rule can tell the two apart; the kernel flag cannot.
+BLK="$WORK/blk"; mkdir -p "$BLK"
+(
+    CFG_DIR="$BLK"; STATE_DIR="$BLK/.s"; mkdir -p "$STATE_DIR"
+    systemctl() { :; }; sysctl() { :; }
+    have() { case "$1" in iptables) return 0 ;; ip | ss | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    iptables() { echo "RULE $*"; }
+    mkb() {
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="$1"; [ "$1" = "icmp" ] && T_KIND="tun"; cfg_mode
+        T_TUNLOCAL="10.$2.10.1/24"; T_TUNPEER="10.$2.10.2/24"
+        T_NAME="$(tunnel_default_name "$(link_octet)")"; T_TUNIF="$(link_iface "$T_NAME")"
+        T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_FORWARDS='"443"'
+        kernel_transport || T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+    }
+    mkb icmp 10
+    mkb gre 20
+    : > "$STATE_DIR/block-icmp"
+    apply_blocking quiet > "$BLK/on.txt" 2>&1
+    rm -f "$STATE_DIR/block-icmp"
+    apply_blocking quiet > "$BLK/off.txt" 2>&1
+) > /dev/null 2>&1
+
+check "the private links are let through" \
+      "$(grep -c 'icmp-type echo-request -j ACCEPT' "$BLK/on.txt")" "2"
+check "the gre link by name"  "$(grep -c -- '-i gre-iran-20 .*ACCEPT' "$BLK/on.txt")"   "1"
+check "and the icmp one"      "$(grep -c -- '-i icmp-iran-10 .*ACCEPT' "$BLK/on.txt")"  "1"
+check "everything else is dropped" \
+      "$(grep -c 'icmp-type echo-request -j DROP' "$BLK/on.txt")" "1"
+check "the accepts come before the drop" \
+      "$([ "$(grep -n 'ACCEPT' "$BLK/on.txt" | tail -1 | cut -d: -f1)" -lt "$(grep -n 'DROP' "$BLK/on.txt" | head -1 | cut -d: -f1)" ] && echo y)" "y"
+check "and with the switch off, no icmp rule at all" \
+      "$(grep -c 'icmp' "$BLK/off.txt")" "0"
+
+# The blunt kernel flag is only for a server with no firewall to be selective
+# with, and it must not be left behind when the rule can do the job.
+ab() { awk '/^apply_blocking\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the kernel flag is the fallback only" \
+      "$(ab | grep -c 'have iptables; then')" "1"
+check "and is cleared when the rule takes over" \
+      "$(ab | grep -c 'rm -f /etc/sysctl.d/99-pingify-block.conf')" "2"
+# Our own ICMP transport rides in echo replies, which none of this matches.
+check "nothing here touches an echo reply" \
+      "$(ab | grep -c 'echo-reply')" "0"
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

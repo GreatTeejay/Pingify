@@ -233,8 +233,8 @@ health_check() {
     # the kernel copies to us regardless, and both ends send echo *replies*,
     # which the kernel never answers by itself. So the block is wanted here.
     if [ "$T_TRANSPORT" = "icmp" ]; then
-        if [ "$(sysctl -n net.ipv4.icmp_echo_ignore_all 2>/dev/null)" = "1" ]; then
-            hc_ok "the kernel is not answering pings, which is what we want"
+        if [ "$(block_state icmp)" = "on" ]; then
+            hc_ok "this server is not answering pings, which is what we want"
         else
             hc_warn "this server still answers ordinary pings"
             hc_note "the tunnel keeps working either way, but the server is"
