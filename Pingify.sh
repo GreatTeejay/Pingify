@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.16.0"
+PINGIFY_VERSION="5.17.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -884,7 +884,7 @@ cfg_reset() {
     T_PORT=9443          # the tunnel's own port, TCP only
     T_ACCEPTS="server"   # reverse: IRAN accepts, KHAREJ comes to it
     T_PUBLIC_IP=""; T_PEER_IP=""
-    T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
+    T_CARRIERS=16; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
@@ -997,12 +997,37 @@ cfg_endpoints() {
 #           carry it.
 # ---------------------------------------------------------------------------
 
+# The numbers, and why each one is what it is.
+#
+# A stream is pinned to one carrier for its life, so the window alone decides
+# how fast a single download can go: window / round-trip. On the 75-90 ms this
+# path actually measures, that is
+#
+#   256 KB  ->  ~24 Mbit/s      1024 KB  ->  ~95 Mbit/s
+#   512 KB  ->  ~48 Mbit/s      4096 KB  -> ~380 Mbit/s
+#
+# for ONE connection. Carriers do not raise that; they spread many connections
+# so one heavy download stops starving everything else.
+#
+# Bigger is not simply better. A window past what the path can carry does not
+# go faster - it queues, and a queue is latency. That is what shows up as a
+# video that stalls and a ping that swings while the speed graph looks fine.
+# So the presets climb the window only as far as the traffic needs, and buy
+# steadiness with carriers rather than with depth.
 apply_preset() {
     case "$1" in
+        # Games and calls: the smallest window that still fills a link, so
+        # nothing is ever sat in a queue waiting. Throughput is not the point.
         gaming)     T_CARRIERS=8;  T_WINDOW=256 ;;
-        latency)    T_CARRIERS=10; T_WINDOW=512 ;;
-        balanced)   T_CARRIERS=14; T_WINDOW=1024 ;;
+        # Browsing and chat - many small things at once, none of them large.
+        latency)    T_CARRIERS=12; T_WINDOW=512 ;;
+        # Video. One stream reaching ~95 Mbit/s covers 4K with room over, and
+        # 16 carriers keep a download from taking the picture down with it.
+        balanced)   T_CARRIERS=16; T_WINDOW=1024 ;;
+        # Large files, where finishing sooner is worth some queueing.
         throughput) T_CARRIERS=20; T_WINDOW=2048 ;;
+        # Everything the path will give. Uses real memory: each carrier holds
+        # a send and a receive buffer this size.
         extreme)    T_CARRIERS=24; T_WINDOW=4096 ;;
         *)          return 1 ;;
     esac
@@ -1018,24 +1043,31 @@ apply_preset() {
 # match. Writing "from token" put a string in the profile field that is not a
 # profile, and told a reader on this server nothing about what the tuning is -
 # while the other server, with the identical numbers, called it Extreme.
+# preset_name asks apply_preset rather than holding a second copy of the table.
+# The two were separate lists, and the moment the presets were retuned they
+# disagreed: apply_preset set balanced to 16 carriers while this still called
+# 16 "custom" and 14 "balanced". A config could then report a profile no preset
+# would produce.
 preset_name() {
-    case "$1/$2" in
-        8/256)   printf 'gaming' ;;
-        10/512)  printf 'latency' ;;
-        14/1024) printf 'balanced' ;;
-        20/2048) printf 'throughput' ;;
-        24/4096) printf 'extreme' ;;
-        *)       printf 'custom' ;;
-    esac
+    local car="$1" win="$2" p
+    for p in gaming latency balanced throughput extreme; do
+        # in a subshell: apply_preset writes the T_ variables, and this is
+        # asked from screens that are holding a tunnel in them
+        if [ "$(apply_preset "$p" >/dev/null 2>&1; printf '%s/%s' "$T_CARRIERS" "$T_WINDOW")" = "$car/$win" ]; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    printf 'custom'
 }
 
 preset_menu() {
     CHOICE_DEF="3"
-    choice 1 "Gaming" "8 carriers - lowest ping, small bursts"
-    choice 2 "Latency" "10 carriers - browsing, calls, anything interactive"
-    choice 3 "Balanced" "14 carriers - fills a 100 Mbit path"
-    choice 4 "Download" "20 carriers - large files"
-    choice 5 "Extreme" "24 carriers - fastest, uses the most memory"
+    choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"
+    choice 2 "Latency" "12 carriers, 512 KB - browsing, calls, chat"
+    choice 3 "Balanced" "16 carriers, 1024 KB - video without stalls"
+    choice 4 "Download" "20 carriers, 2048 KB - large files"
+    choice 5 "Extreme" "24 carriers, 4096 KB - fastest, most memory"
     choice 6 "Custom" "set the numbers yourself"
     CHOICE_DEF=""
     say ""
@@ -1053,7 +1085,7 @@ preset_menu() {
            ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE" ;;
         *) apply_preset balanced ;;
     esac
-    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=14 ;; esac
+    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=16 ;; esac
     case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=1024 ;; esac
     case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
     [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1
@@ -5061,10 +5093,20 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	arqNonce  = 4
-	arqHdr    = 16
-	arqOver   = arqNonce + arqHdr
-	arqWindow = 64 // segments in flight
+	arqNonce = 4
+	arqHdr   = 16
+	arqOver  = arqNonce + arqHdr
+	// The floor and the ceiling on segments in flight. The window itself is
+	// per connection now, sized from the tunnel's own window_kb - it used to
+	// be this constant, 64, and nothing could reach it.
+	//
+	// 64 segments of 1200 bytes is 76.8 KB in flight, and a stream is pinned
+	// to one carrier for its life. At 75 ms that is 8 Mbit/s for a single
+	// download, whatever the carrier count says - which is why an ICMP tunnel
+	// measured a fraction of what the same servers did over TCP, and why one
+	// video stalled while the tunnel looked idle.
+	arqWinMin = 32
+	arqWinMax = 4096
 
 	flagData = 1 << 0
 	flagFin  = 1 << 1
@@ -5127,8 +5169,11 @@ type arqConn struct {
 	carrier uint8
 	mask    cipher.Block
 	maxPay  int
-	send    func([]byte) error
-	remote  net.Addr
+	// Segments allowed in flight. A stream is pinned to one carrier, so this
+	// alone decides how fast a single download can go: window * maxPay / RTT.
+	window int
+	send   func([]byte) error
+	remote net.Addr
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -5164,7 +5209,24 @@ type arqConn struct {
 	maxRetries int
 }
 
-func newARQ(session uint32, carrier uint8, psk []byte, maxPayload int, send func([]byte) error) *arqConn {
+// arqWindowFor turns the tunnel's window_kb into segments in flight, which is
+// the unit the ARQ actually counts in. Sized the same way the TCP transport
+// sizes its credit window, so the two answer to the same setting.
+func arqWindowFor(windowKB, maxPayload int) int {
+	if windowKB <= 0 || maxPayload <= 0 {
+		return arqWinMin
+	}
+	n := windowKB * 1024 / maxPayload
+	if n < arqWinMin {
+		return arqWinMin
+	}
+	if n > arqWinMax {
+		return arqWinMax
+	}
+	return n
+}
+
+func newARQ(session uint32, carrier uint8, psk []byte, maxPayload, window int, send func([]byte) error) *arqConn {
 	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), psk), []byte("arq header"), 32)
 	blk, err := aes.NewCipher(k)
 	if err != nil {
@@ -5175,6 +5237,7 @@ func newARQ(session uint32, carrier uint8, psk []byte, maxPayload int, send func
 		carrier:    carrier,
 		mask:       blk,
 		maxPay:     maxPayload,
+		window:     window,
 		send:       send,
 		sndBuf:     make(map[uint32]*segment),
 		rcvBuf:     make(map[uint32][]byte),
@@ -5215,7 +5278,7 @@ func (c *arqConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		c.mu.Lock()
-		for len(c.sndBuf) >= arqWindow {
+		for len(c.sndBuf) >= c.window {
 			if c.closed || c.err != nil {
 				e := c.err
 				if e == nil {
@@ -5387,7 +5450,7 @@ func (c *arqConn) deliver(seq uint32, payload []byte) {
 	if seq < c.rcvNext {
 		return // already had it; the ack was lost, not the data
 	}
-	if seq >= c.rcvNext+arqWindow*2 {
+	if seq >= c.rcvNext+uint32(c.window)*2 {
 		return // absurdly far ahead, drop rather than grow without bound
 	}
 	if _, dup := c.rcvBuf[seq]; dup {
@@ -5987,6 +6050,8 @@ type sessionKey struct {
 type icmpTransport struct {
 	pc  net.PacketConn
 	psk []byte
+	// Segments in flight per ARQ connection, from the tunnel's window_kb.
+	window int
 
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
@@ -6001,7 +6066,7 @@ type icmpTransport struct {
 // is right on a server with one. On a server with several the kernel picks
 // the source itself, and a reply that leaves from an address the far end is
 // not expecting is a reply the far end throws away - so the wizard asks.
-func newICMPTransport(psk []byte, bind string) (*icmpTransport, error) {
+func newICMPTransport(psk []byte, bind string, windowKB int) (*icmpTransport, error) {
 	if bind == "" || bind == "0.0.0.0" {
 		bind = "0.0.0.0"
 	}
@@ -6012,6 +6077,7 @@ func newICMPTransport(psk []byte, bind string) (*icmpTransport, error) {
 	t := &icmpTransport{
 		pc:       pc,
 		psk:      psk,
+		window:   arqWindowFor(windowKB, icmpMaxPayload),
 		sessions: make(map[sessionKey]*arqConn),
 		inbound:  make(chan net.Conn, 16),
 		done:     make(chan struct{}),
@@ -6099,7 +6165,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
-		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.sender(peer, id))
+		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.window, t.sender(peer, id))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
@@ -6127,7 +6193,7 @@ func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
 	session := binary.BigEndian.Uint32(b[:])
 	id := uint16(session)
 
-	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.sender(ip, id))
+	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.window, t.sender(ip, id))
 	conn.remote = ip
 
 	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
@@ -6262,7 +6328,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.16.0"
+const version = "5.17.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -7166,7 +7232,7 @@ func (p *pool) start() error {
 	if p.cfg.Transport == "icmp" {
 		// The listening side stores the address to answer from; the dialling
 		// side has none and takes the default.
-		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen)
+		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen, p.cfg.WindowKB)
 		if err != nil {
 			return err
 		}

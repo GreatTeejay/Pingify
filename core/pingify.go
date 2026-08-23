@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.16.0"
+const version = "5.17.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -957,7 +957,7 @@ func (p *pool) start() error {
 	if p.cfg.Transport == "icmp" {
 		// The listening side stores the address to answer from; the dialling
 		// side has none and takes the default.
-		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen)
+		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen, p.cfg.WindowKB)
 		if err != nil {
 			return err
 		}

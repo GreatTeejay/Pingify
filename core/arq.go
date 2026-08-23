@@ -42,10 +42,20 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	arqNonce  = 4
-	arqHdr    = 16
-	arqOver   = arqNonce + arqHdr
-	arqWindow = 64 // segments in flight
+	arqNonce = 4
+	arqHdr   = 16
+	arqOver  = arqNonce + arqHdr
+	// The floor and the ceiling on segments in flight. The window itself is
+	// per connection now, sized from the tunnel's own window_kb - it used to
+	// be this constant, 64, and nothing could reach it.
+	//
+	// 64 segments of 1200 bytes is 76.8 KB in flight, and a stream is pinned
+	// to one carrier for its life. At 75 ms that is 8 Mbit/s for a single
+	// download, whatever the carrier count says - which is why an ICMP tunnel
+	// measured a fraction of what the same servers did over TCP, and why one
+	// video stalled while the tunnel looked idle.
+	arqWinMin = 32
+	arqWinMax = 4096
 
 	flagData = 1 << 0
 	flagFin  = 1 << 1
@@ -108,8 +118,11 @@ type arqConn struct {
 	carrier uint8
 	mask    cipher.Block
 	maxPay  int
-	send    func([]byte) error
-	remote  net.Addr
+	// Segments allowed in flight. A stream is pinned to one carrier, so this
+	// alone decides how fast a single download can go: window * maxPay / RTT.
+	window int
+	send   func([]byte) error
+	remote net.Addr
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -145,7 +158,24 @@ type arqConn struct {
 	maxRetries int
 }
 
-func newARQ(session uint32, carrier uint8, psk []byte, maxPayload int, send func([]byte) error) *arqConn {
+// arqWindowFor turns the tunnel's window_kb into segments in flight, which is
+// the unit the ARQ actually counts in. Sized the same way the TCP transport
+// sizes its credit window, so the two answer to the same setting.
+func arqWindowFor(windowKB, maxPayload int) int {
+	if windowKB <= 0 || maxPayload <= 0 {
+		return arqWinMin
+	}
+	n := windowKB * 1024 / maxPayload
+	if n < arqWinMin {
+		return arqWinMin
+	}
+	if n > arqWinMax {
+		return arqWinMax
+	}
+	return n
+}
+
+func newARQ(session uint32, carrier uint8, psk []byte, maxPayload, window int, send func([]byte) error) *arqConn {
 	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), psk), []byte("arq header"), 32)
 	blk, err := aes.NewCipher(k)
 	if err != nil {
@@ -156,6 +186,7 @@ func newARQ(session uint32, carrier uint8, psk []byte, maxPayload int, send func
 		carrier:    carrier,
 		mask:       blk,
 		maxPay:     maxPayload,
+		window:     window,
 		send:       send,
 		sndBuf:     make(map[uint32]*segment),
 		rcvBuf:     make(map[uint32][]byte),
@@ -196,7 +227,7 @@ func (c *arqConn) Write(p []byte) (int, error) {
 	total := 0
 	for len(p) > 0 {
 		c.mu.Lock()
-		for len(c.sndBuf) >= arqWindow {
+		for len(c.sndBuf) >= c.window {
 			if c.closed || c.err != nil {
 				e := c.err
 				if e == nil {
@@ -368,7 +399,7 @@ func (c *arqConn) deliver(seq uint32, payload []byte) {
 	if seq < c.rcvNext {
 		return // already had it; the ack was lost, not the data
 	}
-	if seq >= c.rcvNext+arqWindow*2 {
+	if seq >= c.rcvNext+uint32(c.window)*2 {
 		return // absurdly far ahead, drop rather than grow without bound
 	}
 	if _, dup := c.rcvBuf[seq]; dup {

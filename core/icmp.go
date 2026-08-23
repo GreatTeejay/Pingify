@@ -92,6 +92,8 @@ type sessionKey struct {
 type icmpTransport struct {
 	pc  net.PacketConn
 	psk []byte
+	// Segments in flight per ARQ connection, from the tunnel's window_kb.
+	window int
 
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
@@ -106,7 +108,7 @@ type icmpTransport struct {
 // is right on a server with one. On a server with several the kernel picks
 // the source itself, and a reply that leaves from an address the far end is
 // not expecting is a reply the far end throws away - so the wizard asks.
-func newICMPTransport(psk []byte, bind string) (*icmpTransport, error) {
+func newICMPTransport(psk []byte, bind string, windowKB int) (*icmpTransport, error) {
 	if bind == "" || bind == "0.0.0.0" {
 		bind = "0.0.0.0"
 	}
@@ -117,6 +119,7 @@ func newICMPTransport(psk []byte, bind string) (*icmpTransport, error) {
 	t := &icmpTransport{
 		pc:       pc,
 		psk:      psk,
+		window:   arqWindowFor(windowKB, icmpMaxPayload),
 		sessions: make(map[sessionKey]*arqConn),
 		inbound:  make(chan net.Conn, 16),
 		done:     make(chan struct{}),
@@ -204,7 +207,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
-		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.sender(peer, id))
+		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.window, t.sender(peer, id))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
@@ -232,7 +235,7 @@ func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
 	session := binary.BigEndian.Uint32(b[:])
 	id := uint16(session)
 
-	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.sender(ip, id))
+	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.window, t.sender(ip, id))
 	conn.remote = ip
 
 	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
