@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.11.1"
+PINGIFY_VERSION="5.11.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -2736,7 +2736,7 @@ tunnel_status_block() {
 # One line per tunnel, for the overview table.
 tunnel_row() {
     local name="$1" f="$(cfg_file "$1")"
-    local role proto fwder addr state brief up total rtt
+    local role proto fwder addr state brief up total rtt links kern=0
     role="$(side_label "$(toml_get "$f" tunnel role)")"
     proto="$(transport_label "$(toml_get "$f" transport type)")"
     fwder="$(forwarder_label "$(toml_get "$f" forward forwarder)")"
@@ -2746,6 +2746,7 @@ tunnel_row() {
     up="-"; total="$(toml_get "$f" transport carriers)"; rtt="-"
     if [ "$state" = "active" ]; then
         if kernel_transport "$(toml_get "$f" transport type)"; then
+            kern=1
             # No core and no status endpoint: the kernel holds the link, and
             # the answer comes from the interface plus one ping across it.
             # In a subshell, because cfg_load writes every T_ variable and
@@ -2766,6 +2767,21 @@ tunnel_row() {
         if [ "$1" = "up" ]; then rtt="${4}ms"; else rtt="-"; fi
     fi
 
+    # GRE and AmneziaWG have exactly one link, because they are not built out
+    # of connections the way our own transports are - there is no second one
+    # to open. Printing "1/1" beside a "24/24" invited the reading that they
+    # were running at a twenty-fourth of it, so they say up or down and leave
+    # counting to the transports that have something to count.
+    if [ "$kern" = "1" ]; then
+        case "$up" in
+            0) links="down" ;;
+            -) links="-" ;;
+            *) links="up" ;;
+        esac
+    else
+        links="$up/$total"
+    fi
+
     # Green only when the tunnel is running *and* a carrier is actually up:
     # a running process with no peer is the failure people most need to see.
     local dot="$C_GRY$BX_OFF$C_OFF"
@@ -2783,7 +2799,7 @@ tunnel_row() {
         "$(pad_to "$role" 8)" \
         "$(pad_to "$proto" 10)" \
         "$(pad_to "$fwder" 9)" \
-        "$(pad_to "$up/$total" 6)" \
+        "$(pad_to "$links" 6)" \
         "$(rtt_colour "$rtt")" "$rtt" "$C_OFF"
 }
 
@@ -5724,7 +5740,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.11.1"
+const version = "5.11.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

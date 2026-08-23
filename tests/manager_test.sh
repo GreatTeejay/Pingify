@@ -645,6 +645,13 @@ check "awg too"                    "$(transport_label awg)"  "TUN-AWG"
 
 # The interface is named after the tunnel and has to stay readable and under
 # the fifteen characters Linux allows.
+# One link is not a twenty-fourth of twenty-four - it is a transport that has
+# nothing to count, and printing 1/1 next to 24/24 read as weakness.
+lk() { awk '/^tunnel_row\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "a kernel tunnel says up, not 1/1" "$(lk | grep -c 'links="up"')"      "1"
+check "and down rather than 0/1"         "$(lk | grep -c 'links="down"')"    "1"
+check "the others still count"           "$(lk | grep -c 'links="\$up/\$total"')" "1"
+
 check "the interface reads plainly" "$(T_TRANSPORT=gre; link_iface tun-iran-gre)"   "gre-iran"
 check "on both sides"               "$(T_TRANSPORT=awg; link_iface tun-kharej-awg)" "awg-kharej"
 long="$(T_TRANSPORT=gre; link_iface a-very-long-tunnel-name-indeed)"
