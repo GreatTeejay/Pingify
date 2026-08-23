@@ -143,7 +143,16 @@ func TestAServiceThatHangsUpIsReportedReachable(t *testing.T) {
 			if err != nil {
 				return
 			}
-			c.Close() // "that is not my protocol"
+			// Read first, then close - which is what a proxy actually does:
+			// it waits for the client to speak, does not recognise what it
+			// hears, and hangs up. Closing a socket with data still unread
+			// makes the kernel send a reset instead of a clean close, and
+			// then this test would be measuring which of the two raced.
+			go func(c net.Conn) {
+				defer c.Close()
+				c.SetReadDeadline(time.Now().Add(3 * time.Second))
+				io.Copy(io.Discard, io.LimitReader(c, 64))
+			}(c)
 		}
 	}()
 	hangup := ln.Addr().(*net.TCPAddr).Port
