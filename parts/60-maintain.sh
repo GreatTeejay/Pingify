@@ -28,11 +28,25 @@ self_update() {
     say ""
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
-        fail "could not reach GitHub"
-        dim "on an Iranian server this often fails; update from the Kharej box"
-        dim "and copy the file across instead."
-        return 1
+
+    # From the release, not from the branch. The two are not the same thing at
+    # the same moment: a push to main changes the raw file instantly, while the
+    # release that carries the matching core is built afterwards and appears a
+    # few minutes later. Anyone updating inside that window took a new script
+    # and an old core, and then read "core does not match the script" on their
+    # own screen - which is a fault this tool invented for itself.
+    #
+    # The release carries both, so taking both from it means they cannot
+    # disagree. The branch stays as a fallback for a release that has not
+    # published yet.
+    if ! fetch "$(release_base)/Pingify.sh" "$tmp" 60; then
+        warn "the latest release did not answer; trying the branch"
+        if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
+            fail "could not reach GitHub"
+            dim "on an Iranian server this often fails; update from the Kharej box"
+            dim "and copy the file across instead."
+            return 1
+        fi
     fi
     if ! bash -n "$tmp" 2>/dev/null; then
         fail "the downloaded file is not valid, refusing to install it"

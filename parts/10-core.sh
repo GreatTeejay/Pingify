@@ -121,7 +121,7 @@ ensure_core_current() {
         say ""
         fail "the core could not be updated"
         dim "until it matches, new tunnels will be rejected"
-        dim "Update core in the menu has the other ways to install it"
+        dim "check this server can reach GitHub, then run pingify again"
     fi
     pause
 }

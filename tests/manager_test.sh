@@ -1491,6 +1491,24 @@ check "no stray control bytes in the build" \
 
 
 # ---------------------------------------------------------------------------
+note "an update cannot hand you a core that does not match"
+# ---------------------------------------------------------------------------
+# The script came from the branch and the core from the latest release, and
+# those are not the same thing at the same moment: a push changes the raw file
+# instantly, while the release carrying the matching core is built afterwards.
+# Updating inside that window took a new script and an old core - and then the
+# tool reported "core does not match the script" about a fault it had just
+# caused itself.
+su() { awk '/^self_update\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the script comes from the release" "$(su | grep -c 'release_base.*Pingify.sh')" "1"
+check "the branch is only a fallback"     "$(su | grep -c 'trying the branch')"        "1"
+check "and it is tried second"                  "$([ "$(su | grep -n 'release_base' | cut -d: -f1)" -lt "$(su | grep -n 'RAW_BASE' | cut -d: -f1)" ] && echo y)" "y"
+# and whatever happens, a mismatched core is corrected on the next run
+ec() { awk '/^ensure_core_current\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "a mismatch downloads a new core"   "$(ec | grep -c 'download_core')" "1"
+check "and it names no menu that is gone" "$(ec | grep -c 'Update core in the menu')" "0"
+
+# ---------------------------------------------------------------------------
 note "the speed test says what the number means"
 # ---------------------------------------------------------------------------
 # It ran, printed iperf's own output, and stopped. 412 Mbit/s is excellent on a
