@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.19.1"
+PINGIFY_VERSION="5.19.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -774,7 +774,7 @@ ensure_core_current() {
         say ""
         fail "the core could not be updated"
         dim "until it matches, new tunnels will be rejected"
-        dim "Update core in the menu has the other ways to install it"
+        dim "check this server can reach GitHub, then run pingify again"
     fi
     pause
 }
@@ -5133,11 +5133,25 @@ self_update() {
     say ""
     info "fetching the latest Pingify from GitHub"
     local tmp="/tmp/pingify.new"
-    if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
-        fail "could not reach GitHub"
-        dim "on an Iranian server this often fails; update from the Kharej box"
-        dim "and copy the file across instead."
-        return 1
+
+    # From the release, not from the branch. The two are not the same thing at
+    # the same moment: a push to main changes the raw file instantly, while the
+    # release that carries the matching core is built afterwards and appears a
+    # few minutes later. Anyone updating inside that window took a new script
+    # and an old core, and then read "core does not match the script" on their
+    # own screen - which is a fault this tool invented for itself.
+    #
+    # The release carries both, so taking both from it means they cannot
+    # disagree. The branch stays as a fallback for a release that has not
+    # published yet.
+    if ! fetch "$(release_base)/Pingify.sh" "$tmp" 60; then
+        warn "the latest release did not answer; trying the branch"
+        if ! fetch "$RAW_BASE/Pingify.sh" "$tmp" 60; then
+            fail "could not reach GitHub"
+            dim "on an Iranian server this often fails; update from the Kharej box"
+            dim "and copy the file across instead."
+            return 1
+        fi
     fi
     if ! bash -n "$tmp" 2>/dev/null; then
         fail "the downloaded file is not valid, refusing to install it"
@@ -6816,7 +6830,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.19.1"
+const version = "5.19.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
