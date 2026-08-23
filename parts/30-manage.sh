@@ -28,6 +28,8 @@ cfg_load() {
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
     T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
+    # pfy0 is what tunnels built before the device was named after them
+    # actually have on the wire, so it stays as the fallback for those.
     T_TUNIF="$(toml_get "$f" tun name)";                    : "${T_TUNIF:=pfy0}"
     T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
     T_TUNPEER="$(toml_get "$f" tun remote_addr)"

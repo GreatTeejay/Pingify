@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.13.0"
+PINGIFY_VERSION="5.14.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -888,7 +888,7 @@ cfg_reset() {
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
-    T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
+    T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
     # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
     # the obfuscation values both ends have to agree on
     T_GRE_TTL=255
@@ -1324,7 +1324,7 @@ TOKEN
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
     # The interface is named after the tunnel, which only just got its name.
-    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
+    cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
     # A kernel tunnel runs no process of ours, so there is nothing to serve a
     # status endpoint and nothing that would read one.
     kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:$(pick_status_port 9700)"
@@ -1524,7 +1524,7 @@ new_tunnel() {
     ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
     # The interface is named after the tunnel, and the tunnel only got its
     # name just now - cfg_mode ran back when it had none.
-    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
+    cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
 
     # -- the private link, whenever one is needed --------------------------
     #
@@ -1577,7 +1577,7 @@ new_tunnel() {
         if ! kernel_transport; then
             local iface_owner_name=""
             while :; do
-                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME")"
+                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME" "$T_NAME")"
                 case "$T_TUNIF" in
                     '' | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore"; continue ;;
                 esac
@@ -2126,16 +2126,30 @@ host_has_iface() {
     ip link show "$1" >/dev/null 2>&1
 }
 
+# free_tun_iface [TUNNEL] [EXCEPT] - a device name that is free and says what
+# it is. pfy0 said nothing: not which tunnel it belonged to, not what it
+# carried, and on a server with two of them not even which was which. The name
+# is derived from the tunnel instead - icmp-iran beside gre-iran and
+# awg-kharej - and only falls back to counting when that one is taken.
 free_tun_iface() {
-    local except="${1:-}" n=0
+    local tunnel="${1:-}" except="${2:-}" base n=2
+    if [ -n "$tunnel" ]; then
+        base="$(link_iface "$tunnel")"
+    else
+        base="pfy0"
+    fi
+    if [ -z "$(iface_owner "$base" "$except")" ] && ! host_has_iface "$base"; then
+        printf '%s' "$base"
+        return 0
+    fi
     while [ "$n" -lt 64 ]; do
-        if [ -z "$(iface_owner "pfy$n" "$except")" ] && ! host_has_iface "pfy$n"; then
-            printf 'pfy%s' "$n"
+        if [ -z "$(iface_owner "${base}${n}" "$except")" ] && ! host_has_iface "${base}${n}"; then
+            printf '%s%s' "$base" "$n"
             return 0
         fi
         n=$((n + 1))
     done
-    printf 'pfy0'
+    printf '%s' "$base"
     return 1
 }
 
@@ -2305,9 +2319,10 @@ kernel_transport() {
 link_iface() {
     local name="$1" pfx short
     case "$T_TRANSPORT" in
-        gre) pfx="gre" ;;
-        awg) pfx="awg" ;;
-        *)   pfx="pfy" ;;
+        gre)  pfx="gre" ;;
+        awg)  pfx="awg" ;;
+        icmp) pfx="icmp" ;;
+        *)    pfx="pfy" ;;
     esac
     short="${name#tun-}"
     short="${short%-$pfx}"
@@ -2797,6 +2812,8 @@ cfg_load() {
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
     T_FORWARDS="$(toml_arr "$f" ports)"
     T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
+    # pfy0 is what tunnels built before the device was named after them
+    # actually have on the wire, so it stays as the fallback for those.
     T_TUNIF="$(toml_get "$f" tun name)";                    : "${T_TUNIF:=pfy0}"
     T_TUNLOCAL="$(toml_get "$f" tun local_addr)"
     T_TUNPEER="$(toml_get "$f" tun remote_addr)"
@@ -6121,7 +6138,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.13.0"
+const version = "5.14.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

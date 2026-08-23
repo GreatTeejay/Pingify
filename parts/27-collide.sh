@@ -152,16 +152,30 @@ host_has_iface() {
     ip link show "$1" >/dev/null 2>&1
 }
 
+# free_tun_iface [TUNNEL] [EXCEPT] - a device name that is free and says what
+# it is. pfy0 said nothing: not which tunnel it belonged to, not what it
+# carried, and on a server with two of them not even which was which. The name
+# is derived from the tunnel instead - icmp-iran beside gre-iran and
+# awg-kharej - and only falls back to counting when that one is taken.
 free_tun_iface() {
-    local except="${1:-}" n=0
+    local tunnel="${1:-}" except="${2:-}" base n=2
+    if [ -n "$tunnel" ]; then
+        base="$(link_iface "$tunnel")"
+    else
+        base="pfy0"
+    fi
+    if [ -z "$(iface_owner "$base" "$except")" ] && ! host_has_iface "$base"; then
+        printf '%s' "$base"
+        return 0
+    fi
     while [ "$n" -lt 64 ]; do
-        if [ -z "$(iface_owner "pfy$n" "$except")" ] && ! host_has_iface "pfy$n"; then
-            printf 'pfy%s' "$n"
+        if [ -z "$(iface_owner "${base}${n}" "$except")" ] && ! host_has_iface "${base}${n}"; then
+            printf '%s%s' "$base" "$n"
             return 0
         fi
         n=$((n + 1))
     done
-    printf 'pfy0'
+    printf '%s' "$base"
     return 1
 }
 

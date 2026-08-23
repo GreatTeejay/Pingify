@@ -34,9 +34,10 @@ kernel_transport() {
 link_iface() {
     local name="$1" pfx short
     case "$T_TRANSPORT" in
-        gre) pfx="gre" ;;
-        awg) pfx="awg" ;;
-        *)   pfx="pfy" ;;
+        gre)  pfx="gre" ;;
+        awg)  pfx="awg" ;;
+        icmp) pfx="icmp" ;;
+        *)    pfx="pfy" ;;
     esac
     short="${name#tun-}"
     short="${short%-$pfx}"

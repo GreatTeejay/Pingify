@@ -31,7 +31,7 @@ cfg_reset() {
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
-    T_TUNIF="pfy0"; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
+    T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
     # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
     # the obfuscation values both ends have to agree on
     T_GRE_TTL=255
@@ -467,7 +467,7 @@ TOKEN
         systemctl stop "pingify@$T_NAME" >/dev/null 2>&1
     fi
     # The interface is named after the tunnel, which only just got its name.
-    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
+    cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
     # A kernel tunnel runs no process of ours, so there is nothing to serve a
     # status endpoint and nothing that would read one.
     kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:$(pick_status_port 9700)"
@@ -667,7 +667,7 @@ new_tunnel() {
     ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
     # The interface is named after the tunnel, and the tunnel only got its
     # name just now - cfg_mode ran back when it had none.
-    kernel_transport && T_TUNIF="$(link_iface "$T_NAME")"
+    cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
 
     # -- the private link, whenever one is needed --------------------------
     #
@@ -720,7 +720,7 @@ new_tunnel() {
         if ! kernel_transport; then
             local iface_owner_name=""
             while :; do
-                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME")"
+                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME" "$T_NAME")"
                 case "$T_TUNIF" in
                     '' | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore"; continue ;;
                 esac
