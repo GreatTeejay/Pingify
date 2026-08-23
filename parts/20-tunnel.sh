@@ -27,7 +27,7 @@ cfg_reset() {
     T_PORT=9443          # the tunnel's own port, TCP only
     T_ACCEPTS="server"   # reverse: IRAN accepts, KHAREJ comes to it
     T_PUBLIC_IP=""; T_PEER_IP=""
-    T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
+    T_CARRIERS=16; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
@@ -140,12 +140,37 @@ cfg_endpoints() {
 #           carry it.
 # ---------------------------------------------------------------------------
 
+# The numbers, and why each one is what it is.
+#
+# A stream is pinned to one carrier for its life, so the window alone decides
+# how fast a single download can go: window / round-trip. On the 75-90 ms this
+# path actually measures, that is
+#
+#   256 KB  ->  ~24 Mbit/s      1024 KB  ->  ~95 Mbit/s
+#   512 KB  ->  ~48 Mbit/s      4096 KB  -> ~380 Mbit/s
+#
+# for ONE connection. Carriers do not raise that; they spread many connections
+# so one heavy download stops starving everything else.
+#
+# Bigger is not simply better. A window past what the path can carry does not
+# go faster - it queues, and a queue is latency. That is what shows up as a
+# video that stalls and a ping that swings while the speed graph looks fine.
+# So the presets climb the window only as far as the traffic needs, and buy
+# steadiness with carriers rather than with depth.
 apply_preset() {
     case "$1" in
+        # Games and calls: the smallest window that still fills a link, so
+        # nothing is ever sat in a queue waiting. Throughput is not the point.
         gaming)     T_CARRIERS=8;  T_WINDOW=256 ;;
-        latency)    T_CARRIERS=10; T_WINDOW=512 ;;
-        balanced)   T_CARRIERS=14; T_WINDOW=1024 ;;
+        # Browsing and chat - many small things at once, none of them large.
+        latency)    T_CARRIERS=12; T_WINDOW=512 ;;
+        # Video. One stream reaching ~95 Mbit/s covers 4K with room over, and
+        # 16 carriers keep a download from taking the picture down with it.
+        balanced)   T_CARRIERS=16; T_WINDOW=1024 ;;
+        # Large files, where finishing sooner is worth some queueing.
         throughput) T_CARRIERS=20; T_WINDOW=2048 ;;
+        # Everything the path will give. Uses real memory: each carrier holds
+        # a send and a receive buffer this size.
         extreme)    T_CARRIERS=24; T_WINDOW=4096 ;;
         *)          return 1 ;;
     esac
@@ -161,24 +186,31 @@ apply_preset() {
 # match. Writing "from token" put a string in the profile field that is not a
 # profile, and told a reader on this server nothing about what the tuning is -
 # while the other server, with the identical numbers, called it Extreme.
+# preset_name asks apply_preset rather than holding a second copy of the table.
+# The two were separate lists, and the moment the presets were retuned they
+# disagreed: apply_preset set balanced to 16 carriers while this still called
+# 16 "custom" and 14 "balanced". A config could then report a profile no preset
+# would produce.
 preset_name() {
-    case "$1/$2" in
-        8/256)   printf 'gaming' ;;
-        10/512)  printf 'latency' ;;
-        14/1024) printf 'balanced' ;;
-        20/2048) printf 'throughput' ;;
-        24/4096) printf 'extreme' ;;
-        *)       printf 'custom' ;;
-    esac
+    local car="$1" win="$2" p
+    for p in gaming latency balanced throughput extreme; do
+        # in a subshell: apply_preset writes the T_ variables, and this is
+        # asked from screens that are holding a tunnel in them
+        if [ "$(apply_preset "$p" >/dev/null 2>&1; printf '%s/%s' "$T_CARRIERS" "$T_WINDOW")" = "$car/$win" ]; then
+            printf '%s' "$p"
+            return 0
+        fi
+    done
+    printf 'custom'
 }
 
 preset_menu() {
     CHOICE_DEF="3"
-    choice 1 "Gaming" "8 carriers - lowest ping, small bursts"
-    choice 2 "Latency" "10 carriers - browsing, calls, anything interactive"
-    choice 3 "Balanced" "14 carriers - fills a 100 Mbit path"
-    choice 4 "Download" "20 carriers - large files"
-    choice 5 "Extreme" "24 carriers - fastest, uses the most memory"
+    choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"
+    choice 2 "Latency" "12 carriers, 512 KB - browsing, calls, chat"
+    choice 3 "Balanced" "16 carriers, 1024 KB - video without stalls"
+    choice 4 "Download" "20 carriers, 2048 KB - large files"
+    choice 5 "Extreme" "24 carriers, 4096 KB - fastest, most memory"
     choice 6 "Custom" "set the numbers yourself"
     CHOICE_DEF=""
     say ""
@@ -196,7 +228,7 @@ preset_menu() {
            ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE" ;;
         *) apply_preset balanced ;;
     esac
-    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=14 ;; esac
+    case "$T_CARRIERS" in "" | *[!0-9]*) T_CARRIERS=16 ;; esac
     case "$T_WINDOW" in "" | *[!0-9]*) T_WINDOW=1024 ;; esac
     case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
     [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1

@@ -500,9 +500,15 @@ note "the tuning a token carries has a name"
 # ---------------------------------------------------------------------------
 # "from token" is not a profile. The numbers came from a preset on the other
 # server and this one should call it what that one calls it.
-check "extreme"  "$(preset_name 24 4096)" "extreme"
-check "balanced" "$(preset_name 14 1024)" "balanced"
-check "gaming"   "$(preset_name 8 256)"   "gaming"
+# Every preset must name itself back. Written as a round trip rather than a
+# table of numbers, because a table is a second copy - and when the presets
+# were retuned, the copy in the test went stale at the same moment the copy in
+# preset_name did.
+for _p in gaming latency balanced throughput extreme; do
+    ( cfg_reset; apply_preset "$_p" ) >/dev/null 2>&1
+    cfg_reset; apply_preset "$_p" >/dev/null 2>&1
+    check "$_p names itself back" "$(preset_name "$T_CARRIERS" "$T_WINDOW")" "$_p"
+done
 check "hand-set numbers are custom" "$(preset_name 11 700)" "custom"
 check "nothing assigns it" "$(grep -c 'T_PRESET="from token"' Pingify.sh)" "0"
 
