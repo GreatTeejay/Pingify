@@ -1381,5 +1381,58 @@ ALN="$WORK/align"; mkdir -p "$ALN"
 cols="$(awk '{ i = index($0, "IRAN"); if (i == 0) i = index($0, "SIDE"); if (i) print i }' "$WORK/align.out" | sort -u | wc -l | tr -d ' ')"
 check "every row lines up with the header" "$cols" "1"
 
+
+# ---------------------------------------------------------------------------
+note "the MTU is measured, not guessed"
+# ---------------------------------------------------------------------------
+# A tunnel wraps what it carries, so it carries less than the path allows. Too
+# high and every full-size packet is fragmented or silently dropped - which
+# reads as "connects fine, then stalls on anything large". Too low and every
+# packet wastes room forever. The right number is the path's, minus what this
+# transport wraps it in, and the path's is a property of today's route.
+check "gre wraps 28 bytes"   "$(transport_overhead gre)"  "28"
+check "awg wraps more"       "$(transport_overhead awg)"  "80"
+check "and icmp the same"    "$(transport_overhead icmp)" "80"
+
+# The binary search, against a path with a known ceiling.
+(
+    prev=""
+    ping() {
+        local sz=0 a
+        for a in "$@"; do
+            [ "$prev" = "-s" ] && sz="$a"
+            prev="$a"
+        done
+        [ "$((sz + 28))" -le "$FAKE_MTU" ]
+    }
+    have() { case "$1" in ping) return 0 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+
+    for FAKE_MTU in 1500 1432 1280 900; do
+        echo "m$FAKE_MTU=$(path_mtu 10.0.0.2)"
+    done
+    # a path that answers nothing at all is not a small path - it is no answer
+    ping() { return 1; }
+    if path_mtu 10.0.0.2 >/dev/null 2>&1; then echo "dead=claimed"; else echo "dead=refused"; fi
+) > "$WORK/mtu.out" 2>&1
+mt() { grep -m1 "^$1=" "$WORK/mtu.out" | cut -d= -f2-; }
+
+check "it finds a full path"        "$(mt m1500)" "1500"
+check "and one inside another tunnel" "$(mt m1432)" "1432"
+check "and a small one"             "$(mt m1280)" "1280"
+check "and one below the floor it searches" "$(mt m900)" "900"
+check "a silent path yields nothing" "$(mt dead)" "refused"
+
+# The number people reach for by hand turns out to be the right answer for one
+# specific path - which is the argument for measuring rather than copying it.
+check "1320 is what awg gets on a 1400 path" \
+      "$((1400 - $(transport_overhead awg)))" "1320"
+
+mm() { awk '/^mtu_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it refuses tunnels with no device" "$(mm | grep -c 'cfg_needs_link')" "1"
+check "it says when the path is short"    "$(mm | grep -c 'less than a full 1500')" "1"
+check "and that both ends must match"     "$(mm | grep -c 'the smaller of the two')" "1"
+check "the ping block is named as the reason a path goes silent" \
+      "$(mm | grep -c 'ignore ICMP')" "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

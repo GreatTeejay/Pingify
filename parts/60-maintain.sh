@@ -295,6 +295,7 @@ diagnostics_menu() {
         item 4 "System summary"
         item 5 "Forwarding rules" "what iptables is doing for Pingify"
         item 6 "Speed test" "measure the tunnel itself, against another one"
+        item 7 "Find the MTU" "measure the path instead of guessing at it"
         item 0 "Back"
         say ""
         local c=""
@@ -306,6 +307,7 @@ diagnostics_menu() {
             4) diag_system ;;
             5) show_nat; pause ;;
             6) speed_menu ;;
+            7) mtu_menu ;;
             0 | "") return ;;
         esac
     done
