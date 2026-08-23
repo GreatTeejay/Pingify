@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.17.1"
+PINGIFY_VERSION="5.17.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -3007,9 +3007,11 @@ tunnel_status_block() {
     return 0
 }
 
-# One line per tunnel, for the overview table.
+# One line per tunnel, for the overview table. The second argument is how wide
+# the name column is; list_tunnels works it out from the names it is about to
+# print, so one long name cannot push its own row out of line with the rest.
 tunnel_row() {
-    local name="$1" f="$(cfg_file "$1")"
+    local name="$1" nw="${2:-13}" f="$(cfg_file "$1")"
     local role proto fwder addr state brief up total rtt links kern=0
     role="$(side_label "$(toml_get "$f" tunnel role)")"
     proto="$(transport_label "$(toml_get "$f" transport type)")"
@@ -3069,7 +3071,7 @@ tunnel_row() {
 
     printf '  %s %s %s %s %s %s %s%s%s\n' \
         "$dot" \
-        "$(pad_to "${C_B}${name}${C_OFF}" 13)" \
+        "$(pad_to "${C_B}${name}${C_OFF}" "$nw")" \
         "$(pad_to "$role" 8)" \
         "$(pad_to "$proto" 10)" \
         "$(pad_to "$fwder" 9)" \
@@ -3083,16 +3085,24 @@ list_tunnels() {
         dim "no tunnels configured yet - pick New tunnel to make one"
         return 1
     fi
+    # As wide as the widest name, never narrower than the header. It was a
+    # fixed 13, and the moment a name grew past that - which it did as soon
+    # as the private network went into it - that row alone slid right and
+    # every column after it stopped lining up.
+    local w=13 n
+    for n in $names; do
+        [ "${#n}" -gt "$w" ] && w="${#n}"
+    done
+
     printf '    %s%s %s %s %s %s %s%s\n' \
         "$C_DIM" \
-        "$(pad_to "NAME" 13)" \
+        "$(pad_to "NAME" "$w")" \
         "$(pad_to "SIDE" 8)" \
         "$(pad_to "PROTO" 10)" \
         "$(pad_to "FORWARDER" 9)" \
         "$(pad_to "LINKS" 6)" \
         "RTT" "$C_OFF"
-    local n
-    for n in $names; do tunnel_row "$n"; done
+    for n in $names; do tunnel_row "$n" "$w"; done
     return 0
 }
 
@@ -6377,7 +6387,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.17.1"
+const version = "5.17.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
