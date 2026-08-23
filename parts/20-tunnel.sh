@@ -715,8 +715,28 @@ new_tunnel() {
         ask T_TUNPEER  "the other server" "$T_TUNPEER"
         say ""
         # A kernel tunnel's interface is named after the tunnel, so there is
-        # nothing to answer; ours is ours to choose.
-        kernel_transport || ask T_TUNIF "device name" "$T_TUNIF"
+        # nothing to answer; ours is ours to choose - and has to be one that
+        # is not already taken, or the second tunnel cannot create it.
+        if ! kernel_transport; then
+            local iface_owner_name=""
+            while :; do
+                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME")"
+                case "$T_TUNIF" in
+                    '' | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore"; continue ;;
+                esac
+                [ "${#T_TUNIF}" -le 15 ] || { fail "linux stops at 15 characters"; continue; }
+                iface_owner_name="$(iface_owner "$T_TUNIF" "$T_NAME")"
+                if [ -n "$iface_owner_name" ]; then
+                    fail "$T_TUNIF already belongs to $iface_owner_name"
+                    continue
+                fi
+                if host_has_iface "$T_TUNIF"; then
+                    fail "this server already has an interface called $T_TUNIF"
+                    continue
+                fi
+                break
+            done
+        fi
         ask T_TUNMTU   "MTU" "$T_TUNMTU"
         case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
     fi

@@ -442,3 +442,57 @@ kernel_link_check() {
         hc_fix "check ${T_AWG_PORT}/udp is open here and on the other server"
     fi
 }
+
+# ---------------------------------------------------------------------------
+# reaching the far end
+#
+# The core's probe belongs to the core, and a kernel tunnel has none. What can
+# be done instead is the same thing the DNAT rule does for real traffic: open
+# the forwarded port on the other server's private address and see whether
+# anything is there. If that works, every part of the path works - the link,
+# the routing, and the service at the end of it.
+# ---------------------------------------------------------------------------
+
+# tcp_reaches HOST PORT - true when something accepts there within a moment
+tcp_reaches() {
+    local host="$1" port="$2"
+    timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+}
+
+kernel_probe() {
+    local name="$1" peer="${T_TUNPEER%%/*}" spec p lport rport proto bad=0 any=0
+    [ -n "$peer" ] || return 0
+    [ -n "$T_FORWARDS" ] || return 0
+
+    for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
+        proto=tcp
+        case "$spec" in
+            udp:*) proto=udp; spec="${spec#udp:}" ;;
+            tcp:*) spec="${spec#tcp:}" ;;
+        esac
+        lport="${spec%%=*}"
+        rport="${spec#*=}"
+        [ "$rport" = "$spec" ] && rport="$lport"
+        # a range is described by its first port; testing all of them would
+        # take longer than anybody will wait
+        lport="${lport%%-*}"; rport="${rport%%-*}"
+        case "$rport" in '' | *[!0-9]*) continue ;; esac
+        if [ "$proto" = "udp" ]; then
+            hc_note "udp :$lport cannot be tested this way"
+            continue
+        fi
+        any=1
+        if tcp_reaches "$peer" "$rport"; then
+            hc_ok ":$lport reaches $peer:$rport across the link"
+        else
+            hc_bad ":$lport does not reach $peer:$rport"
+            hc_note "the link is up, so this is the far end rather than the path"
+            hc_fix "on the KHAREJ server:  ss -ltnp | grep :$rport"
+            hc_note "and it must listen on 0.0.0.0, not on 127.0.0.1 alone -"
+            hc_note "the traffic arrives there addressed to $peer"
+            bad=1
+        fi
+    done
+    [ "$any" = "0" ] && return 0
+    return "$bad"
+}

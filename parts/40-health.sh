@@ -179,18 +179,40 @@ health_check() {
     fi
 
     # --- the forwarded ports, on the end that has them ---------------------
+    #
+    # What "bound" means depends on who forwards. Our core binds the port and
+    # accepts on it. The kernel does not bind anything at all - a DNAT rule
+    # rewrites the destination in PREROUTING, before any socket is consulted -
+    # so asking whether something is listening reports a fault on every
+    # working iptables tunnel, and offers a restart that cannot help.
     if [ "$T_ROLE" = "server" ] && [ -n "$T_FORWARDS" ]; then
-        local p spec bad=0
+        local p spec bad=0 rules=""
+        [ "$T_FORWARDER" = "iptables" ] && have iptables \
+            && rules="$(iptables -t nat -S PINGIFY_NAT 2>/dev/null)"
         for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
-            p="${spec%%=*}"; p="${p#udp:}"; p="${p%%-*}"
-            case "$p" in ''|*[!0-9]*) continue ;; esac
-            if port_free "$p"; then
+            p="${spec%%=*}"; p="${p#udp:}"; p="${p#tcp:}"; p="${p%%-*}"
+            case "$p" in '' | *[!0-9]*) continue ;; esac
+            if [ "$T_FORWARDER" = "iptables" ]; then
+                if ! printf '%s' "$rules" | grep -q -- "--dport $p "; then
+                    hc_bad "no forwarding rule for :$p"
+                    hc_note "the kernel forwards this tunnel, so the port is not"
+                    hc_note "bound here - it is rewritten on the way past"
+                    hc_fix "pingify --apply-firewall"
+                    bad=1
+                fi
+            elif port_free "$p"; then
                 hc_bad "nothing is listening on :$p"
-                bad=1
                 hc_fix "systemctl restart pingify@$name"
+                bad=1
             fi
         done
-        [ "$bad" = "0" ] && hc_ok "every forwarded port is bound here"
+        if [ "$bad" = "0" ]; then
+            if [ "$T_FORWARDER" = "iptables" ]; then
+                hc_ok "every forwarded port has a rule here"
+            else
+                hc_ok "every forwarded port is bound here"
+            fi
+        fi
     fi
 
     # --- a leftover NAT rule eats a port silently --------------------------
@@ -226,7 +248,10 @@ health_check() {
     # its verdict has to reach the summary: a report that lists a port the
     # other server could not reach and then says nothing is wrong is worse
     # than no report at all.
-    if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && [ -n "$T_FORWARDS" ]; then
+    # Not for a kernel tunnel: the probe is part of the core, and the core
+    # cannot even read a config for a transport it does not run. Asking it
+    # anyway produced a rejection and then blamed the far server for it.
+    if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && [ -n "$T_FORWARDS" ]        && ! kernel_transport; then
         say ""
         head2 "Through the tunnel"
         local out rc
@@ -241,6 +266,18 @@ health_check() {
             hc_fix "on the KHAREJ server:  ss -ltnp | grep <the port after the arrow>"
             hc_note "whatever should answer there is not listening on that address"
         fi
+    fi
+
+    # A kernel tunnel gets the same question asked a different way: not
+    # through the core, which is not in this path, but across the private link
+    # the kernel built - which is the route real traffic takes.
+    if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && kernel_transport; then
+        say ""
+        head2 "Through the tunnel"
+        kernel_probe "$name" || {
+            say ""
+            hc_note "everything on this server is doing its part"
+        }
     fi
 
     # --- what it comes to --------------------------------------------------
