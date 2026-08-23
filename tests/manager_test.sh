@@ -1489,5 +1489,77 @@ check "and explains itself when it cannot" \
 check "no stray control bytes in the build" \
       "$(grep -c "$(printf '\001')" Pingify.sh)" "0"
 
+
+# ---------------------------------------------------------------------------
+note "the speed test says what the number means"
+# ---------------------------------------------------------------------------
+# It ran, printed iperf's own output, and stopped. 412 Mbit/s is excellent on a
+# path that carries 460 and dreadful on one that carries 900, and only the pair
+# tells you which you have - so it measures both and compares them.
+check "twenty parallel streams" "$IPERF_STREAMS" "20"
+check "ten seconds each way"    "$IPERF_SECONDS" "10"
+
+# the [SUM] line is the only number that means anything in a 20-stream run
+SUMOUT="[SUM]   0.00-10.00  sec  1.09 GBytes   938 Mbits/sec  120   sender
+[SUM]   0.00-10.00  sec  1.08 GBytes   931 Mbits/sec        receiver"
+check "the sender total is read"   "$(iperf_bitrate "$SUMOUT" sender)"   "938 Mbits/sec"
+check "and the receiver total"     "$(iperf_bitrate "$SUMOUT" receiver)" "931 Mbits/sec"
+check "a per-stream line is ignored" \
+      "$(iperf_bitrate '[  5]  0.00-10.00  sec  50.0 MBytes  42.0 Mbits/sec  sender' sender)" ""
+
+check "megabits stay megabits"  "$(mbits '938 Mbits/sec')" "938"
+check "gigabits are converted"  "$(mbits '2.4 Gbits/sec')" "2400"
+check "kilobits too"            "$(mbits '4000 Kbits/sec')" "4"
+check "and nonsense is zero"    "$(mbits 'no reading')"    "0"
+
+# the verdict, which is the part iperf cannot give you
+rep() { ( banner() { :; }; pause() { :; }; PICKED=t; speed_report "$1" "$2" "$3" "$4" ) 2>&1 | sed 's/\x1b\[[0-9;]*m//g'; }
+check "a tunnel keeping up is called good" \
+      "$(rep '412 Mbits/sec' '388 Mbits/sec' '460 Mbits/sec' '450 Mbits/sec' | grep -c 'as good as this gets')" "1"
+check "one losing most of it is not" \
+      "$(rep '90 Mbits/sec' '85 Mbits/sec' '460 Mbits/sec' '450 Mbits/sec' | grep -c 'only 19%')" "1"
+check "and it says where to look next" \
+      "$(rep '90 Mbits/sec' '85 Mbits/sec' '460 Mbits/sec' '450 Mbits/sec' | grep -c 'Find the MTU')" "1"
+check "a middling one suggests the window" \
+      "$(rep '300 Mbits/sec' '290 Mbits/sec' '460 Mbits/sec' '450 Mbits/sec' | grep -c 'Tuning')" "1"
+check "with only one measurement it asks for the other" \
+      "$(rep '412 Mbits/sec' '388 Mbits/sec' '' '' | grep -c 'Run it against the raw path too')" "1"
+
+# ---------------------------------------------------------------------------
+note "the firewall page does not claim Pingify is an iptables tool"
+# ---------------------------------------------------------------------------
+# A tunnel is carried by the engine or by the kernel. The firewall is involved
+# only when a tunnel's forwarder is IPTABLES, or when something under Blocking
+# is on - so an empty list is a normal state, not a fault.
+sn() { awk '/^show_nat\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it shows the forwarding chain"  "$(sn | grep -c 'PINGIFY_NAT')"  "1"
+check "the segment-size chain too"     "$(sn | grep -c 'PINGIFY_MSS')"  "1"
+check "and the blocking chains"        "$(sn | grep -c 'PINGIFY_IN')"   "2"
+check "empty is reported as normal"    "$(sn | grep -c 'Which is normal')" "1"
+check "and it says when PINGIFY forwards instead" \
+      "$(sn | grep -c 'forwarded by')" "3"
+check "the menu no longer says iptables does Pingify" \
+      "$(grep -c 'what iptables is doing for Pingify' Pingify.sh)" "0"
+
+# ---------------------------------------------------------------------------
+note "ping the other end asks the tunnel before asking a person"
+# ---------------------------------------------------------------------------
+# Same fault the MTU page had: the accepting side has no configured peer, so it
+# gave up and asked you to type it - when the running tunnel knew.
+dp() { awk '/^diag_ping\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it asks the running tunnel" "$(dp | grep -c 'status_peer')" "1"
+check "and only then a person"     "$(dp | grep -c 'ask host')"    "1"
+
+# ---------------------------------------------------------------------------
+note "the benchmark is honest about what it runs"
+# ---------------------------------------------------------------------------
+# It fetches a script written by somebody else and runs it as root. That is a
+# reasonable thing to want and an unreasonable thing to do quietly.
+bm() { awk '/^bench_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the address is on screen first" "$(bm | grep -c 'BENCH_URL')"        "2"
+check "it warns whose script it is"    "$(bm | grep -c 'written by someone else')" "1"
+check "and nothing runs unasked"       "$(bm | grep -c 'confirm ')"         "1"
+check "it downloads before running"    "$(bm | grep -c 'fetch "\$BENCH_URL"')" "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
