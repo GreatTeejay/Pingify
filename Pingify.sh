@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.17.0"
+PINGIFY_VERSION="5.17.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -5107,6 +5107,9 @@ const (
 	// video stalled while the tunnel looked idle.
 	arqWinMin = 32
 	arqWinMax = 4096
+	// Where every version before this one sat, and so the only width an
+	// un-updated peer is known to accept.
+	arqWinStart = 64
 
 	flagData = 1 << 0
 	flagFin  = 1 << 1
@@ -5171,9 +5174,23 @@ type arqConn struct {
 	maxPay  int
 	// Segments allowed in flight. A stream is pinned to one carrier, so this
 	// alone decides how fast a single download can go: window * maxPay / RTT.
-	window int
-	send   func([]byte) error
-	remote net.Addr
+	//
+	// It starts at arqWinStart and grows towards maxWindow while the peer
+	// keeps acknowledging, and halves when a segment has to be sent twice.
+	// Two reasons, and both matter:
+	//
+	//   A peer that has not been updated yet only accepts what the old fixed
+	//   window allowed. Starting there means the tunnel comes up against any
+	//   version, and widens only once this peer has shown it keeps up.
+	//
+	//   A window past what the path can carry does not go faster, it queues -
+	//   and a queue is the stalling video and the swinging ping it was meant
+	//   to cure. Backing off on loss is what holds it near the path's own
+	//   capacity instead of above it.
+	window    int
+	maxWindow int
+	send      func([]byte) error
+	remote    net.Addr
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -5237,7 +5254,8 @@ func newARQ(session uint32, carrier uint8, psk []byte, maxPayload, window int, s
 		carrier:    carrier,
 		mask:       blk,
 		maxPay:     maxPayload,
-		window:     window,
+		window:     arqWinStart,
+		maxWindow:  window,
 		send:       send,
 		sndBuf:     make(map[uint32]*segment),
 		rcvBuf:     make(map[uint32][]byte),
@@ -5412,6 +5430,26 @@ func (c *arqConn) onDatagram(buf []byte) {
 	}
 }
 
+// grow widens the window by one segment for each round of clean acks, up to
+// what the tunnel was configured for. Additive on the way up, halved on the
+// way down - the shape that settles near a path's capacity rather than
+// oscillating around it.
+func (c *arqConn) grow() {
+	if c.window < c.maxWindow {
+		c.window++
+	}
+}
+
+// shrink halves the window when a segment had to be sent twice, which is the
+// path saying it is carrying more than it can.
+func (c *arqConn) shrink() {
+	c.window /= 2
+	if c.window < arqWinMin {
+		c.window = arqWinMin
+	}
+	c.cond.Broadcast()
+}
+
 // processAck retires everything the peer has confirmed. Caller holds the lock.
 func (c *arqConn) processAck(ack uint32) {
 	if ack == c.lastAck {
@@ -5422,6 +5460,7 @@ func (c *arqConn) processAck(ack uint32) {
 			if seg, ok := c.sndBuf[ack]; ok {
 				c.emit(seg, flagData)
 				seg.retries++
+				c.shrink()
 			}
 		}
 		return
@@ -5440,6 +5479,9 @@ func (c *arqConn) processAck(ack uint32) {
 	}
 	if ack > c.sndUna {
 		c.sndUna = ack
+		// Fresh ground acknowledged with nothing resent: the peer is keeping
+		// up and is willing to take at least this much, so widen a little.
+		c.grow()
 	}
 	c.cond.Broadcast()
 }
@@ -5450,7 +5492,13 @@ func (c *arqConn) deliver(seq uint32, payload []byte) {
 	if seq < c.rcvNext {
 		return // already had it; the ack was lost, not the data
 	}
-	if seq >= c.rcvNext+uint32(c.window)*2 {
+	// Bounded by what any peer is allowed to send, never by what this end
+	// happens to be sending. Tying it to our own window made the receive
+	// guard a wire parameter: an end with a wide window sent past what an end
+	// with a narrow one would accept, every one of those segments was
+	// dropped, the sender resent them until it gave up, and the carrier died.
+	// Which is exactly what updating one server before the other did.
+	if seq >= c.rcvNext+arqWinMax*2 {
 		return // absurdly far ahead, drop rather than grow without bound
 	}
 	if _, dup := c.rcvBuf[seq]; dup {
@@ -5522,6 +5570,7 @@ func (c *arqConn) timerLoop() {
 			for _, seg := range c.sndBuf {
 				if now.Sub(seg.sentAt) >= c.rto {
 					seg.retries++
+					c.shrink()
 					if seg.retries > c.maxRetries {
 						c.fail(errARQClosed)
 						c.mu.Unlock()
@@ -6328,7 +6377,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.17.0"
+const version = "5.17.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
