@@ -1339,5 +1339,47 @@ check "and is cleared when the rule takes over" \
 check "nothing here touches an echo reply" \
       "$(ab | grep -c 'echo-reply')" "0"
 
+
+# ---------------------------------------------------------------------------
+note "the table stays a table when a name gets long"
+# ---------------------------------------------------------------------------
+# The name column was a fixed 13 characters. The moment a name grew past that -
+# which it did as soon as the private network went into it, tun-iran-icmp-11 -
+# that row alone slid right and every column after it stopped lining up.
+lt() { awk '/^list_tunnels\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+tr_() { awk '/^tunnel_row\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the width is measured"        "$(lt | grep -c '\${#n}" -gt "\$w"')"     "1"
+check "the header uses it"           "$(lt | grep -c 'pad_to "NAME" "\$w"')"   "1"
+check "and every row is told it"     "$(lt | grep -c 'tunnel_row "\$n" "\$w"')" "1"
+check "the row pads to what it was told" "$(tr_ | grep -c 'nw="\${2:-13}"')"   "1"
+check "nothing is hardcoded to 13 any more" \
+      "$(tr_ | grep -c 'C_OFF}" 13')" "0"
+
+# rendered for real, at both extremes
+ALN="$WORK/align"; mkdir -p "$ALN"
+(
+    CFG_DIR="$ALN"
+    svc_state() { printf 'active'; }
+    link_up() { return 0; }; link_rtt() { printf '84.0'; }; awg_handshake_age() { return 1; }
+    CORE_BIN="$ALN/c"; printf '#!/bin/sh\necho "up 16 16 78.9 3 900"\n' > "$ALN/c"; chmod +x "$ALN/c"
+    mka() {
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="$2"; [ "$2" = "icmp" ] && T_KIND="tun"; cfg_mode
+        T_TUNLOCAL="10.$3.10.1/24"; T_TUNPEER="10.$3.10.2/24"
+        T_NAME="$1"; T_TUNIF="$(link_iface "$T_NAME")"
+        T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_FORWARDS='"443"'
+        kernel_transport || T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+    }
+    mka iran-9443 tcp 12
+    mka tun-iran-icmp-11 icmp 11
+    list_tunnels
+) 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' > "$WORK/align.out"
+
+# every SIDE cell must start in the same column, header included
+cols="$(awk '{ i = index($0, "IRAN"); if (i == 0) i = index($0, "SIDE"); if (i) print i }' "$WORK/align.out" | sort -u | wc -l | tr -d ' ')"
+check "every row lines up with the header" "$cols" "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
