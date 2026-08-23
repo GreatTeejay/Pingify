@@ -289,25 +289,31 @@ diagnostics_menu() {
     while :; do
         banner
         head2 "Diagnostics"
+        group "Check"
         item 1 "Full check" "config, service, link, path, ports"
-        item 2 "Ping the other server" "plain ICMP, to see the raw latency"
-        item 3 "Live log" "follow a tunnel as it runs"
-        item 4 "System summary"
-        item 5 "Forwarding rules" "what iptables is doing for Pingify"
-        item 6 "Speed test" "measure the tunnel itself, against another one"
-        item 7 "Find the MTU" "measure the path instead of guessing at it"
+        item 2 "Live log" "follow a tunnel as it runs"
+        group "Measure"
+        item 3 "Speed test" "iperf3 between your two servers, tunnel and path"
+        item 4 "Benchmark this server" "cpu, disk and network of the machine itself"
+        item 5 "Find the MTU" "measure the path instead of guessing at it"
+        item 6 "Ping the other end" "raw latency, outside the tunnel"
+        group "Show"
+        item 7 "Forwarding rules" "the iptables rules Pingify installed, if any"
+        item 8 "System summary"
+        say ""
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
             1) diag_full ;;
-            2) diag_ping ;;
-            3) if pick_tunnel; then live_log "$PICKED"; fi ;;
-            4) diag_system ;;
-            5) show_nat; pause ;;
-            6) speed_menu ;;
-            7) mtu_menu ;;
+            2) if pick_tunnel; then live_log "$PICKED"; fi ;;
+            3) speed_menu ;;
+            4) bench_menu ;;
+            5) mtu_menu ;;
+            6) diag_ping ;;
+            7) show_nat; pause ;;
+            8) diag_system ;;
             0 | "") return ;;
         esac
     done
@@ -319,9 +325,13 @@ diag_ping() {
     local host=""
     cfg_endpoints
     [ -n "$CFG_CONNECT" ] && host="${CFG_CONNECT%:*}"
+    # The end that accepts has no configured peer, but the running tunnel
+    # knows who connected to it - so ask that before asking a person.
+    [ -n "$host" ] || host="$(status_peer "$PICKED")"
     say ""
     if [ -z "$host" ]; then
-        dim "this server waits for the other one, so it does not know its address"
+        dim "this server waits for the other one, and nothing has connected yet -"
+        dim "so neither its config nor the tunnel knows the far address"
         say ""
         ask host "address to ping"
     fi

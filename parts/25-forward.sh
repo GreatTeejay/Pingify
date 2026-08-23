@@ -171,16 +171,73 @@ apply_nat() {
     return 0
 }
 
+# show_nat - every rule Pingify has put in the firewall, and nothing else.
+#
+# Worth being clear about what this is, because the old wording read as though
+# Pingify were an iptables tool. It is not. A tunnel is carried by the engine
+# or by the kernel, and the firewall only ever gets involved for two reasons:
+#
+#   forwarding   only when a tunnel's forwarder is IPTABLES - the kernel NATs
+#                onto the private link. A tunnel forwarded by PINGIFY has the
+#                core carrying each connection itself and needs no rule at all.
+#
+#   blocking     the switches under Blocking - ping, speedtest sites, QUIC.
+#
+# Everything lives in chains named PINGIFY_*, hooked into the built-in ones, so
+# nothing here touches a rule you or your panel put in place. An empty list is
+# a normal state, not a fault.
 show_nat() {
     say ""
     if ! have iptables; then
-        warn "iptables is not installed"
+        warn "iptables is not installed on this server"
+        dim "so nothing here uses it - a tunnel forwarded by PINGIFY does not"
+        dim "need it, and one forwarded by IPTABLES could not be built"
         return
     fi
-    if iptables -t nat -S PINGIFY_NAT >/dev/null 2>&1; then
-        iptables -t nat -S PINGIFY_NAT  2>/dev/null | sed 's/^/    /'
-        iptables -t nat -S PINGIFY_POST 2>/dev/null | sed 's/^/    /'
-    else
-        dim "no iptables forwarding is set up"
+
+    local any=0 out
+
+    out="$(iptables -t nat -S PINGIFY_NAT 2>/dev/null | grep -v '^-N ')"
+    if [ -n "$out" ]; then
+        any=1
+        head2 "Forwarding"
+        dim "sends a port on this server across the private link"
+        say ""
+        printf '%s\n' "$out" | sed 's/^/    /'
+        say ""
+        out="$(iptables -t nat -S PINGIFY_POST 2>/dev/null | grep -v '^-N ')"
+        [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/    /'
+        say ""
+    fi
+
+    out="$(iptables -t mangle -S PINGIFY_MSS 2>/dev/null | grep -v '^-N ')"
+    if [ -n "$out" ]; then
+        any=1
+        head2 "Segment size"
+        dim "clamps what a TCP session announces to what the tunnel can carry -"
+        dim "without it, large transfers stall on a packet that will not fit"
+        say ""
+        printf '%s\n' "$out" | sed 's/^/    /'
+        say ""
+    fi
+
+    out="$(iptables -S PINGIFY_IN 2>/dev/null | grep -v '^-N ')"
+    out="$out$(iptables -S PINGIFY_OUT 2>/dev/null | grep -v '^-N ')"
+    if [ -n "$out" ]; then
+        any=1
+        head2 "Blocking"
+        dim "the switches under Blocking in the main menu"
+        say ""
+        iptables -S PINGIFY_IN  2>/dev/null | grep -v '^-N ' | sed 's/^/    /'
+        iptables -S PINGIFY_OUT 2>/dev/null | grep -v '^-N ' | sed 's/^/    /'
+        say ""
+    fi
+
+    if [ "$any" = "0" ]; then
+        ok "Pingify has no firewall rules on this server"
+        say ""
+        dim "Which is normal. Rules appear only when a tunnel is forwarded by"
+        dim "IPTABLES rather than by the core, or when something under Blocking"
+        dim "is switched on."
     fi
 }
