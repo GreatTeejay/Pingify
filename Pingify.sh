@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.14.0"
+PINGIFY_VERSION="5.15.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -929,14 +929,31 @@ cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 # two copies of this - which drifted the moment one of them was edited, and
 # left an AmneziaWG tunnel called iran-9443 after a TCP port it does not use.
 tunnel_default_name() {
-    local base
+    local extra="${1:-}" base tail=""
+    [ -n "$extra" ] && tail="-$extra"
     base="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
     case "$T_TRANSPORT" in
-        icmp) printf 'tun-%s-icmp' "$base" ;;
-        gre)  printf 'tun-%s-gre' "$base" ;;
-        awg)  printf 'tun-%s-awg' "$base" ;;
+        icmp) printf 'tun-%s-icmp%s' "$base" "$tail" ;;
+        gre)  printf 'tun-%s-gre%s' "$base" "$tail" ;;
+        awg)  printf 'tun-%s-awg%s' "$base" "$tail" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
+}
+
+# link_octet - the x in 10.x.10.0/24.
+#
+# When a server holds two tunnels of the same kind, something has to tell them
+# apart, and a counter tells you nothing: iran-gre-2 says only that it was
+# second. The private network says which one it is - and both servers agreed
+# on it, so both ends of one tunnel still arrive at the same name. The health
+# port cannot do this job: it is chosen locally and independently on each
+# server, so the two ends would end up called different things.
+link_octet() {
+    local a="${T_TUNLOCAL%%/*}"
+    case "$a" in
+        10.*.*.*) a="${a#10.}"; printf '%s' "${a%%.*}"; return 0 ;;
+    esac
+    return 1
 }
 
 # listen and connect are derived, never stored anywhere shared: they are the
@@ -1317,6 +1334,9 @@ TOKEN
     # for here, and nothing on this side to answer with.
 
     T_NAME="$(tunnel_default_name)"
+    # The network came across in the token, so this end reaches the same name
+    # the other end did without either of them being told what it is.
+    local oct; oct="$(link_octet)" && T_NAME="$(tunnel_default_name "$oct")"
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         say ""
         warn "a tunnel named $T_NAME already exists on this server"
@@ -1515,16 +1535,11 @@ new_tunnel() {
     # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
     # tunnel. Two servers side by side say what they are without either file
     # being opened, and there is nothing to answer.
+    #
+    # Provisional for now. When this server already holds a tunnel of the same
+    # kind, what tells the two apart is the private network they sit on - and
+    # that is not known until it has been asked for, a few lines down.
     T_NAME="$(tunnel_default_name)"
-    if [ -f "$(cfg_file "$T_NAME")" ]; then
-        local n=2
-        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
-        T_NAME="${T_NAME}-${n}"
-    fi
-    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
-    # The interface is named after the tunnel, and the tunnel only got its
-    # name just now - cfg_mode ran back when it had none.
-    cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
 
     # -- the private link, whenever one is needed --------------------------
     #
@@ -1570,6 +1585,14 @@ new_tunnel() {
         say ""
         ask T_TUNLOCAL "this server" "$T_TUNLOCAL"
         ask T_TUNPEER  "the other server" "$T_TUNPEER"
+
+        # Now the name carries the network - always, not only when two of
+        # them collide. Ten GRE tunnels where one is bare and nine are
+        # numbered is not an order, it is an exception with nine examples.
+        # Every one of these reads the same and says where to find it:
+        # tun-iran-gre-20 is the tunnel on 10.20.10.0/24.
+        local oct; oct="$(link_octet)" && T_NAME="$(tunnel_default_name "$oct")"
+        T_TUNIF="$(link_iface "$T_NAME")"
         say ""
         # A kernel tunnel's interface is named after the tunnel, so there is
         # nothing to answer; ours is ours to choose - and has to be one that
@@ -1597,6 +1620,17 @@ new_tunnel() {
         ask T_TUNMTU   "MTU" "$T_TUNMTU"
         case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
     fi
+
+    # Whatever is left over - a TCP tunnel has no network to name itself
+    # after, and a private one whose addresses were hand-set may not either.
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+        cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
+    fi
+    say ""
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
 
     # -- AmneziaWG keys -----------------------------------------------------
     #
@@ -2285,6 +2319,50 @@ show_taken_ports() {
 }
 
 # ---------------------------------------------------------------------------
+# health ports
+#
+# One per tunnel, and it has to be: each tunnel is its own process, and two
+# processes cannot bind one port. It is chosen here rather than answered for,
+# but a person changing one should be able to see what the others took.
+# ---------------------------------------------------------------------------
+
+health_owner() {
+    local want="$1" except="${2:-}" f addr name
+    case "$want" in '' | *[!0-9]*) return 0 ;; esac
+    cfg_files | while read -r f; do
+        addr="$(toml_get "$f" status addr)"
+        [ -n "$addr" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        if [ "${addr##*:}" = "$want" ]; then
+            printf '%s' "$name"
+            break
+        fi
+    done
+    return 0
+}
+
+show_taken_health() {
+    local except="${1:-}" listing
+    listing="$(
+        cfg_files | while read -r f; do
+            addr="$(toml_get "$f" status addr)"
+            [ -n "$addr" ] || continue
+            name="$(cfg_name "$f")"
+            [ -n "$except" ] && [ "$name" = "$except" ] && continue
+            printf '%s %s\n' "$name" "$addr"
+        done
+    )"
+    [ -n "$listing" ] || return 0
+    warn "health ports already used on this server"
+    printf '%s\n' "$listing" | while read -r name addr; do
+        [ -n "$name" ] && dim "$(pad_to "$name" 22)${BX_ARR} $addr"
+    done
+    say ""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # kernel tunnels: GRE and AmneziaWG
 #
 # Everything up to here is carried by our own engine: a Go process holds the
@@ -2324,8 +2402,12 @@ link_iface() {
         icmp) pfx="icmp" ;;
         *)    pfx="pfy" ;;
     esac
+    # tun-iran-gre     -> iran        (the transport is the tail)
+    # tun-iran-gre-20   -> iran-20      (it is in the middle, once the network
+    #                                    has been added to tell two apart)
     short="${name#tun-}"
     short="${short%-$pfx}"
+    short="${short//-$pfx-/-}"
     if [ -n "$short" ] && [ "${#short}" -le 11 ]; then
         printf '%s-%s' "$pfx" "$short"
     else
@@ -3130,9 +3212,22 @@ edit_health() {
     dim "Used by -status and by the watchdog. Local to this server: the two"
     dim "ends do not have to match."
     say ""
-    local p=""
-    ask p "port" "${T_STATUS##*:}"
-    case "$p" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
+    dim "One per tunnel, always: each tunnel is its own process, and two"
+    dim "processes cannot bind one port."
+    say ""
+    show_taken_health "$name"
+    local p="" owner=""
+    while :; do
+        ask p "port" "${T_STATUS##*:}"
+        case "$p" in '' | *[!0-9]*) fail "numbers only"; continue ;; esac
+        [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || { fail "1 to 65535"; continue; }
+        owner="$(health_owner "$p" "$name")"
+        if [ -n "$owner" ]; then
+            fail "port $p is already $owner's health port"
+            continue
+        fi
+        break
+    done
 
     cp -f "$f" "$f.bak"
     sed -i "s#^addr .*#addr             = \"127.0.0.1:$p\"#" "$f"
@@ -6138,7 +6233,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.14.0"
+const version = "5.15.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

@@ -1203,5 +1203,77 @@ check "udp is not measurable this way"     "$(sp udp)"    "refused"
 sr() { awk '/^speed_run\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the public address is never the target" "$(sr | grep -c 'T_PEER_IP')" "0"
 
+
+# ---------------------------------------------------------------------------
+note "ten tunnels of one kind stay in order"
+# ---------------------------------------------------------------------------
+# A GRE tunnel has no port to be named after, so with more than one of them
+# something else has to tell them apart. A counter says only which was second.
+# The private network says which one it is - and both servers agreed on that,
+# so both ends of one tunnel reach the same name without being told it.
+#
+# Always, not only on a clash: ten tunnels where one is bare and nine are
+# numbered is not an order, it is an exception with nine examples.
+nmo() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=9443; tunnel_default_name "$3" ); }
+check "a gre tunnel carries its network"  "$(nmo server gre 10)"  "tun-iran-gre-10"
+check "and the next one"                  "$(nmo server gre 20)"  "tun-iran-gre-20"
+check "the far end reaches the same"      "$(nmo client gre 20)"  "tun-kharej-gre-20"
+check "icmp is named the same way"        "$(nmo server icmp 35)" "tun-iran-icmp-35"
+check "and awg"                           "$(nmo client awg 44)"  "tun-kharej-awg-44"
+# TCP already had a shared number of its own - the port both ends agreed on
+check "tcp keeps its port"                "$(nmo server tcp 20)"  "iran-9443"
+
+# the octet is read back out of the address, which is where both ends get it
+oct() { ( T_TUNLOCAL="$1"; link_octet ); }
+check "the network reads out of the address" "$(oct 10.20.10.1/24)" "20"
+check "on either side of it"                 "$(oct 10.20.10.2/24)" "20"
+check "a three digit one too"                "$(oct 10.144.10.1/24)" "144"
+check "a hand-set network outside 10 has none" \
+      "$(oct 172.16.5.1/24 || echo none)" "none"
+
+# and the device follows the tunnel, with the transport not said twice
+dvo() { ( T_TRANSPORT="$1"; link_iface "$2" ); }
+check "the device carries it too"    "$(dvo gre tun-iran-gre-20)"     "gre-iran-20"
+check "on the far side"              "$(dvo gre tun-kharej-gre-35)"   "gre-kharej-35"
+check "and for icmp"                 "$(dvo icmp tun-iran-icmp-10)"   "icmp-iran-10"
+check "the transport is not repeated" \
+      "$(printf '%s' "$(dvo gre tun-iran-gre-20)" | grep -c 'gre.*gre')" "0"
+long="$(dvo awg tun-kharej-awg-144)"
+check "and it still fits in fifteen"  "$([ "${#long}" -le 15 ] && echo y)" "y"
+
+# ---------------------------------------------------------------------------
+note "the health port is one per tunnel, and says whose is whose"
+# ---------------------------------------------------------------------------
+# It has to be one each: a tunnel is a process, and two processes cannot bind
+# one port. What it should not be is invisible.
+HP="$WORK/health"; mkdir -p "$HP"
+(
+    CFG_DIR="$HP"
+    have() { case "$1" in ip | ss | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    mkh() {
+        cfg_reset
+        T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="server"; cfg_mode
+        T_NAME="$1"; T_PORT="$2"; T_STATUS="127.0.0.1:$3"
+        T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"; T_FORWARDS='"443"'
+        cfg_save >/dev/null
+    }
+    mkh hp-a 9443 9700
+    mkh hp-b 9444 9701
+    echo "a=$(health_owner 9700)"
+    echo "b=$(health_owner 9701)"
+    echo "free=$(health_owner 9702)"
+    echo "own=$(health_owner 9700 hp-a)"
+    echo "lines=$(show_taken_health | grep -c 9700)"
+) > "$WORK/health.out" 2>&1
+hp() { grep -m1 "^$1=" "$WORK/health.out" | cut -d= -f2-; }
+check "a taken health port names its tunnel" "$(hp a)"    "hp-a"
+check "and the next one"                     "$(hp b)"    "hp-b"
+check "an unused one is free"                "$(hp free)" ""
+check "a tunnel may keep its own"            "$(hp own)"  ""
+check "and the listing shows them"           "$(hp lines)" "1"
+eh() { awk '/^edit_health\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "changing one lists the others"        "$(eh | grep -c 'show_taken_health')" "1"
+check "and refuses a taken one"              "$(eh | grep -c 'health_owner')"      "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

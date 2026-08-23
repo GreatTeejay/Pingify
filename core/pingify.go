@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.14.0"
+const version = "5.15.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

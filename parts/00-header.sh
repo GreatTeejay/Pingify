@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.14.0"
+PINGIFY_VERSION="5.15.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is

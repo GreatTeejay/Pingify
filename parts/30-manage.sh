@@ -346,9 +346,22 @@ edit_health() {
     dim "Used by -status and by the watchdog. Local to this server: the two"
     dim "ends do not have to match."
     say ""
-    local p=""
-    ask p "port" "${T_STATUS##*:}"
-    case "$p" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
+    dim "One per tunnel, always: each tunnel is its own process, and two"
+    dim "processes cannot bind one port."
+    say ""
+    show_taken_health "$name"
+    local p="" owner=""
+    while :; do
+        ask p "port" "${T_STATUS##*:}"
+        case "$p" in '' | *[!0-9]*) fail "numbers only"; continue ;; esac
+        [ "$p" -ge 1 ] && [ "$p" -le 65535 ] || { fail "1 to 65535"; continue; }
+        owner="$(health_owner "$p" "$name")"
+        if [ -n "$owner" ]; then
+            fail "port $p is already $owner's health port"
+            continue
+        fi
+        break
+    done
 
     cp -f "$f" "$f.bak"
     sed -i "s#^addr .*#addr             = \"127.0.0.1:$p\"#" "$f"

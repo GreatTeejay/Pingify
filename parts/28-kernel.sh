@@ -39,8 +39,12 @@ link_iface() {
         icmp) pfx="icmp" ;;
         *)    pfx="pfy" ;;
     esac
+    # tun-iran-gre     -> iran        (the transport is the tail)
+    # tun-iran-gre-20   -> iran-20      (it is in the middle, once the network
+    #                                    has been added to tell two apart)
     short="${name#tun-}"
     short="${short%-$pfx}"
+    short="${short//-$pfx-/-}"
     if [ -n "$short" ] && [ "${#short}" -le 11 ]; then
         printf '%s-%s' "$pfx" "$short"
     else
