@@ -309,3 +309,47 @@ show_taken_ports() {
     say ""
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# health ports
+#
+# One per tunnel, and it has to be: each tunnel is its own process, and two
+# processes cannot bind one port. It is chosen here rather than answered for,
+# but a person changing one should be able to see what the others took.
+# ---------------------------------------------------------------------------
+
+health_owner() {
+    local want="$1" except="${2:-}" f addr name
+    case "$want" in '' | *[!0-9]*) return 0 ;; esac
+    cfg_files | while read -r f; do
+        addr="$(toml_get "$f" status addr)"
+        [ -n "$addr" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        if [ "${addr##*:}" = "$want" ]; then
+            printf '%s' "$name"
+            break
+        fi
+    done
+    return 0
+}
+
+show_taken_health() {
+    local except="${1:-}" listing
+    listing="$(
+        cfg_files | while read -r f; do
+            addr="$(toml_get "$f" status addr)"
+            [ -n "$addr" ] || continue
+            name="$(cfg_name "$f")"
+            [ -n "$except" ] && [ "$name" = "$except" ] && continue
+            printf '%s %s\n' "$name" "$addr"
+        done
+    )"
+    [ -n "$listing" ] || return 0
+    warn "health ports already used on this server"
+    printf '%s\n' "$listing" | while read -r name addr; do
+        [ -n "$name" ] && dim "$(pad_to "$name" 22)${BX_ARR} $addr"
+    done
+    say ""
+    return 0
+}

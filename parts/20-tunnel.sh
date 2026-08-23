@@ -72,14 +72,31 @@ cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
 # two copies of this - which drifted the moment one of them was edited, and
 # left an AmneziaWG tunnel called iran-9443 after a TCP port it does not use.
 tunnel_default_name() {
-    local base
+    local extra="${1:-}" base tail=""
+    [ -n "$extra" ] && tail="-$extra"
     base="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
     case "$T_TRANSPORT" in
-        icmp) printf 'tun-%s-icmp' "$base" ;;
-        gre)  printf 'tun-%s-gre' "$base" ;;
-        awg)  printf 'tun-%s-awg' "$base" ;;
+        icmp) printf 'tun-%s-icmp%s' "$base" "$tail" ;;
+        gre)  printf 'tun-%s-gre%s' "$base" "$tail" ;;
+        awg)  printf 'tun-%s-awg%s' "$base" "$tail" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
+}
+
+# link_octet - the x in 10.x.10.0/24.
+#
+# When a server holds two tunnels of the same kind, something has to tell them
+# apart, and a counter tells you nothing: iran-gre-2 says only that it was
+# second. The private network says which one it is - and both servers agreed
+# on it, so both ends of one tunnel still arrive at the same name. The health
+# port cannot do this job: it is chosen locally and independently on each
+# server, so the two ends would end up called different things.
+link_octet() {
+    local a="${T_TUNLOCAL%%/*}"
+    case "$a" in
+        10.*.*.*) a="${a#10.}"; printf '%s' "${a%%.*}"; return 0 ;;
+    esac
+    return 1
 }
 
 # listen and connect are derived, never stored anywhere shared: they are the
@@ -460,6 +477,9 @@ TOKEN
     # for here, and nothing on this side to answer with.
 
     T_NAME="$(tunnel_default_name)"
+    # The network came across in the token, so this end reaches the same name
+    # the other end did without either of them being told what it is.
+    local oct; oct="$(link_octet)" && T_NAME="$(tunnel_default_name "$oct")"
     if [ -f "$(cfg_file "$T_NAME")" ]; then
         say ""
         warn "a tunnel named $T_NAME already exists on this server"
@@ -658,16 +678,11 @@ new_tunnel() {
     # iran-9443 on the Iran server, kharej-9443 abroad, iran-icmp for a TUN
     # tunnel. Two servers side by side say what they are without either file
     # being opened, and there is nothing to answer.
+    #
+    # Provisional for now. When this server already holds a tunnel of the same
+    # kind, what tells the two apart is the private network they sit on - and
+    # that is not known until it has been asked for, a few lines down.
     T_NAME="$(tunnel_default_name)"
-    if [ -f "$(cfg_file "$T_NAME")" ]; then
-        local n=2
-        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
-        T_NAME="${T_NAME}-${n}"
-    fi
-    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
-    # The interface is named after the tunnel, and the tunnel only got its
-    # name just now - cfg_mode ran back when it had none.
-    cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
 
     # -- the private link, whenever one is needed --------------------------
     #
@@ -713,6 +728,14 @@ new_tunnel() {
         say ""
         ask T_TUNLOCAL "this server" "$T_TUNLOCAL"
         ask T_TUNPEER  "the other server" "$T_TUNPEER"
+
+        # Now the name carries the network - always, not only when two of
+        # them collide. Ten GRE tunnels where one is bare and nine are
+        # numbered is not an order, it is an exception with nine examples.
+        # Every one of these reads the same and says where to find it:
+        # tun-iran-gre-20 is the tunnel on 10.20.10.0/24.
+        local oct; oct="$(link_octet)" && T_NAME="$(tunnel_default_name "$oct")"
+        T_TUNIF="$(link_iface "$T_NAME")"
         say ""
         # A kernel tunnel's interface is named after the tunnel, so there is
         # nothing to answer; ours is ours to choose - and has to be one that
@@ -740,6 +763,17 @@ new_tunnel() {
         ask T_TUNMTU   "MTU" "$T_TUNMTU"
         case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
     fi
+
+    # Whatever is left over - a TCP tunnel has no network to name itself
+    # after, and a private one whose addresses were hand-set may not either.
+    if [ -f "$(cfg_file "$T_NAME")" ]; then
+        local n=2
+        while [ -f "$(cfg_file "${T_NAME}-${n}")" ]; do n=$((n + 1)); done
+        T_NAME="${T_NAME}-${n}"
+        cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
+    fi
+    say ""
+    ok "this tunnel is called ${C_B}${T_NAME}${C_OFF}"
 
     # -- AmneziaWG keys -----------------------------------------------------
     #
