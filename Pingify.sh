@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.19.0"
+PINGIFY_VERSION="5.19.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -2210,6 +2210,22 @@ free_link_octet() {
     done
     printf '10'
     return 1
+}
+
+# this_side - IRAN, KHAREJ, or nothing when there is no tunnel to tell from.
+#
+# Every tunnel on one machine is the same end of the link, so the first one
+# answers for all of them. Worth knowing wherever a screen has to say "run
+# this one here and that one over there".
+this_side() {
+    local f role
+    cfg_files | while read -r f; do
+        role="$(toml_get "$f" tunnel role)"
+        [ -n "$role" ] || continue
+        [ "$role" = "server" ] && printf 'IRAN' || printf 'KHAREJ'
+        break
+    done
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -4649,30 +4665,34 @@ speed_peer_public() {
     [ -n "$p" ]
 }
 
+# Two steps, in order, one on each server. Anything more than that on this
+# screen is a way to do it in the wrong order.
 speed_menu() {
+    local side here_a="" here_b=""
+    side="$(this_side)"
+    case "$side" in
+        IRAN)   here_b="${C_GRN}  ${BX_ARR} this server${C_OFF}" ;;
+        KHAREJ) here_a="${C_GRN}  ${BX_ARR} this server${C_OFF}" ;;
+    esac
+
     while :; do
         banner
-        head2 "Speed test  ${C_DIM}(iperf3)${C_OFF}"
+        head2 "iperf3"
         say ""
-        dim "Real bandwidth between your two servers, measured with iperf3 -"
-        dim "${IPERF_STREAMS} parallel streams for ${IPERF_SECONDS}s each way, because one stream on a"
-        dim "90 ms path runs out of window long before the path runs out of room."
+        dim "Real bandwidth between your two servers. ${IPERF_STREAMS} parallel streams,"
+        dim "${IPERF_SECONDS} seconds each way - one stream on a 90 ms path runs out of its"
+        dim "own window long before the path runs out of room."
         say ""
-        dim "One server holds a listener; the other runs the test against it."
+        say "  ${C_B}1${C_OFF} ${BX_ARR} Hold the listener   ${C_DIM}on KHAREJ, first${C_OFF}${here_a}"
+        say "  ${C_B}2${C_OFF} ${BX_ARR} Run the test        ${C_DIM}on IRAN, after that${C_OFF}${here_b}"
         say ""
-        item 1 "Hold a listener" "run this FIRST, on the other server"
-        item 2 "Test the tunnel" "what your users actually get"
-        item 3 "Test the raw path" "the ceiling - what the route can carry at all"
-        item 4 "Test both" "the pair, which is the only useful comparison"
         item 0 "Back"
         say ""
         local c=""
         ask c "select"
         case "$c" in
             1) speed_listen ;;
-            2) speed_run tunnel ;;
-            3) speed_run path ;;
-            4) speed_run both ;;
+            2) speed_run both ;;
             0 | "") return ;;
         esac
     done
@@ -4874,10 +4894,13 @@ BENCH_URL="https://raw.githubusercontent.com/teddysun/across/master/bench.sh"
 
 bench_menu() {
     banner
-    head2 "Benchmark this server"
+    head2 "Benchmark & Speedtest"
     say ""
-    dim "CPU, disk and network, measured against public endpoints. Says whether"
+    dim "CPU, disk, and a real speedtest against public servers. Says whether"
     dim "the machine itself is the bottleneck - which no tunnel setting fixes."
+    say ""
+    dim "This is the machine on its own. For the link between your two servers,"
+    dim "use iperf3 instead - that is the number your users get."
     say ""
     warn "this downloads and runs a script written by someone else"
     say ""
@@ -5375,8 +5398,8 @@ diagnostics_menu() {
         item 1 "Full check" "config, service, link, path, ports"
         item 2 "Live log" "follow a tunnel as it runs"
         group "Measure"
-        item 3 "Speed test" "iperf3 between your two servers, tunnel and path"
-        item 4 "Benchmark this server" "cpu, disk and network of the machine itself"
+        item 3 "iperf3" "real bandwidth between your two servers"
+        item 4 "Benchmark & Speedtest" "this machine: cpu, disk, and a real speedtest"
         item 5 "Find the MTU" "measure the path instead of guessing at it"
         item 6 "Ping the other end" "raw latency, outside the tunnel"
         group "Show"
@@ -6793,7 +6816,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.19.0"
+const version = "5.19.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
