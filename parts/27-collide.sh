@@ -113,6 +113,59 @@ free_link_octet() {
 }
 
 # ---------------------------------------------------------------------------
+# tunnel devices
+#
+# A GRE or AmneziaWG device is named after its tunnel, so two can never
+# collide. The core's own TUN device is answered for, and the answer offered
+# was pfy0 every time - so a second ICMP tunnel took the name of the first and
+# then could not create its interface.
+# ---------------------------------------------------------------------------
+
+tun_ifaces() {
+    local except="${1:-}" f iface name
+    cfg_files | while read -r f; do
+        iface="$(toml_get "$f" tun name)"
+        [ -n "$iface" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        printf '%s %s
+' "$iface" "$name"
+    done
+    return 0
+}
+
+iface_owner() {
+    local want="$1" except="${2:-}"
+    tun_ifaces "$except" | while read -r iface name; do
+        if [ "$iface" = "$want" ]; then
+            printf '%s' "$name"
+            break
+        fi
+    done
+    return 0
+}
+
+# host_has_iface NAME - this machine already has an interface by that name,
+# whether Pingify made it or not
+host_has_iface() {
+    have ip || return 1
+    ip link show "$1" >/dev/null 2>&1
+}
+
+free_tun_iface() {
+    local except="${1:-}" n=0
+    while [ "$n" -lt 64 ]; do
+        if [ -z "$(iface_owner "pfy$n" "$except")" ] && ! host_has_iface "pfy$n"; then
+            printf 'pfy%s' "$n"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+    printf 'pfy0'
+    return 1
+}
+
+# ---------------------------------------------------------------------------
 # ports
 # ---------------------------------------------------------------------------
 

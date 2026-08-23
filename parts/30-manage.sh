@@ -208,7 +208,9 @@ pick_tunnel() {
     item 0 "Back"
     say ""
     local sel=""
-    ask sel "select" "1"
+    # No default. It used to offer 1, so the key people press to leave a menu
+    # picked the first tunnel in it instead.
+    ask sel "select"
     [ "$sel" = "0" ] && return 1
     case "$sel" in ''|*[!0-9]*) return 1 ;; esac
     PICKED="$(printf '%s\n' $names | sed -n "${sel}p")"

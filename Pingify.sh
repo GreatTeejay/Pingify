@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.11.2"
+PINGIFY_VERSION="5.12.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1572,8 +1572,28 @@ new_tunnel() {
         ask T_TUNPEER  "the other server" "$T_TUNPEER"
         say ""
         # A kernel tunnel's interface is named after the tunnel, so there is
-        # nothing to answer; ours is ours to choose.
-        kernel_transport || ask T_TUNIF "device name" "$T_TUNIF"
+        # nothing to answer; ours is ours to choose - and has to be one that
+        # is not already taken, or the second tunnel cannot create it.
+        if ! kernel_transport; then
+            local iface_owner_name=""
+            while :; do
+                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME")"
+                case "$T_TUNIF" in
+                    '' | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore"; continue ;;
+                esac
+                [ "${#T_TUNIF}" -le 15 ] || { fail "linux stops at 15 characters"; continue; }
+                iface_owner_name="$(iface_owner "$T_TUNIF" "$T_NAME")"
+                if [ -n "$iface_owner_name" ]; then
+                    fail "$T_TUNIF already belongs to $iface_owner_name"
+                    continue
+                fi
+                if host_has_iface "$T_TUNIF"; then
+                    fail "this server already has an interface called $T_TUNIF"
+                    continue
+                fi
+                break
+            done
+        fi
         ask T_TUNMTU   "MTU" "$T_TUNMTU"
         case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
     fi
@@ -1897,6 +1917,18 @@ nat_rules_for() {
     # different interface than the kernel would have chosen - and the reverse
     # path filter drops exactly that.
     sysctl -w "net.ipv4.conf.${T_TUNIF}.rp_filter=0" >/dev/null 2>&1
+
+    # And the queue on the tunnel itself. A single deep FIFO is what makes a
+    # loaded tunnel feel bad rather than merely full: one large download fills
+    # it, and every small packet behind it - a video's next chunk request, a
+    # chat message, an ACK - waits behind the whole backlog. The delay shows
+    # up as stalling and buffering while the throughput graph looks fine.
+    #
+    # fq_codel gives each flow its own queue and keeps them short, so a big
+    # transfer stops delaying everything travelling with it.
+    if have tc; then
+        tc qdisc replace dev "$T_TUNIF" root fq_codel >/dev/null 2>&1
+    fi
     return 0
 }
 
@@ -2051,6 +2083,59 @@ free_link_octet() {
         x=$((x + 1))
     done
     printf '10'
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# tunnel devices
+#
+# A GRE or AmneziaWG device is named after its tunnel, so two can never
+# collide. The core's own TUN device is answered for, and the answer offered
+# was pfy0 every time - so a second ICMP tunnel took the name of the first and
+# then could not create its interface.
+# ---------------------------------------------------------------------------
+
+tun_ifaces() {
+    local except="${1:-}" f iface name
+    cfg_files | while read -r f; do
+        iface="$(toml_get "$f" tun name)"
+        [ -n "$iface" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        printf '%s %s
+' "$iface" "$name"
+    done
+    return 0
+}
+
+iface_owner() {
+    local want="$1" except="${2:-}"
+    tun_ifaces "$except" | while read -r iface name; do
+        if [ "$iface" = "$want" ]; then
+            printf '%s' "$name"
+            break
+        fi
+    done
+    return 0
+}
+
+# host_has_iface NAME - this machine already has an interface by that name,
+# whether Pingify made it or not
+host_has_iface() {
+    have ip || return 1
+    ip link show "$1" >/dev/null 2>&1
+}
+
+free_tun_iface() {
+    local except="${1:-}" n=0
+    while [ "$n" -lt 64 ]; do
+        if [ -z "$(iface_owner "pfy$n" "$except")" ] && ! host_has_iface "pfy$n"; then
+            printf 'pfy%s' "$n"
+            return 0
+        fi
+        n=$((n + 1))
+    done
+    printf 'pfy0'
     return 1
 }
 
@@ -2630,6 +2715,60 @@ kernel_link_check() {
 }
 
 # ---------------------------------------------------------------------------
+# reaching the far end
+#
+# The core's probe belongs to the core, and a kernel tunnel has none. What can
+# be done instead is the same thing the DNAT rule does for real traffic: open
+# the forwarded port on the other server's private address and see whether
+# anything is there. If that works, every part of the path works - the link,
+# the routing, and the service at the end of it.
+# ---------------------------------------------------------------------------
+
+# tcp_reaches HOST PORT - true when something accepts there within a moment
+tcp_reaches() {
+    local host="$1" port="$2"
+    timeout 5 bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+}
+
+kernel_probe() {
+    local name="$1" peer="${T_TUNPEER%%/*}" spec p lport rport proto bad=0 any=0
+    [ -n "$peer" ] || return 0
+    [ -n "$T_FORWARDS" ] || return 0
+
+    for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
+        proto=tcp
+        case "$spec" in
+            udp:*) proto=udp; spec="${spec#udp:}" ;;
+            tcp:*) spec="${spec#tcp:}" ;;
+        esac
+        lport="${spec%%=*}"
+        rport="${spec#*=}"
+        [ "$rport" = "$spec" ] && rport="$lport"
+        # a range is described by its first port; testing all of them would
+        # take longer than anybody will wait
+        lport="${lport%%-*}"; rport="${rport%%-*}"
+        case "$rport" in '' | *[!0-9]*) continue ;; esac
+        if [ "$proto" = "udp" ]; then
+            hc_note "udp :$lport cannot be tested this way"
+            continue
+        fi
+        any=1
+        if tcp_reaches "$peer" "$rport"; then
+            hc_ok ":$lport reaches $peer:$rport across the link"
+        else
+            hc_bad ":$lport does not reach $peer:$rport"
+            hc_note "the link is up, so this is the far end rather than the path"
+            hc_fix "on the KHAREJ server:  ss -ltnp | grep :$rport"
+            hc_note "and it must listen on 0.0.0.0, not on 127.0.0.1 alone -"
+            hc_note "the traffic arrives there addressed to $peer"
+            bad=1
+        fi
+    done
+    [ "$any" = "0" ] && return 0
+    return "$bad"
+}
+
+# ---------------------------------------------------------------------------
 # reading an existing tunnel back
 # ---------------------------------------------------------------------------
 
@@ -2838,7 +2977,9 @@ pick_tunnel() {
     item 0 "Back"
     say ""
     local sel=""
-    ask sel "select" "1"
+    # No default. It used to offer 1, so the key people press to leave a menu
+    # picked the first tunnel in it instead.
+    ask sel "select"
     [ "$sel" = "0" ] && return 1
     case "$sel" in ''|*[!0-9]*) return 1 ;; esac
     PICKED="$(printf '%s\n' $names | sed -n "${sel}p")"
@@ -3526,18 +3667,40 @@ health_check() {
     fi
 
     # --- the forwarded ports, on the end that has them ---------------------
+    #
+    # What "bound" means depends on who forwards. Our core binds the port and
+    # accepts on it. The kernel does not bind anything at all - a DNAT rule
+    # rewrites the destination in PREROUTING, before any socket is consulted -
+    # so asking whether something is listening reports a fault on every
+    # working iptables tunnel, and offers a restart that cannot help.
     if [ "$T_ROLE" = "server" ] && [ -n "$T_FORWARDS" ]; then
-        local p spec bad=0
+        local p spec bad=0 rules=""
+        [ "$T_FORWARDER" = "iptables" ] && have iptables \
+            && rules="$(iptables -t nat -S PINGIFY_NAT 2>/dev/null)"
         for spec in $(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' '); do
-            p="${spec%%=*}"; p="${p#udp:}"; p="${p%%-*}"
-            case "$p" in ''|*[!0-9]*) continue ;; esac
-            if port_free "$p"; then
+            p="${spec%%=*}"; p="${p#udp:}"; p="${p#tcp:}"; p="${p%%-*}"
+            case "$p" in '' | *[!0-9]*) continue ;; esac
+            if [ "$T_FORWARDER" = "iptables" ]; then
+                if ! printf '%s' "$rules" | grep -q -- "--dport $p "; then
+                    hc_bad "no forwarding rule for :$p"
+                    hc_note "the kernel forwards this tunnel, so the port is not"
+                    hc_note "bound here - it is rewritten on the way past"
+                    hc_fix "pingify --apply-firewall"
+                    bad=1
+                fi
+            elif port_free "$p"; then
                 hc_bad "nothing is listening on :$p"
-                bad=1
                 hc_fix "systemctl restart pingify@$name"
+                bad=1
             fi
         done
-        [ "$bad" = "0" ] && hc_ok "every forwarded port is bound here"
+        if [ "$bad" = "0" ]; then
+            if [ "$T_FORWARDER" = "iptables" ]; then
+                hc_ok "every forwarded port has a rule here"
+            else
+                hc_ok "every forwarded port is bound here"
+            fi
+        fi
     fi
 
     # --- a leftover NAT rule eats a port silently --------------------------
@@ -3573,7 +3736,10 @@ health_check() {
     # its verdict has to reach the summary: a report that lists a port the
     # other server could not reach and then says nothing is wrong is worse
     # than no report at all.
-    if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && [ -n "$T_FORWARDS" ]; then
+    # Not for a kernel tunnel: the probe is part of the core, and the core
+    # cannot even read a config for a transport it does not run. Asking it
+    # anyway produced a rejection and then blamed the far server for it.
+    if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && [ -n "$T_FORWARDS" ]        && ! kernel_transport; then
         say ""
         head2 "Through the tunnel"
         local out rc
@@ -3588,6 +3754,18 @@ health_check() {
             hc_fix "on the KHAREJ server:  ss -ltnp | grep <the port after the arrow>"
             hc_note "whatever should answer there is not listening on that address"
         fi
+    fi
+
+    # A kernel tunnel gets the same question asked a different way: not
+    # through the core, which is not in this path, but across the private link
+    # the kernel built - which is the route real traffic takes.
+    if [ "$T_ROLE" = "server" ] && [ "$up" != "0" ] && kernel_transport; then
+        say ""
+        head2 "Through the tunnel"
+        kernel_probe "$name" || {
+            say ""
+            hc_note "everything on this server is doing its part"
+        }
     fi
 
     # --- what it comes to --------------------------------------------------
@@ -5740,7 +5918,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.11.2"
+const version = "5.12.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

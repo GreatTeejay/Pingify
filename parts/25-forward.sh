@@ -126,6 +126,18 @@ nat_rules_for() {
     # different interface than the kernel would have chosen - and the reverse
     # path filter drops exactly that.
     sysctl -w "net.ipv4.conf.${T_TUNIF}.rp_filter=0" >/dev/null 2>&1
+
+    # And the queue on the tunnel itself. A single deep FIFO is what makes a
+    # loaded tunnel feel bad rather than merely full: one large download fills
+    # it, and every small packet behind it - a video's next chunk request, a
+    # chat message, an ACK - waits behind the whole backlog. The delay shows
+    # up as stalling and buffering while the throughput graph looks fine.
+    #
+    # fq_codel gives each flow its own queue and keeps them short, so a big
+    # transfer stops delaying everything travelling with it.
+    if have tc; then
+        tc qdisc replace dev "$T_TUNIF" root fq_codel >/dev/null 2>&1
+    fi
     return 0
 }
 

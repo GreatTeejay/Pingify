@@ -1080,5 +1080,85 @@ check "the reverse path filter is off"   "$(fw | grep -c 'rp_filter=0')" "1"
 check "the chain is hooked in"           "$(grep -c 'mangle -I FORWARD 1 -j PINGIFY_MSS' Pingify.sh)" "1"
 check "and taken out again on uninstall" "$(grep -c 'mss_drop_chain' Pingify.sh)" "2"
 
+
+# ---------------------------------------------------------------------------
+note "the health check asks the right question of the right forwarder"
+# ---------------------------------------------------------------------------
+# What "bound" means depends on who forwards. Our core binds the port and
+# accepts on it; the kernel binds nothing at all - a DNAT rule rewrites the
+# destination in PREROUTING, before any socket is consulted. Asking whether
+# something is listening reported a fault on every working iptables tunnel,
+# and offered a restart that could not help.
+hcf() { awk '/^health_check\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it splits on the forwarder"   "$(hcf | grep -c 'T_FORWARDER" = "iptables"')" "3"
+check "and looks for a rule instead" "$(hcf | grep -c 'no forwarding rule for')"    "1"
+check "the core probe is skipped for kernel tunnels" \
+      "$(hcf | grep -c '! kernel_transport')" "1"
+check "which get their own instead"  "$(hcf | grep -c 'kernel_probe')"              "1"
+
+# The kernel probe crosses the private link, the way real traffic does.
+kp() { awk '/^kernel_probe\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "it opens the far port"        "$(kp | grep -c 'tcp_reaches')"                "1"
+check "and says where to look"       "$(kp | grep -c 'ss -ltnp')"                   "1"
+check "including the 0.0.0.0 trap"   "$(kp | grep -c '0.0.0.0, not on 127.0.0.1')"  "1"
+
+# ---------------------------------------------------------------------------
+note "two tunnels never share a device either"
+# ---------------------------------------------------------------------------
+# GRE and AmneziaWG name their interface after the tunnel, so they cannot
+# collide. The core's TUN device is answered for, and the answer offered was
+# pfy0 every time - so a second ICMP tunnel took the first one's name and then
+# could not create its interface.
+DEV="$WORK/dev"; mkdir -p "$DEV"
+(
+    CFG_DIR="$DEV"
+    have() { case "$1" in ip | ss | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    mkd() {
+        cfg_reset
+        T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
+        T_NAME="$1"; T_TUNIF="$2"; T_TOKEN="$TOKEN"
+        T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_TUNLOCAL="10.$3.10.1/24"; T_TUNPEER="10.$3.10.2/24"
+        T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+    }
+    echo "first=$(free_tun_iface)"
+    mkd tun-a pfy0 10
+    echo "second=$(free_tun_iface)"
+    mkd tun-b pfy1 20
+    echo "third=$(free_tun_iface)"
+    echo "owner0=$(iface_owner pfy0)"
+    echo "own=$(iface_owner pfy0 tun-a)"
+    echo "spare=$(iface_owner pfy9)"
+) > "$WORK/dev.out" 2>&1
+dv() { grep -m1 "^$1=" "$WORK/dev.out" | cut -d= -f2-; }
+check "the first device offered is free" "$(dv first)"  "pfy0"
+check "the next one moves along"         "$(dv second)" "pfy1"
+check "and the next"                     "$(dv third)"  "pfy2"
+check "a taken device names its owner"   "$(dv owner0)" "tun-a"
+check "a tunnel may keep its own"        "$(dv own)"    ""
+check "an unused one is free"            "$(dv spare)"  ""
+check "the wizard refuses a taken device" \
+      "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'iface_owner "')" "1"
+
+# ---------------------------------------------------------------------------
+note "the queue on a tunnel is not one deep pipe"
+# ---------------------------------------------------------------------------
+# A single FIFO is what makes a loaded tunnel feel bad rather than merely
+# full: one large download fills it and every small packet behind it - the
+# next video chunk request, a chat message, an ACK - waits behind the whole
+# backlog. It reads as stalling while the throughput graph looks fine.
+nrf() { awk '/^nat_rules_for\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "each flow gets its own queue" "$(nrf | grep -c 'root fq_codel')" "1"
+check "on the tunnel interface"      "$(nrf | grep -c 'tc qdisc replace dev "\$T_TUNIF"')" "1"
+check "and only when tc is there"    "$(nrf | grep -c 'have tc')" "1"
+
+# ---------------------------------------------------------------------------
+note "enter leaves a menu instead of choosing from it"
+# ---------------------------------------------------------------------------
+pt() { awk '/^pick_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the picker offers no default" "$(pt | grep -c 'ask sel "select"$')" "1"
+check "so an empty answer goes back" "$(pt | grep -c "''|\*\[!0-9\]\*) return 1")" "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
