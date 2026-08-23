@@ -1496,6 +1496,25 @@ note "the speed test says what the number means"
 # It ran, printed iperf's own output, and stopped. 412 Mbit/s is excellent on a
 # path that carries 460 and dreadful on one that carries 900, and only the pair
 # tells you which you have - so it measures both and compares them.
+# The names have to say what they are: one is iperf3 between the two servers,
+# the other is a speedtest of this machine on its own. Calling the first one
+# "Speed test" hid the second, which is the one that actually is one.
+check "the iperf option is named for it"   "$(grep -c 'item 3 "iperf3"' Pingify.sh)"  "1"
+check "and the other says speedtest"       "$(grep -c 'Benchmark & Speedtest' Pingify.sh)" "2"
+check "neither is called just Speed test"  "$(grep -c 'item [0-9] "Speed test"' Pingify.sh)" "0"
+
+# Two steps, in order, and the screen says which server each belongs on -
+# with the one you are standing on marked, since that is the question a person
+# actually has in front of them.
+sm() { awk '/^speed_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the listener is placed on KHAREJ" "$(sm | grep -c 'on KHAREJ, first')"    "1"
+check "the test on IRAN"                 "$(sm | grep -c 'on IRAN, after that')" "1"
+check "this server is marked"            "$(sm | grep -c 'this server')"         "2"
+check "and there are only two steps"     "$(sm | grep -cE 'say "  \$\{C_B\}[12]')" "2"
+check "which side we are on is read from the tunnels"       "$(sm | grep -c 'this_side')" "1"
+ts() { ( CFG_DIR="$WORK/nothing-here"; this_side ); }
+check "with no tunnels it claims nothing" "$(ts)" ""
+
 check "twenty parallel streams" "$IPERF_STREAMS" "20"
 check "ten seconds each way"    "$IPERF_SECONDS" "10"
 

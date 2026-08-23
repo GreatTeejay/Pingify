@@ -112,6 +112,22 @@ free_link_octet() {
     return 1
 }
 
+# this_side - IRAN, KHAREJ, or nothing when there is no tunnel to tell from.
+#
+# Every tunnel on one machine is the same end of the link, so the first one
+# answers for all of them. Worth knowing wherever a screen has to say "run
+# this one here and that one over there".
+this_side() {
+    local f role
+    cfg_files | while read -r f; do
+        role="$(toml_get "$f" tunnel role)"
+        [ -n "$role" ] || continue
+        [ "$role" = "server" ] && printf 'IRAN' || printf 'KHAREJ'
+        break
+    done
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # tunnel devices
 #
