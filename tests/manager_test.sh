@@ -1160,5 +1160,43 @@ pt() { awk '/^pick_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the picker offers no default" "$(pt | grep -c 'ask sel "select"$')" "1"
 check "so an empty answer goes back" "$(pt | grep -c "''|\*\[!0-9\]\*) return 1")" "1"
 
+
+# ---------------------------------------------------------------------------
+note "the speed test measures the tunnel, not the path beside it"
+# ---------------------------------------------------------------------------
+# Measuring to the other server's public address would measure the public
+# path, which is the one thing here that is not the tunnel - and it would give
+# a confident wrong answer to the only question this feature exists to settle.
+(
+    cfg_reset
+    T_TUNLOCAL="10.30.10.1/24"; T_TUNPEER="10.30.10.2/24"; T_PEER_IP="198.51.100.4"
+    T_FORWARDS='"8007"'
+    speed_over_link && echo "link=yes" || echo "link=no"
+
+    cfg_reset
+    T_TUNLOCAL=""; T_TUNPEER=""; T_PEER_IP="198.51.100.4"
+    T_FORWARDS='"8007=9007"'
+    speed_over_link && echo "nolink=wrong" || echo "nolink=port"
+    echo "ports=$(speed_first_port)"
+
+    cfg_reset
+    T_FORWARDS='"8000-8010=9000"'
+    echo "range=$(speed_first_port)"
+
+    cfg_reset
+    T_FORWARDS='"udp:500"'
+    if speed_first_port >/dev/null 2>&1; then echo "udp=accepted"; else echo "udp=refused"; fi
+) > "$WORK/speed.out" 2>&1
+sp() { grep -m1 "^$1=" "$WORK/speed.out" | cut -d= -f2-; }
+
+check "a private link is measured across"  "$(sp link)"   "yes"
+check "without one it goes through a port" "$(sp nolink)" "port"
+check "the near and far ports both travel" "$(sp ports)"  "8007 9007"
+check "a range is measured at its first"   "$(sp range)"  "8000 9000"
+check "udp is not measurable this way"     "$(sp udp)"    "refused"
+# the public address must never become the target
+sr() { awk '/^speed_run\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the public address is never the target" "$(sr | grep -c 'T_PEER_IP')" "0"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
