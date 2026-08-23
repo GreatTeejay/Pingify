@@ -85,8 +85,22 @@ mtu_menu() {
         return 0
     fi
 
+    # The end that accepts is told nothing about the other server - there is
+    # no connect line in its config, because it does not dial. But the running
+    # tunnel knows who arrived, so ask it.
     local peer="$T_PEER_IP"
-    [ -n "$peer" ] || { fail "this tunnel has no peer address to measure to"; pause; return 0; }
+    if [ -z "$peer" ]; then
+        peer="$(status_peer "$PICKED")"
+    fi
+    if [ -z "$peer" ]; then
+        fail "this end does not know the other server's address"
+        dim "it accepts rather than dials, so nothing in its config names the"
+        dim "far side - and the tunnel is not up to be asked either"
+        say ""
+        dim "start it, or measure from the other server, which does know"
+        pause
+        return 0
+    fi
 
     field "Transport" "$(transport_label "$T_TRANSPORT")"
     field "Measuring to" "$(addr_tint "$peer")"
@@ -113,9 +127,9 @@ mtu_menu() {
 
     say ""
     panel "measured"
-    field "Path carries" "$pmtu bytes"
-    field "$(transport_label "$T_TRANSPORT") wraps" "$over bytes"
-    field "So this tunnel" "$want bytes"
+    field "Path" "$pmtu bytes"
+    field "Wrapping" "$over bytes, $(transport_label "$T_TRANSPORT")"
+    field "Tunnel MTU" "$want bytes"
     panel_end
     say ""
 

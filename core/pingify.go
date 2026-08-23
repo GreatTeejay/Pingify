@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.18.0"
+const version = "5.18.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -2892,6 +2892,25 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		Peer:      cfg.Connect,
 		Carriers:  cfg.Carriers,
 		UptimeS:   int64(time.Since(p.startedAt).Seconds()),
+	}
+	if d.Peer == "" {
+		// The accepting end has no configured peer: it is told nothing about
+		// the other server, which simply arrives. But it does know who
+		// arrived, and that is the only place that address exists on this
+		// machine - so report it rather than the address we listen on, which
+		// is our own and useless to anyone asking.
+		for _, l := range p.liveLinks() {
+			if l.alive() && l.conn != nil {
+				if ra := l.conn.RemoteAddr(); ra != nil {
+					host := ra.String()
+					if h, _, err := net.SplitHostPort(host); err == nil {
+						host = h
+					}
+					d.Peer = host
+					break
+				}
+			}
+		}
 	}
 	if d.Peer == "" {
 		d.Peer = "listen " + cfg.Listen

@@ -1434,5 +1434,60 @@ check "and that both ends must match"     "$(mm | grep -c 'the smaller of the tw
 check "the ping block is named as the reason a path goes silent" \
       "$(mm | grep -c 'ignore ICMP')" "1"
 
+
+# ---------------------------------------------------------------------------
+note "the end that accepts still knows who it is talking to"
+# ---------------------------------------------------------------------------
+# IRAN does not dial, so there is no connect line in its config and no address
+# to read - which is why Find the MTU on the IRAN side said it had no peer to
+# measure to. Something did arrive, though, and the core knows what: that is
+# the only place on that machine where the far address exists at all.
+SP="$WORK/speer"; mkdir -p "$SP"
+(
+    CFG_DIR="$SP"; CORE_BIN="$SP/c"
+    cfg_reset
+    T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
+    T_NAME="sp"; T_TOKEN="$TOKEN"; T_PUBLIC_IP="185.31.8.93"
+    T_TUNLOCAL="10.11.10.1/24"; T_TUNPEER="10.11.10.2/24"; T_TUNIF="icmp-iran-11"
+    T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+    cfg_save >/dev/null
+
+    cfg_load sp >/dev/null 2>&1
+    echo "config=$T_PEER_IP"
+
+    { echo '#!/bin/sh'; echo 'cat <<JSON';
+      echo '{"name":"sp","peer":"2.26.26.37","carriers_up":16}'; echo 'JSON'; } > "$SP/c"
+    chmod +x "$SP/c"
+    echo "attached=$(status_peer sp)"
+
+    # nothing has connected: the core reports the address it listens on, which
+    # is this machine's own and no use to anyone asking
+    { echo '#!/bin/sh'; echo 'cat <<JSON';
+      echo '{"peer":"listen 185.31.8.93"}'; echo 'JSON'; } > "$SP/c"
+    chmod +x "$SP/c"
+    echo "idle=$(status_peer sp)"
+
+    # and a core that will not answer at all
+    { echo '#!/bin/sh'; echo 'exit 1'; } > "$SP/c"; chmod +x "$SP/c"
+    echo "down=$(status_peer sp)"
+) > "$WORK/speer.out" 2>&1
+sp() { grep -m1 "^$1=" "$WORK/speer.out" | cut -d= -f2-; }
+
+check "the accepting config names no peer" "$(sp config)"   ""
+check "but the running tunnel does"        "$(sp attached)" "2.26.26.37"
+check "an idle listen address is not one"  "$(sp idle)"     ""
+check "and a core that is down says nothing" "$(sp down)"   ""
+
+mm() { awk '/^mtu_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the MTU page asks the tunnel"  "$(mm | grep -c 'status_peer')" "1"
+check "and explains itself when it cannot" \
+      "$(mm | grep -c 'accepts rather than dials')" "1"
+
+# The extraction has no backslash escapes in it, because this file is
+# assembled into one script by a build that has eaten a backslash before -
+# turning a sed backreference into a literal control byte.
+check "no stray control bytes in the build" \
+      "$(grep -c "$(printf '\001')" Pingify.sh)" "0"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
