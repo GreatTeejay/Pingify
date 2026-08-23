@@ -354,6 +354,28 @@ kernel_brief() {
     printf 'up 1 1 %s 0 0' "$rtt"
 }
 
+# status_peer NAME - the other server's address, as the running tunnel sees it.
+#
+# The accepting end is told nothing about the far side: it does not dial, so
+# there is no connect line in its config and no address to read. But something
+# arrived, and the core knows what - so this is the only place on that machine
+# where the other server's address exists at all.
+#
+# Written with cut rather than a sed backreference on purpose: this file is
+# assembled into one script by a build that has eaten a backslash before.
+status_peer() {
+    local name="$1" f addr doc
+    f="$(cfg_file "$name")" || return 1
+    addr="$(toml_get "$f" status addr)"
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 1
+    doc="$("$CORE_BIN" -status "$addr" 2>/dev/null)" || return 1
+    # one field out of the JSON, and only when it is an address - the core
+    # falls back to "listen <our own>" when nothing has connected, which is
+    # this machine's address and no use to anyone asking
+    printf '%s' "$doc" | tr ',' '\n' | grep '"peer"' | cut -d'"' -f4 \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1
+}
+
 # tunnel_is_up NAME - one answer for every kind of tunnel, so the list and the
 # status panel cannot disagree. The panel used to ask the core's status
 # endpoint, which a kernel tunnel does not have, so GRE and AmneziaWG could

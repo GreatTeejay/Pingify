@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.18.0"
+PINGIFY_VERSION="5.18.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -2752,6 +2752,28 @@ kernel_brief() {
     printf 'up 1 1 %s 0 0' "$rtt"
 }
 
+# status_peer NAME - the other server's address, as the running tunnel sees it.
+#
+# The accepting end is told nothing about the far side: it does not dial, so
+# there is no connect line in its config and no address to read. But something
+# arrived, and the core knows what - so this is the only place on that machine
+# where the other server's address exists at all.
+#
+# Written with cut rather than a sed backreference on purpose: this file is
+# assembled into one script by a build that has eaten a backslash before.
+status_peer() {
+    local name="$1" f addr doc
+    f="$(cfg_file "$name")" || return 1
+    addr="$(toml_get "$f" status addr)"
+    [ -n "$addr" ] && [ -x "$CORE_BIN" ] || return 1
+    doc="$("$CORE_BIN" -status "$addr" 2>/dev/null)" || return 1
+    # one field out of the JSON, and only when it is an address - the core
+    # falls back to "listen <our own>" when nothing has connected, which is
+    # this machine's address and no use to anyone asking
+    printf '%s' "$doc" | tr ',' '\n' | grep '"peer"' | cut -d'"' -f4 \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1
+}
+
 # tunnel_is_up NAME - one answer for every kind of tunnel, so the list and the
 # status panel cannot disagree. The panel used to ask the core's status
 # endpoint, which a kernel tunnel does not have, so GRE and AmneziaWG could
@@ -4773,8 +4795,22 @@ mtu_menu() {
         return 0
     fi
 
+    # The end that accepts is told nothing about the other server - there is
+    # no connect line in its config, because it does not dial. But the running
+    # tunnel knows who arrived, so ask it.
     local peer="$T_PEER_IP"
-    [ -n "$peer" ] || { fail "this tunnel has no peer address to measure to"; pause; return 0; }
+    if [ -z "$peer" ]; then
+        peer="$(status_peer "$PICKED")"
+    fi
+    if [ -z "$peer" ]; then
+        fail "this end does not know the other server's address"
+        dim "it accepts rather than dials, so nothing in its config names the"
+        dim "far side - and the tunnel is not up to be asked either"
+        say ""
+        dim "start it, or measure from the other server, which does know"
+        pause
+        return 0
+    fi
 
     field "Transport" "$(transport_label "$T_TRANSPORT")"
     field "Measuring to" "$(addr_tint "$peer")"
@@ -4801,9 +4837,9 @@ mtu_menu() {
 
     say ""
     panel "measured"
-    field "Path carries" "$pmtu bytes"
-    field "$(transport_label "$T_TRANSPORT") wraps" "$over bytes"
-    field "So this tunnel" "$want bytes"
+    field "Path" "$pmtu bytes"
+    field "Wrapping" "$over bytes, $(transport_label "$T_TRANSPORT")"
+    field "Tunnel MTU" "$want bytes"
     panel_end
     say ""
 
@@ -6548,7 +6584,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.18.0"
+const version = "5.18.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -9387,6 +9423,25 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		Peer:      cfg.Connect,
 		Carriers:  cfg.Carriers,
 		UptimeS:   int64(time.Since(p.startedAt).Seconds()),
+	}
+	if d.Peer == "" {
+		// The accepting end has no configured peer: it is told nothing about
+		// the other server, which simply arrives. But it does know who
+		// arrived, and that is the only place that address exists on this
+		// machine - so report it rather than the address we listen on, which
+		// is our own and useless to anyone asking.
+		for _, l := range p.liveLinks() {
+			if l.alive() && l.conn != nil {
+				if ra := l.conn.RemoteAddr(); ra != nil {
+					host := ra.String()
+					if h, _, err := net.SplitHostPort(host); err == nil {
+						host = h
+					}
+					d.Peer = host
+					break
+				}
+			}
+		}
 	}
 	if d.Peer == "" {
 		d.Peer = "listen " + cfg.Listen
