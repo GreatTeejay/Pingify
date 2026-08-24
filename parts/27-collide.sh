@@ -330,23 +330,64 @@ show_taken_ports() {
 # the tunnel's own port
 #
 # Not a forwarded port - the one the two servers meet on. It was never checked,
-# so a second tunnel could take a port the first one was already accepting on,
-# and only the second one's log would say why it would not start.
+# so a second tunnel could take a port the first was already accepting on, and
+# only the second one's log would say why it would not start.
 #
-# Only the accepting end binds it. A dialling end names the same number but it
-# belongs to the far server and this machine binds nothing, so two tunnels
-# dialling one port is not a clash. And TCP 9443 and UDP 9443 are two different
-# sockets - neither blocks the other - so the protocol is part of the question.
+# What collides is the SOCKET, not the transport name. WS and WSS are HTTP over
+# TCP, so a plain TCP tunnel on 9443 blocks a WS one on 9443 - while a UDP
+# tunnel on 9443 does not, because that is a different socket entirely. Asking
+# by name got that exactly backwards and called a real clash free.
+#
+# And some transports have no port at all: ICMP has none by design, GRE is IP
+# protocol 47. They cannot collide this way and do not belong in the answer.
 # ---------------------------------------------------------------------------
 
+# port_family TRANSPORT - the socket a transport binds: tcp, udp, or none.
+port_family() {
+    case "$1" in
+        tcp | ws | wss) printf 'tcp' ;;
+        udp | awg)      printf 'udp' ;;
+        *)              printf 'none' ;;
+    esac
+}
+
+# tunnel_port_of FILE - the port that config accepts on, and its family, as
+# "port family" - or nothing when this end does not bind one.
+tunnel_port_of() {
+    local f="$1" t l fam
+    t="$(toml_get "$f" transport type)"
+    fam="$(port_family "$t")"
+    [ "$fam" = "none" ] && return 1
+
+    if [ "$t" = "awg" ]; then
+        # AmneziaWG keeps its port in its own section, and both ends bind it.
+        l="$(toml_get "$f" awg listen_port)"
+        case "$l" in '' | *[!0-9]*) return 1 ;; esac
+        printf '%s %s' "$l" "$fam"
+        return 0
+    fi
+
+    l="$(toml_get "$f" transport listen)"
+    [ -n "$l" ] || return 1        # this one dials; it binds nothing here
+    case "$l" in *:*) ;; *) return 1 ;; esac
+    l="${l##*:}"
+    case "$l" in '' | *[!0-9]*) return 1 ;; esac
+    printf '%s %s' "$l" "$fam"
+}
+
+# tunnel_port_owner PORT TRANSPORT [EXCEPT] - the tunnel already accepting on
+# that port with the same kind of socket.
 tunnel_port_owner() {
-    local want="$1" proto="$2" except="${3:-}" f l name
+    local want="$1" fam f name p
+    fam="$(port_family "$2")"
+    local except="${3:-}"
     case "$want" in '' | *[!0-9]*) return 0 ;; esac
+    [ "$fam" = "none" ] && return 0
+
     cfg_files | while read -r f; do
-        [ "$(toml_get "$f" transport type)" = "$proto" ] || continue
-        l="$(toml_get "$f" transport listen)"
-        [ -n "$l" ] || continue          # this one dials; it binds nothing here
-        [ "${l##*:}" = "$want" ] || continue
+        p="$(tunnel_port_of "$f")" || continue
+        [ "${p%% *}" = "$want" ] || continue
+        [ "${p##* }" = "$fam" ] || continue
         name="$(cfg_name "$f")"
         [ -n "$except" ] && [ "$name" = "$except" ] && continue
         printf '%s' "$name"
@@ -359,20 +400,19 @@ show_taken_tunnel_ports() {
     local except="${1:-}" listing
     listing="$(
         cfg_files | while read -r f; do
-            l="$(toml_get "$f" transport listen)"
-            [ -n "$l" ] || continue
+            p="$(tunnel_port_of "$f")" || continue
             name="$(cfg_name "$f")"
             [ -n "$except" ] && [ "$name" = "$except" ] && continue
-            printf '%s %s %s
-' "$name" "$(toml_get "$f" transport type)" "${l##*:}"
+            printf '%s %s %s\n' "$name" "${p%% *}" "${p##* }"
         done
     )"
     [ -n "$listing" ] || return 0
     warn "tunnel ports this server already accepts on"
-    printf '%s
-' "$listing" | while read -r name proto port; do
-        [ -n "$name" ] && dim "$(pad_to "$name" 22)${BX_ARR} ${port}/${proto}"
+    printf '%s\n' "$listing" | while read -r name port fam; do
+        [ -n "$name" ] && dim "$(pad_to "$name" 22)${BX_ARR} ${port}/${fam}"
     done
+    say ""
+    dim "tcp and udp are separate: 9443/udp does not block 9443/tcp"
     say ""
     return 0
 }
