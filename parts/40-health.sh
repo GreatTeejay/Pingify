@@ -258,7 +258,20 @@ health_check() {
         out="$("$CORE_BIN" -c "$f" -probe 2>&1)"; rc=$?
         # the carrier line is already above, in this report's own words
         printf '%s\n' "$out" | sed '/carriers up,/d' | sed 's/^/  /'
-        if [ "$rc" != "0" ]; then
+        # 3 means nothing came back at all, which is a different machine's
+        # problem from a port that could not be reached - and used to be
+        # reported as the same one, sending the reader to check a listening
+        # socket that was listening perfectly well.
+        if [ "$rc" = "3" ]; then
+            say ""
+            hc_bad "nothing is coming back from the other server at all"
+            hc_note "the carriers are up, so the handshake crossed both ways -"
+            hc_note "then the return direction stopped. A silent service would"
+            hc_note "still leave the keepalives flowing, and they are not"
+            hc_fix "try the same two servers on a TCP tunnel, same port"
+            hc_note "if TCP carries both ways and this does not, the difference"
+            hc_note "is something on the path reading what this transport sends"
+        elif [ "$rc" != "0" ]; then
             say ""
             hc_bad "a forwarded port did not reach the service on the other server"
             hc_note "this end is fine - the tunnel carried the test across"

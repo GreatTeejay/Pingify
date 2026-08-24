@@ -14,6 +14,16 @@ import (
 // separates a working path from a broken one is what happens next: if the far
 // server cannot reach the service it sends back a reset and the connection
 // dies within moments, and if it can, the connection simply stays open.
+// What the probe exits with. The health check words its verdict from this,
+// because "a port could not be reached" and "nothing at all is coming back"
+// are different faults on different machines, and telling them apart is the
+// whole reason this runs.
+const (
+	probeOK     = 0
+	probeFailed = 1 // a forwarded port did not reach its service
+	probeOneWay = 3 // the far server sent nothing at all while we asked
+)
+
 func runProbe(cfg *Config) int {
 	if cfg.Role != "server" {
 		fmt.Println("Run this on the IRAN server: that is the end with the ports.")
@@ -73,11 +83,17 @@ func runProbe(cfg *Config) int {
 			fmt.Printf("\nDuring this test we sent %s and the other server sent back %s.\n",
 				humanBytes(sent), humanBytes(got))
 			if got == 0 {
-				fmt.Println("\nNothing came back at all. The carriers are connected, so the")
-				fmt.Println("path carries a handshake, but nothing after it is getting through")
-				fmt.Println("in this direction. An \"open\" above means only that no refusal")
-				fmt.Println("arrived - which is also what a one-way path looks like.")
-				return 1
+				fmt.Println("\nNot one byte came back - no data, no window credit, no")
+				fmt.Println("keepalive. The carriers all report themselves up, so the")
+				fmt.Println("handshake crossed in both directions and then the return")
+				fmt.Println("direction stopped.")
+				fmt.Println("\nThat is not a service failing to answer: a service that is")
+				fmt.Println("simply silent still leaves the keepalives flowing. Something")
+				fmt.Println("between the two servers is carrying this direction and not")
+				fmt.Println("the other.")
+				fmt.Println("\nAn \"open\" above means only that no refusal arrived, which")
+				fmt.Println("is also what a one-way path looks like.")
+				return probeOneWay
 			}
 		}
 	}
@@ -86,10 +102,10 @@ func runProbe(cfg *Config) int {
 		fmt.Println("\nA port that failed is one the other server could not reach.")
 		fmt.Println("Check that the service is listening there on the address after")
 		fmt.Println("the arrow, and read that server's log for the reason.")
-		return 1
+		return probeFailed
 	}
 	fmt.Println("\nEvery port reached the service on the other server.")
-	return 0
+	return probeOK
 }
 
 // refusalCount reads how many times the far end has said it could not reach a
