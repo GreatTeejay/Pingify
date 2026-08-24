@@ -211,7 +211,15 @@ item() {
 
 WIZ_STEP=0
 
-wiz_reset() { WIZ_STEP=0; }
+# A wizard is a run of questions that only means something finished. Half
+# of one is not a tunnel, so there has to be a way out that is not ctrl-c -
+# and it has to work at every question, not only the first.
+#
+# ask sets WIZ_QUIT when the answer is q, and every question after that
+# returns without asking, so the wizard unwinds instead of finishing.
+wiz_reset() { WIZ_STEP=0; WIZ_ACTIVE=1; WIZ_QUIT=0; }
+wiz_end()   { WIZ_ACTIVE=0; WIZ_QUIT=0; }
+wiz_quit()  { [ "${WIZ_QUIT:-0}" = "1" ]; }
 
 # Kept so the wizard can note a decision without the page having to redraw.
 wiz_add() { :; }
@@ -311,11 +319,28 @@ pause() { printf '\n'; read -rsp "  ${C_DIM}press enter${C_OFF}" _; printf '\n';
 # ask VAR "prompt" ["default"]
 ask() {
     local __var="$1" __prompt="$2" __def="${3:-}" __in=""
+    # Already leaving: do not ask, and do not block a validation loop that
+    # would otherwise sit here forever waiting for an answer nobody is
+    # going to give.
+    [ "${WIZ_QUIT:-0}" = "1" ] && return 1
+    local __rc=0
     if [ -n "$__def" ]; then
-        read -rp "  ${C_CYN}${BX_ARR}${C_OFF} ${__prompt} ${C_DIM}[${__def}]${C_OFF}${C_B}:${C_OFF} " __in
+        read -rp "  ${C_CYN}${BX_ARR}${C_OFF} ${__prompt} ${C_DIM}[${__def}]${C_OFF}${C_B}:${C_OFF} " __in || __rc=1
         [ -z "$__in" ] && __in="$__def"
     else
-        read -rp "  ${C_CYN}${BX_ARR}${C_OFF} ${__prompt}${C_B}:${C_OFF} " __in
+        read -rp "  ${C_CYN}${BX_ARR}${C_OFF} ${__prompt}${C_B}:${C_OFF} " __in || __rc=1
+    fi
+    # Standard input has ended. No answer is coming, and pick would sit here
+    # rejecting the empty one and asking again, forever - which is what a
+    # script piped into this used to do instead of stopping.
+    if [ "$__rc" = "1" ] && [ -z "$__in" ]; then
+        [ "${WIZ_ACTIVE:-0}" = "1" ] && WIZ_QUIT=1
+        return 1
+    fi
+    if [ "${WIZ_ACTIVE:-0}" = "1" ]; then
+        case "$__in" in
+            q | Q | quit) WIZ_QUIT=1; return 1 ;;
+        esac
     fi
     printf -v "$__var" '%s' "$__in"
 }
@@ -333,7 +358,7 @@ pick() {
     local _pk_var="$1" _pk_prompt="$2"; shift 2
     local _pk_in="" _pk_opt
     while :; do
-        ask _pk_in "$_pk_prompt"
+        ask _pk_in "$_pk_prompt" || return 1
         if [ -z "$_pk_in" ]; then
             fail "this one has no default - choose $(printf '%s or ' "$@" | sed 's/ or $//')"
             continue
@@ -352,7 +377,11 @@ pick() {
 # time it is asked, everything has been reviewed and the expected reply is yes.
 confirm_yes() {
     local reply=""
+    [ "${WIZ_QUIT:-0}" = "1" ] && return 1
     read -rp "  ${C_YEL}?${C_OFF} $1 ${C_DIM}[Y/n]${C_OFF}${C_B}:${C_OFF} " reply
+    if [ "${WIZ_ACTIVE:-0}" = "1" ]; then
+        case "$reply" in q | Q | quit) WIZ_QUIT=1; return 1 ;; esac
+    fi
     case "$reply" in [nN] | [nN][oO]) return 1 ;; *) return 0 ;; esac
 }
 

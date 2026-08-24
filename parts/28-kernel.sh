@@ -39,10 +39,16 @@ link_iface() {
         icmp) pfx="icmp" ;;
         *)    pfx="pfy" ;;
     esac
-    # tun-iran-gre     -> iran        (the transport is the tail)
-    # tun-iran-gre-20   -> iran-20      (it is in the middle, once the network
-    #                                    has been added to tell two apart)
-    short="${name#tun-}"
+    # iran-tun-gre      -> iran        (the transport is the tail)
+    # iran-tun-gre-20    -> iran-20      (it is in the middle, once the network
+    #                                     has been added to tell two apart)
+    # The device is named protocol-first because that is what somebody reading
+    # "ip link" wants first; the tunnel is named side-first because that is
+    # what somebody reading a list of tunnels wants first. Same tunnel, two
+    # audiences, and this is where one is turned into the other.
+    short="${name%-tun-$pfx}"
+    short="${short//-tun-$pfx-/-}"
+    short="${short#tun-}"
     short="${short%-$pfx}"
     short="${short//-$pfx-/-}"
     if [ -n "$short" ] && [ "${#short}" -le 11 ]; then

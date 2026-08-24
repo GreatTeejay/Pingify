@@ -686,15 +686,15 @@ check "a kernel tunnel says up, not 1/1" "$(lk | grep -c 'links="up"')"      "1"
 check "and down rather than 0/1"         "$(lk | grep -c 'links="down"')"    "1"
 check "the others still count"           "$(lk | grep -c 'links="\$up/\$total"')" "1"
 
-check "the interface reads plainly" "$(T_TRANSPORT=gre; link_iface tun-iran-gre)"   "gre-iran"
-check "on both sides"               "$(T_TRANSPORT=awg; link_iface tun-kharej-awg)" "awg-kharej"
+check "the interface reads plainly" "$(T_TRANSPORT=gre; link_iface iran-tun-gre)"   "gre-iran"
+check "on both sides"               "$(T_TRANSPORT=awg; link_iface kharej-tun-awg)" "awg-kharej"
 long="$(T_TRANSPORT=gre; link_iface a-very-long-tunnel-name-indeed)"
 check "a long name still fits"      "$([ "${#long}" -le 15 ] && echo y)"            "y"
 
 # A kernel tunnel is always a private link, always forwarded by the kernel,
 # and never has a socket for anything to listen on.
 cfg_reset
-T_NAME="tun-iran-gre"; T_ROLE="server"; T_TRANSPORT="gre"
+T_NAME="iran-tun-gre"; T_ROLE="server"; T_TRANSPORT="gre"
 cfg_mode
 check "it is a TUN kind"      "$T_KIND"      "tun"
 check "in tun mode"           "$T_MODE"      "tun"
@@ -709,7 +709,7 @@ T_TUNIF="$(link_iface "$T_NAME")"
 T_TUNLOCAL="10.10.10.1/24"; T_TUNPEER="10.10.10.2/24"; T_TUNMTU=1400
 T_FORWARDS='"443"'
 gre_file="$(cfg_save)"
-check "the config is written"   "$(basename "$gre_file")"                 "tun-iran-gre.toml"
+check "the config is written"   "$(basename "$gre_file")"                 "iran-tun-gre.toml"
 check "with no status endpoint" "$(toml_get "$gre_file" status addr)"     ""
 check "the ttl is recorded"     "$(toml_get "$gre_file" gre ttl)"         "255"
 check "and both addresses"      "$(toml_get "$gre_file" gre peer_public)" "198.51.100.4"
@@ -729,9 +729,9 @@ T_KIND="$TOK_KIND"; T_TRANSPORT="$TOK_TR"; T_MODE="$TOK_MODE"; T_FORWARDER="$TOK
 T_TOKEN="$TOK_TOKEN"; T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
 T_GRE_TTL="$TOK_TTL"; T_PEER_IP="$TOK_HOST"
 T_ROLE="client"; T_ACCEPTS="server"; T_PUBLIC_IP="198.51.100.4"
-T_NAME="tun-kharej-gre"; T_TUNIF="$(link_iface "$T_NAME")"
+T_NAME="kharej-tun-gre"; T_TUNIF="$(link_iface "$T_NAME")"
 kh_file="$(cfg_save)"
-check "the far end writes too"   "$(basename "$kh_file")"                   "tun-kharej-gre.toml"
+check "the far end writes too"   "$(basename "$kh_file")"                   "kharej-tun-gre.toml"
 check "its own address"          "$(toml_get "$kh_file" gre local_public)"  "198.51.100.4"
 check "and ours as the peer"     "$(toml_get "$kh_file" gre peer_public)"   "203.0.113.9"
 check "its end of the link"      "$(toml_get "$kh_file" tun local_addr)"    "10.10.10.2/24"
@@ -741,10 +741,10 @@ check "no ports over there"      "$(grep -c '^ports' "$kh_file")"           "0"
 UNIT_DIR="$WORK/units"; mkdir -p "$UNIT_DIR"
 (
     systemctl() { :; }
-    cfg_load tun-iran-gre >/dev/null 2>&1
-    write_link_unit tun-iran-gre
+    cfg_load iran-tun-gre >/dev/null 2>&1
+    write_link_unit iran-tun-gre
 )
-gre_unit="$UNIT_DIR/pingify@tun-iran-gre.service"
+gre_unit="$UNIT_DIR/pingify@iran-tun-gre.service"
 check "a unit is written"          "$([ -f "$gre_unit" ] && echo y)"                    "y"
 check "it builds the tunnel"       "$(grep -c 'ip tunnel add gre-iran mode gre' "$gre_unit")" "1"
 check "from both addresses"        "$(grep -c 'local 203.0.113.9 remote 198.51.100.4' "$gre_unit")" "1"
@@ -780,7 +780,7 @@ check "and never collide with real wireguard" "$([ "$h1" -gt 4 ] && echo y)" "y"
 
 AWG_DIR="$WORK/awg"
 cfg_reset
-T_NAME="tun-iran-awg"; T_ROLE="server"; T_TRANSPORT="awg"; cfg_mode
+T_NAME="iran-tun-awg"; T_ROLE="server"; T_TRANSPORT="awg"; cfg_mode
 T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"; T_TOKEN="$TOKEN"
 T_TUNIF="$(link_iface "$T_NAME")"
 T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_TUNMTU=1320
@@ -813,7 +813,7 @@ T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
 T_AWG_PORT="$TOK_AWGPORT"; T_AWG_PRIV="$TOK_AWGPRIV"; T_AWG_PUB="$TOK_AWGPUB"
 T_AWG_OBF="$TOK_AWGOBF"; T_PEER_IP="$TOK_HOST"
 T_ROLE="client"; T_ACCEPTS="server"
-T_NAME="tun-kharej-awg"; T_TUNIF="$(link_iface "$T_NAME")"
+T_NAME="kharej-tun-awg"; T_TUNIF="$(link_iface "$T_NAME")"
 awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
 kc="$(awg_conf_path "$T_TUNIF")"
 check "KHAREJ gets the other key"  "$(grep -c 'PrivateKey = PRIV2' "$kc")"     "1"
@@ -997,7 +997,7 @@ STA="$WORK/state"; mkdir -p "$STA"
     # a tunnel already here, which apply_nat will read
     cfg_reset
     T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
-    T_NAME="tun-iran-icmp"; T_TOKEN="somebody-elses"; T_PUBLIC_IP="203.0.113.9"
+    T_NAME="iran-tun-icmp"; T_TOKEN="somebody-elses"; T_PUBLIC_IP="203.0.113.9"
     T_PEER_IP="198.51.100.4"; T_TUNLOCAL="10.99.10.1/24"; T_TUNPEER="10.99.10.2/24"
     T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"; T_FORWARDER="iptables"
     cfg_save >/dev/null
@@ -1019,7 +1019,7 @@ STA="$WORK/state"; mkdir -p "$STA"
 ) > "$WORK/state.out" 2>&1
 st() { grep -m1 "^$1=" "$WORK/state.out" | cut -d= -f2-; }
 
-check "the name survives"        "$(st name)"    "tun-iran-gre"
+check "the name survives"        "$(st name)"    "iran-tun-gre"
 check "the private link too"     "$(st net)"     "10.20.10.1/24"
 check "and the secret"           "$(st token)"   "mine"
 check "so the token is its own"  "$(st carried)" "10.20.10.2/24"
@@ -1033,9 +1033,9 @@ note "one name, derived one way"
 nm() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT="${3:-9443}"; tunnel_default_name ); }
 check "tcp is named for its port" "$(nm server tcp 9443)"  "iran-9443"
 check "on the other side too"     "$(nm client tcp 9443)"  "kharej-9443"
-check "icmp wears the label"      "$(nm server icmp)"      "tun-iran-icmp"
-check "gre as well"               "$(nm server gre)"       "tun-iran-gre"
-check "and awg"                   "$(nm client awg)"       "tun-kharej-awg"
+check "icmp wears the label"      "$(nm server icmp)"      "iran-tun-icmp"
+check "gre as well"               "$(nm server gre)"       "iran-tun-gre"
+check "and awg"                   "$(nm client awg)"       "kharej-tun-awg"
 check "no port sneaks into a udp tunnel" \
       "$(printf '%s' "$(nm server awg)" | grep -c 9443)" "0"
 check "both callers use the one function" \
@@ -1069,7 +1069,7 @@ awg() {
     esac
 }
 cfg_reset
-T_NAME="tun-iran-awg"; T_ROLE="server"; T_TRANSPORT="awg"; cfg_mode
+T_NAME="iran-tun-awg"; T_ROLE="server"; T_TRANSPORT="awg"; cfg_mode
 T_TOKEN="a-real-secret"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
 T_TUNIF="$(link_iface "$T_NAME")"
 T_TUNLOCAL="10.40.10.1/24"; T_TUNPEER="10.40.10.2/24"; T_TUNMTU=1320
@@ -1086,12 +1086,12 @@ check "and it never enters the token" \
 
 UNIT_DIR="$WORK/units2"; mkdir -p "$UNIT_DIR"
 cfg_reset
-T_NAME="tun-iran-gre"; T_ROLE="server"; T_TRANSPORT="gre"; cfg_mode
+T_NAME="iran-tun-gre"; T_ROLE="server"; T_TRANSPORT="gre"; cfg_mode
 T_TOKEN="a-real-secret"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
 T_TUNIF="$(link_iface "$T_NAME")"
 T_TUNLOCAL="10.41.10.1/24"; T_TUNPEER="10.41.10.2/24"; T_TUNMTU=1400
-( systemctl() { :; }; write_link_unit tun-iran-gre )
-gu="$UNIT_DIR/pingify@tun-iran-gre.service"
+( systemctl() { :; }; write_link_unit iran-tun-gre )
+gu="$UNIT_DIR/pingify@iran-tun-gre.service"
 if [ -x "$CORE_BIN" ]; then
     want_gre="$("$CORE_BIN" -derivekey "a-real-secret" | awk '{print $2}')"
     check "gre stamps the derived key" "$(grep -c "key $want_gre" "$gu")" "1"
@@ -1148,9 +1148,9 @@ DEV="$WORK/dev"; mkdir -p "$DEV"
     CFG_DIR="$DEV"
     have() { case "$1" in ip | ss | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
     nmi() { ( T_ROLE="$1"; T_TRANSPORT="$2"; link_iface "$3" ); }
-    echo "icmp=$(nmi server icmp tun-iran-icmp)"
-    echo "gre=$(nmi server gre tun-iran-gre)"
-    echo "awg=$(nmi client awg tun-kharej-awg)"
+    echo "icmp=$(nmi server icmp iran-tun-icmp)"
+    echo "gre=$(nmi server gre iran-tun-gre)"
+    echo "awg=$(nmi client awg kharej-tun-awg)"
 
     mkd() {
         cfg_reset
@@ -1162,11 +1162,11 @@ DEV="$WORK/dev"; mkdir -p "$DEV"
         cfg_save >/dev/null
     }
     T_TRANSPORT="icmp"
-    echo "first=$(free_tun_iface tun-iran-icmp)"
-    mkd tun-iran-icmp icmp-iran 10
-    echo "second=$(free_tun_iface tun-iran-icmp)"
+    echo "first=$(free_tun_iface iran-tun-icmp)"
+    mkd iran-tun-icmp icmp-iran 10
+    echo "second=$(free_tun_iface iran-tun-icmp)"
     echo "owner=$(iface_owner icmp-iran)"
-    echo "own=$(iface_owner icmp-iran tun-iran-icmp)"
+    echo "own=$(iface_owner icmp-iran iran-tun-icmp)"
     echo "spare=$(iface_owner icmp-nobody)"
 ) > "$WORK/dev.out" 2>&1
 dv() { grep -m1 "^$1=" "$WORK/dev.out" | cut -d= -f2-; }
@@ -1175,7 +1175,7 @@ check "and a gre one"                   "$(dv gre)"    "gre-iran"
 check "and an awg one, on its own side" "$(dv awg)"    "awg-kharej"
 check "the name is offered when free"   "$(dv first)"  "icmp-iran"
 check "and counted up when taken"       "$(dv second)" "icmp-iran2"
-check "a taken device names its owner"  "$(dv owner)"  "tun-iran-icmp"
+check "a taken device names its owner"  "$(dv owner)"  "iran-tun-icmp"
 check "a tunnel may keep its own"       "$(dv own)"    ""
 check "an unused one is free"           "$(dv spare)"  ""
 check "the wizard refuses a taken device"       "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'iface_owner "')" "1"
@@ -1249,11 +1249,11 @@ note "ten tunnels of one kind stay in order"
 # Always, not only on a clash: ten tunnels where one is bare and nine are
 # numbered is not an order, it is an exception with nine examples.
 nmo() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=9443; tunnel_default_name "$3" ); }
-check "a gre tunnel carries its network"  "$(nmo server gre 10)"  "tun-iran-gre-10"
-check "and the next one"                  "$(nmo server gre 20)"  "tun-iran-gre-20"
-check "the far end reaches the same"      "$(nmo client gre 20)"  "tun-kharej-gre-20"
-check "icmp is named the same way"        "$(nmo server icmp 35)" "tun-iran-icmp-35"
-check "and awg"                           "$(nmo client awg 44)"  "tun-kharej-awg-44"
+check "a gre tunnel carries its network"  "$(nmo server gre 10)"  "iran-tun-gre-10"
+check "and the next one"                  "$(nmo server gre 20)"  "iran-tun-gre-20"
+check "the far end reaches the same"      "$(nmo client gre 20)"  "kharej-tun-gre-20"
+check "icmp is named the same way"        "$(nmo server icmp 35)" "iran-tun-icmp-35"
+check "and awg"                           "$(nmo client awg 44)"  "kharej-tun-awg-44"
 # TCP already had a shared number of its own - the port both ends agreed on
 check "tcp keeps its port"                "$(nmo server tcp 20)"  "iran-9443"
 
@@ -1267,12 +1267,12 @@ check "a hand-set network outside 10 has none" \
 
 # and the device follows the tunnel, with the transport not said twice
 dvo() { ( T_TRANSPORT="$1"; link_iface "$2" ); }
-check "the device carries it too"    "$(dvo gre tun-iran-gre-20)"     "gre-iran-20"
-check "on the far side"              "$(dvo gre tun-kharej-gre-35)"   "gre-kharej-35"
-check "and for icmp"                 "$(dvo icmp tun-iran-icmp-10)"   "icmp-iran-10"
+check "the device carries it too"    "$(dvo gre iran-tun-gre-20)"     "gre-iran-20"
+check "on the far side"              "$(dvo gre kharej-tun-gre-35)"   "gre-kharej-35"
+check "and for icmp"                 "$(dvo icmp iran-tun-icmp-10)"   "icmp-iran-10"
 check "the transport is not repeated" \
-      "$(printf '%s' "$(dvo gre tun-iran-gre-20)" | grep -c 'gre.*gre')" "0"
-long="$(dvo awg tun-kharej-awg-144)"
+      "$(printf '%s' "$(dvo gre iran-tun-gre-20)" | grep -c 'gre.*gre')" "0"
+long="$(dvo awg kharej-tun-awg-144)"
 check "and it still fits in fifteen"  "$([ "${#long}" -le 15 ] && echo y)" "y"
 
 # ---------------------------------------------------------------------------
@@ -1370,7 +1370,7 @@ check "nothing here touches an echo reply" \
 note "the table stays a table when a name gets long"
 # ---------------------------------------------------------------------------
 # The name column was a fixed 13 characters. The moment a name grew past that -
-# which it did as soon as the private network went into it, tun-iran-icmp-11 -
+# which it did as soon as the private network went into it, iran-tun-icmp-11 -
 # that row alone slid right and every column after it stopped lining up.
 lt() { awk '/^list_tunnels\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 tr_() { awk '/^tunnel_row\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
@@ -1399,7 +1399,7 @@ ALN="$WORK/align"; mkdir -p "$ALN"
         cfg_save >/dev/null
     }
     mka iran-9443 tcp 12
-    mka tun-iran-icmp-11 icmp 11
+    mka iran-tun-icmp-11 icmp 11
     list_tunnels
 ) 2>/dev/null | sed 's/\x1b\[[0-9;]*m//g' > "$WORK/align.out"
 
@@ -1638,8 +1638,8 @@ check "five protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5' Pingif
 # It carries ports like TCP does, so it is named and addressed like TCP
 nu() { ( T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443; tunnel_default_name ); }
 # a udp tunnel says so: tcp and udp can hold 9443 at the same time
-check "named for its port and protocol" "$(nu server)" "udp-iran-9443"
-check "on the far side too"             "$(nu client)" "udp-kharej-9443"
+check "named for its port and protocol" "$(nu server)" "iran-udp-9443"
+check "on the far side too"             "$(nu client)" "kharej-udp-9443"
 ep() { ( cfg_reset; T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443
          T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
          T_ACCEPTS="server"; cfg_endpoints
@@ -1694,7 +1694,7 @@ TPO="$WORK/tport"; mkdir -p "$TPO"
     echo "udp9443=$(tunnel_port_owner 9443 udp)"
     echo "tcp9443=$(tunnel_port_owner 9443 tcp)"
     echo "tcp9444=$(tunnel_port_owner 9444 tcp)"
-    echo "own=$(tunnel_port_owner 9443 udp udp-iran-9443)"
+    echo "own=$(tunnel_port_owner 9443 udp iran-udp-9443)"
     # a tunnel that dials binds nothing here, so it cannot be the owner
     cfg_reset
     T_ROLE="client"; T_TRANSPORT="tcp"; T_ACCEPTS="server"; cfg_mode
@@ -1705,7 +1705,7 @@ TPO="$WORK/tport"; mkdir -p "$TPO"
 ) > "$WORK/tport.out" 2>&1
 tp() { grep -m1 "^$1=" "$WORK/tport.out" | cut -d= -f2-; }
 
-check "a udp tunnel names itself"     "$(grep -m1 '^name=' "$WORK/tport.out" | cut -d= -f2-)" "udp-iran-9443"
+check "a udp tunnel names itself"     "$(grep -m1 '^name=' "$WORK/tport.out" | cut -d= -f2-)" "iran-udp-9443"
 check "and tcp keeps the plain name"  "$(grep '^name=' "$WORK/tport.out" | sed -n 2p | cut -d= -f2-)" "iran-9443"
 # What collides is the SOCKET, not the transport name. WS and WSS are HTTP
 # over TCP, so a plain TCP tunnel blocks a WS one on the same port - while a
@@ -1718,7 +1718,7 @@ check "awg binds udp"        "$(port_family awg)"  "udp"
 check "icmp binds no port"   "$(port_family icmp)" "none"
 check "and neither does gre" "$(port_family gre)"  "none"
 
-check "a taken udp port names its owner" "$(tp udp9443)" "udp-iran-9443"
+check "a taken udp port names its owner" "$(tp udp9443)" "iran-udp-9443"
 check "and the tcp one is separate"      "$(tp tcp9443)" "iran-9443"
 check "an unused port is free"           "$(tp tcp9444)" ""
 check "a tunnel may keep its own"        "$(tp own)"     ""
@@ -1782,13 +1782,93 @@ check "and ws under it"     "$(grep -c 'choice 7 "WS"' Pingify.sh)"  "1"
 
 # Each names itself, since several can hold 443 at once on one server
 nw() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=443; tunnel_default_name ); }
-check "a wss tunnel says so"  "$(nw server wss)" "wss-iran-443"
-check "and a ws one"          "$(nw client ws)"  "ws-kharej-443"
+check "a wss tunnel says so"  "$(nw server wss)" "iran-wss-443"
+check "and a ws one"          "$(nw client ws)"  "kharej-ws-443"
 check "tcp keeps the plain name" "$(nw server tcp)" "iran-443"
 
 # they carry a port, so the port question and its clash check must cover them
 wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the port question covers them" "$(wz | grep -c 'tcp | udp | ws | wss) has_port=1')" "1"
+
+# ---------------------------------------------------------------------------
+note "a name says which server first"
+# ---------------------------------------------------------------------------
+# Which end, then what it is, then which one of those. A list of tunnels is
+# read to find out which side you are looking at, and a name that leads with
+# the protocol sorts the two halves of one tunnel apart.
+nm() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT="${3:-9443}"; tunnel_default_name "${4:-}" ); }
+check "tcp is the plain case"   "$(nm server tcp 9443)"   "iran-9443"
+check "ws says so"              "$(nm server ws 9453)"    "iran-ws-9453"
+check "wss too"                 "$(nm client wss 9050)"   "kharej-wss-9050"
+check "and udp"                 "$(nm server udp 9443)"   "iran-udp-9443"
+check "gre leads with the side" "$(nm server gre 0 10)"   "iran-tun-gre-10"
+check "icmp as well"            "$(nm client icmp 0 11)"  "kharej-tun-icmp-11"
+check "and awg"                 "$(nm server awg 0 12)"   "iran-tun-awg-12"
+
+# The device keeps the protocol first: that is what ip link is read for.
+li() { ( T_TRANSPORT="$1"; link_iface "$2" ); }
+check "the device reads protocol first" "$(li gre iran-tun-gre)"        "gre-iran"
+check "with its network when it has one" "$(li gre iran-tun-gre-20)"    "gre-iran-20"
+check "and on the far side"             "$(li icmp kharej-tun-icmp-35)" "icmp-kharej-35"
+
+# ---------------------------------------------------------------------------
+note "a wizard can be left"
+# ---------------------------------------------------------------------------
+# Half a wizard is not a tunnel. Before this the only way out of twenty
+# questions was ctrl-c, which leaves the terminal to guess what happened.
+(
+    wiz_reset
+    ask v "anything" <<< "q"; echo "rc=$?"
+    echo "quit=$WIZ_QUIT"
+    # and every question after it returns without waiting for an answer
+    ask v2 "and this one" < /dev/null; echo "after=$?"
+    pick p2 "select" 1 2 3 < /dev/null; echo "pick=$?"
+    confirm_yes "sure?" < /dev/null; echo "confirm=$?"
+    wiz_end
+    echo "cleared=$WIZ_QUIT"
+) > "$WORK/quit.out" 2>&1
+qz() { grep -m1 "^$1=" "$WORK/quit.out" | cut -d= -f2-; }
+check "q ends the question"        "$(qz rc)"      "1"
+check "and marks the wizard done"  "$(qz quit)"    "1"
+check "the next one does not ask"  "$(qz after)"   "1"
+check "nor does a pick"            "$(qz pick)"    "1"
+check "nor a confirmation"         "$(qz confirm)" "1"
+check "and leaving clears it"      "$(qz cleared)" "0"
+
+# outside a wizard, q is just an answer - a token or a name may well be "q"
+(
+    wiz_end
+    ask v "anything" <<< "q"; echo "rc=$?"
+    echo "val=$v"
+) > "$WORK/noquit.out" 2>&1
+nq() { grep -m1 "^$1=" "$WORK/noquit.out" | cut -d= -f2-; }
+check "q outside a wizard answers" "$(nq rc)"  "0"
+check "and keeps the value"        "$(nq val)" "q"
+
+# a closed stdin is not an answer either. This used to spin: read failed, ask
+# returned success with nothing in it, and pick asked again.
+(
+    wiz_end
+    pick p3 "select" 1 2 3 < /dev/null
+    echo "eof_pick=$?"
+    ask v3 "anything" < /dev/null
+    echo "eof_ask=$?"
+) > "$WORK/eof.out" 2>&1
+ez() { grep -m1 "^$1=" "$WORK/eof.out" | cut -d= -f2-; }
+check "a closed stdin stops a pick" "$(ez eof_pick)" "1"
+check "and a question"              "$(ez eof_ask)"  "1"
+
+# every question in the wizard has to unwind, not just the first
+wzf() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
+# Asserted as an equality rather than a count, so a question added later is
+# covered without anybody remembering to come back here.
+check "every wizard question can be left"       "$(wzf | grep -cE '^\s*(ask|pick) ')"       "$(wzf | grep -cE '^\s*(ask|pick) .*wiz_end; return 0')"
+imf() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
+check "and every importer question too"       "$(imf | grep -cE '^\s*(ask|pick) ')"       "$(imf | grep -cE '^\s*(ask|pick) .*wiz_end; return 0')"
+# and there is at least one of each, or the check above passes on nothing
+check "the wizard does ask things"  "$([ "$(wzf | grep -cE '^\s*(ask|pick) ')" -gt 10 ] && echo yes)" "yes"
+check "and so does the importer"    "$([ "$(imf | grep -cE '^\s*(ask|pick) ')" -gt 1 ] && echo yes)" "yes"
+check "and the menu resets it"        "$(grep -c '1) new_tunnel; wiz_end ;;' Pingify.sh)" "1"
 
 # ---------------------------------------------------------------------------
 note "the token carries the port, whatever the transport"
