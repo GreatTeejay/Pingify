@@ -486,6 +486,15 @@ check "it reports the unbound port"    "$(grep -c 'nothing is listening on :6526
 # the failure marker is ASCII when the console is not talking UTF-8, so count
 # the problems off the summary line rather than matching the glyph
 hc_probs="$(grep -oE "[0-9]+ problem" "$HC" | head -1 | cut -d" " -f1)"
+# "nothing came back at all" and "a port could not be reached" are different
+# faults on different machines. Reported as one, the advice sent the reader to
+# check a listening socket that was listening perfectly well.
+hcp() { awk '/^health_check\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
+check "a one-way path is its own verdict" "$(hcp | grep -c 'rc" = "3"')" "1"
+check "and does not blame the service"    "$(hcp | grep -c 'nothing is coming back from the other server at all')" "1"
+check "a port failure still says so"      "$(hcp | grep -c 'did not reach the service on the other server')" "1"
+check "the core has a code for it"        "$(grep -c 'probeOneWay = 3' Pingify.sh)" "1"
+
 check "every failure has a fix"        "$hc_probs" "$(grep -c "fix:" "$HC")"
 check "and it counts them"             "$(grep -c 'problems' "$HC")"                 "1"
 
