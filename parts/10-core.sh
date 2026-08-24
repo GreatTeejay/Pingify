@@ -134,7 +134,7 @@ write_units() {
     cat > "$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
-Documentation=https://github.com/GreatTeejay/Pingify
+Documentation=https://github.com/GreatTeejay/pingfa
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0

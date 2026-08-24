@@ -3,7 +3,7 @@
 # update / remove
 # ---------------------------------------------------------------------------
 
-RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/Pingify/main"
+RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/pingfa/main"
 
 restart_all() {
     local n any=0

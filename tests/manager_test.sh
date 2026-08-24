@@ -1784,23 +1784,22 @@ note "WebSocket goes where the web goes"
 # what it is, and on a path that passes 80 and nothing else, none of them go
 # anywhere. This one is an HTTP request that becomes a WebSocket.
 #
-# WSS is not in the list. It was removed with the braided WS it was built on,
-# and comes back on top of the multiplexed one once that is proven in the
-# field - so nothing here should offer it in the meantime.
 check "ws has a label"      "$(transport_label ws)"  "WS"
-check "six protocols now"   "$(grep -c 'pick proto "select" 1 2 3 4 5 6' Pingify.sh)" "1"
-check "ws is offered"       "$(grep -c 'choice 6 "WS"' Pingify.sh)" "1"
-check "and wss is not"      "$(grep -c 'choice . "WSS"' Pingify.sh)" "0"
+check "wss has a label"     "$(transport_label wss)" "WSS"
+check "seven protocols now" "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7' Pingify.sh)" "1"
+check "wss is offered"      "$(grep -c 'choice 6 "WSS"' Pingify.sh)" "1"
+check "ws is offered"       "$(grep -c 'choice 7 "WS"' Pingify.sh)" "1"
 
 # Each names itself, since several can hold 443 at once on one server
 nw() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=443; tunnel_default_name ); }
 check "a ws tunnel says so"   "$(nw server ws)" "iran-ws-443"
 check "and a ws one"          "$(nw client ws)"  "kharej-ws-443"
+check "a wss tunnel says so"  "$(nw server wss)" "iran-wss-443"
 check "tcp keeps the plain name" "$(nw server tcp)" "iran-443"
 
 # they carry a port, so the port question and its clash check must cover them
 wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "the port question covers them" "$(wz | grep -c 'tcp | udp | ws) has_port=1')" "1"
+check "the port question covers them" "$(wz | grep -c 'tcp | udp | ws | wss) has_port=1')" "1"
 
 # ---------------------------------------------------------------------------
 note "a name says which server first"
@@ -1812,6 +1811,7 @@ nm() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT="${3:-9443}"; tunnel_default_name
 check "tcp is the plain case"   "$(nm server tcp 9443)"   "iran-9443"
 check "ws says so"              "$(nm server ws 9453)"    "iran-ws-9453"
 check "and on the other side"   "$(nm client ws 9050)"    "kharej-ws-9050"
+check "wss says so"             "$(nm client wss 443)"    "kharej-wss-443"
 check "and udp"                 "$(nm server udp 9443)"   "iran-udp-9443"
 check "gre leads with the side" "$(nm server gre 0 10)"   "iran-tun-gre-10"
 check "icmp as well"            "$(nm client icmp 0 11)"  "kharej-tun-icmp-11"
@@ -2037,14 +2037,14 @@ check "an edge says why it cannot help"       "$(ae2 | grep -c 'an address rathe
 # WS is not encrypted by itself and the screen has to say so, because the name
 # looks like WSS with one letter missing
 check "ws warns it is in the clear" "$(wz | grep -c 'WS is not encrypted by itself')" "1"
-check "and says WSS is coming back" "$(wz | grep -c 'WSS is being rebuilt on top of this one')" "1"
+check "and points to WSS"            "$(wz | grep -c 'Choose WSS when TLS or a CDN is available')" "1"
 
 # One connection is the whole point of the transport, so the wizard must not
 # offer a number that the core will then ignore, and the preset it lands on
 # must not leave sixteen behind either.
 pm() { awk '/^preset_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "ws is pinned to one"         "$(pm | grep -c 'T_TRANSPORT" = "ws" \] && T_CARRIERS=1')" "1"
-check "and the number is not asked" "$(pm | grep -c 'T_TRANSPORT" = "ws" \] ||')" "1"
+check "websockets are pinned to one" "$(pm | grep -c 'ws | wss) T_CARRIERS=1')" "1"
+check "and both skip the number"     "$(pm | grep -c 'T_TRANSPORT" = "wss"')" "1"
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
