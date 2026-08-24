@@ -70,13 +70,14 @@ cfg_load() {
         case "$c" in *:*) T_PORT="${c##*:}" ;; *) T_PEER_IP="$c" ;; esac
     fi
 
-    # ws and wss keep the name apart from the address, so connect holds
-    # whatever is dialled - the edge, when there is one. peer is written
-    # alongside it precisely so the server itself can be recovered here.
-    T_DOMAIN="$(toml_get "$f" transport host)"
-    T_EDGE="$(toml_get "$f" transport edge)"
-    local pr; pr="$(toml_get "$f" transport peer)"
-    [ -n "$pr" ] && T_PEER_IP="$pr"
+    # A WSS tunnel that dials an edge has the edge in connect and the name
+    # it presents in host - so host is the peer, and what connect gave us
+    # was the edge all along.
+    local hn; hn="$(toml_get "$f" transport host)"
+    if [ -n "$hn" ]; then
+        T_EDGE="$T_PEER_IP"
+        T_PEER_IP="$hn"
+    fi
     return 0
 }
 

@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.23.0"
+PINGIFY_VERSION="5.23.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -890,11 +890,9 @@ cfg_reset() {
     T_PORT=9443          # the tunnel's own port, TCP only
     T_ACCEPTS="server"   # reverse: IRAN accepts, KHAREJ comes to it
     T_PUBLIC_IP=""; T_PEER_IP=""
-    # ws and wss only: the name presented (the TLS SNI and the HTTP Host
-    # header) and, separately, the address dialled to reach it. A CDN routes
-    # on the name, so the two need not be the same - and the whole point of
-    # an edge is that they are not.
-    T_DOMAIN=""; T_EDGE=""
+    # wss only, and optional: an address to dial instead of the peer, for
+    # a connection that must not be seen going to the peer at all.
+    T_EDGE=""
     T_CARRIERS=16; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
@@ -973,50 +971,67 @@ link_octet() {
     return 1
 }
 
-# A CDN proxies a fixed set of ports and nothing else. On any other port an
-# orange-clouded record simply does not arrive, which looks exactly like a
-# tunnel that will not start - so it is worth saying before it is built.
-cdn_ports() {
+# ---------------------------------------------------------------------------
+# WSS behind a CDN
+#
+# Nothing here is a new field. The IRAN server is asked for its address as
+# always, and for WSS that address is a domain - so the domain travels in
+# the token like any other address, both ends dial and present the same
+# name, and the config says it once, in connect.
+#
+# The one thing that is genuinely extra is an edge: an address to dial that
+# is not the peer. The name still travels, so the CDN still routes it home;
+# only the address changes, and it never names the IRAN server.
+# ---------------------------------------------------------------------------
+
+# is_name - a hostname rather than an address. Only a name can be routed on:
+# TLS carries no SNI for an IP literal, so a CDN handed one has nothing to
+# look at and an edge would be pointless.
+is_name() {
     case "$1" in
-        wss) printf '443 2053 2083 2087 2096 8443' ;;
-        *)   printf '80 8080 8880 2052 2082 2086 2095' ;;
+        "" | *:*) return 1 ;;
+        *[!0-9.]*) return 0 ;;
     esac
+    return 1
 }
 
+# A CDN proxies these ports and no others. On any other one a proxied record
+# never reaches the server at all, which looks exactly like a tunnel that
+# will not start - so it is worth saying before it is built.
+cdn_ports() { printf '443 2053 2083 2087 2096 8443'; }
+
 cdn_port_ok() {
-    case " $(cdn_ports "$2") " in
+    case " $(cdn_ports) " in
         *" $1 "*) return 0 ;;
     esac
     return 1
 }
 
-# ask_edge is asked only on the end that dials, and only once a domain is
-# known - without one there is nothing for the edge to present, and the
-# connection would arrive at the CDN with no name to route on.
-ask_edge() {
-    [ -n "$T_DOMAIN" ] || return 0
-    say ""
-    head2 "Edge address"
-    dim "This end presents ${C_OFF}${T_DOMAIN}${C_DIM} whatever address it dials, so a"
-    dim "CDN still routes it to the right place. An edge address is simply"
-    dim "a different way in: somewhere cheap or unfiltered from here, that"
-    dim "never names the IRAN server."
-    say ""
-    ask T_EDGE "edge address to dial, blank to dial the domain" "$T_EDGE"
-}
-
-# cdn_port_warn says so before the tunnel is built rather than after it
-# fails, because the failure is silent: the packets simply never arrive.
 cdn_port_warn() {
-    [ -n "$T_DOMAIN" ] || return 0
-    cdn_port_ok "$T_PORT" "$T_TRANSPORT" && return 0
+    [ "$T_TRANSPORT" = "wss" ] || return 0
+    is_name "$T_PEER_IP" || return 0
+    cdn_port_ok "$T_PORT" && return 0
     say ""
     warn "a CDN does not proxy port $T_PORT"
-    dim "behind Cloudflare, $T_TRANSPORT arrives on these and no others:"
-    dim "  $(cdn_ports "$T_TRANSPORT")"
-    dim "on any other port a proxied record never reaches this server at all,"
+    dim "behind Cloudflare, WSS arrives on these and no others:"
+    dim "  $(cdn_ports)"
+    dim "on any other port a proxied record never reaches this server,"
     dim "which looks exactly like a tunnel that will not start"
     return 0
+}
+
+# ask_edge - only WSS, only the end that dials, and only when the peer is a
+# name. Everything else has nothing for the CDN to route on.
+ask_edge() {
+    [ "$T_TRANSPORT" = "wss" ] || return 0
+    is_name "$T_PEER_IP" || return 0
+    say ""
+    head2 "Edge address"
+    dim "Optional. This end presents ${C_OFF}${T_PEER_IP}${C_DIM} whatever it dials, so"
+    dim "a CDN still routes it to the right place. An edge is only a different"
+    dim "way in - one that never names the IRAN server."
+    say ""
+    ask T_EDGE "edge address to dial, blank to dial ${T_PEER_IP}" "$T_EDGE"
 }
 
 # listen and connect are derived, never stored anywhere shared: they are the
@@ -1034,16 +1049,10 @@ cfg_endpoints() {
         if [ "$T_TRANSPORT" = "icmp" ]; then
             CFG_CONNECT="$T_PEER_IP"
         else
-            # What gets dialled. For ws and wss that is the edge when there
-            # is one, because the name travels separately - see cfg_render,
-            # which writes it as host. Everything else dials the server.
+            # The peer address, which for WSS is the domain - or the edge,
+            # on the one tunnel that asks for one.
             local target="$T_PEER_IP"
-            case "$T_TRANSPORT" in
-                ws | wss)
-                    [ -n "$T_DOMAIN" ] && target="$T_DOMAIN"
-                    [ -n "$T_EDGE" ] && target="$T_EDGE"
-                    ;;
-            esac
+            [ "$T_TRANSPORT" = "wss" ] && [ -n "$T_EDGE" ] && target="$T_EDGE"
             CFG_CONNECT="$target:$T_PORT"
         fi
     fi
@@ -1193,20 +1202,11 @@ cfg_render() {
     printf 'type             = "%s"\n' "$T_TRANSPORT"
     [ -n "$listen" ]  && printf 'listen           = "%s"\n' "$listen"
     [ -n "$connect" ] && printf 'connect          = "%s"\n' "$connect"
-    case "$T_TRANSPORT" in
-        ws | wss)
-            # host is the name presented on the wire. The core prefers it
-            # over the address, which is what lets a carrier reach an edge
-            # and still arrive at the right origin.
-            [ -n "$T_DOMAIN" ] && printf 'host             = "%s"\n' "$T_DOMAIN"
-            # edge and peer are for the manager alone - the core ignores
-            # keys it does not know. Without them an edge tunnel could not
-            # be read back, because connect holds the edge, not the server.
-            [ -n "$T_EDGE" ] && printf 'edge             = "%s"\n' "$T_EDGE"
-            [ -n "$T_DOMAIN" ] && [ -n "$T_PEER_IP" ] &&
-                printf 'peer             = "%s"\n' "$T_PEER_IP"
-            ;;
-    esac
+    # connect already holds the name, so nothing else is needed - except on
+    # the one tunnel that dials an edge instead. There, connect holds the
+    # edge, and host says which name to present when it gets there.
+    [ "$T_TRANSPORT" = "wss" ] && [ -n "$T_EDGE" ] && [ -n "$T_PEER_IP" ] &&
+        printf 'host             = "%s"\n' "$T_PEER_IP"
     printf 'carriers         = %s\n' "$T_CARRIERS"
     printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
     printf 'obfuscate        = %s\n' "$T_OBFUSCATE"
@@ -1348,7 +1348,7 @@ transport_label() {
 # ---------------------------------------------------------------------------
 
 cfg_setup_token() {
-    local dial host="" port="" tl="" tp="" mtu="" dom=""
+    local dial host="" port="" tl="" tp="" mtu=""
     local ttl="" awgport="" awgpriv="" awgpub="" awgobf=""
     if this_side_accepts; then
         dial=1; host="$T_PUBLIC_IP"
@@ -1362,9 +1362,6 @@ cfg_setup_token() {
     # in a field further along.
     case "$(port_family "$T_TRANSPORT")" in
         tcp | udp) port="$T_PORT" ;;
-    esac
-    case "$T_TRANSPORT" in
-        ws | wss) dom="$T_DOMAIN" ;;
     esac
     if [ "$T_MODE" = "tun" ] || [ "$T_MODE" = "both" ]; then
         local pfx="${T_TUNLOCAL##*/}"
@@ -1386,12 +1383,12 @@ cfg_setup_token() {
             awgobf="$T_AWG_OBF"
         fi
     fi
-    printf 'p3|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    printf 'p3|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$T_KIND" "$T_TRANSPORT" "$T_MODE" "$T_FORWARDER" \
         "$dial" "$host" "$port" "$T_TOKEN" \
         "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
         "$tl" "$tp" "$mtu" \
-        "$ttl" "$awgport" "$awgpriv" "$awgpub" "$awgobf" "$dom" \
+        "$ttl" "$awgport" "$awgpriv" "$awgpub" "$awgobf" \
         | base64 | tr -d '\n'
 }
 
@@ -1415,8 +1412,8 @@ import_tunnel() {
     # p3 added the five kernel-tunnel fields on the end. A p2 token simply
     # leaves them empty, which is what it meant.
     local v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu
-    local ttl awgport awgpriv awgpub awgobf dom
-    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu ttl awgport awgpriv awgpub awgobf dom <<TOKEN
+    local ttl awgport awgpriv awgpub awgobf
+    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu ttl awgport awgpriv awgpub awgobf <<TOKEN
 $raw
 TOKEN
     if [ -z "$tok" ] || [ -z "$tr" ]; then
@@ -1428,7 +1425,6 @@ TOKEN
     server_info
     T_KIND="$kind"; T_TRANSPORT="$tr"; T_MODE="$mode"; T_FORWARDER="$fwd"
     T_TOKEN="$tok"; T_PORT="${port:-9443}"
-    T_DOMAIN="$dom"
     T_CARRIERS="$car"; T_WINDOW="$win"; T_KEEPALIVE="$ka"
     T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
     T_PRESET="$(preset_name "$car" "$win")"
@@ -1496,8 +1492,7 @@ TOKEN
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
     field "Address" "$(addr_tint "$T_PUBLIC_IP")"
-    [ -n "$T_DOMAIN" ] && field "Domain" "$(addr_tint "$T_DOMAIN")"
-    [ -n "$T_EDGE" ] && field "Edge" "$(addr_tint "$T_EDGE") ${BX_ARR} presents $T_DOMAIN"
+    [ -n "$T_EDGE" ] && field "Edge" "$(addr_tint "$T_EDGE") ${BX_ARR} presents $T_PEER_IP"
     field "Protocol" "$(transport_label "$T_TRANSPORT")"
     field "Forwarder" "$(forwarder_label "$T_FORWARDER")"
     if [ -n "$CFG_LISTEN" ]; then
@@ -1691,6 +1686,13 @@ new_tunnel() {
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
     say ""
+    if [ "$T_TRANSPORT" = "wss" ] && ! this_side_accepts; then
+        # Behind a CDN the domain is the address: it is what gets dialled,
+        # what the certificate is for, and what the CDN routes on. There is
+        # no second field for it.
+        dim "for WSS behind Cloudflare, give the domain here, not the address"
+        say ""
+    fi
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
@@ -1725,21 +1727,8 @@ new_tunnel() {
         done
         this_side_accepts && dim "leave ${T_PORT}/$(port_family "$T_TRANSPORT") open in this server's firewall"
     fi
-    case "$T_TRANSPORT" in
-        ws | wss)
-            # The name on the wire, which is not the same thing as the
-            # address. Both ends must agree on it, so the accepting end is
-            # asked and the other end reads it out of the token.
-            wiz "Domain"
-            dim "A domain pointed at the IRAN server, if there is one. It becomes"
-            dim "the name on the wire - the TLS SNI and the Host header - and that"
-            dim "is what a CDN routes on. Blank uses the address itself."
-            say ""
-            ask T_DOMAIN "domain for this tunnel, blank for none" "$T_DOMAIN"
-            cdn_port_warn
-            this_side_accepts || ask_edge
-            ;;
-    esac
+    cdn_port_warn
+    this_side_accepts || ask_edge
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
         ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT"
@@ -1950,8 +1939,7 @@ new_tunnel() {
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
     field "Address" "$(addr_tint "$T_PUBLIC_IP")"
-    [ -n "$T_DOMAIN" ] && field "Domain" "$(addr_tint "$T_DOMAIN")"
-    [ -n "$T_EDGE" ] && field "Edge" "$(addr_tint "$T_EDGE") ${BX_ARR} presents $T_DOMAIN"
+    [ -n "$T_EDGE" ] && field "Edge" "$(addr_tint "$T_EDGE") ${BX_ARR} presents $T_PEER_IP"
     if [ "$T_KIND" = "tun" ]; then
         field "Type" "TUN over $(transport_label "$T_TRANSPORT")"
     else
@@ -3345,13 +3333,14 @@ cfg_load() {
         case "$c" in *:*) T_PORT="${c##*:}" ;; *) T_PEER_IP="$c" ;; esac
     fi
 
-    # ws and wss keep the name apart from the address, so connect holds
-    # whatever is dialled - the edge, when there is one. peer is written
-    # alongside it precisely so the server itself can be recovered here.
-    T_DOMAIN="$(toml_get "$f" transport host)"
-    T_EDGE="$(toml_get "$f" transport edge)"
-    local pr; pr="$(toml_get "$f" transport peer)"
-    [ -n "$pr" ] && T_PEER_IP="$pr"
+    # A WSS tunnel that dials an edge has the edge in connect and the name
+    # it presents in host - so host is the peer, and what connect gave us
+    # was the edge all along.
+    local hn; hn="$(toml_get "$f" transport host)"
+    if [ -n "$hn" ]; then
+        T_EDGE="$T_PEER_IP"
+        T_PEER_IP="$hn"
+    fi
     return 0
 }
 
@@ -7180,7 +7169,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.23.0"
+const version = "5.23.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
