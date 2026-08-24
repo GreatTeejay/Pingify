@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.24.0"
+PINGIFY_VERSION="5.24.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -7213,7 +7213,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.24.0"
+const version = "5.24.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -9859,9 +9859,34 @@ func flowHash(pkt []byte) uint32 {
 // tuneSocket applies the settings that actually move the needle on a
 // long-haul, lossy Iran<->Kharej path: no Nagle delay on the carrier, and
 // socket buffers big enough to hold a full bandwidth-delay product.
+// baseTCP walks down to the socket under whatever is wrapping it.
+//
+// A carrier is not always a bare socket. A ws carrier is framing over a
+// socket; a wss carrier is framing over TLS over a socket. A plain type
+// assert saw neither, so every ws and wss carrier ran with Nagle on - up to
+// forty milliseconds of hesitation before a small write leaves - with no
+// keepalive and with the tuning's socket buffers silently ignored, while the
+// tcp transport got all three.
+func baseTCP(c net.Conn) *net.TCPConn {
+	for i := 0; i < 4 && c != nil; i++ {
+		if tc, ok := c.(*net.TCPConn); ok {
+			return tc
+		}
+		switch v := c.(type) {
+		case interface{ netConn() net.Conn }: // our own framing
+			c = v.netConn()
+		case interface{ NetConn() net.Conn }: // *tls.Conn
+			c = v.NetConn()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func tuneSocket(c net.Conn, cfg *Config) {
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
+	tc := baseTCP(c)
+	if tc == nil {
 		return
 	}
 	tc.SetNoDelay(true)
@@ -11020,6 +11045,28 @@ const (
 // The close frame's status code: 1000, a normal end.
 var wsCloseNormal = []byte{0x03, 0xE8}
 
+// wsMask XORs src into dst with the frame's key, eight bytes at a time.
+//
+// A byte at a time is what this did, and on a full 128 KiB frame that is the
+// difference between microseconds and tens of them - per frame, on every frame
+// the client sends, on a link carrying video. Both gorilla and coder do it
+// this way for the same reason. dst and src may be the same slice, which is
+// how the reader unmasks in place.
+func wsMask(dst, src []byte, key [4]byte) {
+	var k [8]byte
+	copy(k[0:4], key[:])
+	copy(k[4:8], key[:])
+	kw := binary.LittleEndian.Uint64(k[:])
+	n := len(src)
+	i := 0
+	for ; i+8 <= n; i += 8 {
+		binary.LittleEndian.PutUint64(dst[i:], binary.LittleEndian.Uint64(src[i:])^kw)
+	}
+	for ; i < n; i++ {
+		dst[i] = src[i] ^ key[i&3]
+	}
+}
+
 // wsConn is a net.Conn over RFC 6455 frames. The braid above it sees a byte
 // stream and never learns there is framing underneath.
 //
@@ -11049,6 +11096,11 @@ type wsConn struct {
 	// See writeControl.
 	wmu  chan struct{}
 	wbuf []byte // one frame, header and payload, reused
+
+	// The deadline the layer above last asked for, so that a control frame
+	// can put its own on for the length of one write and then hand it back.
+	dmu sync.Mutex
+	wdl time.Time
 
 	rmu   sync.Mutex
 	rest  []byte // what is left of the frame last read
@@ -11102,7 +11154,12 @@ func (w *wsConn) Read(p []byte) (int, error) {
 			w.rest = f.payload
 		case wsOpPing:
 			// Best effort: see writeControl for why this must not block.
-			w.writeControl(wsOpPong, f.payload)
+			// Said out loud when it fails, because a peer that pings and
+			// hears nothing back hangs up at its own idle timeout, and that
+			// looked from here like the far end simply going away.
+			if err := w.writeControl(wsOpPong, f.payload); err != nil {
+				logDebug("ws: could not answer a ping: %v", err)
+			}
 		case wsOpPong:
 			// Nothing asked for it and nothing is waiting on it.
 		case wsOpClose:
@@ -11211,9 +11268,7 @@ func (w *wsConn) readFrame() (wsFrame, error) {
 		return f, err
 	}
 	if masked {
-		for i := range body {
-			body[i] ^= key[i&3]
-		}
+		wsMask(body, body, key)
 	}
 	f.payload = body
 	return f, nil
@@ -11270,9 +11325,9 @@ func (w *wsConn) frameOut(op byte, payload []byte) error {
 			return err
 		}
 		b = append(b, key[:]...)
-		for i := 0; i < n; i++ {
-			b = append(b, payload[i]^key[i&3])
-		}
+		at := len(b)
+		b = b[:at+n]
+		wsMask(b[at:], payload, key)
 	}
 
 	_, err := w.c.Write(b)
@@ -11304,7 +11359,18 @@ func (w *wsConn) writeControl(op byte, payload []byte) error {
 		}
 	}
 	defer func() { <-w.wmu }()
-	return w.frameOut(op, payload)
+
+	// The write deadline belongs to whatever the braid last set for its own
+	// writes, and on an idle carrier that moment is long past - a pong sent
+	// under it fails instantly with i/o timeout. Put a deadline of our own on
+	// for this one write and give the old one back after.
+	w.dmu.Lock()
+	prev := w.wdl
+	w.dmu.Unlock()
+	w.c.SetWriteDeadline(time.Now().Add(wsControlWait))
+	err := w.frameOut(op, payload)
+	w.c.SetWriteDeadline(prev)
+	return err
 }
 
 func (w *wsConn) Close() error {
@@ -11317,11 +11383,26 @@ func (w *wsConn) Close() error {
 	return w.c.Close()
 }
 
-func (w *wsConn) LocalAddr() net.Addr                { return w.c.LocalAddr() }
-func (w *wsConn) RemoteAddr() net.Addr               { return w.c.RemoteAddr() }
-func (w *wsConn) SetDeadline(t time.Time) error      { return w.c.SetDeadline(t) }
-func (w *wsConn) SetReadDeadline(t time.Time) error  { return w.c.SetReadDeadline(t) }
-func (w *wsConn) SetWriteDeadline(t time.Time) error { return w.c.SetWriteDeadline(t) }
+// netConn is the socket under the framing. tuneSocket walks down to it to
+// turn Nagle off and put the tuning's buffers on; without a way through, a
+// carrier that is framing over a socket looked like neither.
+func (w *wsConn) netConn() net.Conn { return w.c }
+
+func (w *wsConn) LocalAddr() net.Addr  { return w.c.LocalAddr() }
+func (w *wsConn) RemoteAddr() net.Addr { return w.c.RemoteAddr() }
+func (w *wsConn) SetDeadline(t time.Time) error {
+	w.dmu.Lock()
+	w.wdl = t
+	w.dmu.Unlock()
+	return w.c.SetDeadline(t)
+}
+func (w *wsConn) SetReadDeadline(t time.Time) error { return w.c.SetReadDeadline(t) }
+func (w *wsConn) SetWriteDeadline(t time.Time) error {
+	w.dmu.Lock()
+	w.wdl = t
+	w.dmu.Unlock()
+	return w.c.SetWriteDeadline(t)
+}
 
 // ---------------------------------------------------------------------------
 // the handshake
@@ -11376,9 +11457,29 @@ func wsDial(addr, host, path string, useTLS bool, timeout time.Duration) (net.Co
 		return nil, err
 	}
 
+	// The dial timeout covered the TCP connect, and for TLS it covered the
+	// handshake too - but nothing covered the answer. A server that accepts
+	// the connection and then says nothing parked this goroutine for good:
+	// every carrier stuck in the same place, "0 of 16", and not one line in
+	// the log to say why, because the dial loop only reports what returns.
+	//
+	// Which is exactly what a CDN does on a port it does not proxy.
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+		c.Close()
+		return nil, err
+	}
 	br := bufio.NewReaderSize(c, 32*1024)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
+		c.Close()
+		return nil, fmt.Errorf("ws: no answer to the upgrade: %v", err)
+	}
+	// The carrier lives for hours after this; the deadline was for the
+	// handshake alone.
+	if err := c.SetReadDeadline(time.Time{}); err != nil {
 		c.Close()
 		return nil, err
 	}
