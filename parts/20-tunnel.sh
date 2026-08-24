@@ -167,14 +167,25 @@ cdn_port_warn() {
 # name. Everything else has nothing for the CDN to route on.
 ask_edge() {
     [ "$T_TRANSPORT" = "wss" ] || return 0
-    is_name "$T_PEER_IP" || return 0
     say ""
     head2 "Edge address"
-    dim "Optional. This end presents ${C_OFF}${T_PEER_IP}${C_DIM} whatever it dials, so"
-    dim "a CDN still routes it to the right place. An edge is only a different"
-    dim "way in - one that never names the IRAN server."
+    if ! is_name "$T_PEER_IP"; then
+        # An edge presents the peer's name to the CDN. When the peer is a bare
+        # address there is no name, TLS sends no SNI for one, and the CDN has
+        # nothing to route on - so there is nothing an edge could do here.
+        dim "The IRAN server is ${C_OFF}${T_PEER_IP}${C_DIM}, an address rather than a name."
+        dim "An edge only works when there is a domain to present to the CDN,"
+        dim "so this tunnel goes straight there. Rebuild the IRAN end with a"
+        dim "domain if you want a CDN in front."
+        say ""
+        return 0
+    fi
+    dim "Optional. This end presents ${C_OFF}${T_PEER_IP}${C_DIM} whatever address it"
+    dim "dials, so a CDN still routes it to the right place. An edge is only a"
+    dim "different way in - one that never names the IRAN server."
     say ""
     ask T_EDGE "edge address to dial, blank to dial ${T_PEER_IP}" "$T_EDGE"
+    cdn_port_warn
 }
 
 # listen and connect are derived, never stored anywhere shared: they are the
@@ -606,9 +617,9 @@ TOKEN
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
     # The domain came in the token, so this end never types it and the two
-    # ends cannot disagree about it. What is local to this server is which
-    # way in it takes.
-    this_side_accepts && ask_edge
+    # ends cannot disagree about it. What is local to this server is which way
+    # in it takes - and this is the end that dials, so this is where to ask.
+    this_side_accepts || ask_edge
 
     # The ports live on IRAN, which already has them - there is nothing to ask
     # for here, and nothing on this side to answer with.
@@ -828,14 +839,26 @@ new_tunnel() {
         dim "this machine reports ${C_OFF}${SRV_IP}${C_DIM} - press enter to take it"
         say ""
     fi
-    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP" || { wiz_end; return 0; }
+    if [ "$T_TRANSPORT" = "wss" ] && this_side_accepts; then
+        # For WSS the domain is not a second field - it IS the address. It is
+        # what the far end dials, what the certificate is for, and the only
+        # thing a CDN routes on, and it travels in the token like any other
+        # address. Saying so here is the whole of it: this is the one place
+        # anybody types it, because the other end reads it out of the token.
+        say ""
+        dim "Behind Cloudflare, put the ${C_OFF}domain${C_DIM} here rather than the address."
+        dim "It is what the other end dials, what the certificate is made for,"
+        dim "and the only thing a CDN can route on. A bare address works too,"
+        dim "but then there is no CDN in front of it."
+        say ""
+        ask T_PUBLIC_IP "domain or address of this IRAN server" "$T_PUBLIC_IP" || { wiz_end; return 0; }
+    else
+        ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP" || { wiz_end; return 0; }
+    fi
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
     say ""
     if [ "$T_TRANSPORT" = "wss" ] && ! this_side_accepts; then
-        # Behind a CDN the domain is the address: it is what gets dialled,
-        # what the certificate is for, and what the CDN routes on. There is
-        # no second field for it.
         dim "for WSS behind Cloudflare, give the domain here, not the address"
         say ""
     fi
