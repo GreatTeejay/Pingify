@@ -243,6 +243,27 @@ func assign(c *Config, section, key, val string) error {
 	}
 
 	switch section {
+	case "", "kcp":
+		switch key {
+		case "data_shards", "fec_data":
+			err = num(&c.FECData)
+		case "parity_shards", "fec_parity":
+			err = num(&c.FECParity)
+		case "mtu", "packet_mtu":
+			err = num(&c.PacketMTU)
+		case "interval_ms", "kcp_interval_ms":
+			err = num(&c.KCPInterval)
+		}
+	}
+
+	switch section {
+	case "", "pck":
+		if key == "flags" || key == "pck_flags" {
+			c.PCKFlags = unquote(val)
+		}
+	}
+
+	switch section {
 	case "", "status":
 		if key == "addr" || key == "status_addr" {
 			c.StatusAddr = unquote(val)

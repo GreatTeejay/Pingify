@@ -32,6 +32,8 @@ cfg_reset() {
     T_EDGE=""
     T_CARRIERS=16; T_WINDOW=1024; T_KEEPALIVE=10; T_PRESET="balanced"
     T_SNDBUF=1024; T_RCVBUF=1024   # socket buffers, sized to hold a BDP
+    T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1200; T_KCP_INTERVAL=10
+    T_PCK_FLAGS="PA"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
@@ -42,6 +44,20 @@ cfg_reset() {
 }
 
 this_side_accepts() { [ "$T_ROLE" = "$T_ACCEPTS" ]; }
+
+# PCK has no kernel connection to allocate an ephemeral source port. Keep one
+# stable across reconnects, derived from the shared token, and away from the
+# service/privileged ranges. The core uses the same two SHA-256 bytes.
+pck_source_port() {
+    local tok="$1" remote="$2" hex n
+    hex="$(printf '%s' "$tok" | sha256sum | cut -c1-4)"
+    n=$((16#$hex))
+    n=$((20000 + n % 40000))
+    if [ "$n" = "$remote" ]; then
+        n=$((n + 1)); [ "$n" -ge 60000 ] && n=20000
+    fi
+    printf '%s' "$n"
+}
 
 # A local tunnel belongs to the TUN kind and nowhere else. A TCP tunnel runs
 # over the two public addresses and leaves the machine as it found it, so the
@@ -92,6 +108,8 @@ tunnel_default_name() {
         gre)  printf '%s-tun-gre%s' "$base" "$tail" ;;
         awg)  printf '%s-tun-awg%s' "$base" "$tail" ;;
         udp)  printf '%s-udp-%s' "$base" "$T_PORT" ;;
+        kcp)  printf '%s-kcp-%s' "$base" "$T_PORT" ;;
+        pck)  printf '%s-pck-%s' "$base" "$T_PORT" ;;
         ws)   printf '%s-ws-%s' "$base" "$T_PORT" ;;
         wss)  printf '%s-wss-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
@@ -284,6 +302,20 @@ apply_preset() {
                 *)          return 1 ;;
             esac
             ;;
+        kcp | pck)
+            # KCP already fills a path with one session and repairs loss with
+            # FEC. A small pool buys fairness and failover without multiplying
+            # parity traffic sixteen times as the TCP presets would.
+            case "$1" in
+                gaming)     T_CARRIERS=1; T_WINDOW=256 ;;
+                latency)    T_CARRIERS=2; T_WINDOW=512 ;;
+                balanced)   T_CARRIERS=4; T_WINDOW=1024 ;;
+                throughput) T_CARRIERS=6; T_WINDOW=2048 ;;
+                extreme)    T_CARRIERS=8; T_WINDOW=4096 ;;
+                *)          return 1 ;;
+            esac
+            default_preset_buffers
+            ;;
         *)
             # These were measured on the multi-carrier Iran-Europe path. Do
             # not trade known field behaviour for prettier round numbers.
@@ -337,6 +369,13 @@ preset_menu() {
             choice 3 "Balanced" "1 MUX, 2048 KB - smooth video and everyday use"
             choice 4 "Download" "1 MUX, 4096 KB - large files on a fast path"
             choice 5 "Extreme" "1 MUX, 8192 KB - maximum single-stream throughput"
+            ;;
+        kcp | pck)
+            choice 1 "Gaming" "1 KCP, 256 KB - minimum jitter and FEC overhead"
+            choice 2 "Latency" "2 KCP, 512 KB - responsive with fast failover"
+            choice 3 "Balanced" "4 KCP, 1024 KB - loss recovery and smooth video"
+            choice 4 "Download" "6 KCP, 2048 KB - faster multi-flow transfers"
+            choice 5 "Extreme" "8 KCP, 4096 KB - maximum packet-path throughput"
             ;;
         *)
             choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"
@@ -403,6 +442,17 @@ cfg_render() {
     printf 'carriers         = %s\n' "$T_CARRIERS"
     printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
     printf 'obfuscate        = %s\n' "$T_OBFUSCATE"
+    if [ "$T_TRANSPORT" = "kcp" ] || [ "$T_TRANSPORT" = "pck" ]; then
+        printf '\n[kcp]\n'
+        printf 'data_shards      = %s\n' "$T_FEC_DATA"
+        printf 'parity_shards    = %s\n' "$T_FEC_PARITY"
+        printf 'mtu              = %s\n' "$T_PACKET_MTU"
+        printf 'interval_ms      = %s\n' "$T_KCP_INTERVAL"
+    fi
+    if [ "$T_TRANSPORT" = "pck" ]; then
+        printf '\n[pck]\n'
+        printf 'flags            = "%s"\n' "$T_PCK_FLAGS"
+    fi
     printf '\n[security]\n'
     printf 'token            = "%s"\n' "$T_TOKEN"
     printf '\n[forward]\n'
@@ -509,6 +559,8 @@ transport_label() {
     case "$1" in
         icmp | echo) printf 'TUN-ICMP' ;;
         udp)         printf 'UDP' ;;
+        kcp)         printf 'KCP+FEC' ;;
+        pck)         printf 'TCP+PCK' ;;
         ws)          printf 'WS' ;;
         wss)         printf 'WSS' ;;
         gre)         printf 'TUN-GRE' ;;
@@ -528,8 +580,9 @@ transport_label() {
 # server is finished. Everything both ends have to agree on travels in it, so
 # there is nothing to copy by hand and nothing to get wrong:
 #
-#   p2|kind|transport|mode|forwarder|dial|host|port|token|carriers|window|
-#      keepalive|snd|rcv|tunlocal|tunpeer|mtu
+#   p4|kind|transport|mode|forwarder|dial|host|port|token|carriers|window|
+#      keepalive|snd|rcv|tunlocal|tunpeer|mtu|...|fec-data|fec-parity|
+#      packet-mtu|kcp-interval|pck-flags
 #
 # dial says what the far end does about the connection: 1 means it dials us
 # and host is where, 0 means it accepts and supplies its own address. The
@@ -576,12 +629,13 @@ cfg_setup_token() {
             awgobf="$T_AWG_OBF"
         fi
     fi
-    printf 'p3|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    printf 'p4|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$T_KIND" "$T_TRANSPORT" "$T_MODE" "$T_FORWARDER" \
         "$dial" "$host" "$port" "$T_TOKEN" \
         "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
         "$tl" "$tp" "$mtu" \
         "$ttl" "$awgport" "$awgpriv" "$awgpub" "$awgobf" \
+        "$T_FEC_DATA" "$T_FEC_PARITY" "$T_PACKET_MTU" "$T_KCP_INTERVAL" "$T_PCK_FLAGS" \
         | base64 | tr -d '\n'
 }
 
@@ -598,15 +652,15 @@ import_tunnel() {
     local raw
     raw="$(printf '%s' "$token" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)"
     case "$raw" in
-        p2\|* | p3\|*) ;;
+        p2\|* | p3\|* | p4\|*) ;;
         *) fail "that is not a Pingify setup token"; pause; return 1 ;;
     esac
 
     # p3 added the five kernel-tunnel fields on the end. A p2 token simply
     # leaves them empty, which is what it meant.
     local v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu
-    local ttl awgport awgpriv awgpub awgobf
-    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu ttl awgport awgpriv awgpub awgobf <<TOKEN
+    local ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval pckflags
+    IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval pckflags <<TOKEN
 $raw
 TOKEN
     if [ -z "$tok" ] || [ -z "$tr" ]; then
@@ -620,6 +674,9 @@ TOKEN
     T_TOKEN="$tok"; T_PORT="${port:-9443}"
     T_CARRIERS="$car"; T_WINDOW="$win"; T_KEEPALIVE="$ka"
     T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
+    T_FEC_DATA="${fecdata:-10}"; T_FEC_PARITY="${fecparity:-3}"
+    T_PACKET_MTU="${packetmtu:-1200}"; T_KCP_INTERVAL="${kcpinterval:-10}"
+    T_PCK_FLAGS="${pckflags:-PA}"
     T_PRESET="$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF")"
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
     if kernel_transport; then
@@ -682,6 +739,11 @@ TOKEN
     banner
     head2 "Ready to create"
     cfg_endpoints
+    local pck_local=""
+    if [ "$T_TRANSPORT" = "pck" ]; then
+        pck_local="$T_PORT"
+        this_side_accepts || pck_local="$(pck_source_port "$T_TOKEN" "$T_PORT")"
+    fi
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
     field "Address" "$(addr_tint "$T_PUBLIC_IP")"
@@ -695,10 +757,15 @@ TOKEN
     fi
     cfg_needs_link && field "Private link" "$(addr_tint "$T_TUNLOCAL") ${BX_ARR} $(addr_tint "$T_TUNPEER")"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
+    [ -n "$pck_local" ] && field "PCK local port" "$pck_local/tcp"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Carriers" "$T_CARRIERS"
     panel_end
     say ""
+    if [ -n "$pck_local" ] && ! this_side_accepts; then
+        dim "if this provider filters unsolicited replies, allow ${pck_local}/tcp inbound here"
+        say ""
+    fi
     confirm_yes "create the tunnel ${C_B}${T_NAME}${C_OFF}?" || { warn "cancelled"; pause; return 1; }
 
     say ""
@@ -765,9 +832,11 @@ new_tunnel() {
     say ""
     choice 6 "WSS" "one TLS WebSocket carrying everything - encrypted web traffic"
     choice 7 "WS" "one plain WebSocket carrying everything - goes where HTTP goes"
+    choice 8 "KCP+FEC" "low-jitter UDP with real Reed-Solomon loss recovery"
+    choice 9 "TCP+PCK" "raw TCP-shaped packets when normal TCP is throttled"
     say ""
     local proto=""
-    pick proto "select" 1 2 3 4 5 6 7 || { wiz_end; return 0; }
+    pick proto "select" 1 2 3 4 5 6 7 8 9 || { wiz_end; return 0; }
 
     case "$proto" in
         2)  T_KIND="tcp"; T_TRANSPORT="udp"
@@ -846,6 +915,23 @@ new_tunnel() {
             say ""
             dim "Port 80 is the one to use. A WebSocket on an unusual port is"
             dim "a WebSocket nothing else on the internet looks like." ;;
+        8)  T_KIND="tcp"; T_TRANSPORT="kcp"
+            T_FORWARDER="pingify"
+            say ""
+            dim "KCP repairs loss on a 10 ms clock and Reed-Solomon FEC can"
+            dim "rebuild short packet-loss bursts without waiting for resend."
+            dim "Use this for video, Instagram and games on a lossy route."
+            say ""
+            warn "needs UDP to pass between both servers" ;;
+        9)  T_KIND="tcp"; T_TRANSPORT="pck"
+            T_FORWARDER="pingify"
+            say ""
+            dim "Builds established-looking TCP packets directly, then runs"
+            dim "the same KCP+FEC engine inside them. There is no kernel TCP"
+            dim "connection for a middlebox to throttle or reset."
+            say ""
+            warn "Linux and root/CAP_NET_RAW are required on both servers"
+            dim "Pingify installs narrow RST and NOTRACK rules automatically." ;;
         *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
     esac
@@ -924,7 +1010,7 @@ new_tunnel() {
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP" || { wiz_end; return 0; }
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    case "$T_TRANSPORT" in tcp | udp | ws | wss) has_port=1 ;; *) has_port=0 ;; esac
+    case "$T_TRANSPORT" in tcp | udp | kcp | pck | ws | wss) has_port=1 ;; *) has_port=0 ;; esac
     if [ "$has_port" = "1" ]; then
         say ""
         # The port the two servers meet on. Only the accepting end binds it,
@@ -1164,6 +1250,11 @@ new_tunnel() {
     banner
     cfg_endpoints
     head2 "Ready to create"
+    local pck_local=""
+    if [ "$T_TRANSPORT" = "pck" ]; then
+        pck_local="$T_PORT"
+        this_side_accepts || pck_local="$(pck_source_port "$T_TOKEN" "$T_PORT")"
+    fi
     panel "$T_NAME"
     field "This server" "$(side_label "$T_ROLE")"
     field "Address" "$(addr_tint "$T_PUBLIC_IP")"
@@ -1181,11 +1272,16 @@ new_tunnel() {
     fi
     cfg_needs_link && field "Private link" "$(addr_tint "$T_TUNLOCAL") ${BX_ARR} $(addr_tint "$T_TUNPEER")"
     [ -n "$T_FORWARDS" ] && field "Ports" "$(printf '%s' "$T_FORWARDS" | tr -d '"' | tr ',' ' ')"
+    [ -n "$pck_local" ] && field "PCK local port" "$pck_local/tcp"
     field "Token" "$(token_print "$T_TOKEN")"
     field "Tuning" "$T_PRESET"
     field "Logging" "$T_LOG"
     panel_end
     say ""
+    if [ -n "$pck_local" ] && ! this_side_accepts; then
+        dim "if this provider filters unsolicited replies, allow ${pck_local}/tcp inbound here"
+        say ""
+    fi
     if ! confirm_yes "create the tunnel ${C_B}${T_NAME}${C_OFF}?"; then
         warn "cancelled, nothing was written"
         pause

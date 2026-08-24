@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.29.0"
+const version = "5.30.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -149,10 +149,19 @@ type Config struct {
 	// exactly the same size on exactly the same schedule across eight
 	// connections at once. Whatever removed that traffic, masking the lengths
 	// did not help, and v2.1.1 without any of it worked on the same path.
-	Obfuscate   *bool  `json:"obfuscate,omitempty"`
-	DialTimeout int    `json:"dial_timeout_sec,omitempty"`
-	SndBufKB    int    `json:"sndbuf_kb,omitempty"`
-	RcvBufKB    int    `json:"rcvbuf_kb,omitempty"`
+	Obfuscate   *bool `json:"obfuscate,omitempty"`
+	DialTimeout int   `json:"dial_timeout_sec,omitempty"`
+	SndBufKB    int   `json:"sndbuf_kb,omitempty"`
+	RcvBufKB    int   `json:"rcvbuf_kb,omitempty"`
+
+	// Packet transports use the same low-latency KCP/FEC shape. Keeping the
+	// values in the config makes both ends explicit and lets a lossy route be
+	// tuned without recompiling the core.
+	FECData     int    `json:"fec_data,omitempty"`
+	FECParity   int    `json:"fec_parity,omitempty"`
+	PacketMTU   int    `json:"packet_mtu,omitempty"`
+	KCPInterval int    `json:"kcp_interval_ms,omitempty"`
+	PCKFlags    string `json:"pck_flags,omitempty"`
 	LogLevel    string `json:"log_level,omitempty"`
 }
 
@@ -222,6 +231,21 @@ func (c *Config) applyDefaults() {
 	if c.RcvBufKB <= 0 {
 		c.RcvBufKB = 4096
 	}
+	if c.FECData <= 0 {
+		c.FECData = 10
+	}
+	if c.FECParity <= 0 {
+		c.FECParity = 3
+	}
+	if c.PacketMTU <= 0 {
+		c.PacketMTU = 1200
+	}
+	if c.KCPInterval <= 0 {
+		c.KCPInterval = 10
+	}
+	if c.PCKFlags == "" {
+		c.PCKFlags = "PA"
+	}
 	if c.TUN.MTU <= 0 {
 		c.TUN.MTU = 1380
 	}
@@ -248,7 +272,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp", "udp", "ws", "wss":
+	case "tcp", "icmp", "udp", "kcp", "pck", "ws", "wss":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -262,6 +286,18 @@ func (c *Config) validate() error {
 		if k, err := hex.DecodeString(strings.TrimSpace(c.PSK)); err != nil || len(k) < 16 {
 			return fmt.Errorf("psk must be at least 16 bytes of hex")
 		}
+	}
+	if c.FECData < 1 || c.FECData > 64 || c.FECParity < 1 || c.FECParity > 32 || c.FECData+c.FECParity > 96 {
+		return fmt.Errorf("KCP FEC shards must be data 1..64, parity 1..32, total at most 96")
+	}
+	if c.PacketMTU < 576 || c.PacketMTU > 1400 {
+		return fmt.Errorf("packet_mtu must be between 576 and 1400")
+	}
+	if c.KCPInterval < 5 || c.KCPInterval > 100 {
+		return fmt.Errorf("kcp_interval_ms must be between 5 and 100")
+	}
+	if _, err := parsePCKFlags(c.PCKFlags); err != nil {
+		return err
 	}
 	if c.Mode != "tun" && c.Role == "server" && len(c.Forwards) == 0 {
 		return fmt.Errorf("edge side in forward mode needs at least one entry in \"forwards\"")
@@ -390,6 +426,10 @@ func main() {
 	if cfg.CarriersAsked > 0 {
 		logInfo("%s multiplexes the whole tunnel onto one connection, so the %d carriers configured are not used",
 			strings.ToUpper(cfg.Transport), cfg.CarriersAsked)
+	}
+	if cfg.Transport == "kcp" || cfg.Transport == "pck" {
+		logInfo("packet engine: KCP fast mode %dms, Reed-Solomon FEC %d+%d, MTU %d",
+			cfg.KCPInterval, cfg.FECData, cfg.FECParity, cfg.PacketMTU)
 	}
 	if !cfg.obfuscated() {
 		logInfo("traffic shaping is off: frame lengths are in the clear, and both servers must agree")

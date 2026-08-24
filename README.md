@@ -2,7 +2,7 @@
 
 ابزار تانل نقطه‌به‌نقطه بین **سرور ایران** و **سرور خارج**، در قالب **یک اسکریپت واحد**.
 
-هستهٔ Pingify یک موتور کوچک با **Go** است که ترافیک را با **AES-256-GCM** رمز می‌کند و روی Direct TCP، UDP، ICMP یا **WS/WSS MUX** جابه‌جا می‌کند.
+هستهٔ Pingify یک موتور Go است که ترافیک را با **AES-256-GCM** رمز می‌کند و روی **TCP MUX، KCP+FEC، TCP+PCK، ICMP، UDP یا WS/WSS MUX** جابه‌جا می‌کند.
 
 ```bash
 bash <(wget -qO- https://github.com/GreatTeejay/pingfa/releases/latest/download/Pingify.sh)
@@ -20,7 +20,7 @@ sudo pingify
 
 موتور از قبل کامپایل شده و از **GitHub Releases** دانلود می‌شود — چند ثانیه، بدون نیاز به نصب Go. چک‌سام `SHA256SUMS` هم کنارش منتشر می‌شود و اسکریپت قبل از نصب تطبیقش می‌دهد.
 
-اگر سروری به Releases نرسد، **سورس کامل موتور داخل خود `Pingify.sh` جاسازی شده** و همان‌جا کامپایل می‌شود. این مسیر عمداً بدون هیچ ماژول خارجی نوشته شده تا با `GOPROXY=off` هم بیلد شود — سرورهای ایران معمولاً به `proxy.golang.org` دسترسی ندارند.
+اگر سروری به Releases نرسد، **سورس کامل موتور و vendor آفلاین KCP/FEC داخل خود `Pingify.sh` جاسازی شده** و همان‌جا کامپایل می‌شود. بیلد با `GOPROXY=off` انجام می‌شود و به `proxy.golang.org` نیاز ندارد.
 
 و اگر هیچ‌کدام نشد، از منوی `Core` می‌توانی باینری‌ای را که روی سرور خارج ساخته‌ای import کنی.
 
@@ -37,6 +37,9 @@ sudo pingify
 | تکنیک | چه می‌کند |
 |---|---|
 | **MUX واقعی WS/WSS** | در Direct/UDP/ICMP کریرها مسیر را موازی می‌کنند؛ در WS/WSS یک کریر، همهٔ streamها را روی دقیقاً یک WebSocket مالتی‌پلکس می‌کند. |
+| **KCP + Reed–Solomon FEC** | روی مسیر lossy، burstهای کوتاه loss را بدون صبر برای retransmit بازسازی می‌کند و KCP با tick ده میلی‌ثانیه باقی loss را جبران می‌کند. |
+| **TCP + PCK** | روی لینوکس پکت‌های TCP-shaped را با AF_PACKET می‌سازد؛ kernel TCP connection، handshake و stateای وجود ندارد که بعداً throttle یا reset شود. |
+| **ICMP سریع‌تر** | ARQ تطبیقی بعد از ACK تجمعی به‌اندازهٔ تمام سگمنت‌های تأییدشده رشد می‌کند؛ پنجره در چند RTT باز می‌شود و روی loss نصف می‌شود. |
 | **پین‌کردن فلو به کریر** | هر کانکشن با هش ۵-تایی به یک کریر چسبیده می‌شود. عمداً round-robin نیست: جابه‌جایی بین کریرها باعث reorder و فروپاشی TCP داخلی می‌شود. |
 | **بسته‌بندی دسته‌ای فریم‌ها** | هرچه لحظهٔ نوشتن در صف است در **یک فریم** جمع می‌شود: یک بار رمزنگاری، یک syscall — به‌جای ده‌ها تا. |
 | **پنجرهٔ اعتباری (credit window)** | کنترل جریان واقعی per-stream؛ یک کانکشن کُند بقیه را روی همان کریر بلاک نمی‌کند. |
@@ -47,7 +50,17 @@ sudo pingify
 
 ## پروتکل
 
-هسته پنج ترنسپورت دارد: **Direct TCP، UDP، ICMP، WS و WSS**. Direct کم‌هزینه‌ترین حالت است؛ WS/WSS برای مسیری است که ترافیک وب را عبور می‌دهد یا باید پشت CDN قرار بگیرد.
+هسته هفت ترنسپورت دارد: **TCP MUX، KCP+FEC، TCP+PCK، UDP، ICMP، WS و WSS**؛ و wizard دو تونل kernel یعنی GRE و AmneziaWG را هم مدیریت می‌کند.
+
+| ترنسپورت | بهترین کاربرد |
+|---|---|
+| **ICMP** | وقتی همین مسیر شما ICMP را خوب و پایدار عبور می‌دهد؛ همچنان یک انتخاب اصلی است، نه گزینهٔ حذف‌شده. |
+| **KCP+FEC** | loss و jitter، ویدئو، اینستاگرام و بازی؛ UDP باید بین دو سرور باز باشد. |
+| **TCP MUX** | مسیر TCP تمیز؛ کم‌هزینه و معمولاً بهترین throughput خام. |
+| **TCP+PCK** | TCP معمولی وصل می‌شود ولی بعد از مدتی throttle، stall یا reset می‌شود. Linux و root/CAP_NET_RAW لازم است. |
+| **WSS MUX** | مسیر وب/CDN؛ یک WebSocket واقعی روی TLS. |
+
+`TCP+PCK` جعل IP نیست: source/destination واقعی‌اند و در نسخهٔ فعلی فقط IPv4 پشتیبانی می‌شود. پکت‌ها header، checksum، sequence/ack و timestamp معتبر TCP دارند، اما TCP socket یا handshake کرنل ساخته نمی‌شود. source port سمت dialer به‌صورت پایدار از token مشتق می‌شود و هسته برای پورت محلی هر سمت سه قانون محدود `RST DROP` و `NOTRACK` نصب می‌کند. در security group، پورت TCP تونل را روی سمت accept باز کن؛ اگر سرویس‌دهندهٔ سمت dialer پاسخ raw را stateful تشخیص نداد، همان `PCK local port` که ویزارد و log نشان می‌دهند باید inbound مجاز شود.
 
 در Direct، هندشیک و فریم داخلی برای نداشتن امضای ثابت طراحی شده‌اند:
 
@@ -116,11 +129,7 @@ MAINTENANCE
 
 ### راه‌اندازی دو سروره
 
-روی سرور اول ویزارد را کامل کن. آخرش یک **توکن** چاپ می‌شود. روی سرور دوم برو
-روی سرور دوم هم `New tunnel` را بزن و همان جواب‌ها را بده — همان پروتکل، همان پورت، همان security token. تمام — نقش، جهت اتصال،
-کلید و پورت‌ها همه خودکار آینه می‌شوند.
-
-> هیچ توکنی بین دو سرور کپی نمی‌شود — فقط یک security token را روی هر دو دستی وارد می‌کنی.
+روی سرور اول ویزارد را کامل کن. آخرش یک **setup token** چاپ می‌شود. روی سرور دوم `New tunnel` و بعد `Paste a token` را بزن. پروتکل، جهت، پورت، security token، tuning، FEC و آدرس‌های خصوصی خودکار آینه می‌شوند.
 
 ---
 
@@ -182,7 +191,11 @@ MAINTENANCE
 
 ```
 core/
-  pingify.go       کل موتور در یک فایل — فقط کتابخانهٔ استاندارد، صفر دیپندنسی
+  pingify.go       framing، MUX، forwarding، TUN و status
+  arq.go           ARQ تطبیقی ICMP/UDP
+  kcp_transport.go KCP + Reed-Solomon FEC
+  pck_frame.go     ساخت/اعتبارسنجی IPv4/TCP packet
+  pck_linux.go     AF_PACKET، route discovery و firewall guard
   ws.go            RFC 6455 + نشست MUX مشترک WS/WSS
   wsdecoy.go       پاسخ nginx و گواهی WSS
   tun_linux.go     باز کردن دستگاه TUN (جدا، چون build tag کل فایل را می‌گیرد)
@@ -191,7 +204,8 @@ core/
 parts/             منبع اسکریپت مدیریت، به ترتیب شماره
 tests/             تست سرتاسری تولید کانفیگ + توکن با موتور واقعی
 .github/workflows/ بیلد و انتشار خودکار باینری‌ها روی تگ
-build.sh           parts/*.sh + core/*.go  ->  Pingify.sh
+  vendor/          وابستگی‌های MIT/BSD برای بیلد کاملاً آفلاین
+build.sh           parts + core + vendor فشرده  ->  Pingify.sh
 ```
 
 **هرگز `Pingify.sh` را مستقیم ویرایش نکن** — تولیدی است.

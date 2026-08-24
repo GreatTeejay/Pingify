@@ -393,10 +393,9 @@ func (c *arqConn) onDatagram(buf []byte) {
 	}
 }
 
-// grow widens the window by one segment for each round of clean acks, up to
-// what the tunnel was configured for. Additive on the way up, halved on the
-// way down - the shape that settles near a path's capacity rather than
-// oscillating around it.
+// grow widens the window by one segment for each newly acknowledged segment,
+// up to what the tunnel was configured for. That is slow start on clean RTTs;
+// loss still halves it so a saturated path sheds its queue quickly.
 func (c *arqConn) grow() {
 	if c.window < c.maxWindow {
 		c.window++
@@ -415,6 +414,11 @@ func (c *arqConn) shrink() {
 
 // processAck retires everything the peer has confirmed. Caller holds the lock.
 func (c *arqConn) processAck(ack uint32) {
+	// An authenticated peer should never acknowledge data we have not sent.
+	// Refusing it also bounds the retirement/growth loops below.
+	if ack > c.sndNext {
+		return
+	}
 	if ack == c.lastAck {
 		c.dupAcks++
 		// Three duplicates mean the segment after the ack is almost certainly
@@ -441,10 +445,16 @@ func (c *arqConn) processAck(ack uint32) {
 		}
 	}
 	if ack > c.sndUna {
+		advanced := int(ack - c.sndUna)
 		c.sndUna = ack
-		// Fresh ground acknowledged with nothing resent: the peer is keeping
-		// up and is willing to take at least this much, so widen a little.
-		c.grow()
+		// Grow for the amount of fresh ground acknowledged, not merely once
+		// for the cumulative ACK packet. ICMP coalesces many segment ACKs into
+		// one response every timer tick; counting that response as one made a
+		// 1 MB window take tens of seconds to open. This is ordinary slow start:
+		// roughly double once per clean RTT, while shrink still halves on loss.
+		for i := 0; i < advanced; i++ {
+			c.grow()
+		}
 	}
 	c.cond.Broadcast()
 }

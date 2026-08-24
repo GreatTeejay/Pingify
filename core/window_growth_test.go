@@ -83,3 +83,33 @@ func TestTheWindowGrowsOnProgressAndHalvesOnLoss(t *testing.T) {
 		t.Errorf("window grew to %d, want it capped at the configured 100", capped)
 	}
 }
+
+func TestCumulativeACKOpensTheWindowForEverySegment(t *testing.T) {
+	c := newARQ(5, 0, []byte("k"), icmpARQLabel, 1200, 1000, func([]byte) error { return nil })
+	defer c.Close()
+	c.mu.Lock()
+	start := c.window
+	for i := 0; i < start; i++ {
+		c.sndBuf[uint32(i)] = &segment{seq: uint32(i), retries: 1}
+	}
+	c.sndNext = uint32(start)
+	c.processAck(uint32(start))
+	got := c.window
+	c.mu.Unlock()
+	if got != start*2 {
+		t.Fatalf("one cumulative ACK for %d clean segments grew %d -> %d, want %d", start, start, got, start*2)
+	}
+}
+
+func TestARQIgnoresACKBeyondWhatItSent(t *testing.T) {
+	c := newARQ(5, 0, []byte("k"), icmpARQLabel, 1200, 1000, func([]byte) error { return nil })
+	defer c.Close()
+	c.mu.Lock()
+	beforeWindow, beforeUna := c.window, c.sndUna
+	c.processAck(1000)
+	gotWindow, gotUna := c.window, c.sndUna
+	c.mu.Unlock()
+	if gotWindow != beforeWindow || gotUna != beforeUna {
+		t.Fatalf("invalid ACK changed state: window %d -> %d, sndUna %d -> %d", beforeWindow, gotWindow, beforeUna, gotUna)
+	}
+}
