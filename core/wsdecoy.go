@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -96,17 +97,20 @@ func newDecoyIdentity(psk []byte) decoyIdentity {
 	}
 }
 
-var decoyOnce struct {
-	id  decoyIdentity
-	set bool
-}
+// Worked out once and then read from every connection at the same time. The
+// unguarded "have I done this yet" flag was a data race from the day it was
+// written; nothing caught it while only the decoy handler read it, and the
+// moment the upgrade reply started carrying the same Server header - so that
+// the one response that was not the decoy's finally matched the rest - every
+// carrier coming up hit it at once.
+var (
+	decoyOnce sync.Once
+	decoyID   decoyIdentity
+)
 
 func decoyFor(psk []byte) decoyIdentity {
-	if !decoyOnce.set {
-		decoyOnce.id = newDecoyIdentity(psk)
-		decoyOnce.set = true
-	}
-	return decoyOnce.id
+	decoyOnce.Do(func() { decoyID = newDecoyIdentity(psk) })
+	return decoyID
 }
 
 // wsDecoy answers anything that is not a carrier.

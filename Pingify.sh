@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.25.0"
+PINGIFY_VERSION="5.25.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -7249,7 +7249,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.25.0"
+const version = "5.25.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -11794,6 +11794,7 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -11879,17 +11880,20 @@ func newDecoyIdentity(psk []byte) decoyIdentity {
 	}
 }
 
-var decoyOnce struct {
-	id  decoyIdentity
-	set bool
-}
+// Worked out once and then read from every connection at the same time. The
+// unguarded "have I done this yet" flag was a data race from the day it was
+// written; nothing caught it while only the decoy handler read it, and the
+// moment the upgrade reply started carrying the same Server header - so that
+// the one response that was not the decoy's finally matched the rest - every
+// carrier coming up hit it at once.
+var (
+	decoyOnce sync.Once
+	decoyID   decoyIdentity
+)
 
 func decoyFor(psk []byte) decoyIdentity {
-	if !decoyOnce.set {
-		decoyOnce.id = newDecoyIdentity(psk)
-		decoyOnce.set = true
-	}
-	return decoyOnce.id
+	decoyOnce.Do(func() { decoyID = newDecoyIdentity(psk) })
+	return decoyID
 }
 
 // wsDecoy answers anything that is not a carrier.
