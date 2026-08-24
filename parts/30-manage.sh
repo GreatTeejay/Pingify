@@ -686,7 +686,7 @@ tuning_write() {
     sed -i "s#^sndbuf_kb.*#sndbuf_kb        = $snd#" "$f"
     sed -i "s#^rcvbuf_kb.*#rcvbuf_kb        = $rcv#" "$f"
     # A hand-set profile is no longer whichever preset it started as.
-    sed -i "s#^profile.*#profile          = \"$(preset_name "$car" "$win")\"#" "$f"
+    sed -i "s#^profile.*#profile          = \"$(preset_name "$car" "$win" "$ka" "$snd" "$rcv")\"#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"

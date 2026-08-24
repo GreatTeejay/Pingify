@@ -542,10 +542,29 @@ note "the tuning a token carries has a name"
 for _p in gaming latency balanced throughput extreme; do
     ( cfg_reset; apply_preset "$_p" ) >/dev/null 2>&1
     cfg_reset; apply_preset "$_p" >/dev/null 2>&1
-    check "$_p names itself back" "$(preset_name "$T_CARRIERS" "$T_WINDOW")" "$_p"
+    check "$_p names itself back" "$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF")" "$_p"
 done
-check "hand-set numbers are custom" "$(preset_name 11 700)" "custom"
+check "hand-set numbers are custom" "$(preset_name 11 700 10 700 700)" "custom"
 check "nothing assigns it" "$(grep -c 'T_PRESET="from token"' Pingify.sh)" "0"
+
+# WebSockets keep the familiar names, but their presets describe the shape
+# they really have: one multiplexed connection with enough aggregate socket
+# room for all the logical streams sharing it.
+T_TRANSPORT="wss"
+for _p in gaming latency balanced throughput extreme; do
+    apply_preset "$_p" >/dev/null 2>&1
+    check "wss $_p stays one carrier" "$T_CARRIERS" "1"
+    check "wss $_p names itself back" \
+        "$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF")" "$_p"
+done
+apply_preset balanced >/dev/null 2>&1
+check "wss balanced window"       "$T_WINDOW" "2048"
+check "wss balanced send room"    "$T_SNDBUF" "8192"
+check "wss balanced receive room" "$T_RCVBUF" "8192"
+apply_preset extreme >/dev/null 2>&1
+check "wss extreme window"  "$T_WINDOW" "8192"
+check "wss extreme buffers" "$T_SNDBUF/$T_RCVBUF" "32768/32768"
+T_TRANSPORT="tcp"
 
 # ---------------------------------------------------------------------------
 note "an ICMP tunnel wants the kernel quiet, not loud"
@@ -870,8 +889,9 @@ check "carriers are written"   "$(toml_get "$twf" transport carriers)"  "20"
 check "the window too"         "$(toml_get "$twf" tuning window_kb)"    "2048"
 check "and both buffers"       "$(toml_get "$twf" tuning sndbuf_kb)"    "3072"
 check "receive as well"        "$(toml_get "$twf" tuning rcvbuf_kb)"    "3072"
-# Hand-set numbers are no longer whichever preset they started as.
-check "the profile follows"    "$(toml_get "$twf" tuning profile)"      "throughput"
+# A preset is the whole set of numbers, not only carrier/window. Hand-edited
+# buffers must say custom instead of claiming they are still Download.
+check "the profile follows"    "$(toml_get "$twf" tuning profile)"      "custom"
 
 # and cfg_load has to read them back, or the screen shows a default that is
 # not what is in the file
