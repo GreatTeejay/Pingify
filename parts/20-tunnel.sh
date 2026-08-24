@@ -93,7 +93,6 @@ tunnel_default_name() {
         awg)  printf '%s-tun-awg%s' "$base" "$tail" ;;
         udp)  printf '%s-udp-%s' "$base" "$T_PORT" ;;
         ws)   printf '%s-ws-%s' "$base" "$T_PORT" ;;
-        wss)  printf '%s-wss-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
 }
@@ -319,7 +318,10 @@ preset_menu() {
         5) apply_preset extreme ;;
         6) T_PRESET="custom"
            say ""
-           ask T_CARRIERS "parallel connections" "$T_CARRIERS"
+           # ws is one connection by construction, so there is nothing to ask
+           # and a number here would only be ignored later.
+           [ "$T_TRANSPORT" = "ws" ] ||
+               ask T_CARRIERS "parallel connections" "$T_CARRIERS"
            ask T_WINDOW "window per connection, KB" "$T_WINDOW"
            ask T_KEEPALIVE "keepalive seconds" "$T_KEEPALIVE" ;;
         *) apply_preset balanced ;;
@@ -329,6 +331,8 @@ preset_menu() {
     case "$T_KEEPALIVE" in "" | *[!0-9]*) T_KEEPALIVE=10 ;; esac
     [ "$T_CARRIERS" -lt 1 ] && T_CARRIERS=1
     [ "$T_CARRIERS" -gt 64 ] && T_CARRIERS=64
+    # Whatever the preset said, ws carries the whole tunnel on one connection.
+    [ "$T_TRANSPORT" = "ws" ] && T_CARRIERS=1
 
     # Socket buffers have to hold a delay bandwidth product or the kernel
     # window cannot grow into one. Sized from the chosen window, capped where
@@ -471,7 +475,6 @@ transport_label() {
         icmp | echo) printf 'TUN-ICMP' ;;
         udp)         printf 'UDP' ;;
         ws)          printf 'WS' ;;
-        wss)         printf 'WSS' ;;
         gre)         printf 'TUN-GRE' ;;
         awg)         printf 'TUN-AWG' ;;
         *)           printf 'TCP' ;;
@@ -724,11 +727,10 @@ new_tunnel() {
     choice 4 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
     choice 5 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
-    choice 6 "WSS" "looks like ordinary HTTPS - goes where the web goes, and behind a CDN"
-    choice 7 "WS" "the same without TLS - only behind something that adds it"
+    choice 6 "WS" "one WebSocket carrying everything - goes where the web goes"
     say ""
     local proto=""
-    pick proto "select" 1 2 3 4 5 6 7 || { wiz_end; return 0; }
+    pick proto "select" 1 2 3 4 5 6 || { wiz_end; return 0; }
 
     case "$proto" in
         2)  T_KIND="tcp"; T_TRANSPORT="udp"
@@ -768,25 +770,28 @@ new_tunnel() {
             gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
         5)  T_TRANSPORT="awg"
             awg_install || { pause; return 1; } ;;
-        6)  T_KIND="tcp"; T_TRANSPORT="wss"
+        6)  T_KIND="tcp"; T_TRANSPORT="ws"
             T_FORWARDER="pingify"
+            T_CARRIERS=1
             say ""
             dim "An HTTP request that becomes a WebSocket, which is what a chat"
-            dim "app and a live dashboard look like. Two things follow:"
+            dim "app and a live dashboard look like. It goes where HTTP goes:"
+            dim "a proxy that passes 80 passes this."
             say ""
-            dim "  it goes where HTTP goes - a proxy that passes 443 passes this"
-            dim "  it can sit behind a CDN, and then the KHAREJ address never"
-            dim "  appears on the wire at all"
+            dim "One connection, not a braid. Every stream is multiplexed onto"
+            dim "it, because twenty WebSockets opened at once from one address"
+            dim "is the most recognisable thing a tunnel can do - and it is"
+            dim "what stopped the old one from carrying anything."
             say ""
-            dim "Anything that is not a carrier gets a stock nginx page, so a"
-            dim "scanner finds a web server with nothing on it." ;;
-        7)  T_KIND="tcp"; T_TRANSPORT="ws"
-            T_FORWARDER="pingify"
+            dim "Anything that is not the tunnel gets a stock nginx page, so a"
+            dim "scanner finds a web server with nothing on it."
             say ""
             warn "WS is not encrypted by itself"
             dim "the frames this tunnel carries are, but the WebSocket around"
-            dim "them is in the clear - use it only behind something that adds"
-            dim "TLS, like a CDN you control. On a bare path, pick WSS." ;;
+            dim "them is in the clear. WSS is being rebuilt on top of this one."
+            say ""
+            dim "Port 80 is the one to use. A WebSocket on an unusual port is"
+            dim "a WebSocket nothing else on the internet looks like." ;;
         *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
     esac
@@ -865,7 +870,7 @@ new_tunnel() {
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP" || { wiz_end; return 0; }
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    case "$T_TRANSPORT" in tcp | udp | ws | wss) has_port=1 ;; *) has_port=0 ;; esac
+    case "$T_TRANSPORT" in tcp | udp | ws) has_port=1 ;; *) has_port=0 ;; esac
     if [ "$has_port" = "1" ]; then
         say ""
         # The port the two servers meet on. Only the accepting end binds it,

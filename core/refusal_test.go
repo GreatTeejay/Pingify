@@ -205,13 +205,13 @@ func TestARefusedTargetUnderLoadStaysQuietAndKeepsItsCarriers(t *testing.T) {
 	iran := &Config{
 		Role: "server", Mode: "forward", Transport: "ws",
 		Listen: fmt.Sprintf("127.0.0.1:%d", port),
-		Token:  psk, Carriers: 4, BindAddr: "127.0.0.1",
+		Token:  psk, Carriers: 1, BindAddr: "127.0.0.1",
 		Forwards: []string{fmt.Sprintf("%d=%d", local, dead)},
 	}
 	kharej := &Config{
 		Role: "client", Mode: "forward", Transport: "ws",
 		Connect: fmt.Sprintf("127.0.0.1:%d", port),
-		Token:   psk, Carriers: 4,
+		Token:   psk, Carriers: 1,
 	}
 	for _, c := range []*Config{iran, kharej} {
 		c.applyDefaults()
@@ -239,13 +239,13 @@ func TestARefusedTargetUnderLoadStaysQuietAndKeepsItsCarriers(t *testing.T) {
 
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		if up, _, _, _ := ip.stats(); up >= 4 {
+		if up, _, _, _ := ip.stats(); up >= 1 {
 			break
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	if up, _, _, _ := ip.stats(); up < 4 {
-		t.Fatalf("only %d of 4 carriers came up", up)
+	if up, _, _, _ := ip.stats(); up < 1 {
+		t.Fatalf("the one multiplexed connection never came up")
 	}
 
 	lines := captureLog(func() {
@@ -275,11 +275,11 @@ func TestARefusedTargetUnderLoadStaysQuietAndKeepsItsCarriers(t *testing.T) {
 
 	// And the braid is still whole. The point of rationing the log was never
 	// the log.
-	if up, _, _, _ := ip.stats(); up < 4 {
-		t.Errorf("iran ended with %d of 4 carriers", up)
+	if up, _, _, _ := ip.stats(); up < 1 {
+		t.Errorf("iran ended with the connection down")
 	}
-	if up, _, _, _ := kp.stats(); up < 4 {
-		t.Errorf("kharej ended with %d of 4 carriers", up)
+	if up, _, _, _ := kp.stats(); up < 1 {
+		t.Errorf("kharej ended with the connection down")
 	}
 	t.Logf("200 refusals, %d log lines, braid intact", len(lines))
 }

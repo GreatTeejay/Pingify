@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.26.1"
+const version = "5.27.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -89,7 +89,12 @@ type Config struct {
 	Token    string `json:"token,omitempty"`
 	PSK      string `json:"psk,omitempty"`
 	Carriers int    `json:"carriers"`
-	WindowKB int    `json:"window_kb"`
+
+	// CarriersAsked remembers a carrier count a transport would not honour,
+	// so the startup line can say the setting was not used rather than
+	// quietly running something else. Never read from a config file.
+	CarriersAsked int `json:"-"`
+	WindowKB      int `json:"window_kb"`
 
 	// forward mode: "443", "443=8443", "443=10.0.0.5:8443", "udp:500=500",
 	// "8000-8010" (range, same port on the far side).
@@ -180,6 +185,17 @@ func (c *Config) applyDefaults() {
 	if c.Carriers > 64 {
 		c.Carriers = 64
 	}
+	// ws multiplexes: one WebSocket carries the whole tunnel. Twenty of them
+	// opened at once from one address is the most recognisable thing a tunnel
+	// can do, and a carrier here is already a multiplexer - streams by id,
+	// with a credit window each - so one of them is not one stream, it is
+	// every stream on one connection. What the config asked for is kept, so
+	// that startup can say the setting was not used rather than quietly
+	// running something else.
+	if c.Transport == "ws" && c.Carriers != 1 {
+		c.CarriersAsked = c.Carriers
+		c.Carriers = 1
+	}
 	if c.WindowKB <= 0 {
 		// 512 KiB per stream is roughly 50 Mbit/s on an 80 ms path, and it
 		// bounds what one stalled connection can hold in memory. Raise it for
@@ -227,7 +243,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp", "udp", "ws", "wss":
+	case "tcp", "icmp", "udp", "ws":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -366,6 +382,10 @@ func main() {
 	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d keepalive=%ds token=%s",
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
 		cfg.KeepaliveSec, cfg.tokenPrint())
+	if cfg.CarriersAsked > 0 {
+		logInfo("ws multiplexes the whole tunnel onto one connection, so the %d carriers configured are not used",
+			cfg.CarriersAsked)
+	}
 	if !cfg.obfuscated() {
 		logInfo("traffic shaping is off: frame lengths are in the clear, and both servers must agree")
 	}

@@ -1,15 +1,8 @@
 package main
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/binary"
 	"fmt"
-	"math/big"
 	"net/http"
 	"sync"
 	"time"
@@ -150,51 +143,3 @@ func wsDecoy(w http.ResponseWriter, r *http.Request) {
 // decoyPSK is set once at startup so the handler, which has no config, can
 // derive the same identity every time.
 var decoyPSK []byte
-
-// ---------------------------------------------------------------------------
-// the certificate
-//
-// A real one from Let's Encrypt is better and the manager can arrange it. When
-// there is none, a self-signed certificate is generated and kept, because the
-// alternative is refusing to start - and the tunnel does not trust the
-// certificate anyway. What proves the far end is the token, in the handshake
-// the braid runs immediately after the upgrade.
-// ---------------------------------------------------------------------------
-
-func wsCertificate(cfg *Config) (tls.Certificate, error) {
-	if cfg.CertFile != "" && cfg.KeyFile != "" {
-		return tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	}
-	return selfSignedFor(wsHostFor(cfg), cfg.key())
-}
-
-// selfSignedFor makes a certificate that looks like one a small site would
-// have: a real-looking issuer, a year of validity, the hostname it is for.
-// Derived from the token so it is the same one after a restart - a certificate
-// that changes on every start is itself a signal.
-func selfSignedFor(host string, psk []byte) (tls.Certificate, error) {
-	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 cert"), psk), []byte("serial"), 16)
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	serial := new(big.Int).SetBytes(k)
-	if host == "" {
-		host = "localhost"
-	}
-	tmpl := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: host},
-		DNSNames:     []string{host},
-		NotBefore:    time.Now().Add(-30 * 24 * time.Hour),
-		NotAfter:     time.Now().Add(335 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
-}

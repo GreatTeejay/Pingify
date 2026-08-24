@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
-	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -13,35 +12,48 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // ---------------------------------------------------------------------------
-// the WebSocket transports
+// ws: one WebSocket, with the whole tunnel multiplexed onto it
 //
-// Everything else here looks like what it is. TCP looks like a long-lived TCP
-// connection, ICMP looks like a great many pings, GRE looks like GRE. On a
-// path that only passes web traffic, none of them go anywhere.
+// Every other transport here is a braid: a number of connections sharing the
+// traffic between them, so that loss on one does not stall the rest. That is
+// the right shape for a long, lossy path and the wrong shape for this one.
 //
-// This one is an HTTP request that becomes a WebSocket, which is what a chat
-// application, a live dashboard and a stock ticker all look like. Two things
-// follow from that and both matter more than the framing:
+// Twenty WebSocket connections, opened from one address inside forty
+// milliseconds of each other, each sending a small binary frame every ten
+// seconds and never closing, is not what any application on the web does. It
+// is not a subtle tell either: it is the most recognisable thing about a
+// tunnel that has otherwise gone to some trouble to look ordinary. The braided
+// version did exactly that, and on a real Iran-Europe path the carriers came
+// up, carried a few kilobytes, and went deaf in both directions at once, over
+// and over - which is what a flow looks like after something has watched it
+// long enough to decide.
 //
-//	it goes where HTTP goes. A proxy that passes 80 and 443 and nothing else
-//	passes this.
+// So this one opens a single connection, and the whole tunnel rides it.
 //
-//	it can sit behind a CDN. Point the tunnel at a CDN-proxied hostname and
-//	the Kharej server's address never appears on the wire at all - the Iran
-//	server is talking to Cloudflare, and blocking one address does not end
-//	the tunnel.
+// Nothing above had to be written for that. A carrier here has always been a
+// multiplexer: streams are opened, fed and closed on it by id, with a credit
+// window each, dozens at a time. Giving the pool one carrier is therefore
+// exactly what mux means everywhere else it is offered - many streams over one
+// connection - using the multiplexer that was already carrying them.
 //
-// The frames are RFC 6455 rather than a raw stream after the upgrade, because
-// a CDN parses them. A stream of unframed bytes behind a WebSocket handshake
-// is not a WebSocket and does not survive the first middlebox that looks.
+// What it costs is real and worth naming. One connection is one congestion
+// window for everything, so a lost segment holds up every stream behind it;
+// and there is no second carrier to hold the tunnel open while a broken one
+// reconnects. Against that: a shape nothing has a reason to look at twice,
+// which on this path is the difference between a tunnel and no tunnel. The
+// keepalive below is part of paying that price - a single connection has to
+// notice quickly that it has died, because nothing is moving while it works
+// that out.
 //
-// Written against the standard library. Not because a module was unavailable -
-// they are - but because this is 300 lines of well-specified framing, and one
-// less dependency in a tool whose job is not being interfered with.
+// The framing is RFC 6455 rather than a raw stream after the upgrade, because
+// anything that parses WebSocket will parse this. A stream of unframed bytes
+// behind a WebSocket handshake is not a WebSocket and does not survive the
+// first middlebox that looks.
 // ---------------------------------------------------------------------------
 
 // The constant RFC 6455 requires the server to hash with the client's key.
@@ -68,23 +80,38 @@ const (
 	// server out of memory.
 	wsMaxFrame = maxFrame + 1024
 
-	// How long a pong may wait for the writer before it is given up on.
-	// Losing a pong costs nothing. Blocking the reader costs the carrier.
-	wsControlWait = 2 * time.Second
-
 	// The largest frame we put on the wire.
 	//
 	// Not a limit of the protocol - a frame may be enormous - but of what
 	// ordinary WebSocket traffic looks like. A browser sends kilobytes at a
-	// time. Our own records reach 128 KiB, so every large write went out as
-	// one frame with an eight-byte length field, and that field is rare
-	// enough in the wild that plenty of middleboxes have never carried one.
+	// time. Our own records reach 128 KiB, and a frame that size needs the
+	// eight-byte length field, which is rare enough in the wild that plenty
+	// of middleboxes have never carried one.
 	//
 	// The layer above is a byte stream with no message boundaries of its own,
 	// so each piece goes out as a whole message rather than a fragment. That
-	// is also what a chat, a dashboard or a live feed looks like: a great
-	// many small binary messages, one after another.
+	// is also what a chat, a dashboard or a live feed looks like: a great many
+	// small binary messages, one after another.
 	wsMaxSend = 16 * 1024
+
+	// How long a control frame may wait for the writer before it is given up
+	// on. Losing a pong costs nothing. Blocking the reader costs the
+	// connection, and here the connection is the whole tunnel.
+	wsControlWait = 2 * time.Second
+
+	// The WebSocket keepalive: a Ping frame on this interval, and the
+	// connection is finished when this many go unanswered.
+	//
+	// Two reasons, and the second is the one that matters. It is what a real
+	// WebSocket does - servers ping idle sockets, and a connection that never
+	// exchanges a control frame in an hour is itself unusual. And with one
+	// connection carrying everything, a path that has quietly stopped
+	// forwarding has to be found in tens of seconds rather than the minute
+	// the multiplexer's own keepalive is allowed to take, because nothing at
+	// all is getting through while we wait for it.
+	wsPingEvery   = 20 * time.Second
+	wsPingMissed  = 3
+	wsPongOverdue = wsPingEvery*wsPingMissed + 5*time.Second
 )
 
 // The close frame's status code: 1000, a normal end.
@@ -92,10 +119,9 @@ var wsCloseNormal = []byte{0x03, 0xE8}
 
 // wsMask XORs src into dst with the frame's key, eight bytes at a time.
 //
-// A byte at a time is what this did, and on a full 128 KiB frame that is the
-// difference between microseconds and tens of them - per frame, on every frame
-// the client sends, on a link carrying video. Both gorilla and coder do it
-// this way for the same reason. dst and src may be the same slice, which is
+// A byte at a time is the obvious way and on a full frame it is the difference
+// between microseconds and tens of them - per frame, on every frame the client
+// sends, on a link carrying video. dst and src may be the same slice, which is
 // how the reader unmasks in place.
 func wsMask(dst, src []byte, key [4]byte) {
 	var k [8]byte
@@ -107,23 +133,23 @@ func wsMask(dst, src []byte, key [4]byte) {
 	for ; i+8 <= n; i += 8 {
 		binary.LittleEndian.PutUint64(dst[i:], binary.LittleEndian.Uint64(src[i:])^kw)
 	}
+	// i is a multiple of eight here, so i&3 is zero and the tail picks the key
+	// up exactly where the wide loop left it.
 	for ; i < n; i++ {
 		dst[i] = src[i] ^ key[i&3]
 	}
 }
 
-// wsConn is a net.Conn over RFC 6455 frames. The braid above it sees a byte
-// stream and never learns there is framing underneath.
+// wsConn is a net.Conn over RFC 6455 frames. The multiplexer above it sees a
+// byte stream and never learns there is framing underneath.
 //
-// Two things about that stream matter and both were got wrong before:
+// Two things about that stream matter:
 //
 //	a message may arrive in pieces. The first frame carries the opcode and
 //	the rest carry opcode 0, and an endpoint that does not join them back
 //	together loses everything after the first piece. We never fragment - but
 //	a proxy, a CDN or anything that reassembles and re-splits a stream does,
-//	and it is entitled to. The old reader had no case for opcode 0, so those
-//	bytes fell past the switch and were dropped, with no error anywhere and
-//	the carrier still counted as up.
+//	and it is entitled to.
 //
 //	a control frame may arrive in the middle of one. A ping between two
 //	fragments is normal and must be answered without disturbing the message
@@ -140,10 +166,13 @@ type wsConn struct {
 	// A channel rather than a Mutex so a control frame can give up on it.
 	// See writeControl.
 	wmu  chan struct{}
-	wbuf []byte // one frame, header and payload, reused
+	wbuf []byte // one write, header and payload, reused
 
-	// The deadline the layer above last asked for, so that a control frame
-	// can put its own on for the length of one write and then hand it back.
+	// The deadline the layer above last asked for, so that a control frame can
+	// put its own on for the length of one write and then hand it back. Held
+	// across the whole borrow: the writer above sets its deadline before it
+	// asks for the write lock, and giving back a value read before that would
+	// leave an expired deadline on a socket about to be written to.
 	dmu sync.Mutex
 	wdl time.Time
 
@@ -153,18 +182,61 @@ type wsConn struct {
 	dbuf  []byte // data payloads, reused
 	cbuf  []byte // control payloads, kept apart so a ping cannot clobber data
 
-	closeOnce sync.Once
+	lastPong int64 // unix nano; see keepalive
+	done     chan struct{}
+	once     sync.Once
 }
 
 func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
 	if br == nil {
 		br = bufio.NewReaderSize(c, 32*1024)
 	}
-	return &wsConn{
+	w := &wsConn{
 		c:    c,
 		br:   br,
 		mask: clientSide,
 		wmu:  make(chan struct{}, 1),
+		done: make(chan struct{}),
+	}
+	atomic.StoreInt64(&w.lastPong, time.Now().UnixNano())
+	go w.keepalive()
+	return w
+}
+
+// keepalive pings, and hangs up on a path that has stopped answering.
+//
+// Both ends run it. A ping is answered by the reader below without troubling
+// anything above, so an idle connection exchanges two control frames an
+// interval and looks like every other long-lived WebSocket on the internet.
+//
+// The hanging up is the point. When a path stops forwarding a flow it does not
+// close it: both ends are left holding a socket that is open, writable, and
+// carrying nothing at all. The layer above works that out on its own clock,
+// which has a floor of a minute because the two ends are configured separately
+// and one of them must not hang up on the other for being slower. A single
+// connection cannot afford that minute, so this end reaches the same
+// conclusion sooner and closes, which turns a silent hole into a reconnect.
+func (w *wsConn) keepalive() {
+	t := time.NewTicker(wsPingEvery)
+	defer t.Stop()
+	var payload [4]byte
+	for {
+		select {
+		case <-w.done:
+			return
+		case <-t.C:
+		}
+		if since := time.Since(time.Unix(0, atomic.LoadInt64(&w.lastPong))); since > wsPongOverdue {
+			logDebug("ws: no pong from %s for %s - the path is carrying nothing, closing",
+				w.c.RemoteAddr(), since.Round(time.Second))
+			w.Close()
+			return
+		}
+		binary.BigEndian.PutUint32(payload[:], uint32(time.Now().Unix()))
+		if err := w.writeControl(wsOpPing, payload[:]); err != nil {
+			logDebug("ws: ping to %s: %v", w.c.RemoteAddr(), err)
+			return
+		}
 	}
 }
 
@@ -198,23 +270,22 @@ func (w *wsConn) Read(p []byte) (int, error) {
 			w.inMsg = !f.fin
 			w.rest = f.payload
 		case wsOpPing:
-			// Best effort: see writeControl for why this must not block.
-			// Said out loud when it fails, because a peer that pings and
-			// hears nothing back hangs up at its own idle timeout, and that
-			// looked from here like the far end simply going away.
+			// Best effort: see writeControl for why this must not block. Said
+			// out loud when it fails, because a peer that pings and hears
+			// nothing back hangs up at its own timeout, and that looks from
+			// here like the far end simply going away.
 			if err := w.writeControl(wsOpPong, f.payload); err != nil {
 				logDebug("ws: could not answer a ping: %v", err)
 			}
 		case wsOpPong:
-			// Nothing asked for it and nothing is waiting on it.
+			atomic.StoreInt64(&w.lastPong, time.Now().UnixNano())
 		case wsOpClose:
 			w.writeControl(wsOpClose, wsCloseNormal)
 			return 0, io.EOF
 		default:
-			// Refused rather than skipped. Skipping is what hid the fault
-			// this replaced: an opcode nobody handles is a stream nobody
-			// understands, and carrying on reads the next frame out of the
-			// middle of this one.
+			// Refused rather than skipped. An opcode nobody handles is a
+			// stream nobody understands, and carrying on reads the next frame
+			// out of the middle of this one.
 			return 0, fmt.Errorf("ws: opcode %#x is not one we speak", f.op)
 		}
 	}
@@ -230,9 +301,9 @@ func (w *wsConn) Write(p []byte) (int, error) {
 	w.wmu <- struct{}{}
 	defer func() { <-w.wmu }()
 
-	// Split into ordinary-sized frames, but build them all into one buffer
-	// and put them on the wire in a single write - so looking like everyone
-	// else costs nothing in system calls.
+	// Split into ordinary-sized frames, but build them all into one buffer and
+	// put them on the wire in a single write - so looking like everyone else
+	// costs nothing in system calls.
 	b := w.wbuf[:0]
 	var err error
 	for off := 0; off < len(p); {
@@ -342,11 +413,6 @@ func (w *wsConn) readFrame() (wsFrame, error) {
 }
 
 // frameOut writes one whole frame. The caller holds the write lock.
-//
-// Header and payload go out in a single write, out of a buffer that is grown
-// once and then reused - a frame is up to 128 KiB and this carries video, so
-// an allocation and a copy per frame is not free. Two writes would not be
-// either: the header would leave in its own packet.
 func (w *wsConn) frameOut(op byte, payload []byte) error {
 	b, err := w.appendFrame(w.wbuf[:0], op, payload)
 	w.wbuf = b
@@ -358,6 +424,11 @@ func (w *wsConn) frameOut(op byte, payload []byte) error {
 }
 
 // appendFrame puts one whole frame on the end of b and hands it back.
+//
+// Header and payload go out of one buffer that is grown once and then reused:
+// this carries video, and an allocation and a copy per frame is not free. Two
+// writes would not be either - the header would leave in its own packet, which
+// is both slower and a shape of its own.
 func (w *wsConn) appendFrame(b []byte, op byte, payload []byte) ([]byte, error) {
 	n := len(payload)
 	if need := len(b) + 14 + n; cap(b) < need {
@@ -367,7 +438,7 @@ func (w *wsConn) appendFrame(b []byte, op byte, payload []byte) ([]byte, error) 
 	}
 
 	// FIN is always set: every piece goes out as a whole message. What this
-	// had to learn was how to READ a fragmented one.
+	// has to know is how to READ a fragmented one.
 	b = append(b, 0x80|op)
 	var lenByte byte
 	switch {
@@ -395,19 +466,19 @@ func (w *wsConn) appendFrame(b []byte, op byte, payload []byte) ([]byte, error) 
 
 	if !w.mask {
 		b = append(b, payload...)
-	} else {
-		// A client masks with a fresh key per frame. It buys no secrecy - the
-		// key travels in the header - but a proxy that sees an unmasked client
-		// frame is entitled to hang up, and some do.
-		var key [4]byte
-		if _, err := rand.Read(key[:]); err != nil {
-			return b, err
-		}
-		b = append(b, key[:]...)
-		at := len(b)
-		b = b[:at+n]
-		wsMask(b[at:], payload, key)
+		return b, nil
 	}
+	// A client masks with a fresh key per frame. It buys no secrecy - the key
+	// travels in the header - but a proxy that sees an unmasked client frame
+	// is entitled to hang up, and some do.
+	var key [4]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return b, err
+	}
+	b = append(b, key[:]...)
+	at := len(b)
+	b = b[:at+n]
+	wsMask(b[at:], payload, key)
 	return b, nil
 }
 
@@ -417,8 +488,8 @@ func (w *wsConn) appendFrame(b []byte, op byte, payload []byte) ([]byte, error) 
 // The reader answers pings, and the writer may be part way through a frame
 // that has not gone out because the far end has stopped reading. If the reader
 // waited for the writer there, it would stop reading too - and two ends each
-// waiting for the other to read is a carrier that is up, idle, and finished.
-// A dropped pong is worth nothing next to that.
+// waiting for the other to read is a connection that is up, idle, and
+// finished. A dropped pong is worth nothing next to that.
 func (w *wsConn) writeControl(op byte, payload []byte) error {
 	if len(payload) > wsMaxControl {
 		payload = payload[:wsMaxControl]
@@ -436,19 +507,12 @@ func (w *wsConn) writeControl(op byte, payload []byte) error {
 	}
 	defer func() { <-w.wmu }()
 
-	// The write deadline belongs to whatever the braid last set for its own
-	// writes, and on an idle carrier that moment is long past - a pong sent
-	// under it fails instantly with i/o timeout. Put a deadline of our own on
-	// for this one write and give the old one back after.
-	//
-	// Held for the whole borrow, because taking the old value and handing it
-	// back are one operation. The braid's writer sets its deadline BEFORE it
-	// asks for the write lock, so a control frame that read the old value
-	// first, and gave it back after, would put an hour-old deadline on a
-	// socket the braid had just set a fresh one on - and the braid's next
-	// write, the one that deadline was for, would fail on the spot with a
-	// timeout no clock had reached. That is a carrier lost to answering a
-	// ping, which is the opposite of what answering it was for.
+	// The write deadline belongs to whatever the layer above last set for its
+	// own writes, and on an idle connection that moment is long past - a pong
+	// sent under it fails instantly with i/o timeout. Borrow the socket for
+	// one write and give the deadline back, both under dmu, because the writer
+	// above sets its deadline before it asks for the write lock and handing
+	// back a value read before that would leave an expired one behind it.
 	w.dmu.Lock()
 	w.c.SetWriteDeadline(time.Now().Add(wsControlWait))
 	err := w.frameOut(op, payload)
@@ -458,34 +522,37 @@ func (w *wsConn) writeControl(op byte, payload []byte) error {
 }
 
 func (w *wsConn) Close() error {
-	w.closeOnce.Do(func() {
+	w.once.Do(func() {
+		close(w.done)
 		// Say goodbye if it can be said quickly. Never wait on it: the point
-		// of Close is that this carrier is done with.
+		// of Close is that this connection is done with.
 		w.c.SetWriteDeadline(time.Now().Add(time.Second))
 		w.writeControl(wsOpClose, wsCloseNormal)
 	})
 	return w.c.Close()
 }
 
-// netConn is the socket under the framing. tuneSocket walks down to it to
-// turn Nagle off and put the tuning's buffers on; without a way through, a
-// carrier that is framing over a socket looked like neither.
+// netConn is the socket under the framing. tuneSocket walks down to it to turn
+// Nagle off and put the tuning's buffers on; without a way through, a carrier
+// that is framing over a socket looked like neither.
 func (w *wsConn) netConn() net.Conn { return w.c }
 
 func (w *wsConn) LocalAddr() net.Addr  { return w.c.LocalAddr() }
 func (w *wsConn) RemoteAddr() net.Addr { return w.c.RemoteAddr() }
 
-// The two write-deadline setters hold dmu across the socket call, not just
-// around the field. A control frame borrows the deadline under the same lock,
-// so the borrow and a change from the braid can no longer overlap and end
-// with the older of the two on the socket.
+// The two write-deadline setters hold dmu across the socket call, not only
+// around the field, so that a control frame borrowing the deadline and the
+// layer above changing it cannot overlap and end with the older of the two on
+// the socket.
 func (w *wsConn) SetDeadline(t time.Time) error {
 	w.dmu.Lock()
 	defer w.dmu.Unlock()
 	w.wdl = t
 	return w.c.SetDeadline(t)
 }
+
 func (w *wsConn) SetReadDeadline(t time.Time) error { return w.c.SetReadDeadline(t) }
+
 func (w *wsConn) SetWriteDeadline(t time.Time) error {
 	w.dmu.Lock()
 	defer w.dmu.Unlock()
@@ -503,29 +570,16 @@ func wsAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
-// wsDial opens one carrier: a plain TCP or TLS connection, an HTTP upgrade
-// request over it, and the byte stream that follows.
+// wsDial opens the connection: TCP, an HTTP upgrade request over it, and the
+// byte stream that follows.
 //
-// sni is the bare name TLS is told about and the certificate is checked
-// against; authority is what goes in the Host header and the Origin, which is
-// that name with the port when the port is not the default for the scheme.
-// They are not the same string, and one string was doing both.
-func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duration) (net.Conn, error) {
-	var c net.Conn
-	var err error
+// authority is what goes in the Host header and the Origin: the name this end
+// presents, with the port it dialled when that port is not the default. RFC
+// 7230 5.4 requires it and every browser sends it, so a request that says it
+// is Chrome and then leaves it off disagrees with the socket it arrived on.
+func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, error) {
 	d := &net.Dialer{Timeout: timeout}
-	if useTLS {
-		// The certificate is not verified: it is usually self-signed, and the
-		// tunnel's own token is what proves who is on the other end. See the
-		// handshake the braid runs immediately after this one.
-		c, err = tls.DialWithDialer(d, "tcp", addr, &tls.Config{
-			ServerName:         sni,
-			InsecureSkipVerify: true,
-			NextProtos:         []string{"http/1.1"},
-		})
-	} else {
-		c, err = d.Dial("tcp", addr)
-	}
+	c, err := d.Dial("tcp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -537,10 +591,6 @@ func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duratio
 	}
 	key := base64.StdEncoding.EncodeToString(raw[:])
 
-	scheme := "http"
-	if useTLS {
-		scheme = "https"
-	}
 	// Chrome's own header set, in Chrome's own order. Extensions are the one
 	// thing deliberately left out: advertising permessage-deflate invites a
 	// peer to negotiate it, and then every frame carries RSV1 and means
@@ -553,7 +603,7 @@ func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duratio
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
 		"Upgrade: websocket\r\n" +
-		"Origin: " + scheme + "://" + authority + "\r\n" +
+		"Origin: http://" + authority + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"Accept-Encoding: gzip, deflate, br\r\n" +
 		"Accept-Language: en-US,en;q=0.9\r\n" +
@@ -564,13 +614,11 @@ func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duratio
 		return nil, err
 	}
 
-	// The dial timeout covered the TCP connect, and for TLS it covered the
-	// handshake too - but nothing covered the answer. A server that accepts
-	// the connection and then says nothing parked this goroutine for good:
-	// every carrier stuck in the same place, "0 of 16", and not one line in
-	// the log to say why, because the dial loop only reports what returns.
-	//
-	// Which is exactly what a CDN does on a port it does not proxy.
+	// The dial timeout covered the TCP connect, and nothing covered the
+	// answer. A server that accepts the connection and then says nothing
+	// parks this goroutine for good, with not one line in the log to say why,
+	// because the dial loop only reports what returns. Which is exactly what a
+	// CDN does on a port it does not proxy.
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
@@ -584,7 +632,7 @@ func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duratio
 		c.Close()
 		return nil, fmt.Errorf("ws: no answer to the upgrade: %v", err)
 	}
-	// The carrier lives for hours after this; the deadline was for the
+	// The connection lives for hours after this; the deadline was for the
 	// handshake alone.
 	if err := c.SetReadDeadline(time.Time{}); err != nil {
 		c.Close()
@@ -608,54 +656,40 @@ func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duratio
 // ---------------------------------------------------------------------------
 
 type wsTransport struct {
-	cfg    *Config
-	useTLS bool
-	path   string
-	host   string
+	cfg  *Config
+	path string
+	auth string
 
-	auth    string // the Host header: the name, with the port when it shows
 	ln      net.Listener
 	inbound chan net.Conn
 	done    chan struct{}
 	once    sync.Once
 }
 
-func newWSTransport(cfg *Config, useTLS bool) (*wsTransport, error) {
+func newWSTransport(cfg *Config) (*wsTransport, error) {
 	t := &wsTransport{
-		cfg:     cfg,
-		useTLS:  useTLS,
-		path:    wsPathFor(cfg),
-		host:    wsHostFor(cfg),
-		auth:    wsAuthority(cfg, useTLS),
-		inbound: make(chan net.Conn, 64),
+		cfg:  cfg,
+		path: wsPathFor(cfg),
+		auth: wsAuthority(cfg),
+		// One connection is the whole point, but a replacement can arrive
+		// before the old one has been noticed as gone. Room for a couple, and
+		// no more, so a flood of upgrades cannot queue here.
+		inbound: make(chan net.Conn, 4),
 		done:    make(chan struct{}),
 	}
 	if cfg.Connect != "" {
 		return t, nil // this end dials; it binds nothing
 	}
-
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, err
-	}
-	if useTLS {
-		cert, err := wsCertificate(cfg)
-		if err != nil {
-			ln.Close()
-			return nil, err
-		}
-		ln = tls.NewListener(ln, &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"http/1.1"},
-			MinVersion:   tls.VersionTLS12,
-		})
 	}
 	t.ln = ln
 	go t.serve()
 	return t, nil
 }
 
-// The path a carrier asks for. Derived from the token, so it is neither
+// The path the connection asks for. Derived from the token, so it is neither
 // guessable from outside nor something anybody has to agree by hand: both ends
 // reach the same one from the same secret. Anything asking for a different
 // path is answered like an ordinary web server, and learns nothing.
@@ -664,10 +698,11 @@ func wsPathFor(cfg *Config) string {
 	return "/" + strings.TrimRight(base64.RawURLEncoding.EncodeToString(k), "=")
 }
 
-// The name this end presents: the TLS SNI and the HTTP Host header.
+// wsHostFor is the name this end presents: the name half of the Host header,
+// and the name a certificate would be issued for.
 //
 // A CDN routes on the name, so when there is a domain it wins over whatever
-// address is being dialled - that is what lets a carrier go to an edge and
+// address is being dialled - that is what lets a connection go to an edge and
 // still arrive at the right origin. Without one it falls back to the address,
 // which is right for a tunnel that goes straight to the server.
 func wsHostFor(cfg *Config) string {
@@ -684,33 +719,17 @@ func wsHostFor(cfg *Config) string {
 	return target
 }
 
-// wsAuthority is what the Host header and the Origin carry: the name this end
-// presents, with the port it actually dialled.
-//
-// wsHostFor answers a different question and was answering both. TLS needs the
-// bare name - an SNI with a port in it is not a name, and a certificate is
-// issued for a name - so the port came off for everybody, and a carrier to
-// port 9445 announced "Host: 1.2.3.4".
-//
-// RFC 7230 5.4 says the Host header carries the port whenever it is not the
-// default for the scheme, and every browser does. So the request said it was
-// Chrome and then sent a Host line Chrome cannot produce, on a port where the
-// mismatch is plain to anything that compares the two - and a proxy that
-// checks them is entitled to refuse it, which is a carrier that never comes up
-// with nothing in the log to say why.
-func wsAuthority(cfg *Config, useTLS bool) string {
+// wsAuthority is what the Host header and the Origin carry: that name, with
+// the port actually dialled, and without it when it is 80 - which is what a
+// browser leaves off too.
+func wsAuthority(cfg *Config) string {
 	host := wsHostFor(cfg)
 	target := cfg.Connect
 	if target == "" {
 		target = cfg.Listen
 	}
 	_, port, err := net.SplitHostPort(target)
-	if err != nil || port == "" {
-		return host
-	}
-	// The default for the scheme comes off, which is what a browser leaves
-	// off too: a CDN carrier on 443 says "tunnel.example.com" and no more.
-	if (useTLS && port == "443") || (!useTLS && port == "80") {
+	if err != nil || port == "" || port == "80" {
 		return host
 	}
 	return net.JoinHostPort(host, port)
@@ -721,17 +740,17 @@ func (t *wsTransport) serve() {
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler:           http.HandlerFunc(t.handle),
 	}
-	// Only the header read is bounded. A carrier is hijacked out of this
+	// Only the header read is bounded. The connection is hijacked out of this
 	// server and then lives for hours, so a read, write or idle timeout here
 	// would be a clock quietly killing the tunnel.
 	err := srv.Serve(t.ln)
 	select {
 	case <-t.done:
 	default:
-		// The listener stopped but the tunnel did not. Carriers already up
-		// keep working, so nothing else notices - and no new one can ever
+		// The listener stopped but the tunnel did not. A connection already up
+		// keeps working, so nothing else notices - and no new one can ever
 		// arrive. Say so, or this is a tunnel that degrades in silence.
-		logWarn("ws: stopped accepting carriers: %v", err)
+		logWarn("ws: stopped accepting: %v", err)
 	}
 }
 
@@ -739,8 +758,8 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 	key := r.Header.Get("Sec-WebSocket-Key")
 	if r.URL.Path != t.path || key == "" ||
 		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-		// Not a carrier. Answer the way a web server with nothing on it
-		// answers, so a scanner learns that and no more.
+		// Not ours. Answer the way a web server with nothing on it answers, so
+		// a scanner learns that and no more.
 		wsDecoy(w, r)
 		return
 	}
@@ -769,18 +788,17 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 	case <-t.done:
 		c.Close()
 	default:
-		// Never block the HTTP handler waiting for an acceptor - the same
-		// lesson the echo transport taught, in a different shape. But say it
-		// happened: dropping a carrier on the floor and letting the far end
-		// retry forever is exactly the kind of quiet failure that leaves
-		// somebody staring at "0 of 16" with nothing to go on.
-		logWarn("ws: no room to accept a carrier from %s, dropped", c.RemoteAddr())
+		// Never block the HTTP handler waiting for an acceptor. But say it
+		// happened: dropping a connection on the floor and letting the far end
+		// retry forever is the kind of quiet failure that leaves somebody
+		// staring at "0 of 1" with nothing to go on.
+		logWarn("ws: no room to accept a connection from %s, dropped", c.RemoteAddr())
 		c.Close()
 	}
 }
 
 func (t *wsTransport) Dial(idx int) (net.Conn, error) {
-	return wsDial(t.cfg.Connect, t.host, t.auth, t.path, t.useTLS,
+	return wsDial(t.cfg.Connect, t.auth, t.path,
 		time.Duration(t.cfg.DialTimeout)*time.Second)
 }
 
@@ -804,9 +822,4 @@ func (t *wsTransport) Close() error {
 	return nil
 }
 
-func (t *wsTransport) Name() string {
-	if t.useTLS {
-		return "wss"
-	}
-	return "ws"
-}
+func (t *wsTransport) Name() string { return "ws" }
