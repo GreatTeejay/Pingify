@@ -553,7 +553,7 @@ func TestWSDialGivesUpOnASilentServer(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := wsDial(ln.Addr().String(), "example.com", "/x", false, 2*time.Second)
+		_, err := wsDial(ln.Addr().String(), "example.com", "example.com", "/x", false, 2*time.Second)
 		done <- err
 	}()
 
@@ -751,7 +751,7 @@ func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
 		n, _ := c.Read(buf)
 		got <- string(buf[:n])
 	}()
-	go wsDial(ln.Addr().String(), "example.com", "/x", false, 2*time.Second)
+	go wsDial(ln.Addr().String(), "example.com", "example.com", "/x", false, 2*time.Second)
 
 	select {
 	case req := <-got:
@@ -964,7 +964,7 @@ func TestWSFullDuplexUnderChopping(t *testing.T) {
 		srvDone <- pump(c, 2, 1, total)
 	}()
 
-	c, err := wsDial(addr, "example.com", tr.path, false, 5*time.Second)
+	c, err := wsDial(addr, "example.com", "example.com", tr.path, false, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1019,4 +1019,94 @@ func pump(c net.Conn, send, recv int64, total int) error {
 		return werr
 	}
 	return rerr
+}
+
+// The Host header and the SNI are two different questions and one string was
+// answering both. TLS wants a name with no port in it; HTTP wants the port
+// whenever it is not the default for the scheme, and a browser always sends
+// it. A carrier to :9445 announcing "Host: 1.2.3.4" is a request no browser
+// makes, on the one line a proxy can check against the socket it arrived on.
+func TestWSHostCarriesThePortAndTheSNIDoesNot(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		cfg     Config
+		tls     bool
+		sni     string
+		want    string
+		explain string
+	}{
+		{
+			name: "a direct address on an odd port", cfg: Config{Connect: "203.0.113.9:9445"},
+			sni: "203.0.113.9", want: "203.0.113.9:9445",
+			explain: "this is the case in the field, and it was sending the address alone",
+		},
+		{
+			name: "ws on 80 leaves the default off", cfg: Config{Connect: "203.0.113.9:80"},
+			sni: "203.0.113.9", want: "203.0.113.9",
+			explain: "a browser does not write the default port either",
+		},
+		{
+			name: "wss on 443 leaves the default off", cfg: Config{Connect: "tunnel.example.com:443"}, tls: true,
+			sni: "tunnel.example.com", want: "tunnel.example.com",
+			explain: "the CDN case, and the one that was already right",
+		},
+		{
+			name: "an edge on an odd port keeps the domain and the port",
+			cfg:  Config{Connect: "speedtest.net:8443", WSHost: "tunnel.example.com"}, tls: true,
+			sni: "tunnel.example.com", want: "tunnel.example.com:8443",
+			explain: "the name is what the CDN routes on, the port is where we knocked",
+		},
+		{
+			name: "a portless target has no port to carry", cfg: Config{Connect: "tunnel.example.com"},
+			sni: "tunnel.example.com", want: "tunnel.example.com",
+			explain: "nothing to add, and nothing to invent",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := wsHostFor(&c.cfg); got != c.sni {
+				t.Errorf("SNI = %q, want %q - a certificate is issued for a name, not a name and a port", got, c.sni)
+			}
+			if got := wsAuthority(&c.cfg, c.tls); got != c.want {
+				t.Fatalf("Host = %q, want %q - %s", got, c.want, c.explain)
+			}
+		})
+	}
+}
+
+// And the request on the wire has to carry it, not only the helper.
+func TestWSHandshakeSendsThePortItDialled(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		buf := make([]byte, 2048)
+		n, _ := c.Read(buf)
+		got <- string(buf[:n])
+	}()
+
+	addr := ln.Addr().String()
+	host, port, _ := net.SplitHostPort(addr)
+	authority := net.JoinHostPort(host, port)
+	go wsDial(addr, host, authority, "/x", false, 2*time.Second)
+
+	select {
+	case req := <-got:
+		if !strings.Contains(req, "Host: "+authority+"\r\n") {
+			t.Fatalf("the request does not carry the port it dialled, want Host: %s\ngot:\n%s", authority, req)
+		}
+		if !strings.Contains(req, "Origin: http://"+authority+"\r\n") {
+			t.Errorf("the Origin does not match the Host, which no browser does either:\n%s", req)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no request arrived")
+	}
 }

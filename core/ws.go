@@ -505,7 +505,12 @@ func wsAccept(key string) string {
 
 // wsDial opens one carrier: a plain TCP or TLS connection, an HTTP upgrade
 // request over it, and the byte stream that follows.
-func wsDial(addr, host, path string, useTLS bool, timeout time.Duration) (net.Conn, error) {
+//
+// sni is the bare name TLS is told about and the certificate is checked
+// against; authority is what goes in the Host header and the Origin, which is
+// that name with the port when the port is not the default for the scheme.
+// They are not the same string, and one string was doing both.
+func wsDial(addr, sni, authority, path string, useTLS bool, timeout time.Duration) (net.Conn, error) {
 	var c net.Conn
 	var err error
 	d := &net.Dialer{Timeout: timeout}
@@ -514,7 +519,7 @@ func wsDial(addr, host, path string, useTLS bool, timeout time.Duration) (net.Co
 		// tunnel's own token is what proves who is on the other end. See the
 		// handshake the braid runs immediately after this one.
 		c, err = tls.DialWithDialer(d, "tcp", addr, &tls.Config{
-			ServerName:         host,
+			ServerName:         sni,
 			InsecureSkipVerify: true,
 			NextProtos:         []string{"http/1.1"},
 		})
@@ -541,14 +546,14 @@ func wsDial(addr, host, path string, useTLS bool, timeout time.Duration) (net.Co
 	// peer to negotiate it, and then every frame carries RSV1 and means
 	// something this does not implement.
 	req := "GET " + path + " HTTP/1.1\r\n" +
-		"Host: " + host + "\r\n" +
+		"Host: " + authority + "\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Pragma: no-cache\r\n" +
 		"Cache-Control: no-cache\r\n" +
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
 		"Upgrade: websocket\r\n" +
-		"Origin: " + scheme + "://" + host + "\r\n" +
+		"Origin: " + scheme + "://" + authority + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"Accept-Encoding: gzip, deflate, br\r\n" +
 		"Accept-Language: en-US,en;q=0.9\r\n" +
@@ -608,6 +613,7 @@ type wsTransport struct {
 	path   string
 	host   string
 
+	auth    string // the Host header: the name, with the port when it shows
 	ln      net.Listener
 	inbound chan net.Conn
 	done    chan struct{}
@@ -620,6 +626,7 @@ func newWSTransport(cfg *Config, useTLS bool) (*wsTransport, error) {
 		useTLS:  useTLS,
 		path:    wsPathFor(cfg),
 		host:    wsHostFor(cfg),
+		auth:    wsAuthority(cfg, useTLS),
 		inbound: make(chan net.Conn, 64),
 		done:    make(chan struct{}),
 	}
@@ -675,6 +682,38 @@ func wsHostFor(cfg *Config) string {
 		return h
 	}
 	return target
+}
+
+// wsAuthority is what the Host header and the Origin carry: the name this end
+// presents, with the port it actually dialled.
+//
+// wsHostFor answers a different question and was answering both. TLS needs the
+// bare name - an SNI with a port in it is not a name, and a certificate is
+// issued for a name - so the port came off for everybody, and a carrier to
+// port 9445 announced "Host: 1.2.3.4".
+//
+// RFC 7230 5.4 says the Host header carries the port whenever it is not the
+// default for the scheme, and every browser does. So the request said it was
+// Chrome and then sent a Host line Chrome cannot produce, on a port where the
+// mismatch is plain to anything that compares the two - and a proxy that
+// checks them is entitled to refuse it, which is a carrier that never comes up
+// with nothing in the log to say why.
+func wsAuthority(cfg *Config, useTLS bool) string {
+	host := wsHostFor(cfg)
+	target := cfg.Connect
+	if target == "" {
+		target = cfg.Listen
+	}
+	_, port, err := net.SplitHostPort(target)
+	if err != nil || port == "" {
+		return host
+	}
+	// The default for the scheme comes off, which is what a browser leaves
+	// off too: a CDN carrier on 443 says "tunnel.example.com" and no more.
+	if (useTLS && port == "443") || (!useTLS && port == "80") {
+		return host
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (t *wsTransport) serve() {
@@ -741,7 +780,7 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (t *wsTransport) Dial(idx int) (net.Conn, error) {
-	return wsDial(t.cfg.Connect, t.host, t.path, t.useTLS,
+	return wsDial(t.cfg.Connect, t.host, t.auth, t.path, t.useTLS,
 		time.Duration(t.cfg.DialTimeout)*time.Second)
 }
 
