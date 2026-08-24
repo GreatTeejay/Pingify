@@ -1790,6 +1790,118 @@ check "tcp keeps the plain name" "$(nw server tcp)" "iran-443"
 wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the port question covers them" "$(wz | grep -c 'tcp | udp | ws | wss) has_port=1')" "1"
 
+# ---------------------------------------------------------------------------
+note "the token carries the port, whatever the transport"
+# ---------------------------------------------------------------------------
+# It used to carry it only for tcp. For udp, ws and wss the field went out
+# empty and the far end filled it with 9443 - so a ws tunnel built on any
+# other port had one end listening where the other was not dialling, and
+# neither end said anything. It reported "0 of 16 carriers" and nothing else.
+TOKPORT="$WORK/tokport"; mkdir -p "$TOKPORT"
+(
+    CFG_DIR="$TOKPORT"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    for tr in tcp udp ws wss icmp; do
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="$tr"; T_ACCEPTS="server"
+        [ "$tr" = "icmp" ] && T_KIND="tun"
+        cfg_mode
+        T_PORT=9553; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_TOKEN="$TOKEN"; T_FORWARDS='"443"'
+        T_TUNLOCAL="10.11.10.1/24"; T_TUNPEER="10.11.10.2/24"
+        raw="$(cfg_setup_token | base64 -d)"
+        IFS='|' read -r _v _k _t _m _f _d _h port _rest <<TOK
+$raw
+TOK
+        echo "$tr=${port:-EMPTY}"
+    done
+) > "$WORK/tokport.out" 2>&1
+tkp() { grep -m1 "^$1=" "$WORK/tokport.out" | cut -d= -f2-; }
+
+check "tcp carries its port"  "$(tkp tcp)"  "9553"
+check "and so does udp"       "$(tkp udp)"  "9553"
+check "and ws"                "$(tkp ws)"   "9553"
+check "and wss"               "$(tkp wss)"  "9553"
+# icmp has none to carry, and inventing one would be a lie the far end acts on
+check "icmp carries none"     "$(tkp icmp)" "EMPTY"
+
+# ---------------------------------------------------------------------------
+note "the name on the wire is not the address"
+# ---------------------------------------------------------------------------
+# A CDN routes on the name and never looks at the address, so the two are
+# separate: dial an edge that is cheap or unfiltered from here, present the
+# domain the CDN knows, and the address dialled never names the server.
+check "wss proxies on these ports"  "$(cdn_ports wss)" "443 2053 2083 2087 2096 8443"
+check "and ws on the plain ones"    "$(cdn_ports ws)"  "80 8080 8880 2052 2082 2086 2095"
+check "443 is proxied"       "$(cdn_port_ok 443 wss && echo yes || echo no)"  "yes"
+check "8443 too"             "$(cdn_port_ok 8443 wss && echo yes || echo no)" "yes"
+check "9553 is not"          "$(cdn_port_ok 9553 wss && echo yes || echo no)" "no"
+check "nor is 443 for ws"    "$(cdn_port_ok 443 ws && echo yes || echo no)"   "no"
+
+EDGE="$WORK/edge"; mkdir -p "$EDGE"
+(
+    CFG_DIR="$EDGE"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    server_info() { :; }
+
+    # IRAN names the domain, and it travels in the token
+    cfg_reset
+    T_ROLE="server"; T_TRANSPORT="wss"; T_ACCEPTS="server"; cfg_mode
+    T_PORT=8443; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+    T_DOMAIN="tunnel.example.com"; T_TOKEN="$TOKEN"; T_FORWARDS='"443"'
+    T_NAME="$(tunnel_default_name)"; T_STATUS="127.0.0.1:9700"
+    cfg_save > /dev/null
+    echo "iran_host=$(toml_get "$(cfg_file "$T_NAME")" transport host)"
+    raw="$(cfg_setup_token | base64 -d)"
+    echo "token_dom=$(printf '%s' "$raw" | awk -F'|' '{print $23}')"
+
+    # KHAREJ takes the domain from the token and adds its own way in
+    cfg_reset
+    T_ROLE="client"; T_TRANSPORT="wss"; T_ACCEPTS="server"; cfg_mode
+    T_PORT=8443; T_PUBLIC_IP="198.51.100.4"; T_PEER_IP="203.0.113.9"
+    T_DOMAIN="tunnel.example.com"; T_EDGE="speedtest.net"
+    T_TOKEN="$TOKEN"; T_NAME="$(tunnel_default_name)"; T_STATUS="127.0.0.1:9701"
+    cfg_save > /dev/null
+    kf="$(cfg_file "$T_NAME")"
+    echo "kharej_connect=$(toml_get "$kf" transport connect)"
+    echo "kharej_host=$(toml_get "$kf" transport host)"
+    echo "kharej_peer=$(toml_get "$kf" transport peer)"
+
+    # and it survives being read back for an edit
+    kn="$T_NAME"; cfg_reset; cfg_load "$kn"
+    cfg_endpoints
+    echo "reload_domain=$T_DOMAIN"
+    echo "reload_edge=$T_EDGE"
+    echo "reload_peer=$T_PEER_IP"
+    echo "reload_dials=$CFG_CONNECT"
+
+    # without an edge it dials the domain, not the address
+    T_EDGE=""; cfg_endpoints
+    echo "nodedge_dials=$CFG_CONNECT"
+    # and with no domain at all, the address - which is what a direct tunnel wants
+    T_DOMAIN=""; cfg_endpoints
+    echo "plain_dials=$CFG_CONNECT"
+) > "$WORK/edge.out" 2>&1
+eg() { grep -m1 "^$1=" "$WORK/edge.out" | cut -d= -f2-; }
+
+check "IRAN writes the name it answers to" "$(eg iran_host)"  "tunnel.example.com"
+check "the token carries the domain"       "$(eg token_dom)"  "tunnel.example.com"
+check "KHAREJ dials the edge"              "$(eg kharej_connect)" "speedtest.net:8443"
+check "but presents the domain"            "$(eg kharej_host)"    "tunnel.example.com"
+# connect holds the edge, so the server itself has to be written down separately
+check "and remembers the real server"      "$(eg kharej_peer)"    "203.0.113.9"
+check "an edit reads the domain back"      "$(eg reload_domain)"  "tunnel.example.com"
+check "and the edge"                       "$(eg reload_edge)"    "speedtest.net"
+check "and the server, not the edge"       "$(eg reload_peer)"    "203.0.113.9"
+check "and still dials the edge"           "$(eg reload_dials)"   "speedtest.net:8443"
+check "no edge dials the domain"           "$(eg nodedge_dials)"  "tunnel.example.com:8443"
+check "no domain dials the address"        "$(eg plain_dials)"    "203.0.113.9:8443"
+
+# the question is asked on the end that dials, and only there
+im() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the importer offers an edge"  "$(im | grep -c 'ask_edge')" "1"
+check "and an edge needs a domain"   "$(awk '/^ask_edge\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'T_DOMAIN" \] || return 0')" "1"
+
 # WS is not encrypted by itself and the screen has to say so, because the name
 # looks like WSS with one letter missing
 check "ws warns it is in the clear" "$(wz | grep -c 'WS is not encrypted by itself')" "1"
