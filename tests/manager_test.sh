@@ -2001,9 +2001,26 @@ check "and never writes a host"       "$(eg ws_host)"       ""
 # the edge is offered on the end that dials, for wss, and nowhere else
 ae() { awk '/^ask_edge\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "an edge is wss only"     "$(ae | grep -c 'T_TRANSPORT" = "wss" \] || return 0')" "1"
-check "and needs a name to present" "$(ae | grep -c 'is_name "\$T_PEER_IP" || return 0')" "1"
+# It still needs a name to present - it just says so now instead of vanishing
+check "and needs a name to present" "$(ae | grep -c 'if ! is_name "\$T_PEER_IP"; then')" "1"
 im() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the importer offers it"  "$(im | grep -c 'ask_edge')" "1"
+
+# The end that DIALS is the end an edge belongs to. This read
+# "this_side_accepts && ask_edge", which on KHAREJ - the only place it was
+# ever meant to run - is false, so the question never appeared at all.
+check "and asks the end that dials"       "$(im | grep -c 'this_side_accepts || ask_edge')" "1"
+check "not the end that accepts"       "$(im | grep -c 'this_side_accepts && ask_edge')" "0"
+
+# And the accepting end is told what WSS wants in the address field, because
+# it is the only place anybody types it - the other end reads it from the
+# token. The hint used to be on the dialling end, where nobody types it.
+check "IRAN is asked for a domain"       "$(wzf | grep -c 'domain or address of this IRAN server')" "1"
+check "and only for wss"        "$(wzf | grep -c 'T_TRANSPORT" = "wss" \] && this_side_accepts')" "1"
+
+# a question that silently does not appear reads as one that was forgotten
+ae2() { awk '/^ask_edge\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
+check "an edge says why it cannot help"       "$(ae2 | grep -c 'an address rather than a name')" "1"
 
 # WS is not encrypted by itself and the screen has to say so, because the name
 # looks like WSS with one letter missing
