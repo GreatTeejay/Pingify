@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.25.2"
+PINGIFY_VERSION="5.26.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -7249,7 +7249,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.25.2"
+const version = "5.26.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -7621,6 +7621,7 @@ func main() {
 		top.Close()
 	}
 	p.close()
+	logFlush()
 }
 
 // ==========================================================================
@@ -7674,7 +7675,75 @@ func setLogLevel(s string) {
 // race detector is right about it, so the swap goes through atomic.Value.
 var logSink atomic.Value // holds a func(string)
 
-func stderrSink(line string) { fmt.Fprintln(os.Stderr, line) }
+// stderrSink is where a line goes when nothing has replaced the sink, and
+// under systemd that is a pipe to journald. A pipe blocks when it is full,
+// and journald fills it whenever it is rate limiting, or the disk is busy, or
+// the machine is small. So every log call was a place this process could
+// stop - including the ones a carrier's read loop makes for the records it
+// dispatches, while the socket it was reading went unread behind it.
+//
+// That is how a target being down became a tunnel being down. The far end
+// refuses every connection there is, sends a record saying so for each one,
+// and this end stopped to write a warning about each one. Behind the stalled
+// reader the peer's send buffer filled, its keepalives never left the queue,
+// and the carrier died of a minute of silence that was ours - then
+// reconnected, and the flood started again.
+//
+// A log line is never worth a carrier. Lines go on a queue and a writer
+// drains it; when the queue is full the line is dropped and counted, and the
+// count goes out with the next line that fits. Logging that cannot keep up
+// now costs log lines, which is the only thing it should ever have cost.
+func stderrSink(line string) { stderrLog.write(line) }
+
+var stderrLog = newAsyncWriter(os.Stderr)
+
+// How many lines may be waiting before new ones are dropped. Large enough
+// that an ordinary burst - every carrier in a braid reporting at once - is
+// never lost, small enough that a wedged journald costs a few hundred
+// kilobytes rather than the heap.
+const logQueue = 4096
+
+type asyncWriter struct {
+	q       chan string
+	dropped uint64
+}
+
+func newAsyncWriter(w io.Writer) *asyncWriter {
+	a := &asyncWriter{q: make(chan string, logQueue)}
+	go a.pump(w)
+	return a
+}
+
+func (a *asyncWriter) write(line string) {
+	select {
+	case a.q <- line:
+	default:
+		atomic.AddUint64(&a.dropped, 1)
+	}
+}
+
+func (a *asyncWriter) pump(w io.Writer) {
+	for line := range a.q {
+		// Said before the line that made room for it, so the gap is marked
+		// where it happened rather than at the end of the burst.
+		if d := atomic.SwapUint64(&a.dropped, 0); d > 0 {
+			fmt.Fprintln(w, logLine(lvlWarn, fmt.Sprintf(
+				"%d log lines dropped - the log could not keep up, and the tunnel did not wait for it", d)))
+		}
+		fmt.Fprintln(w, line)
+	}
+}
+
+// flush gives the queue a moment to empty, so that the reason a tunnel
+// stopped is not still sitting in a channel when the process ends.
+func (a *asyncWriter) flush(d time.Duration) {
+	deadline := time.Now().Add(d)
+	for len(a.q) > 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func logFlush() { stderrLog.flush(2 * time.Second) }
 
 func currentSink() func(string) {
 	if f, ok := logSink.Load().(func(string)); ok && f != nil {
@@ -7729,17 +7798,21 @@ var logTags = [5]struct{ plain, coloured string }{
 
 const logStamp = "2006-01-02 15:04:05.000"
 
-func logAt(lvl int32, format string, args ...interface{}) {
-	if atomic.LoadInt32(&logLevel) < lvl {
-		return
-	}
+func logLine(lvl int32, msg string) string {
 	tag := logTags[lvl].plain
 	stamp := time.Now().Format(logStamp)
 	if logColour {
 		tag = logTags[lvl].coloured
 		stamp = "\033[90m" + stamp + "\033[0m"
 	}
-	currentSink()(fmt.Sprintf("%s  %s  %s", stamp, tag, fmt.Sprintf(format, args...)))
+	return fmt.Sprintf("%s  %s  %s", stamp, tag, msg)
+}
+
+func logAt(lvl int32, format string, args ...interface{}) {
+	if atomic.LoadInt32(&logLevel) < lvl {
+		return
+	}
+	currentSink()(logLine(lvl, fmt.Sprintf(format, args...)))
 }
 
 func logError(f string, a ...interface{}) { logAt(lvlError, f, a...) }
@@ -8145,6 +8218,9 @@ type pool struct {
 	// here as a closed socket; this counter is the only thing that separates
 	// them, and the probe needs that distinction badly.
 	refusals uint64
+	// What refusals had reached the last time the log said so, so that the
+	// line can carry the number it stood in for.
+	refusalsSaid uint64
 
 	// when each kind of failure was last written down. Every carrier fails
 	// the same way at the same moment, so without this the log is the same
@@ -9070,11 +9146,7 @@ func (l *link) dispatch(p []byte) error {
 			}
 		case cmdRST:
 			if n > 0 {
-				// Sent by the far side, which is the only end that knows why.
-				logWarn("the other server refused a connection: %s", string(body))
-				if l.pool != nil {
-					atomic.AddUint64(&l.pool.refusals, 1)
-				}
+				l.refused(string(body))
 			}
 			if s := l.getStream(id); s != nil {
 				s.reset()
@@ -9123,6 +9195,39 @@ func (l *link) rxSummary() string {
 	}
 	last := time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Second)
 	return fmt.Sprintf(" (received %s in all, last %s ago)", humanBytes(n), last)
+}
+
+// refused reports what the far end said about a connection it would not make.
+//
+// One line a minute, with a count of the ones it stood for. The far side
+// sends one of these per refused connection, and a target that is down
+// refuses every connection there is - so a dead port on one server used to
+// write a line per record here, out of the carrier's read loop, on a socket
+// that went unread for as long as the write took. Under systemd that write is
+// to a pipe journald can stop draining, and the tunnel stopped with it.
+//
+// Both halves of that are fixed: the sink no longer waits for anybody, and
+// this no longer speaks per record. The volume follows the clock, which is
+// the rule the carrier count already keeps.
+func (l *link) refused(why string) {
+	p := l.pool
+	if p == nil {
+		logWarn("the other server refused a connection: %s", why)
+		return
+	}
+	n := atomic.AddUint64(&p.refusals, 1)
+	if !p.firstIn("refused", time.Minute) {
+		return
+	}
+	// How many arrived since the last time this said anything - which is the
+	// number an operator wants, and the one a per-record line never gave.
+	quiet := n - atomic.SwapUint64(&p.refusalsSaid, n)
+	if quiet > 1 {
+		logWarn("the other server refused a connection: %s (and %d more since the last time this said so)",
+			why, quiet-1)
+		return
+	}
+	logWarn("the other server refused a connection: %s", why)
 }
 
 func (l *link) idleLimit() time.Duration {
@@ -9343,6 +9448,11 @@ type forwarder struct {
 	allow  map[string]bool
 	closed chan struct{}
 	once   sync.Once
+
+	// Refused streams, and how many of those the log had reported the last
+	// time it said anything. See noteRefusal.
+	refused     uint64
+	refusedSaid uint64
 }
 
 func startForward(cfg *Config, p *pool) (*forwarder, error) {
@@ -9528,6 +9638,32 @@ func (f *forwarder) onRecord(l *link, cmd byte, id uint32, body []byte) {
 	}
 }
 
+// noteRefusal says a stream could not be made, at most once a minute, with a
+// count of the ones it stood for.
+//
+// The reason still travels back to the other server on every single one -
+// that is what tells an operator over there that the service is down rather
+// than the tunnel. What is rationed is this server's own log, because a
+// target that is down refuses every connection there is, and a line per
+// connection is thousands a minute into a journal that then stops keeping up
+// with anything else.
+func (f *forwarder) noteRefusal(target, why string) {
+	if f.p == nil {
+		logWarn("stream to %s: %s", target, why)
+		return
+	}
+	n := atomic.AddUint64(&f.refused, 1)
+	if !f.p.firstIn("stream-refused", time.Minute) {
+		return
+	}
+	quiet := n - atomic.SwapUint64(&f.refusedSaid, n)
+	if quiet > 1 {
+		logWarn("stream to %s: %s (and %d more since the last time this said so)", target, why, quiet-1)
+		return
+	}
+	logWarn("stream to %s: %s", target, why)
+}
+
 func (f *forwarder) targetAllowed(target string) bool {
 	if f.allow == nil {
 		return true
@@ -9540,7 +9676,7 @@ func (f *forwarder) dialTCP(s *stream, target string) {
 	// closes the user's connection with nothing to say, and "the tunnel does
 	// not work" is indistinguishable from "the service is not running here".
 	refuse := func(why string) {
-		logWarn("stream to %s: %s", target, why)
+		f.noteRefusal(target, why)
 		s.l.send(ctrlRec(cmdRST, s.id, []byte(target+": "+why)))
 		s.reset()
 	}
