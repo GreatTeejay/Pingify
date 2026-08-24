@@ -3,11 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"math/rand"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +28,24 @@ import (
 // point of the transport: twenty WebSockets from one address is the shape that
 // gets a flow looked at.
 func TestWSIsOneConnectionCarryingEverything(t *testing.T) {
+	testWebSocketIsOneConnectionCarryingEverything(t, "ws")
+}
+
+func TestWSSIsOneTLSConnectionCarryingEverything(t *testing.T) {
+	testWebSocketIsOneConnectionCarryingEverything(t, "wss")
+}
+
+func TestWebSocketDefaultsToOneWithoutInventingARequest(t *testing.T) {
+	for _, transport := range []string{"ws", "wss"} {
+		cfg := &Config{Transport: transport}
+		cfg.applyDefaults()
+		if cfg.Carriers != 1 || cfg.CarriersAsked != 0 {
+			t.Errorf("%s default: carriers=%d asked=%d, want 1 and 0", transport, cfg.Carriers, cfg.CarriersAsked)
+		}
+	}
+}
+
+func testWebSocketIsOneConnectionCarryingEverything(t *testing.T, transport string) {
 	setLogLevel("error")
 	echo := echoServer(t)
 	local := freePort(t)
@@ -30,13 +53,13 @@ func TestWSIsOneConnectionCarryingEverything(t *testing.T) {
 	psk := testPSK(t)
 
 	iran := &Config{
-		Role: "server", Mode: "forward", Transport: "ws",
+		Role: "server", Mode: "forward", Transport: transport,
 		Listen: fmt.Sprintf("127.0.0.1:%d", port),
 		Token:  psk, Carriers: 20, BindAddr: "127.0.0.1",
 		Forwards: []string{fmt.Sprintf("%d=%d", local, echo)},
 	}
 	kharej := &Config{
-		Role: "client", Mode: "forward", Transport: "ws",
+		Role: "client", Mode: "forward", Transport: transport,
 		Connect: fmt.Sprintf("127.0.0.1:%d", port),
 		Token:   psk, Carriers: 20,
 	}
@@ -46,8 +69,8 @@ func TestWSIsOneConnectionCarryingEverything(t *testing.T) {
 			t.Fatal(err)
 		}
 		if c.Carriers != 1 {
-			t.Fatalf("%s asked for 20 carriers and got %d - ws is meant to be one connection",
-				c.Role, c.Carriers)
+			t.Fatalf("%s %s asked for 20 carriers and got %d - it must be one connection",
+				c.Role, transport, c.Carriers)
 		}
 		if c.CarriersAsked != 20 {
 			t.Errorf("%s forgot that 20 were asked for, so startup cannot say the setting was ignored", c.Role)
@@ -97,23 +120,17 @@ func TestWSIsOneConnectionCarryingEverything(t *testing.T) {
 	if up, _, _, _ := kp.stats(); up != 1 {
 		t.Fatalf("kharej reports %d connections, want exactly 1", up)
 	}
-	t.Logf("%d streams and %d KiB through one WebSocket", streams, streams*8)
+	t.Logf("%d streams and %d KiB through one %s connection", streams, streams*8, strings.ToUpper(transport))
 }
 
-// wss is gone until ws is proven. A config that still asks for it has to be
-// told, not quietly turned into something else.
-func TestWSSIsNotAcceptedWhileItIsBeingRebuilt(t *testing.T) {
-	c := &Config{
-		Role: "server", Mode: "forward", Transport: "wss",
-		Listen: "127.0.0.1:9445", Token: strings.Repeat("a", 32),
+func TestWriteFullRepairsShortSocketWrites(t *testing.T) {
+	w := &shortWriter{max: 7}
+	want := bytes.Repeat([]byte("websocket-frame"), 50)
+	if err := writeFull(w, want); err != nil {
+		t.Fatal(err)
 	}
-	c.applyDefaults()
-	err := c.validate()
-	if err == nil {
-		t.Fatal("a wss config was accepted, and would have run as something the far end is not speaking")
-	}
-	if !strings.Contains(err.Error(), "wss") {
-		t.Errorf("the error does not name what was asked for: %v", err)
+	if !bytes.Equal(w.Bytes(), want) {
+		t.Fatalf("short writes changed the frame: got %d bytes, want %d", w.Len(), len(want))
 	}
 }
 
@@ -607,6 +624,40 @@ func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
 	}
 }
 
+func TestWebSocketUpgradeIsStrictRFC6455(t *testing.T) {
+	const path = "/secret"
+	valid := func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "http://example.com"+path, nil)
+		r.Header.Set("Connection", "keep-alive, Upgrade")
+		r.Header.Set("Upgrade", "websocket")
+		r.Header.Set("Sec-WebSocket-Version", "13")
+		r.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 16)))
+		return r
+	}
+	if _, ok := wsUpgradeRequest(valid(), path); !ok {
+		t.Fatal("a valid RFC 6455 upgrade was refused")
+	}
+
+	cases := map[string]func(*http.Request){
+		"method":     func(r *http.Request) { r.Method = http.MethodPost },
+		"http 1.0":   func(r *http.Request) { r.ProtoMinor = 0 },
+		"path":       func(r *http.Request) { r.URL.Path = "/public" },
+		"key":        func(r *http.Request) { r.Header.Set("Sec-WebSocket-Key", "not-a-key") },
+		"upgrade":    func(r *http.Request) { r.Header.Set("Upgrade", "h2c") },
+		"connection": func(r *http.Request) { r.Header.Set("Connection", "keep-alive") },
+		"version":    func(r *http.Request) { r.Header.Set("Sec-WebSocket-Version", "12") },
+	}
+	for name, breakRequest := range cases {
+		t.Run(name, func(t *testing.T) {
+			r := valid()
+			breakRequest(r)
+			if _, ok := wsUpgradeRequest(r, path); ok {
+				t.Fatal("a malformed upgrade was accepted")
+			}
+		})
+	}
+}
+
 // A server that accepts the connection and then says nothing must not park the
 // dialler for good - which is exactly what a CDN does on a port it does not
 // proxy, and what left a tunnel at "0 of 1" with nothing in the log.
@@ -686,9 +737,84 @@ func TestAScannerFindsOnlyNginx(t *testing.T) {
 	}
 }
 
+func TestAWSSScannerFindsHTTPSNginx(t *testing.T) {
+	setLogLevel("error")
+	port := freePort(t)
+	cfg := &Config{
+		Role: "server", Mode: "forward", Transport: "wss",
+		Listen: fmt.Sprintf("127.0.0.1:%d", port), Token: testPSK(t), Carriers: 8,
+		BindAddr: "127.0.0.1", Forwards: []string{fmt.Sprintf("%d=%d", freePort(t), freePort(t))},
+	}
+	cfg.applyDefaults()
+	if err := cfg.validate(); err != nil {
+		t.Fatal(err)
+	}
+	tr, err := newWSSTransport(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tr.Close()
+
+	c, err := tls.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port), &tls.Config{
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+		NextProtos:         []string{"http/1.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := fmt.Fprint(c, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	body, err := io.ReadAll(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "Server: nginx") || !strings.Contains(string(body), "Welcome to nginx") {
+		t.Fatalf("WSS decoy did not look like HTTPS nginx:\n%s", body)
+	}
+}
+
+func TestWSSGeneratedCertificateNamesItsHost(t *testing.T) {
+	for _, host := range []string{"tunnel.example.com", "127.0.0.1"} {
+		cert, err := selfSignedFor(host)
+		if err != nil {
+			t.Fatal(err)
+		}
+		leaf, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := leaf.VerifyHostname(host); err != nil {
+			t.Errorf("certificate for %q: %v", host, err)
+		}
+	}
+}
+
+func TestWSSRefusesHalfACertificatePair(t *testing.T) {
+	cfg := &Config{CertFile: "certificate.pem"}
+	if _, err := wsCertificate(cfg); err == nil || !strings.Contains(err.Error(), "both") {
+		t.Fatalf("one half of a certificate pair was not clearly refused: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+type shortWriter struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *shortWriter) Write(p []byte) (int, error) {
+	if len(p) > w.max {
+		p = p[:w.max]
+	}
+	return w.Buffer.Write(p)
+}
 
 // appendFragment is appendFrame with FIN under the caller's control. Only the
 // tests need it: the transport never fragments, it only has to read one.

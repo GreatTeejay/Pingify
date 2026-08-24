@@ -569,8 +569,11 @@ tuning_menu() {
         # The one number worth reading off this screen.
         panel "what that buys"
         field "One link" "up to ${ceiling} Mbit/s" "Round trip" "${rtt} ms, ${measured}"
-        # More carriers spread more connections; they do nothing for one.
-        field "Spread over" "$T_CARRIERS carriers at once"
+        # The stream MUX above the carrier shares one physical WebSocket.
+        case "$T_TRANSPORT" in
+            ws | wss) field "Spread over" "all streams / 1 WebSocket" ;;
+            *)        field "Spread over" "$T_CARRIERS carriers at once" ;;
+        esac
         panel_end
 
         # A socket that cannot hold a window's worth of data makes the window
@@ -589,7 +592,10 @@ tuning_menu() {
 
         rule
         item 1 "Profile" "pick a preset and set them all at once"
-        item 2 "Carriers" "$T_CARRIERS - parallel connections"
+        case "$T_TRANSPORT" in
+            ws | wss) item 2 "Connection" "fixed at 1 by the WebSocket MUX" ;;
+            *)        item 2 "Carriers" "$T_CARRIERS - parallel connections" ;;
+        esac
         item 3 "Window" "$T_WINDOW KB - the ceiling on one connection"
         item 4 "Buffers" "$T_SNDBUF / $T_RCVBUF KB - what the sockets hold"
         item 5 "Keepalive" "$T_KEEPALIVE seconds"
@@ -603,8 +609,11 @@ tuning_menu() {
         case "$c" in
             1) say ""; preset_menu
                tuning_write "$name" "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
-            2) say ""; ask v "parallel connections" "$T_CARRIERS"
-               tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
+            2) case "$T_TRANSPORT" in
+                   ws | wss) say ""; warn "the WebSocket MUX always uses one physical connection"; pause ;;
+                   *) say ""; ask v "parallel connections" "$T_CARRIERS"
+                      tuning_write "$name" "$v" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" ;;
+               esac ;;
             3) say ""
                dim "one connection tops out at window / round trip"
                dim "at ${rtt} ms:  1024 KB = $(stream_ceiling 1024 "$rtt") Mbit/s   4096 KB = $(stream_ceiling 4096 "$rtt") Mbit/s"
@@ -627,16 +636,26 @@ tuning_menu() {
 # fiction, too large and a busy server spends real memory on carriers that
 # are idle.
 edit_buffers() {
-    local name="$1" snd rcv
+    local name="$1" snd rcv total_buf
     cfg_load "$name" || return 1
     banner
     head2 "Buffers: $name"
     say ""
-    dim "Each carrier gets a send and a receive buffer of this size, so a"
-    dim "$T_CARRIERS-carrier tunnel holds ${T_CARRIERS} of each."
+    case "$T_TRANSPORT" in
+        ws | wss)
+            dim "The one physical WebSocket gets one send and receive socket buffer."
+            ;;
+        *)
+            dim "Each carrier gets a send and a receive buffer of this size, so a"
+            dim "$T_CARRIERS-carrier tunnel holds ${T_CARRIERS} of each."
+            ;;
+    esac
     say ""
-    field "Now" "${T_SNDBUF} / ${T_RCVBUF} KB" \
-          "In total" "$(( (T_SNDBUF + T_RCVBUF) * T_CARRIERS / 1024 )) MB"
+    case "$T_TRANSPORT" in
+        ws | wss) total_buf="$(( (T_SNDBUF + T_RCVBUF) / 1024 )) MB" ;;
+        *)        total_buf="$(( (T_SNDBUF + T_RCVBUF) * T_CARRIERS / 1024 )) MB" ;;
+    esac
+    field "Now" "${T_SNDBUF} / ${T_RCVBUF} KB" "In total" "$total_buf"
     say ""
     dim "They should be at least the window (${T_WINDOW} KB), or the window"
     dim "cannot fill. Past that they buy nothing."
@@ -652,6 +671,7 @@ tuning_write() {
     f="$(cfg_file "$name")"
     [ -n "$snd" ] || snd="$win"
     [ -n "$rcv" ] || rcv="$win"
+    case "$T_TRANSPORT" in ws | wss) car=1 ;; esac
     case "$car$win$ka$snd$rcv" in *[!0-9]* | "") fail "numbers only"; pause; return ;; esac
     [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
     [ "$win" -ge 16 ] || { fail "a window under 16 KB stalls every connection"; pause; return; }

@@ -144,6 +144,8 @@ func newTransport(cfg *Config) (carrierTransport, error) {
 		return newUDPCarrier(cfg)
 	case "ws":
 		return newWSTransport(cfg)
+	case "wss":
+		return newWSSTransport(cfg)
 	case "tcp", "":
 		return newTCPTransport(cfg)
 	}

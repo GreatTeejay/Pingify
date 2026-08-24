@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
@@ -317,7 +318,7 @@ func (w *wsConn) Write(p []byte) (int, error) {
 		}
 		off = end
 	}
-	_, err = w.c.Write(b)
+	err = writeFull(w.c, b)
 	w.wbuf = b
 	if err != nil {
 		return 0, err
@@ -419,8 +420,27 @@ func (w *wsConn) frameOut(op byte, payload []byte) error {
 	if err != nil {
 		return err
 	}
-	_, err = w.c.Write(b)
-	return err
+	return writeFull(w.c, b)
+}
+
+// writeFull is io.WriteString's missing byte-slice counterpart. net.Conn is
+// allowed to return a short write without an error; leaving half a WebSocket
+// frame on the wire makes every byte after it undecodable, so every protocol
+// write here must finish or fail the connection.
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if n > 0 {
+			b = b[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }
 
 // appendFrame puts one whole frame on the end of b and hands it back.
@@ -570,6 +590,30 @@ func wsAccept(key string) string {
 	return base64.StdEncoding.EncodeToString(h.Sum(nil))
 }
 
+func hasHTTPToken(value, want string) bool {
+	for _, token := range strings.Split(value, ",") {
+		if strings.EqualFold(strings.TrimSpace(token), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func validWSKey(key string) bool {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(key))
+	return err == nil && len(raw) == 16
+}
+
+func wsUpgradeRequest(r *http.Request, path string) (string, bool) {
+	key := r.Header.Get("Sec-WebSocket-Key")
+	ok := r.Method == http.MethodGet && r.ProtoMajor == 1 && r.ProtoMinor >= 1 &&
+		r.URL.Path == path && validWSKey(key) &&
+		strings.EqualFold(r.Header.Get("Upgrade"), "websocket") &&
+		hasHTTPToken(r.Header.Get("Connection"), "upgrade") &&
+		r.Header.Get("Sec-WebSocket-Version") == "13"
+	return key, ok
+}
+
 // wsDial opens the connection: TCP, an HTTP upgrade request over it, and the
 // byte stream that follows.
 //
@@ -578,9 +622,39 @@ func wsAccept(key string) string {
 // 7230 5.4 requires it and every browser sends it, so a request that says it
 // is Chrome and then leaves it off disagrees with the socket it arrived on.
 func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, error) {
-	d := &net.Dialer{Timeout: timeout}
-	c, err := d.Dial("tcp", addr)
+	return dialWebSocket(addr, "", authority, path, false, timeout)
+}
+
+func wssDial(addr, serverName, authority, path string, timeout time.Duration) (net.Conn, error) {
+	return dialWebSocket(addr, serverName, authority, path, true, timeout)
+}
+
+func dialWebSocket(addr, serverName, authority, path string, useTLS bool, timeout time.Duration) (net.Conn, error) {
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	d := &net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}
+	var c net.Conn
+	var err error
+	if useTLS {
+		// A supplied certificate or a public CDN certificate is accepted, but a
+		// direct origin also works with Pingify's generated self-signed one. The
+		// outer TLS layer is camouflage and transport encryption; the Pingify
+		// handshake immediately inside it authenticates the peer with the token.
+		c, err = tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+			ServerName:         serverName,
+			InsecureSkipVerify: true, // authenticated by the inner token handshake
+			MinVersion:         tls.VersionTLS12,
+			NextProtos:         []string{"http/1.1"},
+		})
+	} else {
+		c, err = d.Dial("tcp", addr)
+	}
 	if err != nil {
+		return nil, err
+	}
+	if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
+		c.Close()
 		return nil, err
 	}
 
@@ -595,6 +669,10 @@ func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, erro
 	// thing deliberately left out: advertising permessage-deflate invites a
 	// peer to negotiate it, and then every frame carries RSV1 and means
 	// something this does not implement.
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + authority + "\r\n" +
 		"Connection: Upgrade\r\n" +
@@ -603,13 +681,13 @@ func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, erro
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
 		"Upgrade: websocket\r\n" +
-		"Origin: http://" + authority + "\r\n" +
+		"Origin: " + scheme + "://" + authority + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"Accept-Encoding: gzip, deflate, br\r\n" +
 		"Accept-Language: en-US,en;q=0.9\r\n" +
 		"Sec-WebSocket-Key: " + key + "\r\n" +
 		"\r\n"
-	if _, err := c.Write([]byte(req)); err != nil {
+	if err := writeFull(c, []byte(req)); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -619,13 +697,6 @@ func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, erro
 	// parks this goroutine for good, with not one line in the log to say why,
 	// because the dial loop only reports what returns. Which is exactly what a
 	// CDN does on a port it does not proxy.
-	if timeout <= 0 {
-		timeout = 15 * time.Second
-	}
-	if err := c.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		c.Close()
-		return nil, err
-	}
 	br := bufio.NewReaderSize(c, 32*1024)
 	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
@@ -634,7 +705,7 @@ func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, erro
 	}
 	// The connection lives for hours after this; the deadline was for the
 	// handshake alone.
-	if err := c.SetReadDeadline(time.Time{}); err != nil {
+	if err := c.SetDeadline(time.Time{}); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -644,6 +715,7 @@ func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, erro
 		return nil, fmt.Errorf("ws: the server answered %s, not an upgrade", resp.Status)
 	}
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
+		!hasHTTPToken(resp.Header.Get("Connection"), "upgrade") ||
 		resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
 		c.Close()
 		return nil, fmt.Errorf("ws: the upgrade did not answer our key")
@@ -659,6 +731,8 @@ type wsTransport struct {
 	cfg  *Config
 	path string
 	auth string
+	host string
+	tls  bool
 
 	ln      net.Listener
 	inbound chan net.Conn
@@ -667,10 +741,20 @@ type wsTransport struct {
 }
 
 func newWSTransport(cfg *Config) (*wsTransport, error) {
+	return newWebSocketTransport(cfg, false)
+}
+
+func newWSSTransport(cfg *Config) (*wsTransport, error) {
+	return newWebSocketTransport(cfg, true)
+}
+
+func newWebSocketTransport(cfg *Config, useTLS bool) (*wsTransport, error) {
 	t := &wsTransport{
 		cfg:  cfg,
 		path: wsPathFor(cfg),
 		auth: wsAuthority(cfg),
+		host: wsHostFor(cfg),
+		tls:  useTLS,
 		// One connection is the whole point, but a replacement can arrive
 		// before the old one has been noticed as gone. Room for a couple, and
 		// no more, so a flood of upgrades cannot queue here.
@@ -683,6 +767,18 @@ func newWSTransport(cfg *Config) (*wsTransport, error) {
 	ln, err := net.Listen("tcp", cfg.Listen)
 	if err != nil {
 		return nil, err
+	}
+	if useTLS {
+		cert, certErr := wsCertificate(cfg)
+		if certErr != nil {
+			ln.Close()
+			return nil, fmt.Errorf("wss certificate: %w", certErr)
+		}
+		ln = tls.NewListener(ln, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"http/1.1"},
+		})
 	}
 	t.ln = ln
 	go t.serve()
@@ -729,7 +825,11 @@ func wsAuthority(cfg *Config) string {
 		target = cfg.Listen
 	}
 	_, port, err := net.SplitHostPort(target)
-	if err != nil || port == "" || port == "80" {
+	defaultPort := "80"
+	if cfg.Transport == "wss" {
+		defaultPort = "443"
+	}
+	if err != nil || port == "" || port == defaultPort {
 		return host
 	}
 	return net.JoinHostPort(host, port)
@@ -750,14 +850,13 @@ func (t *wsTransport) serve() {
 		// The listener stopped but the tunnel did not. A connection already up
 		// keeps working, so nothing else notices - and no new one can ever
 		// arrive. Say so, or this is a tunnel that degrades in silence.
-		logWarn("ws: stopped accepting: %v", err)
+		logWarn("%s: stopped accepting: %v", t.Name(), err)
 	}
 }
 
 func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
-	key := r.Header.Get("Sec-WebSocket-Key")
-	if r.URL.Path != t.path || key == "" ||
-		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+	key, valid := wsUpgradeRequest(r, t.path)
+	if !valid {
 		// Not ours. Answer the way a web server with nothing on it answers, so
 		// a scanner learns that and no more.
 		wsDecoy(w, r)
@@ -779,7 +878,7 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 		"Connection: upgrade\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Sec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"
-	if _, err := c.Write([]byte(resp)); err != nil {
+	if err := writeFull(c, []byte(resp)); err != nil {
 		c.Close()
 		return
 	}
@@ -792,19 +891,23 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 		// happened: dropping a connection on the floor and letting the far end
 		// retry forever is the kind of quiet failure that leaves somebody
 		// staring at "0 of 1" with nothing to go on.
-		logWarn("ws: no room to accept a connection from %s, dropped", c.RemoteAddr())
+		logWarn("%s: no room to accept a connection from %s, dropped", t.Name(), c.RemoteAddr())
 		c.Close()
 	}
 }
 
 func (t *wsTransport) Dial(idx int) (net.Conn, error) {
+	if t.tls {
+		return wssDial(t.cfg.Connect, t.host, t.auth, t.path,
+			time.Duration(t.cfg.DialTimeout)*time.Second)
+	}
 	return wsDial(t.cfg.Connect, t.auth, t.path,
 		time.Duration(t.cfg.DialTimeout)*time.Second)
 }
 
 func (t *wsTransport) Accept() (net.Conn, error) {
 	if t.ln == nil {
-		return nil, fmt.Errorf("ws: this end dials, it does not accept")
+		return nil, fmt.Errorf("%s: this end dials, it does not accept", t.Name())
 	}
 	select {
 	case c := <-t.inbound:
@@ -822,4 +925,9 @@ func (t *wsTransport) Close() error {
 	return nil
 }
 
-func (t *wsTransport) Name() string { return "ws" }
+func (t *wsTransport) Name() string {
+	if t.tls {
+		return "wss"
+	}
+	return "ws"
+}

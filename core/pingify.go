@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.27.0"
+const version = "5.28.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -179,20 +179,25 @@ func (c *Config) applyDefaults() {
 	case "echo":
 		c.Transport = "icmp"
 	}
+	websocket := c.Transport == "ws" || c.Transport == "wss"
 	if c.Carriers <= 0 {
-		c.Carriers = 4
+		if websocket {
+			c.Carriers = 1
+		} else {
+			c.Carriers = 4
+		}
 	}
 	if c.Carriers > 64 {
 		c.Carriers = 64
 	}
-	// ws multiplexes: one WebSocket carries the whole tunnel. Twenty of them
+	// ws and wss multiplex: one WebSocket carries the whole tunnel. Twenty of them
 	// opened at once from one address is the most recognisable thing a tunnel
 	// can do, and a carrier here is already a multiplexer - streams by id,
 	// with a credit window each - so one of them is not one stream, it is
 	// every stream on one connection. What the config asked for is kept, so
 	// that startup can say the setting was not used rather than quietly
 	// running something else.
-	if c.Transport == "ws" && c.Carriers != 1 {
+	if websocket && c.Carriers != 1 {
 		c.CarriersAsked = c.Carriers
 		c.Carriers = 1
 	}
@@ -243,7 +248,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp", "udp", "ws":
+	case "tcp", "icmp", "udp", "ws", "wss":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -383,8 +388,8 @@ func main() {
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
 		cfg.KeepaliveSec, cfg.tokenPrint())
 	if cfg.CarriersAsked > 0 {
-		logInfo("ws multiplexes the whole tunnel onto one connection, so the %d carriers configured are not used",
-			cfg.CarriersAsked)
+		logInfo("%s multiplexes the whole tunnel onto one connection, so the %d carriers configured are not used",
+			strings.ToUpper(cfg.Transport), cfg.CarriersAsked)
 	}
 	if !cfg.obfuscated() {
 		logInfo("traffic shaping is off: frame lengths are in the clear, and both servers must agree")

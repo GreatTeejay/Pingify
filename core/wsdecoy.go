@@ -1,8 +1,16 @@
 package main
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -143,3 +151,54 @@ func wsDecoy(w http.ResponseWriter, r *http.Request) {
 // decoyPSK is set once at startup so the handler, which has no config, can
 // derive the same identity every time.
 var decoyPSK []byte
+
+// ---------------------------------------------------------------------------
+// the WSS certificate
+// ---------------------------------------------------------------------------
+
+func wsCertificate(cfg *Config) (tls.Certificate, error) {
+	if (cfg.CertFile == "") != (cfg.KeyFile == "") {
+		return tls.Certificate{}, fmt.Errorf("set both cert_file and key_file, or neither")
+	}
+	if cfg.CertFile != "" {
+		return tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	}
+	return selfSignedFor(wsHostFor(cfg))
+}
+
+// selfSignedFor is the no-dependency fallback for a direct origin. The key and
+// serial are freshly generated at process start. Neither may be derived from
+// the token: both are public and would turn the certificate into an offline
+// token oracle. A real certificate can be supplied with cert_file/key_file,
+// and a CDN presents its own certificate to the dialling end.
+func selfSignedFor(host string) (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	if host == "" {
+		host = "localhost"
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: host},
+		NotBefore:    time.Now().Add(-24 * time.Hour),
+		NotAfter:     time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		tmpl.IPAddresses = []net.IP{ip}
+	} else {
+		tmpl.DNSNames = []string{host}
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
