@@ -57,7 +57,8 @@ done
 
 # --- 3. concatenate the manager parts -------------------------------------
 tmp="$(mktemp)"
-trap 'rm -f "$tmp" "$tmp.core"' EXIT
+vendor_stage="$(mktemp -d)"
+trap 'rm -f "$tmp" "$tmp.core"; rm -rf "$vendor_stage"' EXIT
 cat parts/*.sh > "$tmp"
 
 grep -q '@@CORE_FILES@@' "$tmp" || { red "the @@CORE_FILES@@ marker is missing"; exit 1; }
@@ -75,9 +76,26 @@ grep -q '@@CORE_FILES@@' "$tmp" || { red "the @@CORE_FILES@@ marker is missing";
 # KCP/FEC has audited MIT/BSD dependencies. Keep the server-side build fully
 # offline by shipping the vendored module tree as one compressed block rather
 # than turning hundreds of small source files into hundreds of heredocs.
+#
+# The staging pass is deliberate. A module zip may leave CRLF files in a
+# Windows worktree even though Git stores LF; without canonical content and tar
+# metadata, Windows and Ubuntu produce different Pingify.sh files from the same
+# commit and the release freshness check can never pass.
+cp core/go.mod core/go.sum "$vendor_stage/"
+mkdir -p "$vendor_stage/vendor"
+cp -R core/vendor/. "$vendor_stage/vendor/"
+while IFS= read -r -d '' f; do
+    if grep -Iq . "$f"; then
+        sed -i 's/\r$//' "$f"
+    fi
+done < <(find "$vendor_stage" -type f -print0)
+find "$vendor_stage" -type d -exec chmod 0755 {} +
+find "$vendor_stage" -type f -exec chmod 0644 {} +
 {
     printf "    base64 -d <<'%s' | tar -xzf - -C \"\$d\"\n" "$VENDOR_DELIM"
-    ( cd core && tar -czf - go.mod go.sum vendor ) | base64
+    ( cd "$vendor_stage" && LC_ALL=C tar --sort=name --format=gnu --mtime=@0 \
+        --owner=0 --group=0 --numeric-owner -cf - go.mod go.sum vendor ) \
+        | gzip -n -9 | base64
     printf '%s\n' "$VENDOR_DELIM"
 } >> "$tmp.core"
 
@@ -105,9 +123,9 @@ for f in core/*.go; do
         exit 1
     fi
 done
-if ! diff -qr core/vendor "$check_dir/vendor" >/dev/null ||
-   ! diff -q core/go.mod "$check_dir/go.mod" >/dev/null ||
-   ! diff -q core/go.sum "$check_dir/go.sum" >/dev/null; then
+if ! diff -qr "$vendor_stage/vendor" "$check_dir/vendor" >/dev/null ||
+   ! diff -q "$vendor_stage/go.mod" "$check_dir/go.mod" >/dev/null ||
+   ! diff -q "$vendor_stage/go.sum" "$check_dir/go.sum" >/dev/null; then
     red "embedded vendored modules differ from the originals"
     rm -rf "$check_dir"
     exit 1
