@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -248,5 +250,226 @@ func TestWSHostSurvivesAPortlessTarget(t *testing.T) {
 	cfg := Config{Connect: "tunnel.example.com", WSHost: ""}
 	if got := wsHostFor(&cfg); got != "tunnel.example.com" {
 		t.Fatalf("host = %q, want the bare name back", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// framing
+//
+// The fault these are here for: a message that arrives in pieces. The reader
+// had no case for a continuation frame, so everything after the first piece
+// fell past the switch and was dropped - no error, no log, the carrier still
+// counted as up. We never fragment, but anything that reassembles and re-splits
+// a stream does, and is entitled to.
+// ---------------------------------------------------------------------------
+
+// wsFrameBytes builds one frame the way a conformant peer would.
+func wsFrameBytes(fin bool, op byte, payload []byte, masked bool) []byte {
+	var b []byte
+	first := op
+	if fin {
+		first |= 0x80
+	}
+	b = append(b, first)
+	n := len(payload)
+	var l byte
+	switch {
+	case n < 126:
+		l = byte(n)
+	case n < 1<<16:
+		l = 126
+	default:
+		l = 127
+	}
+	if masked {
+		l |= 0x80
+	}
+	b = append(b, l)
+	switch {
+	case n >= 1<<16:
+		var e [8]byte
+		binary.BigEndian.PutUint64(e[:], uint64(n))
+		b = append(b, e[:]...)
+	case n >= 126:
+		var e [2]byte
+		binary.BigEndian.PutUint16(e[:], uint16(n))
+		b = append(b, e[:]...)
+	}
+	if !masked {
+		return append(b, payload...)
+	}
+	key := [4]byte{0x11, 0x22, 0x33, 0x44}
+	b = append(b, key[:]...)
+	for i := 0; i < n; i++ {
+		b = append(b, payload[i]^key[i&3])
+	}
+	return b
+}
+
+// serverReading hands back a server-side wsConn fed by the bytes given, the
+// way a client that masks would have sent them.
+func serverReading(t *testing.T, wire []byte) *wsConn {
+	t.Helper()
+	a, b := net.Pipe()
+	go func() {
+		b.Write(wire)
+		// leave it open: the reader must not need EOF to make progress
+	}()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	return newWSConn(a, nil, false)
+}
+
+func TestWSReassemblesAFragmentedMessage(t *testing.T) {
+	// "hello world" split three ways, which is what a proxy does to a stream
+	// it reassembled and then wrote out again.
+	var wire []byte
+	wire = append(wire, wsFrameBytes(false, wsOpBinary, []byte("hello "), true)...)
+	wire = append(wire, wsFrameBytes(false, wsOpCont, []byte("world"), true)...)
+	wire = append(wire, wsFrameBytes(true, wsOpCont, []byte("!"), true)...)
+
+	w := serverReading(t, wire)
+	got := make([]byte, 0, 12)
+	buf := make([]byte, 4)
+	for len(got) < 12 {
+		w.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, err := w.Read(buf)
+		if err != nil {
+			t.Fatalf("read: %v - got %q of %q", err, got, "hello world!")
+		}
+		got = append(got, buf[:n]...)
+	}
+	if string(got) != "hello world!" {
+		t.Fatalf("got %q, want %q - the pieces after the first were dropped", got, "hello world!")
+	}
+}
+
+func TestWSAnswersAPingBetweenFragments(t *testing.T) {
+	// A ping is allowed to arrive in the middle of a message and must not
+	// disturb it. It also must not overwrite the payload being handed up.
+	var wire []byte
+	wire = append(wire, wsFrameBytes(false, wsOpBinary, []byte("abc"), true)...)
+	wire = append(wire, wsFrameBytes(true, wsOpPing, []byte("ping"), true)...)
+	wire = append(wire, wsFrameBytes(true, wsOpCont, []byte("def"), true)...)
+
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	w := newWSConn(a, nil, false)
+
+	done := make(chan string, 1)
+	go func() {
+		got := make([]byte, 0, 6)
+		buf := make([]byte, 64)
+		for len(got) < 6 {
+			a.SetReadDeadline(time.Now().Add(3 * time.Second))
+			n, err := w.Read(buf)
+			if err != nil {
+				done <- "read failed: " + err.Error()
+				return
+			}
+			got = append(got, buf[:n]...)
+		}
+		done <- string(got)
+	}()
+
+	b.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := b.Write(wire); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// the pong comes back on the same conn; drain it so the writer is not stuck
+	go io.Copy(io.Discard, b)
+
+	select {
+	case got := <-done:
+		if got != "abcdef" {
+			t.Fatalf("got %q, want %q", got, "abcdef")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reader never finished the message")
+	}
+}
+
+func TestWSRefusesWhatItCannotParse(t *testing.T) {
+	big := make([]byte, 200)
+	for _, c := range []struct {
+		name string
+		wire []byte
+		why  string
+	}{
+		{
+			name: "a continuation with nothing to continue",
+			wire: wsFrameBytes(true, wsOpCont, []byte("x"), true),
+			why:  "there was no message open, so this is not our stream",
+		},
+		{
+			name: "an opcode we do not speak",
+			wire: wsFrameBytes(true, 0x3, []byte("x"), true),
+			why:  "skipping it reads the next frame out of the middle of this one",
+		},
+		{
+			name: "a control frame that was fragmented",
+			wire: wsFrameBytes(false, wsOpPing, []byte("x"), true),
+			why:  "RFC 6455 5.5 forbids it",
+		},
+		{
+			name: "an oversized control frame",
+			wire: wsFrameBytes(true, wsOpPing, big, true),
+			why:  "a control frame carries at most 125 bytes",
+		},
+		{
+			name: "an unmasked frame from a client",
+			wire: wsFrameBytes(true, wsOpBinary, []byte("x"), false),
+			why:  "RFC 6455 5.1: a client masks everything it sends",
+		},
+		{
+			name: "reserved bits with no extension agreed",
+			wire: func() []byte {
+				f := wsFrameBytes(true, wsOpBinary, []byte("x"), true)
+				f[0] |= 0x40 // RSV1
+				return f
+			}(),
+			why: "the frame is not shaped the way we are about to read it",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := serverReading(t, c.wire)
+			w.SetReadDeadline(time.Now().Add(3 * time.Second))
+			if _, err := w.Read(make([]byte, 64)); err == nil {
+				t.Fatalf("accepted it - %s", c.why)
+			}
+		})
+	}
+}
+
+// A whole message still arrives whole, and a big one still goes out as one
+// frame with the 64-bit length.
+func TestWSCarriesALargeMessageIntact(t *testing.T) {
+	payload := make([]byte, 100*1024)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	client := newWSConn(a, nil, true)
+	server := newWSConn(b, nil, false)
+
+	go func() {
+		a.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		client.Write(payload)
+	}()
+
+	got := make([]byte, 0, len(payload))
+	buf := make([]byte, 16*1024)
+	for len(got) < len(payload) {
+		b.SetReadDeadline(time.Now().Add(5 * time.Second))
+		n, err := server.Read(buf)
+		if err != nil {
+			t.Fatalf("read after %d of %d: %v", len(got), len(payload), err)
+		}
+		got = append(got, buf[:n]...)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("the payload came back different")
 	}
 }
