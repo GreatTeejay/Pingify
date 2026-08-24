@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -471,5 +472,183 @@ func TestWSCarriesALargeMessageIntact(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("the payload came back different")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the socket under the framing
+//
+// tuneSocket type-asserted *net.TCPConn. A ws carrier is framing over a
+// socket and a wss carrier is framing over TLS over a socket, so it matched
+// neither and returned - leaving every WebSocket carrier with Nagle on, no
+// keepalive, and the tuning's socket buffers silently ignored.
+// ---------------------------------------------------------------------------
+
+func TestBaseTCPReachesThroughTheFraming(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+
+	if baseTCP(raw) == nil {
+		t.Fatal("a bare socket is not reachable")
+	}
+	if baseTCP(newWSConn(raw, nil, true)) == nil {
+		t.Fatal("a ws carrier's socket is not reachable - Nagle stays on")
+	}
+	// wss is the same conn with TLS between, and *tls.Conn answers NetConn.
+	tlsOver := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
+	if baseTCP(newWSConn(tlsOver, nil, true)) == nil {
+		t.Fatal("a wss carrier's socket is not reachable")
+	}
+	// and something with no socket under it at all is simply left alone
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	if baseTCP(a) != nil {
+		t.Fatal("a pipe is not a socket")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the handshake has to end
+// ---------------------------------------------------------------------------
+
+// A server that accepts the connection and then says nothing used to park the
+// dialling goroutine for good. Every carrier stopped in the same place, the
+// tunnel showed "0 of 16", and nothing was logged - which is what a CDN does
+// on a port it does not proxy.
+func TestWSDialGivesUpOnASilentServer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		accepted <- c // hold it open and answer nothing at all
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := wsDial(ln.Addr().String(), "example.com", "/x", false, 2*time.Second)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("it claimed to have upgraded against a server that said nothing")
+		}
+		if !strings.Contains(err.Error(), "no answer to the upgrade") {
+			t.Fatalf("gave up, but not clearly: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("it never gave up - this is the carrier that parks forever")
+	}
+	if c := <-accepted; c != nil {
+		c.Close()
+	}
+}
+
+// ---------------------------------------------------------------------------
+// masking
+// ---------------------------------------------------------------------------
+
+func TestWSMaskMatchesTheObviousLoop(t *testing.T) {
+	key := [4]byte{0xA1, 0xB2, 0xC3, 0xD4}
+	// lengths either side of the eight-byte step, so the tail is covered
+	for _, n := range []int{0, 1, 7, 8, 9, 15, 16, 17, 4096, 131072 + 3} {
+		src := make([]byte, n)
+		for i := range src {
+			src[i] = byte(i*31 + 7)
+		}
+		want := make([]byte, n)
+		for i := range src {
+			want[i] = src[i] ^ key[i&3]
+		}
+		got := make([]byte, n)
+		wsMask(got, src, key)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("n=%d: the fast path does not agree with the plain one", n)
+		}
+		// and in place, which is how the reader unmasks
+		inplace := append([]byte(nil), src...)
+		wsMask(inplace, inplace, key)
+		if !bytes.Equal(inplace, want) {
+			t.Fatalf("n=%d: in place gives something else", n)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// a pong under a stale deadline
+// ---------------------------------------------------------------------------
+
+// The braid sets a write deadline before its own writes. On an idle carrier
+// that moment is long past, and a pong sent under it failed instantly with
+// i/o timeout - so a peer that pinged heard nothing and hung up, which looked
+// from here like the far end going away on its own.
+func TestWSPongSurvivesAStaleWriteDeadline(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	server := newWSConn(a, nil, false)
+
+	// what the braid left behind: a deadline that expired a minute ago
+	server.SetWriteDeadline(time.Now().Add(-time.Minute))
+
+	go func() {
+		b.SetWriteDeadline(time.Now().Add(3 * time.Second))
+		b.Write(wsFrameBytes(true, wsOpPing, []byte("are you there"), true))
+	}()
+
+	got := make(chan []byte, 1)
+	go func() {
+		b.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 64)
+		n, err := b.Read(buf)
+		if err != nil {
+			got <- nil
+			return
+		}
+		got <- buf[:n]
+	}()
+
+	// the reader is what answers the ping
+	go func() {
+		a.SetReadDeadline(time.Now().Add(3 * time.Second))
+		server.Read(make([]byte, 64))
+	}()
+
+	select {
+	case f := <-got:
+		if f == nil {
+			t.Fatal("no pong came back - the stale deadline killed it")
+		}
+		if f[0]&0x0f != wsOpPong {
+			t.Fatalf("answered with opcode %#x, not a pong", f[0]&0x0f)
+		}
+	case <-time.After(6 * time.Second):
+		t.Fatal("no pong came back at all")
 	}
 }

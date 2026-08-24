@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.24.0"
+const version = "5.24.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -2699,9 +2699,34 @@ func flowHash(pkt []byte) uint32 {
 // tuneSocket applies the settings that actually move the needle on a
 // long-haul, lossy Iran<->Kharej path: no Nagle delay on the carrier, and
 // socket buffers big enough to hold a full bandwidth-delay product.
+// baseTCP walks down to the socket under whatever is wrapping it.
+//
+// A carrier is not always a bare socket. A ws carrier is framing over a
+// socket; a wss carrier is framing over TLS over a socket. A plain type
+// assert saw neither, so every ws and wss carrier ran with Nagle on - up to
+// forty milliseconds of hesitation before a small write leaves - with no
+// keepalive and with the tuning's socket buffers silently ignored, while the
+// tcp transport got all three.
+func baseTCP(c net.Conn) *net.TCPConn {
+	for i := 0; i < 4 && c != nil; i++ {
+		if tc, ok := c.(*net.TCPConn); ok {
+			return tc
+		}
+		switch v := c.(type) {
+		case interface{ netConn() net.Conn }: // our own framing
+			c = v.netConn()
+		case interface{ NetConn() net.Conn }: // *tls.Conn
+			c = v.NetConn()
+		default:
+			return nil
+		}
+	}
+	return nil
+}
+
 func tuneSocket(c net.Conn, cfg *Config) {
-	tc, ok := c.(*net.TCPConn)
-	if !ok {
+	tc := baseTCP(c)
+	if tc == nil {
 		return
 	}
 	tc.SetNoDelay(true)
