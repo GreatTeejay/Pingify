@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.23.1"
+PINGIFY_VERSION="5.24.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -7213,7 +7213,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.23.1"
+const version = "5.24.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -10992,49 +10992,129 @@ import (
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 const (
+	wsOpCont   = 0x0
+	wsOpText   = 0x1
 	wsOpBinary = 0x2
 	wsOpClose  = 0x8
 	wsOpPing   = 0x9
 	wsOpPong   = 0xA
 )
 
-// wsConn is a net.Conn over WebSocket binary frames. The braid above it sees a
-// byte stream and never learns there is framing underneath.
+const (
+	// RFC 6455 5.5: a control frame carries at most 125 bytes and is never
+	// fragmented. Both are worth checking, because a peer that breaks either
+	// is not sending what we are about to parse.
+	wsMaxControl = 125
+
+	// The largest frame we will read. Our own records stop at maxFrame, so
+	// anything past it is a bug on the far side or somebody probing - and
+	// allocating whatever was asked for is how that becomes a way to run this
+	// server out of memory.
+	wsMaxFrame = maxFrame + 1024
+
+	// How long a pong may wait for the writer before it is given up on.
+	// Losing a pong costs nothing. Blocking the reader costs the carrier.
+	wsControlWait = 2 * time.Second
+)
+
+// The close frame's status code: 1000, a normal end.
+var wsCloseNormal = []byte{0x03, 0xE8}
+
+// wsConn is a net.Conn over RFC 6455 frames. The braid above it sees a byte
+// stream and never learns there is framing underneath.
+//
+// Two things about that stream matter and both were got wrong before:
+//
+//	a message may arrive in pieces. The first frame carries the opcode and
+//	the rest carry opcode 0, and an endpoint that does not join them back
+//	together loses everything after the first piece. We never fragment - but
+//	a proxy, a CDN or anything that reassembles and re-splits a stream does,
+//	and it is entitled to. The old reader had no case for opcode 0, so those
+//	bytes fell past the switch and were dropped, with no error anywhere and
+//	the carrier still counted as up.
+//
+//	a control frame may arrive in the middle of one. A ping between two
+//	fragments is normal and must be answered without disturbing the message
+//	being assembled.
+//
+// Because this is a stream and not a message channel, each piece is handed up
+// as it arrives rather than held until the message ends: nothing above cares
+// where a message began, and waiting for the end would add latency for nothing.
 type wsConn struct {
 	c    net.Conn
 	br   *bufio.Reader
 	mask bool // clients mask, servers must not
 
-	wmu sync.Mutex
+	// A channel rather than a Mutex so a control frame can give up on it.
+	// See writeControl.
+	wmu  chan struct{}
+	wbuf []byte // one frame, header and payload, reused
 
-	rmu  sync.Mutex
-	rest []byte // what is left of the frame last read
+	rmu   sync.Mutex
+	rest  []byte // what is left of the frame last read
+	inMsg bool   // a fragmented message is part way through
+	dbuf  []byte // data payloads, reused
+	cbuf  []byte // control payloads, kept apart so a ping cannot clobber data
+
+	closeOnce sync.Once
 }
 
 func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
 	if br == nil {
 		br = bufio.NewReaderSize(c, 32*1024)
 	}
-	return &wsConn{c: c, br: br, mask: clientSide}
+	return &wsConn{
+		c:    c,
+		br:   br,
+		mask: clientSide,
+		wmu:  make(chan struct{}, 1),
+	}
 }
+
+type wsFrame struct {
+	fin     bool
+	op      byte
+	payload []byte
+}
+
+func (f wsFrame) control() bool { return f.op >= 0x8 }
 
 func (w *wsConn) Read(p []byte) (int, error) {
 	w.rmu.Lock()
 	defer w.rmu.Unlock()
 	for len(w.rest) == 0 {
-		op, payload, err := w.readFrame()
+		f, err := w.readFrame()
 		if err != nil {
 			return 0, err
 		}
-		switch op {
-		case wsOpBinary:
-			w.rest = payload
+		switch f.op {
+		case wsOpBinary, wsOpText:
+			if w.inMsg {
+				return 0, fmt.Errorf("ws: a message began before the last one ended")
+			}
+			w.inMsg = !f.fin
+			w.rest = f.payload
+		case wsOpCont:
+			if !w.inMsg {
+				return 0, fmt.Errorf("ws: a continuation with nothing to continue")
+			}
+			w.inMsg = !f.fin
+			w.rest = f.payload
 		case wsOpPing:
-			w.writeFrame(wsOpPong, payload)
+			// Best effort: see writeControl for why this must not block.
+			w.writeControl(wsOpPong, f.payload)
+		case wsOpPong:
+			// Nothing asked for it and nothing is waiting on it.
 		case wsOpClose:
+			w.writeControl(wsOpClose, wsCloseNormal)
 			return 0, io.EOF
+		default:
+			// Refused rather than skipped. Skipping is what hid the fault
+			// this replaced: an opcode nobody handles is a stream nobody
+			// understands, and carrying on reads the next frame out of the
+			// middle of this one.
+			return 0, fmt.Errorf("ws: opcode %#x is not one we speak", f.op)
 		}
-		// anything else - a pong, a continuation we do not use - is read past
 	}
 	n := copy(p, w.rest)
 	w.rest = w.rest[n:]
@@ -11042,66 +11122,119 @@ func (w *wsConn) Read(p []byte) (int, error) {
 }
 
 func (w *wsConn) Write(p []byte) (int, error) {
-	if err := w.writeFrame(wsOpBinary, p); err != nil {
+	w.wmu <- struct{}{}
+	defer func() { <-w.wmu }()
+	if err := w.frameOut(wsOpBinary, p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
-func (w *wsConn) readFrame() (byte, []byte, error) {
+// buf hands back a scratch buffer of exactly n bytes. Data and control frames
+// keep separate ones so that answering a ping cannot overwrite the payload the
+// reader is part way through handing up.
+func (w *wsConn) buf(n int, control bool) []byte {
+	if control {
+		if cap(w.cbuf) < n {
+			w.cbuf = make([]byte, n)
+		}
+		return w.cbuf[:n]
+	}
+	if cap(w.dbuf) < n {
+		w.dbuf = make([]byte, n)
+	}
+	return w.dbuf[:n]
+}
+
+func (w *wsConn) readFrame() (wsFrame, error) {
+	var f wsFrame
 	var h [2]byte
 	if _, err := io.ReadFull(w.br, h[:]); err != nil {
-		return 0, nil, err
+		return f, err
 	}
-	op := h[0] & 0x0f
+	f.fin = h[0]&0x80 != 0
+	if h[0]&0x70 != 0 {
+		// RSV1-3 mean an extension was negotiated. We negotiate none, so the
+		// frame is not shaped the way we are about to read it, and reading on
+		// would be reading rubbish and calling it payload.
+		return f, fmt.Errorf("ws: reserved bits set, but no extension was agreed")
+	}
+	f.op = h[0] & 0x0f
 	masked := h[1]&0x80 != 0
 	n := int(h[1] & 0x7f)
 	switch n {
 	case 126:
 		var e [2]byte
 		if _, err := io.ReadFull(w.br, e[:]); err != nil {
-			return 0, nil, err
+			return f, err
 		}
 		n = int(binary.BigEndian.Uint16(e[:]))
 	case 127:
 		var e [8]byte
 		if _, err := io.ReadFull(w.br, e[:]); err != nil {
-			return 0, nil, err
+			return f, err
 		}
 		v := binary.BigEndian.Uint64(e[:])
-		// A frame this large is not something we send, so it is either a bug
-		// on the other side or somebody probing. Refuse it rather than
-		// allocating whatever was asked for.
-		if v > 1<<20 {
-			return 0, nil, fmt.Errorf("ws: frame of %d bytes refused", v)
+		if v > wsMaxFrame {
+			return f, fmt.Errorf("ws: a frame of %d bytes was refused", v)
 		}
 		n = int(v)
+	}
+	if n > wsMaxFrame {
+		return f, fmt.Errorf("ws: a frame of %d bytes was refused", n)
+	}
+	// RFC 6455 5.1: a client masks every frame it sends, a server masks none.
+	// Getting it the wrong way round is a peer that is not talking WebSocket
+	// to us - or a middlebox rewriting frames it should be passing through.
+	if masked == w.mask {
+		if w.mask {
+			return f, fmt.Errorf("ws: the server masked a frame")
+		}
+		return f, fmt.Errorf("ws: the client sent an unmasked frame")
+	}
+	if f.control() {
+		if !f.fin {
+			return f, fmt.Errorf("ws: a control frame arrived fragmented")
+		}
+		if n > wsMaxControl {
+			return f, fmt.Errorf("ws: a control frame carried %d bytes", n)
+		}
 	}
 	var key [4]byte
 	if masked {
 		if _, err := io.ReadFull(w.br, key[:]); err != nil {
-			return 0, nil, err
+			return f, err
 		}
 	}
-	payload := make([]byte, n)
-	if _, err := io.ReadFull(w.br, payload); err != nil {
-		return 0, nil, err
+	body := w.buf(n, f.control())
+	if _, err := io.ReadFull(w.br, body); err != nil {
+		return f, err
 	}
 	if masked {
-		for i := range payload {
-			payload[i] ^= key[i%4]
+		for i := range body {
+			body[i] ^= key[i&3]
 		}
 	}
-	return op, payload, nil
+	f.payload = body
+	return f, nil
 }
 
-func (w *wsConn) writeFrame(op byte, payload []byte) error {
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
-
-	hdr := make([]byte, 0, 14)
-	hdr = append(hdr, 0x80|op) // FIN set: we never fragment
+// frameOut writes one whole frame. The caller holds the write lock.
+//
+// Header and payload go out in a single write, out of a buffer that is grown
+// once and then reused - a frame is up to 128 KiB and this carries video, so
+// an allocation and a copy per frame is not free. Two writes would not be
+// either: the header would leave in its own packet.
+func (w *wsConn) frameOut(op byte, payload []byte) error {
 	n := len(payload)
+	if need := 14 + n; cap(w.wbuf) < need {
+		w.wbuf = make([]byte, 0, need)
+	}
+	b := w.wbuf[:0]
+
+	// FIN is always set: we hand every write out as one whole message. What
+	// this had to learn was how to READ a fragmented one.
+	b = append(b, 0x80|op)
 	var lenByte byte
 	switch {
 	case n < 126:
@@ -11114,40 +11247,76 @@ func (w *wsConn) writeFrame(op byte, payload []byte) error {
 	if w.mask {
 		lenByte |= 0x80
 	}
-	hdr = append(hdr, lenByte)
+	b = append(b, lenByte)
 	switch {
 	case n >= 1<<16:
 		var e [8]byte
 		binary.BigEndian.PutUint64(e[:], uint64(n))
-		hdr = append(hdr, e[:]...)
+		b = append(b, e[:]...)
 	case n >= 126:
 		var e [2]byte
 		binary.BigEndian.PutUint16(e[:], uint16(n))
-		hdr = append(hdr, e[:]...)
+		b = append(b, e[:]...)
 	}
 
-	body := payload
-	if w.mask {
-		// RFC 6455 requires a client to mask every frame with a fresh key.
-		// It buys no secrecy - the key travels with the frame - but a proxy
-		// that sees an unmasked client frame is entitled to hang up.
+	if !w.mask {
+		b = append(b, payload...)
+	} else {
+		// A client masks with a fresh key per frame. It buys no secrecy - the
+		// key travels in the header - but a proxy that sees an unmasked client
+		// frame is entitled to hang up, and some do.
 		var key [4]byte
 		if _, err := rand.Read(key[:]); err != nil {
 			return err
 		}
-		hdr = append(hdr, key[:]...)
-		body = make([]byte, n)
-		for i := range payload {
-			body[i] = payload[i] ^ key[i%4]
+		b = append(b, key[:]...)
+		for i := 0; i < n; i++ {
+			b = append(b, payload[i]^key[i&3])
 		}
 	}
-	if _, err := w.c.Write(append(hdr, body...)); err != nil {
-		return err
-	}
-	return nil
+
+	_, err := w.c.Write(b)
+	w.wbuf = b // keep whatever capacity it grew to
+	return err
 }
 
-func (w *wsConn) Close() error                       { return w.c.Close() }
+// writeControl sends a ping, pong or close without ever waiting long for the
+// writer.
+//
+// The reader answers pings, and the writer may be part way through a frame
+// that has not gone out because the far end has stopped reading. If the reader
+// waited for the writer there, it would stop reading too - and two ends each
+// waiting for the other to read is a carrier that is up, idle, and finished.
+// A dropped pong is worth nothing next to that.
+func (w *wsConn) writeControl(op byte, payload []byte) error {
+	if len(payload) > wsMaxControl {
+		payload = payload[:wsMaxControl]
+	}
+	select {
+	case w.wmu <- struct{}{}:
+	default:
+		t := time.NewTimer(wsControlWait)
+		defer t.Stop()
+		select {
+		case w.wmu <- struct{}{}:
+		case <-t.C:
+			return nil
+		}
+	}
+	defer func() { <-w.wmu }()
+	return w.frameOut(op, payload)
+}
+
+func (w *wsConn) Close() error {
+	w.closeOnce.Do(func() {
+		// Say goodbye if it can be said quickly. Never wait on it: the point
+		// of Close is that this carrier is done with.
+		w.c.SetWriteDeadline(time.Now().Add(time.Second))
+		w.writeControl(wsOpClose, wsCloseNormal)
+	})
+	return w.c.Close()
+}
+
 func (w *wsConn) LocalAddr() net.Addr                { return w.c.LocalAddr() }
 func (w *wsConn) RemoteAddr() net.Addr               { return w.c.RemoteAddr() }
 func (w *wsConn) SetDeadline(t time.Time) error      { return w.c.SetDeadline(t) }
@@ -11310,7 +11479,18 @@ func (t *wsTransport) serve() {
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler:           http.HandlerFunc(t.handle),
 	}
-	srv.Serve(t.ln)
+	// Only the header read is bounded. A carrier is hijacked out of this
+	// server and then lives for hours, so a read, write or idle timeout here
+	// would be a clock quietly killing the tunnel.
+	err := srv.Serve(t.ln)
+	select {
+	case <-t.done:
+	default:
+		// The listener stopped but the tunnel did not. Carriers already up
+		// keep working, so nothing else notices - and no new one can ever
+		// arrive. Say so, or this is a tunnel that degrades in silence.
+		logWarn("ws: stopped accepting carriers: %v", err)
+	}
 }
 
 func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
@@ -11345,7 +11525,11 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 		c.Close()
 	default:
 		// Never block the HTTP handler waiting for an acceptor - the same
-		// lesson the echo transport taught, in a different shape.
+		// lesson the echo transport taught, in a different shape. But say it
+		// happened: dropping a carrier on the floor and letting the far end
+		// retry forever is exactly the kind of quiet failure that leaves
+		// somebody staring at "0 of 16" with nothing to go on.
+		logWarn("ws: no room to accept a carrier from %s, dropped", c.RemoteAddr())
 		c.Close()
 	}
 }
