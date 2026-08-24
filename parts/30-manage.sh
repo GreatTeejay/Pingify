@@ -69,6 +69,14 @@ cfg_load() {
         T_PEER_IP="${c%:*}"
         case "$c" in *:*) T_PORT="${c##*:}" ;; *) T_PEER_IP="$c" ;; esac
     fi
+
+    # ws and wss keep the name apart from the address, so connect holds
+    # whatever is dialled - the edge, when there is one. peer is written
+    # alongside it precisely so the server itself can be recovered here.
+    T_DOMAIN="$(toml_get "$f" transport host)"
+    T_EDGE="$(toml_get "$f" transport edge)"
+    local pr; pr="$(toml_get "$f" transport peer)"
+    [ -n "$pr" ] && T_PEER_IP="$pr"
     return 0
 }
 

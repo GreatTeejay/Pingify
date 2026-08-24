@@ -195,6 +195,8 @@ func assign(c *Config, section, key, val string) error {
 			c.Listen = unquote(val)
 		case "connect":
 			c.Connect = unquote(val)
+		case "host", "ws_host":
+			c.WSHost = unquote(val)
 		case "carriers":
 			err = num(&c.Carriers)
 		case "keepalive_sec":

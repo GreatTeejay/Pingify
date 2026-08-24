@@ -199,3 +199,54 @@ func contains(h, n string) bool {
 		return false
 	})()
 }
+
+// The name presented and the address dialled are two different things.
+//
+// A CDN routes on the name in the SNI and the Host header, and never looks at
+// the address the packets arrived on. Keeping them separate is what lets a
+// carrier go to an edge - somewhere cheap or unfiltered from where the client
+// sits - and still arrive at the right origin, without the address it dialled
+// ever naming the server.
+func TestWSHostIsNotTheAddress(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		cfg     Config
+		want    string
+		explain string
+	}{
+		{
+			name:    "an edge dialled, the domain presented",
+			cfg:     Config{Connect: "speedtest.net:8443", WSHost: "tunnel.example.com"},
+			want:    "tunnel.example.com",
+			explain: "the CDN has to see the domain or it cannot route the carrier",
+		},
+		{
+			name:    "no domain falls back to the address",
+			cfg:     Config{Connect: "203.0.113.9:8443"},
+			want:    "203.0.113.9",
+			explain: "a tunnel that goes straight to the server has only the address",
+		},
+		{
+			name:    "the accepting end names itself for its certificate",
+			cfg:     Config{Listen: "0.0.0.0:8443", WSHost: "tunnel.example.com"},
+			want:    "tunnel.example.com",
+			explain: "otherwise the self-signed certificate is issued for 0.0.0.0",
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := wsHostFor(&c.cfg); got != c.want {
+				t.Fatalf("host = %q, want %q - %s", got, c.want, c.explain)
+			}
+		})
+	}
+}
+
+// Go omits SNI entirely for an IP literal, so a tunnel pointed at a bare
+// address arrives at a CDN with nothing to route on. That is not a bug to fix
+// here - it is the reason the domain has to travel separately.
+func TestWSHostSurvivesAPortlessTarget(t *testing.T) {
+	cfg := Config{Connect: "tunnel.example.com", WSHost: ""}
+	if got := wsHostFor(&cfg); got != "tunnel.example.com" {
+		t.Fatalf("host = %q, want the bare name back", got)
+	}
+}

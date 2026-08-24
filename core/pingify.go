@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.22.2"
+const version = "5.23.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -107,6 +107,16 @@ type Config struct {
 	// anything that opens the page, not about proving who we are.
 	CertFile string `json:"cert_file,omitempty"`
 	KeyFile  string `json:"key_file,omitempty"`
+
+	// WSHost is the name a ws or wss carrier presents: the TLS SNI and the
+	// HTTP Host header. Empty means take it from the address being dialled,
+	// which is what a tunnel that goes straight to the server wants.
+	//
+	// The name and the address are separate because a CDN routes on the name
+	// and never looks at the address. That is the whole trick: dial an edge
+	// that is cheap or unfiltered where the client is, present the domain the
+	// CDN knows, and the address dialled never names the server at all.
+	WSHost string `json:"ws_host,omitempty"`
 	// origin side: if non-empty, only these host:port targets may be dialled.
 	Allow []string `json:"allow,omitempty"`
 

@@ -341,9 +341,16 @@ func wsPathFor(cfg *Config) string {
 	return "/" + strings.TrimRight(base64.RawURLEncoding.EncodeToString(k), "=")
 }
 
-// The Host header. A CDN routes on it, so it has to be the hostname the tunnel
-// was pointed at rather than an address.
+// The name this end presents: the TLS SNI and the HTTP Host header.
+//
+// A CDN routes on the name, so when there is a domain it wins over whatever
+// address is being dialled - that is what lets a carrier go to an edge and
+// still arrive at the right origin. Without one it falls back to the address,
+// which is right for a tunnel that goes straight to the server.
 func wsHostFor(cfg *Config) string {
+	if cfg.WSHost != "" {
+		return cfg.WSHost
+	}
 	target := cfg.Connect
 	if target == "" {
 		target = cfg.Listen
