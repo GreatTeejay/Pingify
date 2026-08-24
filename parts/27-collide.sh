@@ -345,8 +345,8 @@ show_taken_ports() {
 # port_family TRANSPORT - the socket a transport binds: tcp, udp, or none.
 port_family() {
     case "$1" in
-        tcp | ws | wss) printf 'tcp' ;;
-        udp | awg)      printf 'udp' ;;
+        tcp | pck | ws | wss) printf 'tcp' ;;
+        udp | kcp | awg)      printf 'udp' ;;
         *)              printf 'none' ;;
     esac
 }

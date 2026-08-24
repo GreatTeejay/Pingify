@@ -9,6 +9,7 @@ cd "$(dirname "$0")"
 
 OUT="Pingify.sh"
 DELIM="PINGIFY_SRC_EOF"
+VENDOR_DELIM="PINGIFY_VENDOR_EOF"
 GO_BIN="${GO_BIN:-go}"
 
 red()  { printf '\033[31m%s\033[0m\n' "$*"; }
@@ -71,6 +72,15 @@ grep -q '@@CORE_FILES@@' "$tmp" || { red "the @@CORE_FILES@@ marker is missing";
     done
 } > "$tmp.core"
 
+# KCP/FEC has audited MIT/BSD dependencies. Keep the server-side build fully
+# offline by shipping the vendored module tree as one compressed block rather
+# than turning hundreds of small source files into hundreds of heredocs.
+{
+    printf "    base64 -d <<'%s' | tar -xzf - -C \"\$d\"\n" "$VENDOR_DELIM"
+    ( cd core && tar -czf - go.mod go.sum vendor ) | base64
+    printf '%s\n' "$VENDOR_DELIM"
+} >> "$tmp.core"
+
 awk -v corefile="$tmp.core" '
     /@@CORE_FILES@@/ { while ((getline line < corefile) > 0) print line; next }
     { print }
@@ -95,6 +105,13 @@ for f in core/*.go; do
         exit 1
     fi
 done
+if ! diff -qr core/vendor "$check_dir/vendor" >/dev/null ||
+   ! diff -q core/go.mod "$check_dir/go.mod" >/dev/null ||
+   ! diff -q core/go.sum "$check_dir/go.sum" >/dev/null; then
+    red "embedded vendored modules differ from the originals"
+    rm -rf "$check_dir"
+    exit 1
+fi
 rm -rf "$check_dir"
 
 grn "Wrote $OUT ($(wc -l < "$OUT") lines, $(wc -c < "$OUT") bytes) - parses, sources verified."

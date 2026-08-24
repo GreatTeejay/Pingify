@@ -26,6 +26,11 @@ cfg_load() {
     T_SNDBUF="$(toml_get "$f" tuning sndbuf_kb)";           : "${T_SNDBUF:=$T_WINDOW}"
     T_RCVBUF="$(toml_get "$f" tuning rcvbuf_kb)";           : "${T_RCVBUF:=$T_WINDOW}"
     T_PRESET="$(toml_get "$f" tuning profile)";             : "${T_PRESET:=custom}"
+    T_FEC_DATA="$(toml_get "$f" kcp data_shards)";          : "${T_FEC_DATA:=10}"
+    T_FEC_PARITY="$(toml_get "$f" kcp parity_shards)";      : "${T_FEC_PARITY:=3}"
+    T_PACKET_MTU="$(toml_get "$f" kcp mtu)";                : "${T_PACKET_MTU:=1200}"
+    T_KCP_INTERVAL="$(toml_get "$f" kcp interval_ms)";      : "${T_KCP_INTERVAL:=10}"
+    T_PCK_FLAGS="$(toml_get "$f" pck flags)";               : "${T_PCK_FLAGS:=PA}"
     T_FORWARDS="$(toml_arr "$f" ports)"
     T_FORWARDER="$(toml_get "$f" forward forwarder)";       : "${T_FORWARDER:=pingify}"
     # pfy0 is what tunnels built before the device was named after them

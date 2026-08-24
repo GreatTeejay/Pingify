@@ -147,21 +147,35 @@ health_check() {
         hc_bad "no carrier is up (0 of $total)"
         if this_side_accepts; then
             hc_note "this end waits for the other one to connect"
-            if [ "$T_TRANSPORT" = "tcp" ]; then
-                hc_fix "check the other server is running, then open ${T_PORT}/tcp here:"
-                hc_note "ufw allow ${T_PORT}/tcp    (or the provider's firewall)"
-                hc_note "if it still will not hold, rebuild with Direct instead"
-            else
-                hc_fix "check the other server is running and can ping this one"
-            fi
+            case "$T_TRANSPORT" in
+                tcp)
+                    hc_fix "check the other server is running, then open ${T_PORT}/tcp here:"
+                    hc_note "ufw allow ${T_PORT}/tcp    (or the provider's firewall)"
+                    hc_note "if it still will not hold, rebuild with Direct instead" ;;
+                kcp)
+                    hc_fix "open ${T_PORT}/udp here and in the provider firewall"
+                    hc_note "ufw allow ${T_PORT}/udp" ;;
+                pck)
+                    hc_fix "open ${T_PORT}/tcp in the provider firewall and inspect the live log"
+                    hc_note "PCK has no TCP listener; do not test it with ss or /dev/tcp"
+                    hc_note "both servers need Linux, CAP_NET_RAW/root and iptables" ;;
+                *)
+                    hc_fix "check the other server is running and can ping this one" ;;
+            esac
         else
             hc_note "this end dials ${CFG_CONNECT}"
-            if [ "$T_TRANSPORT" = "tcp" ]; then
-                hc_fix "check that port is open on the other server"
-                hc_note "from here:  timeout 5 bash -c '</dev/tcp/${CFG_CONNECT%:*}/${CFG_CONNECT##*:}' && echo open"
-            else
-                hc_fix "check the other server answers a ping:  ping -c3 ${CFG_CONNECT}"
-            fi
+            case "$T_TRANSPORT" in
+                tcp)
+                    hc_fix "check that port is open on the other server"
+                    hc_note "from here:  timeout 5 bash -c '</dev/tcp/${CFG_CONNECT%:*}/${CFG_CONNECT##*:}' && echo open" ;;
+                kcp)
+                    hc_fix "open ${T_PORT}/udp on the other server and its provider firewall" ;;
+                pck)
+                    hc_fix "inspect both live logs for packet-socket or firewall-rule errors"
+                    hc_note "PCK deliberately has no TCP handshake for /dev/tcp to test" ;;
+                *)
+                    hc_fix "check the other server answers a ping:  ping -c3 ${CFG_CONNECT}" ;;
+            esac
         fi
         hc_note "and that both ends have the same security token"
     elif [ "$up" != "$total" ]; then
@@ -240,6 +254,25 @@ health_check() {
             hc_note "the tunnel keeps working either way, but the server is"
             hc_note "louder than it needs to be and answers every scanner"
             hc_fix "main menu ${BX_ARR} Blocking ${BX_ARR} turn the ICMP block on"
+        fi
+    fi
+
+    # PCK receives before conntrack but Linux still tries to answer the fake
+    # established segments with RST. The core installs these narrow guards;
+    # show a precise repair when a stripped-down VPS lacks iptables support.
+    if [ "$T_TRANSPORT" = "pck" ]; then
+        local pck_local_port="$T_PORT"
+        this_side_accepts || pck_local_port="$(pck_source_port "$T_TOKEN" "$T_PORT")"
+        if ! have iptables; then
+            hc_bad "iptables is missing, so PCK cannot suppress kernel RST packets"
+            hc_fix "install iptables, then restart pingify@$name"
+        elif iptables -t filter -C OUTPUT -p tcp --sport "$pck_local_port" --tcp-flags RST RST -m comment --comment "pingify-pck-$pck_local_port" -j DROP >/dev/null 2>&1 &&
+           iptables -t raw -C PREROUTING -p tcp --dport "$pck_local_port" -m comment --comment "pingify-pck-$pck_local_port" -j NOTRACK >/dev/null 2>&1 &&
+           iptables -t raw -C OUTPUT -p tcp --sport "$pck_local_port" -m comment --comment "pingify-pck-$pck_local_port" -j NOTRACK >/dev/null 2>&1; then
+            hc_ok "PCK RST and conntrack guards are installed"
+        else
+            hc_bad "PCK firewall guards are missing"
+            hc_fix "systemctl restart pingify@$name, then inspect its first 30 log lines"
         fi
     fi
 

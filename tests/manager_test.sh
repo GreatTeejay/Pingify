@@ -339,7 +339,7 @@ note "the setup token carries a whole tunnel"
 decode() {
     local raw
     raw="$(printf '%s' "$1" | base64 -d)"
-    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV TOK_TL TOK_TP TOK_MTU TOK_TTL TOK_AWGPORT TOK_AWGPRIV TOK_AWGPUB TOK_AWGOBF <<EOF
+    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV TOK_TL TOK_TP TOK_MTU TOK_TTL TOK_AWGPORT TOK_AWGPRIV TOK_AWGPUB TOK_AWGOBF TOK_FEC_DATA TOK_FEC_PARITY TOK_PACKET_MTU TOK_KCP_INTERVAL TOK_PCK_FLAGS <<EOF
 $raw
 EOF
 }
@@ -352,7 +352,7 @@ T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"
 T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_SNDBUF=1024; T_RCVBUF=1024
 T_FORWARDS='"6526"'; T_STATUS="127.0.0.1:9700"
 decode "$(cfg_setup_token)"
-check "token version"           "$TOK_V"      "p3"
+check "token version"           "$TOK_V"      "p4"
 check "transport travels"       "$TOK_TR"     "tcp"
 check "forwarder travels"       "$TOK_FWD"    "pingify"
 check "the peer is told to dial" "$TOK_DIAL"  "1"
@@ -392,6 +392,9 @@ T_KIND="$TOK_KIND"; T_TRANSPORT="$TOK_TR"; T_MODE="$TOK_MODE"
 T_FORWARDER="$TOK_FWD"; T_TOKEN="$TOK_TOKEN"
 T_CARRIERS="$TOK_CAR"; T_WINDOW="$TOK_WIN"; T_KEEPALIVE="$TOK_KA"
 T_SNDBUF="$TOK_SND"; T_RCVBUF="$TOK_RCV"
+T_FEC_DATA="$TOK_FEC_DATA"; T_FEC_PARITY="$TOK_FEC_PARITY"
+T_PACKET_MTU="$TOK_PACKET_MTU"; T_KCP_INTERVAL="$TOK_KCP_INTERVAL"
+T_PCK_FLAGS="$TOK_PCK_FLAGS"
 T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
 T_ROLE="client"; T_ACCEPTS="server"; T_PEER_IP="$TOK_HOST"
 T_NAME="kharej-icmp"; T_PUBLIC_IP="198.51.100.4"; T_STATUS="127.0.0.1:9702"
@@ -744,7 +747,7 @@ check "and both addresses"      "$(toml_get "$gre_file" gre peer_public)" "198.5
 check "the interface is named"  "$(toml_get "$gre_file" tun name)"        "gre-iran"
 
 decode "$(cfg_setup_token)"
-check "the token is p3"          "$TOK_V"     "p3"
+check "the token is p4"          "$TOK_V"     "p4"
 check "gre travels"              "$TOK_TR"    "gre"
 check "the ttl travels"          "$TOK_TTL"   "255"
 check "and our address, always"  "$TOK_HOST"  "203.0.113.9"
@@ -1662,7 +1665,7 @@ note "a transport is a seam now, not a branch"
 # interface for three things now, and adding one is writing those three.
 check "udp has a label"        "$(transport_label udp)"  "UDP"
 check "and is offered"         "$(grep -c 'choice 2 "UDP"' Pingify.sh)" "1"
-check "five protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5' Pingify.sh)" "1"
+check "nine protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7 8 9' Pingify.sh)" "1"
 
 # It carries ports like TCP does, so it is named and addressed like TCP
 nu() { ( T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443; tunnel_default_name ); }
@@ -1693,6 +1696,44 @@ if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
     "$CORE_BIN" -c "$uf" -check >/dev/null 2>&1
     check "and the core accepts it" "$?" "0"
 fi
+
+# KCP+FEC and PCK share the low-latency packet engine, but claim different
+# socket families and are never silently rendered as legacy UDP/TCP.
+check "kcp has its own label" "$(transport_label kcp)" "KCP+FEC"
+check "pck has its own label" "$(transport_label pck)" "TCP+PCK"
+check "kcp is offered" "$(grep -c 'choice 8 "KCP+FEC"' Pingify.sh)" "1"
+check "pck is offered" "$(grep -c 'choice 9 "TCP+PCK"' Pingify.sh)" "1"
+check "pck source port matches core" "$(pck_source_port "$TOKEN" 443)" "28817"
+check "pck avoids the remote port" "$(pck_source_port "$TOKEN" 28817)" "28818"
+check "pck health checks outbound NOTRACK" "$(grep -c 'iptables -t raw -C OUTPUT -p tcp --sport.*NOTRACK' Pingify.sh)" "1"
+
+PKTC="$WORK/packetcfg"; mkdir -p "$PKTC"
+for tr in kcp pck; do
+    (
+        CFG_DIR="$PKTC"
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="$tr"; T_ACCEPTS="server"; cfg_mode
+        T_NAME="iran-$tr-9443"; T_PORT=9443; T_TOKEN="$TOKEN"
+        T_PUBLIC_IP="203.0.113.9"; T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+    )
+done
+kf="$PKTC/iran-kcp-9443.toml"; pf="$PKTC/iran-pck-9443.toml"
+check "kcp writes real FEC data shards" "$(toml_get "$kf" kcp data_shards)" "10"
+check "kcp writes parity shards" "$(toml_get "$kf" kcp parity_shards)" "3"
+check "kcp writes its packet MTU" "$(toml_get "$kf" kcp mtu)" "1200"
+check "pck writes its TCP flags" "$(toml_get "$pf" pck flags)" "PA"
+if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
+    "$CORE_BIN" -c "$kf" -check >/dev/null 2>&1
+    check "the core accepts kcp+fec" "$?" "0"
+    "$CORE_BIN" -c "$pf" -check >/dev/null 2>&1
+    check "the core accepts tcp+pck" "$?" "0"
+fi
+
+T_TRANSPORT="kcp"; apply_preset balanced >/dev/null
+check "balanced kcp uses a small pool" "$T_CARRIERS" "4"
+T_TRANSPORT="pck"; apply_preset gaming >/dev/null
+check "gaming pck stays one session" "$T_CARRIERS" "1"
 
 
 # ---------------------------------------------------------------------------
@@ -1742,7 +1783,9 @@ check "and tcp keeps the plain name"  "$(grep '^name=' "$WORK/tport.out" | sed -
 # called a real clash free.
 check "ws is a tcp socket"   "$(port_family ws)"   "tcp"
 check "and wss too"          "$(port_family wss)"  "tcp"
+check "pck is TCP-shaped"    "$(port_family pck)"  "tcp"
 check "udp is its own"       "$(port_family udp)"  "udp"
+check "kcp binds UDP"        "$(port_family kcp)"  "udp"
 check "awg binds udp"        "$(port_family awg)"  "udp"
 check "icmp binds no port"   "$(port_family icmp)" "none"
 check "and neither does gre" "$(port_family gre)"  "none"
@@ -1806,7 +1849,7 @@ note "WebSocket goes where the web goes"
 #
 check "ws has a label"      "$(transport_label ws)"  "WS"
 check "wss has a label"     "$(transport_label wss)" "WSS"
-check "seven protocols now" "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7' Pingify.sh)" "1"
+check "nine protocols now"  "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7 8 9' Pingify.sh)" "1"
 check "wss is offered"      "$(grep -c 'choice 6 "WSS"' Pingify.sh)" "1"
 check "ws is offered"       "$(grep -c 'choice 7 "WS"' Pingify.sh)" "1"
 
@@ -1819,7 +1862,7 @@ check "tcp keeps the plain name" "$(nw server tcp)" "iran-443"
 
 # they carry a port, so the port question and its clash check must cover them
 wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "the port question covers them" "$(wz | grep -c 'tcp | udp | ws | wss) has_port=1')" "1"
+check "the port question covers them" "$(wz | grep -c 'tcp | udp | kcp | pck | ws | wss) has_port=1')" "1"
 
 # ---------------------------------------------------------------------------
 note "a name says which server first"
@@ -1913,7 +1956,7 @@ TOKPORT="$WORK/tokport"; mkdir -p "$TOKPORT"
 (
     CFG_DIR="$TOKPORT"
     have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
-    for tr in tcp udp ws wss icmp; do
+    for tr in tcp udp kcp pck ws wss icmp; do
         cfg_reset
         T_ROLE="server"; T_TRANSPORT="$tr"; T_ACCEPTS="server"
         [ "$tr" = "icmp" ] && T_KIND="tun"
@@ -1932,6 +1975,8 @@ tkp() { grep -m1 "^$1=" "$WORK/tokport.out" | cut -d= -f2-; }
 
 check "tcp carries its port"  "$(tkp tcp)"  "9553"
 check "and so does udp"       "$(tkp udp)"  "9553"
+check "and kcp"               "$(tkp kcp)"  "9553"
+check "and pck"               "$(tkp pck)"  "9553"
 check "and ws"                "$(tkp ws)"   "9553"
 check "and wss"               "$(tkp wss)"  "9553"
 # icmp has none to carry, and inventing one would be a lie the far end acts on
@@ -2014,7 +2059,7 @@ eg() { grep -m1 "^$1=" "$WORK/edge.out" | cut -d= -f2-; }
 check "the address travels as the address" "$(eg token_host)"   "tunnel.example.com"
 check "with its port beside it"            "$(eg token_port)"   "8443"
 # no field was added for the domain, because the address already was one
-check "and the token grew no field"        "$(eg token_fields)" "22"
+check "and the token carries packet tuning" "$(eg token_fields)" "27"
 
 check "KHAREJ dials the domain"       "$(eg plain_connect)" "tunnel.example.com:8443"
 check "and says it only once"         "$(eg plain_host)"    ""

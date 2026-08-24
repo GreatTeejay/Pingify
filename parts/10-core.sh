@@ -67,12 +67,11 @@ build_core() {
     rm -rf "$SRC_DIR"
     mkdir -p "$SRC_DIR" || return 1
     write_core_sources "$SRC_DIR" || return 1
-    printf 'module pingify\n\ngo 1.%s\n' "$GO_MIN_MINOR" > "$SRC_DIR/go.mod"
 
     local log="/tmp/pingify-build.log"
     go_build_now() {
         ( cd "$SRC_DIR" && \
-          GOTOOLCHAIN=local GO111MODULE=on GOFLAGS=-mod=mod GOPROXY=off GOSUMDB=off \
+          GOTOOLCHAIN=local GO111MODULE=on GOFLAGS=-mod=vendor GOPROXY=off GOSUMDB=off \
           GOPATH="${GOPATH:-/tmp/pingify-gopath}" GOCACHE="${GOCACHE:-/tmp/pingify-gocache}" \
           CGO_ENABLED=0 "$GO_BIN" build -trimpath -ldflags "-s -w" \
           -o "$SRC_DIR/pingify-core" . ) >"$log" 2>&1
