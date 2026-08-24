@@ -1826,17 +1826,24 @@ check "and wss"               "$(tkp wss)"  "9553"
 check "icmp carries none"     "$(tkp icmp)" "EMPTY"
 
 # ---------------------------------------------------------------------------
-note "the name on the wire is not the address"
+note "WSS behind a CDN, which is only an address and one extra"
 # ---------------------------------------------------------------------------
-# A CDN routes on the name and never looks at the address, so the two are
-# separate: dial an edge that is cheap or unfiltered from here, present the
-# domain the CDN knows, and the address dialled never names the server.
-check "wss proxies on these ports"  "$(cdn_ports wss)" "443 2053 2083 2087 2096 8443"
-check "and ws on the plain ones"    "$(cdn_ports ws)"  "80 8080 8880 2052 2082 2086 2095"
-check "443 is proxied"       "$(cdn_port_ok 443 wss && echo yes || echo no)"  "yes"
-check "8443 too"             "$(cdn_port_ok 8443 wss && echo yes || echo no)" "yes"
-check "9553 is not"          "$(cdn_port_ok 9553 wss && echo yes || echo no)" "no"
-check "nor is 443 for ws"    "$(cdn_port_ok 443 ws && echo yes || echo no)"   "no"
+# For WSS the address IS the domain: it is what gets dialled, what the CDN
+# routes on, and what travels in the token like any other address. There is no
+# second field for it, and the config says it once, in connect.
+#
+# An edge is the only genuinely extra thing - an address to dial that is not
+# the peer. The name still travels, so it still arrives; only the address
+# changes, and it never names the IRAN server.
+check "a domain is a name"      "$(is_name tunnel.example.com && echo yes || echo no)" "yes"
+check "an address is not"       "$(is_name 203.0.113.9 && echo yes || echo no)"        "no"
+check "nor is an v6 address"    "$(is_name 2001:db8::1 && echo yes || echo no)"        "no"
+check "nor is nothing"          "$(is_name '' && echo yes || echo no)"                 "no"
+
+check "a CDN proxies these"  "$(cdn_ports)" "443 2053 2083 2087 2096 8443"
+check "443 is one of them"   "$(cdn_port_ok 443 && echo yes || echo no)"  "yes"
+check "8443 too"             "$(cdn_port_ok 8443 && echo yes || echo no)" "yes"
+check "9553 is not"          "$(cdn_port_ok 9553 && echo yes || echo no)" "no"
 
 EDGE="$WORK/edge"; mkdir -p "$EDGE"
 (
@@ -1844,63 +1851,79 @@ EDGE="$WORK/edge"; mkdir -p "$EDGE"
     have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
     server_info() { :; }
 
-    # IRAN names the domain, and it travels in the token
+    # IRAN gives its domain where it would give its address. Nothing else.
     cfg_reset
     T_ROLE="server"; T_TRANSPORT="wss"; T_ACCEPTS="server"; cfg_mode
-    T_PORT=8443; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
-    T_DOMAIN="tunnel.example.com"; T_TOKEN="$TOKEN"; T_FORWARDS='"443"'
+    T_PORT=8443; T_PUBLIC_IP="tunnel.example.com"; T_PEER_IP="198.51.100.4"
+    T_TOKEN="$TOKEN"; T_FORWARDS='"443"'
     T_NAME="$(tunnel_default_name)"; T_STATUS="127.0.0.1:9700"
     cfg_save > /dev/null
-    echo "iran_host=$(toml_get "$(cfg_file "$T_NAME")" transport host)"
     raw="$(cfg_setup_token | base64 -d)"
-    echo "token_dom=$(printf '%s' "$raw" | awk -F'|' '{print $23}')"
+    echo "token_host=$(printf '%s' "$raw" | awk -F'|' '{print $7}')"
+    echo "token_port=$(printf '%s' "$raw" | awk -F'|' '{print $8}')"
+    echo "token_fields=$(printf '%s' "$raw" | awk -F'|' '{print NF}')"
 
-    # KHAREJ takes the domain from the token and adds its own way in
+    # KHAREJ dials the domain it was given, and says so once
     cfg_reset
     T_ROLE="client"; T_TRANSPORT="wss"; T_ACCEPTS="server"; cfg_mode
-    T_PORT=8443; T_PUBLIC_IP="198.51.100.4"; T_PEER_IP="203.0.113.9"
-    T_DOMAIN="tunnel.example.com"; T_EDGE="speedtest.net"
+    T_PORT=8443; T_PUBLIC_IP="198.51.100.4"; T_PEER_IP="tunnel.example.com"
     T_TOKEN="$TOKEN"; T_NAME="$(tunnel_default_name)"; T_STATUS="127.0.0.1:9701"
     cfg_save > /dev/null
-    kf="$(cfg_file "$T_NAME")"
-    echo "kharej_connect=$(toml_get "$kf" transport connect)"
-    echo "kharej_host=$(toml_get "$kf" transport host)"
-    echo "kharej_peer=$(toml_get "$kf" transport peer)"
+    pf="$(cfg_file "$T_NAME")"
+    echo "plain_connect=$(toml_get "$pf" transport connect)"
+    echo "plain_host=$(toml_get "$pf" transport host)"
+    echo "plain_keys=$(grep -c '^host\|^edge\|^peer' "$pf")"
 
-    # and it survives being read back for an edit
-    kn="$T_NAME"; cfg_reset; cfg_load "$kn"
-    cfg_endpoints
-    echo "reload_domain=$T_DOMAIN"
-    echo "reload_edge=$T_EDGE"
+    # and with an edge, connect holds the way in and host the name to present
+    T_EDGE="speedtest.net"; cfg_save > /dev/null
+    ef="$(cfg_file "$T_NAME")"
+    echo "edge_connect=$(toml_get "$ef" transport connect)"
+    echo "edge_host=$(toml_get "$ef" transport host)"
+
+    # an edit gets both back the right way round
+    en="$T_NAME"; cfg_reset; cfg_load "$en"
     echo "reload_peer=$T_PEER_IP"
-    echo "reload_dials=$CFG_CONNECT"
+    echo "reload_edge=$T_EDGE"
+    cfg_endpoints; echo "reload_dials=$CFG_CONNECT"
 
-    # without an edge it dials the domain, not the address
-    T_EDGE=""; cfg_endpoints
-    echo "nodedge_dials=$CFG_CONNECT"
-    # and with no domain at all, the address - which is what a direct tunnel wants
-    T_DOMAIN=""; cfg_endpoints
-    echo "plain_dials=$CFG_CONNECT"
+    # ws is a different tunnel: an address, and no CDN anywhere near it
+    cfg_reset
+    T_ROLE="client"; T_TRANSPORT="ws"; T_ACCEPTS="server"; cfg_mode
+    T_PORT=8080; T_PUBLIC_IP="198.51.100.4"; T_PEER_IP="203.0.113.9"
+    T_TOKEN="$TOKEN"; T_NAME="$(tunnel_default_name)"; T_STATUS="127.0.0.1:9702"
+    T_EDGE="speedtest.net"
+    cfg_save > /dev/null
+    wf="$(cfg_file "$T_NAME")"
+    echo "ws_connect=$(toml_get "$wf" transport connect)"
+    echo "ws_host=$(toml_get "$wf" transport host)"
 ) > "$WORK/edge.out" 2>&1
 eg() { grep -m1 "^$1=" "$WORK/edge.out" | cut -d= -f2-; }
 
-check "IRAN writes the name it answers to" "$(eg iran_host)"  "tunnel.example.com"
-check "the token carries the domain"       "$(eg token_dom)"  "tunnel.example.com"
-check "KHAREJ dials the edge"              "$(eg kharej_connect)" "speedtest.net:8443"
-check "but presents the domain"            "$(eg kharej_host)"    "tunnel.example.com"
-# connect holds the edge, so the server itself has to be written down separately
-check "and remembers the real server"      "$(eg kharej_peer)"    "203.0.113.9"
-check "an edit reads the domain back"      "$(eg reload_domain)"  "tunnel.example.com"
-check "and the edge"                       "$(eg reload_edge)"    "speedtest.net"
-check "and the server, not the edge"       "$(eg reload_peer)"    "203.0.113.9"
-check "and still dials the edge"           "$(eg reload_dials)"   "speedtest.net:8443"
-check "no edge dials the domain"           "$(eg nodedge_dials)"  "tunnel.example.com:8443"
-check "no domain dials the address"        "$(eg plain_dials)"    "203.0.113.9:8443"
+check "the address travels as the address" "$(eg token_host)"   "tunnel.example.com"
+check "with its port beside it"            "$(eg token_port)"   "8443"
+# no field was added for the domain, because the address already was one
+check "and the token grew no field"        "$(eg token_fields)" "22"
 
-# the question is asked on the end that dials, and only there
+check "KHAREJ dials the domain"       "$(eg plain_connect)" "tunnel.example.com:8443"
+check "and says it only once"         "$(eg plain_host)"    ""
+check "no extra keys at all"          "$(eg plain_keys)"    "0"
+
+check "an edge changes the address"   "$(eg edge_connect)"  "speedtest.net:8443"
+check "and only then names the peer"  "$(eg edge_host)"     "tunnel.example.com"
+check "an edit reads the peer back"   "$(eg reload_peer)"   "tunnel.example.com"
+check "and the edge"                  "$(eg reload_edge)"   "speedtest.net"
+check "and still dials the edge"      "$(eg reload_dials)"  "speedtest.net:8443"
+
+# WS is not WSS. It has no TLS, so nothing carries a name a CDN could route on
+check "ws dials its address"          "$(eg ws_connect)"    "203.0.113.9:8080"
+check "and never writes a host"       "$(eg ws_host)"       ""
+
+# the edge is offered on the end that dials, for wss, and nowhere else
+ae() { awk '/^ask_edge\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "an edge is wss only"     "$(ae | grep -c 'T_TRANSPORT" = "wss" \] || return 0')" "1"
+check "and needs a name to present" "$(ae | grep -c 'is_name "\$T_PEER_IP" || return 0')" "1"
 im() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "the importer offers an edge"  "$(im | grep -c 'ask_edge')" "1"
-check "and an edge needs a domain"   "$(awk '/^ask_edge\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'T_DOMAIN" \] || return 0')" "1"
+check "the importer offers it"  "$(im | grep -c 'ask_edge')" "1"
 
 # WS is not encrypted by itself and the screen has to say so, because the name
 # looks like WSS with one letter missing
