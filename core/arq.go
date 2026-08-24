@@ -60,6 +60,12 @@ const (
 	// un-updated peer is known to accept.
 	arqWinStart = 64
 
+	// The longest a segment waits before going again. Twelve retries with a
+	// doubling back-off up to this is about forty-seven seconds, which is
+	// inside the minute the braid gives a carrier before declaring the peer
+	// gone - so the ARQ, which knows more, is the one that decides.
+	arqMaxRTO = 5 * time.Second
+
 	flagData = 1 << 0
 	flagFin  = 1 << 1
 	flagRst  = 1 << 2
@@ -514,21 +520,36 @@ func (c *arqConn) timerLoop() {
 				c.mu.Unlock()
 				return
 			}
-			// Anything past its timeout goes again, with the timeout doubled
-			// so a dead path is not hammered.
+			// Anything past its timeout goes again. Both the back-off and
+			// the window cut happen ONCE for the pass, not once per segment:
+			// a full window timing out together is one event - the path
+			// stopped carrying - and treating it as sixty-four drove the
+			// timeout from 500ms to its five-second ceiling on the first
+			// pass, and halved the window past its floor in the same instant.
+			// Twelve retries at five seconds is exactly the sixty seconds a
+			// carrier is given before it is declared dead, so every carrier
+			// died together on the first real stall rather than riding it out.
+			lost := false
 			for _, seg := range c.sndBuf {
 				if now.Sub(seg.sentAt) >= c.rto {
 					seg.retries++
-					c.shrink()
+					lost = true
 					if seg.retries > c.maxRetries {
 						c.fail(errARQClosed)
 						c.mu.Unlock()
 						return
 					}
 					c.emit(seg, flagData)
-					if c.rto < 5*time.Second {
-						c.rto *= 2
-					}
+				}
+			}
+			if lost {
+				c.shrink()
+				// Clamped after doubling, not before. Testing first let it
+				// pass the ceiling on the way through - four seconds is under
+				// five, so it doubled to eight.
+				c.rto *= 2
+				if c.rto > arqMaxRTO {
+					c.rto = arqMaxRTO
 				}
 			}
 			if c.needAck {

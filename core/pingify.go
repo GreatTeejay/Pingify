@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.19.2"
+const version = "5.20.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -918,6 +918,13 @@ type pool struct {
 	// only when that changed
 	reported int
 
+	// why the most recent carrier died. Sixteen carriers dropping together
+	// wrote sixteen identical reasons, so the reason was moved to debug - and
+	// then the log said "1 went down" sixteen times and never once said why,
+	// which is the only thing anybody reads a log for. It is kept here
+	// instead, and reported once with the count.
+	lastDown string
+
 	// How many times the far end has told us it could not reach a target.
 	// A stream that ends because the service on the other server hung up and
 	// a stream that ends because there was no service to hang up both arrive
@@ -1159,6 +1166,7 @@ func (p *pool) noteStrength() {
 	}
 	was := p.reported
 	p.reported = n
+	why := p.lastDown
 	p.mu.Unlock()
 
 	switch {
@@ -1170,8 +1178,14 @@ func (p *pool) noteStrength() {
 		logInfo("all %d carriers up", n)
 	case n == 0:
 		logWarn("every carrier is down: nothing can cross the tunnel now")
+		if why != "" {
+			logWarn("the last one went because: %s", why)
+		}
 	case n < was:
 		logWarn("%d of %d carriers up, %d went down", n, p.cfg.Carriers, was-n)
+		if why != "" {
+			logWarn("  because: %s", why)
+		}
 	}
 }
 
@@ -1985,6 +1999,9 @@ func (l *link) close() {
 		logDebug("carrier %d down: %s (up %s)", l.idx, why,
 			time.Since(time.Unix(0, atomic.LoadInt64(&l.upSince))).Round(time.Second))
 		if l.pool != nil {
+			l.pool.mu.Lock()
+			l.pool.lastDown = why
+			l.pool.mu.Unlock()
 			l.pool.noteStrength()
 		}
 	})

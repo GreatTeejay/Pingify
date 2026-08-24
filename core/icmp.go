@@ -121,8 +121,10 @@ func newICMPTransport(psk []byte, bind string, windowKB int) (*icmpTransport, er
 		psk:      psk,
 		window:   arqWindowFor(windowKB, icmpMaxPayload),
 		sessions: make(map[sessionKey]*arqConn),
-		inbound:  make(chan net.Conn, 16),
-		done:     make(chan struct{}),
+		// Deep enough that a listening end with a busy acceptor does not drop
+		// a carrier it wanted; the reader never waits on it either way.
+		inbound: make(chan net.Conn, 64),
+		done:    make(chan struct{}),
 	}
 	go t.readLoop()
 	return t, nil
@@ -207,10 +209,39 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
+		// Is there anywhere for it to go? Checked before anything is built,
+		// because a connection nobody accepts is a goroutine and a timer for
+		// a session that does not exist - and closing one sends a datagram
+		// back to a stray we have decided to ignore.
+		//
+		// dispatch runs only on the single read loop, so a plain length test
+		// races with nothing.
+		if len(t.inbound) == cap(t.inbound) {
+			t.mu.Unlock()
+			logDebug("icmp: no room to accept session %08x carrier %d from %s, ignored",
+				h.session, h.carrier, peer)
+			return
+		}
 		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.window, t.sender(peer, id))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
+
+		// Never block here. This is the one read loop, shared by every live
+		// carrier on this transport, and it was waiting for somebody to
+		// accept a session nobody had asked for.
+		//
+		// The dialling end never calls Accept at all - it only dials - so the
+		// first sixteen strays filled this channel and the reader stopped
+		// dead. Every carrier then went silent, and sixty seconds later the
+		// braid declared the peer gone and took all of them down together.
+		// Restart, and the same thing a minute later. A raw ICMP socket
+		// receives every echo reply the host sees, so strays are not an edge
+		// case: a peer retransmitting to a session this end has already torn
+		// down is enough.
+		//
+		// If there is no room, the session is not wanted. Drop it - the peer
+		// retries, and a listening end with a live acceptor has room.
 		select {
 		case t.inbound <- conn:
 		case <-t.done:
