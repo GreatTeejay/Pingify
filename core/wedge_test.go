@@ -43,7 +43,7 @@ func TestStraySessionsCannotWedgeTheReader(t *testing.T) {
 	peer := &net.IPAddr{IP: net.ParseIP("198.51.100.4")}
 
 	// One session this end is actually using, as a dialled carrier would be.
-	live := newARQ(0x11110001, 0, psk, 1200, 64, func([]byte) error { return nil })
+	live := newARQ(0x11110001, 0, psk, icmpARQLabel, 1200, 64, func([]byte) error { return nil })
 	defer live.Close()
 	tr.sessions[sessionKey{peer: peer.String(), session: 0x11110001, carrier: 0}] = live
 

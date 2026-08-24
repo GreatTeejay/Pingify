@@ -13,7 +13,7 @@ import "testing"
 func TestAWideSenderCannotOutrunAnOldReceiver(t *testing.T) {
 	// 1. Every connection starts where every previous version sat, so a peer
 	//    that has not been updated accepts everything it is sent.
-	c := newARQ(1, 0, []byte("k"), 1200, arqWindowFor(4096, 1200), func([]byte) error { return nil })
+	c := newARQ(1, 0, []byte("k"), icmpARQLabel, 1200, arqWindowFor(4096, 1200), func([]byte) error { return nil })
 	defer c.Close()
 	if c.window != arqWinStart {
 		t.Errorf("a fresh connection opens at %d segments, want %d", c.window, arqWinStart)
@@ -25,7 +25,7 @@ func TestAWideSenderCannotOutrunAnOldReceiver(t *testing.T) {
 	// 2. The receive guard is bounded by what any peer may send, never by
 	//    what this end happens to be sending - or it becomes a wire parameter
 	//    again and the next change to it breaks tunnels the same way.
-	narrow := newARQ(2, 0, []byte("k"), 1200, arqWinMin, func([]byte) error { return nil })
+	narrow := newARQ(2, 0, []byte("k"), icmpARQLabel, 1200, arqWinMin, func([]byte) error { return nil })
 	defer narrow.Close()
 	narrow.mu.Lock()
 	narrow.deliver(uint32(arqWinMax), []byte("late but legal"))
@@ -39,7 +39,7 @@ func TestAWideSenderCannotOutrunAnOldReceiver(t *testing.T) {
 // And the width has to be earned, because a window past what the path carries
 // does not go faster - it queues, which is the stall it was meant to cure.
 func TestTheWindowGrowsOnProgressAndHalvesOnLoss(t *testing.T) {
-	c := newARQ(3, 0, []byte("k"), 1200, 1000, func([]byte) error { return nil })
+	c := newARQ(3, 0, []byte("k"), icmpARQLabel, 1200, 1000, func([]byte) error { return nil })
 	defer c.Close()
 
 	c.mu.Lock()
@@ -71,7 +71,7 @@ func TestTheWindowGrowsOnProgressAndHalvesOnLoss(t *testing.T) {
 	}
 
 	// and never above what the tunnel asked for
-	c2 := newARQ(4, 0, []byte("k"), 1200, 100, func([]byte) error { return nil })
+	c2 := newARQ(4, 0, []byte("k"), icmpARQLabel, 1200, 100, func([]byte) error { return nil })
 	defer c2.Close()
 	c2.mu.Lock()
 	for i := 0; i < 5000; i++ {

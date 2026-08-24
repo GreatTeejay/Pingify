@@ -368,6 +368,7 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'TUN-ICMP' ;;
+        udp)         printf 'UDP' ;;
         gre)         printf 'TUN-GRE' ;;
         awg)         printf 'TUN-AWG' ;;
         *)           printf 'TCP' ;;
@@ -599,15 +600,26 @@ new_tunnel() {
     # is a protocol you pick, and picking it is what brings up the local link.
     wiz "Protocol"
     choice 1 "TCP" "over the two public addresses - several connections at once"
-    choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
-    choice 3 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
-    choice 4 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
+    choice 2 "UDP" "the same, on datagrams - no TCP carried inside TCP"
+    choice 3 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
+    choice 4 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
+    choice 5 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
     local proto=""
-    pick proto "select" 1 2 3 4
+    pick proto "select" 1 2 3 4 5
 
     case "$proto" in
-        2)  T_KIND="tun"; T_TRANSPORT="icmp"
+        2)  T_KIND="tcp"; T_TRANSPORT="udp"
+            T_FORWARDER="pingify"
+            say ""
+            dim "One reliability layer instead of two. Our own sits on the"
+            dim "datagrams, so a lost packet is repaired once by the layer that"
+            dim "knows what the tunnel is doing - rather than by TCP inside TCP,"
+            dim "where both ends retransmit the same loss and fight over it."
+            say ""
+            warn "needs UDP to pass between the two servers"
+            dim "some providers throttle or block it; test before committing" ;;
+        3)  T_KIND="tun"; T_TRANSPORT="icmp"
             wiz "Who forwards the ports?"
             choice 1 "PINGIFY" "the core carries every connection itself"
             choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
@@ -620,7 +632,7 @@ new_tunnel() {
                 [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
                 T_FORWARDER="pingify"
             fi ;;
-        3)  T_TRANSPORT="gre"
+        4)  T_TRANSPORT="gre"
             # GRE is protocol 47 with no encryption and no disguise. It is the
             # fastest thing here by a distance, and the easiest to recognise,
             # so say so before rather than after.
@@ -632,7 +644,7 @@ new_tunnel() {
             say ""
             confirm_yes "use TUN-GRE?" || return 0
             gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
-        4)  T_TRANSPORT="awg"
+        5)  T_TRANSPORT="awg"
             awg_install || { pause; return 1; } ;;
         *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
@@ -693,7 +705,7 @@ new_tunnel() {
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if [ "$T_TRANSPORT" = "tcp" ]; then
+    if [ "$T_TRANSPORT" = "tcp" ] || [ "$T_TRANSPORT" = "udp" ]; then
         say ""
         ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
         case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac

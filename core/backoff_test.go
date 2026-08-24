@@ -15,7 +15,7 @@ import (
 // real stall killed every carrier at once, sixty seconds later, on the dot -
 // which is the shape the field logs showed.
 func TestOnePassOfLossIsOneBackoff(t *testing.T) {
-	c := newARQ(1, 0, []byte("k"), 1200, 512, func([]byte) error { return nil })
+	c := newARQ(1, 0, []byte("k"), icmpARQLabel, 1200, 512, func([]byte) error { return nil })
 	defer c.Close()
 
 	c.mu.Lock()

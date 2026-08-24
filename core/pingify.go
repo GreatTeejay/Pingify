@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.20.0"
+const version = "5.21.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -210,7 +210,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp":
+	case "tcp", "icmp", "udp":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -908,8 +908,9 @@ type pool struct {
 	links [maxCarriers]*link
 	h     recordHandler
 
-	ln        net.Listener
-	icmp      *icmpTransport
+	// Whatever carries the carriers. The pool asks it for three things and
+	// knows nothing else about it.
+	tr        carrierTransport
 	guard     *replayGuard
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -958,77 +959,46 @@ func (p *pool) handler() recordHandler {
 	return h
 }
 
+// start brings the transport up and then either dials the carriers or waits
+// for them. Which transport it is stops mattering here: it answers Dial,
+// Accept and Close, and this function asks for nothing else.
 func (p *pool) start() error {
-	// The echo transport owns a single raw socket for every carrier, so it is
-	// set up once here rather than per connection.
-	if p.cfg.Transport == "icmp" {
-		// The listening side stores the address to answer from; the dialling
-		// side has none and takes the default.
-		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen, p.cfg.WindowKB)
-		if err != nil {
-			return err
-		}
-		p.icmp = t
-		go t.reap()
-		if p.cfg.Connect != "" {
-			for i := 0; i < p.cfg.Carriers; i++ {
-				go p.dialLoop(i)
-			}
-			logInfo("opening %d echo carriers to %s", p.cfg.Carriers, p.cfg.Connect)
-		} else {
-			go p.acceptEcho()
-			logInfo("waiting for echo carriers")
-		}
-		return nil
+	t, err := newTransport(p.cfg)
+	if err != nil {
+		return err
 	}
+	p.tr = t
+
 	if p.cfg.Connect != "" {
 		for i := 0; i < p.cfg.Carriers; i++ {
 			go p.dialLoop(i)
 		}
-		logInfo("dialling %d carriers to %s", p.cfg.Carriers, p.cfg.Connect)
+		logInfo("opening %d %s carriers to %s", p.cfg.Carriers, t.Name(), p.cfg.Connect)
 		return nil
 	}
-	ln, err := net.Listen("tcp", p.cfg.Listen)
-	if err != nil {
-		return err
-	}
-	p.ln = ln
-	go p.acceptLoop(ln)
-	logInfo("waiting for carriers on %s", p.cfg.Listen)
+	// validate insists on exactly one of listen and connect, so reaching here
+	// means listen is set - there is no second case to write.
+	go p.acceptLoop()
+	logInfo("waiting for %s carriers on %s", t.Name(), p.cfg.Listen)
 	return nil
 }
 
-func (p *pool) acceptEcho() {
-	for {
-		c, err := p.icmp.Accept()
-		if err != nil {
-			return
-		}
-		go p.serveInbound(c)
-	}
-}
-
 // dialCarrier opens one carrier with whichever transport is configured.
-func (p *pool) dialCarrier(idx int) (net.Conn, error) {
-	if p.icmp != nil {
-		host := p.cfg.Connect
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		return p.icmp.Dial(host, idx)
-	}
-	return net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
-}
+func (p *pool) dialCarrier(idx int) (net.Conn, error) { return p.tr.Dial(idx) }
 
-func (p *pool) acceptLoop(ln net.Listener) {
+func (p *pool) acceptLoop() {
 	for {
-		conn, err := ln.Accept()
+		conn, err := p.tr.Accept()
 		if err != nil {
 			select {
 			case <-p.closed:
 				return
 			default:
 			}
+			// A raw socket transport ends its accept loop by returning an
+			// error and has nothing to retry; a listener can hit a transient
+			// one. Backing off covers both without either needing to say
+			// which it is.
 			logWarn("accept: %v", err)
 			time.Sleep(200 * time.Millisecond)
 			continue
@@ -1261,11 +1231,10 @@ func (p *pool) liveLinks() []*link {
 func (p *pool) close() {
 	p.closeOnce.Do(func() {
 		close(p.closed)
-		if p.ln != nil {
-			p.ln.Close()
-		}
-		if p.icmp != nil {
-			p.icmp.Close()
+		// The transport owns whatever it opened - a listener, a raw socket -
+		// and closing it is what ends the accept loop.
+		if p.tr != nil {
+			p.tr.Close()
 		}
 		p.mu.Lock()
 		links := p.links

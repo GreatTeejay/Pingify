@@ -39,6 +39,9 @@ const (
 	icmpTagLen      = 4
 	icmpHdrLen      = 8
 	icmpMaxPayload  = 1200 // conservative: fits inside a 1400-byte path MTU
+
+	// what this transport's header mask key is derived from
+	icmpARQLabel = "pingify/v3 icmp"
 )
 
 var errICMPClosed = errors.New("icmp: transport closed")
@@ -195,8 +198,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	// session and carrier can be read out before any connection exists.
 	hdr := make([]byte, arqHdr)
 	copy(hdr, datagram[arqNonce:arqOver])
-	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), t.psk), []byte("arq header"), 32)
-	maskHeader(blockFrom(k), datagram[:arqNonce], hdr)
+	maskHeader(blockFrom(arqMaskKey(icmpARQLabel, t.psk)), datagram[:arqNonce], hdr)
 	var h arqHeader
 	h.get(hdr)
 
@@ -222,7 +224,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 				h.session, h.carrier, peer)
 			return
 		}
-		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.window, t.sender(peer, id))
+		conn = newARQ(h.session, h.carrier, t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(peer, id))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
@@ -266,7 +268,7 @@ func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
 	session := binary.BigEndian.Uint32(b[:])
 	id := uint16(session)
 
-	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.window, t.sender(ip, id))
+	conn := newARQ(session, uint8(carrier), t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(ip, id))
 	conn.remote = ip
 
 	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}

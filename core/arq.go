@@ -198,8 +198,16 @@ func arqWindowFor(windowKB, maxPayload int) int {
 	return n
 }
 
-func newARQ(session uint32, carrier uint8, psk []byte, maxPayload, window int, send func([]byte) error) *arqConn {
-	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), psk), []byte("arq header"), 32)
+// arqLabel is the domain separator the header mask key is derived from. Each
+// transport passes its own, so two transports carrying the same tunnel never
+// mask with the same key - and so the derivation is not a constant buried in
+// here that a new transport has to know to copy.
+func arqMaskKey(label string, psk []byte) []byte {
+	return hkdfExpand(hkdfExtract([]byte(label), psk), []byte("arq header"), 32)
+}
+
+func newARQ(session uint32, carrier uint8, psk []byte, label string, maxPayload, window int, send func([]byte) error) *arqConn {
+	k := arqMaskKey(label, psk)
 	blk, err := aes.NewCipher(k)
 	if err != nil {
 		panic(err)

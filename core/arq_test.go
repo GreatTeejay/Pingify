@@ -69,14 +69,14 @@ func (l *lossyLink) close() {
 func newLossyPair(loss, dupe float64, jitterMs int) (*arqConn, *arqConn, *lossyLink) {
 	l := &lossyLink{rnd: mrand.New(mrand.NewSource(1)), loss: loss, dupe: dupe, jitterMs: jitterMs}
 	psk := []byte("shared key for the arq layer only")
-	a := newARQ(0x1234, 0, psk, 1200, 64, func(b []byte) error {
+	a := newARQ(0x1234, 0, psk, icmpARQLabel, 1200, 64, func(b []byte) error {
 		l.mu.Lock()
 		l.sentAB++
 		l.mu.Unlock()
 		l.deliver(&l.b, b)
 		return nil
 	})
-	b := newARQ(0x1234, 0, psk, 1200, 64, func(buf []byte) error {
+	b := newARQ(0x1234, 0, psk, icmpARQLabel, 1200, 64, func(buf []byte) error {
 		l.mu.Lock()
 		l.sentBA++
 		l.mu.Unlock()
@@ -172,7 +172,7 @@ func TestARQHeaderIsMaskedAndVaries(t *testing.T) {
 	var captured [][]byte
 	var mu sync.Mutex
 	psk := []byte("shared key for the arq layer only")
-	c := newARQ(0xAABBCCDD, 0, psk, 1200, 64, func(b []byte) error {
+	c := newARQ(0xAABBCCDD, 0, psk, icmpARQLabel, 1200, 64, func(b []byte) error {
 		mu.Lock()
 		captured = append(captured, append([]byte(nil), b...))
 		mu.Unlock()
@@ -213,7 +213,7 @@ func TestARQRetransmitsAndGivesUp(t *testing.T) {
 	// retrying for ever.
 	sent := 0
 	var mu sync.Mutex
-	c := newARQ(1, 0, []byte("k"), 1200, 64, func(b []byte) error {
+	c := newARQ(1, 0, []byte("k"), icmpARQLabel, 1200, 64, func(b []byte) error {
 		mu.Lock()
 		sent++
 		mu.Unlock()
