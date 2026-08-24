@@ -253,22 +253,50 @@ cfg_endpoints() {
 # video that stalls and a ping that swings while the speed graph looks fine.
 # So the presets climb the window only as far as the traffic needs, and buy
 # steadiness with carriers rather than with depth.
+default_preset_buffers() {
+    local ceiling=4096
+    # A WebSocket has one physical TCP socket carrying every logical stream.
+    # Its buffer therefore has to cover the aggregate BDP, not merely one
+    # stream's credit window. It is still bounded: a deep socket queue is
+    # latency, and Custom remains available for an exceptional path.
+    case "$T_TRANSPORT" in ws | wss) ceiling=32768 ;; esac
+    T_SNDBUF="$T_WINDOW"; T_RCVBUF="$T_WINDOW"
+    [ "$T_SNDBUF" -lt 512 ] && T_SNDBUF=512
+    [ "$T_RCVBUF" -lt 512 ] && T_RCVBUF=512
+    [ "$T_SNDBUF" -gt "$ceiling" ] && T_SNDBUF="$ceiling"
+    [ "$T_RCVBUF" -gt "$ceiling" ] && T_RCVBUF="$ceiling"
+}
+
 apply_preset() {
-    case "$1" in
-        # Games and calls: the smallest window that still fills a link, so
-        # nothing is ever sat in a queue waiting. Throughput is not the point.
-        gaming)     T_CARRIERS=8;  T_WINDOW=256 ;;
-        # Browsing and chat - many small things at once, none of them large.
-        latency)    T_CARRIERS=12; T_WINDOW=512 ;;
-        # Video. One stream reaching ~95 Mbit/s covers 4K with room over, and
-        # 16 carriers keep a download from taking the picture down with it.
-        balanced)   T_CARRIERS=16; T_WINDOW=1024 ;;
-        # Large files, where finishing sooner is worth some queueing.
-        throughput) T_CARRIERS=20; T_WINDOW=2048 ;;
-        # Everything the path will give. Uses real memory: each carrier holds
-        # a send and a receive buffer this size.
-        extreme)    T_CARRIERS=24; T_WINDOW=4096 ;;
-        *)          return 1 ;;
+    case "$T_TRANSPORT" in
+        ws | wss)
+            # One ordinary-looking WebSocket remains one physical carrier.
+            # The presets buy throughput with enough per-stream credit and a
+            # larger aggregate socket buffer instead of pretending that the
+            # 8-24 carriers used by the other transports exist here.
+            T_CARRIERS=1
+            case "$1" in
+                gaming)     T_WINDOW=256;  T_SNDBUF=1024;  T_RCVBUF=1024 ;;
+                latency)    T_WINDOW=512;  T_SNDBUF=2048;  T_RCVBUF=2048 ;;
+                balanced)   T_WINDOW=2048; T_SNDBUF=8192;  T_RCVBUF=8192 ;;
+                throughput) T_WINDOW=4096; T_SNDBUF=16384; T_RCVBUF=16384 ;;
+                extreme)    T_WINDOW=8192; T_SNDBUF=32768; T_RCVBUF=32768 ;;
+                *)          return 1 ;;
+            esac
+            ;;
+        *)
+            # These were measured on the multi-carrier Iran-Europe path. Do
+            # not trade known field behaviour for prettier round numbers.
+            case "$1" in
+                gaming)     T_CARRIERS=8;  T_WINDOW=256 ;;
+                latency)    T_CARRIERS=12; T_WINDOW=512 ;;
+                balanced)   T_CARRIERS=16; T_WINDOW=1024 ;;
+                throughput) T_CARRIERS=20; T_WINDOW=2048 ;;
+                extreme)    T_CARRIERS=24; T_WINDOW=4096 ;;
+                *)          return 1 ;;
+            esac
+            default_preset_buffers
+            ;;
     esac
     # One keepalive for every preset. What kept a carrier alive was how often
     # the *peer* spoke, so two ends on different presets used to disagree about
@@ -288,11 +316,11 @@ apply_preset() {
 # 16 "custom" and 14 "balanced". A config could then report a profile no preset
 # would produce.
 preset_name() {
-    local car="$1" win="$2" p
+    local car="$1" win="$2" ka="$3" snd="$4" rcv="$5" p
     for p in gaming latency balanced throughput extreme; do
         # in a subshell: apply_preset writes the T_ variables, and this is
         # asked from screens that are holding a tunnel in them
-        if [ "$(apply_preset "$p" >/dev/null 2>&1; printf '%s/%s' "$T_CARRIERS" "$T_WINDOW")" = "$car/$win" ]; then
+        if [ "$(apply_preset "$p" >/dev/null 2>&1; printf '%s/%s/%s/%s/%s' "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF")" = "$car/$win/$ka/$snd/$rcv" ]; then
             printf '%s' "$p"
             return 0
         fi
@@ -302,11 +330,22 @@ preset_name() {
 
 preset_menu() {
     CHOICE_DEF="3"
-    choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"
-    choice 2 "Latency" "12 carriers, 512 KB - browsing, calls, chat"
-    choice 3 "Balanced" "16 carriers, 1024 KB - video without stalls"
-    choice 4 "Download" "20 carriers, 2048 KB - large files"
-    choice 5 "Extreme" "24 carriers, 4096 KB - fastest, most memory"
+    case "$T_TRANSPORT" in
+        ws | wss)
+            choice 1 "Gaming" "1 MUX, 256 KB - shallow queues and the lowest loaded ping"
+            choice 2 "Latency" "1 MUX, 512 KB - responsive browsing, calls and chat"
+            choice 3 "Balanced" "1 MUX, 2048 KB - smooth video and everyday use"
+            choice 4 "Download" "1 MUX, 4096 KB - large files on a fast path"
+            choice 5 "Extreme" "1 MUX, 8192 KB - maximum single-stream throughput"
+            ;;
+        *)
+            choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"
+            choice 2 "Latency" "12 carriers, 512 KB - browsing, calls, chat"
+            choice 3 "Balanced" "16 carriers, 1024 KB - video without stalls"
+            choice 4 "Download" "20 carriers, 2048 KB - large files"
+            choice 5 "Extreme" "24 carriers, 4096 KB - fastest, most memory"
+            ;;
+    esac
     choice 6 "Custom" "set the numbers yourself"
     CHOICE_DEF=""
     say ""
@@ -335,14 +374,9 @@ preset_menu() {
     # Whatever the preset said, WS/WSS carries the whole tunnel on one connection.
     case "$T_TRANSPORT" in ws | wss) T_CARRIERS=1 ;; esac
 
-    # Socket buffers have to hold a delay bandwidth product or the kernel
-    # window cannot grow into one. Sized from the chosen window, capped where
-    # more stops helping.
-    T_SNDBUF="$T_WINDOW"; T_RCVBUF="$T_WINDOW"
-    [ "$T_SNDBUF" -lt 512 ] && T_SNDBUF=512
-    [ "$T_RCVBUF" -lt 512 ] && T_RCVBUF=512
-    [ "$T_SNDBUF" -gt 4096 ] && T_SNDBUF=4096
-    [ "$T_RCVBUF" -gt 4096 ] && T_RCVBUF=4096
+    # Presets chose their own transport-aware buffers above. Custom starts
+    # from a safe value derived from its window and can be edited afterwards.
+    [ "$T_PRESET" = "custom" ] && default_preset_buffers
 }
 
 # ---------------------------------------------------------------------------
@@ -586,7 +620,7 @@ TOKEN
     T_TOKEN="$tok"; T_PORT="${port:-9443}"
     T_CARRIERS="$car"; T_WINDOW="$win"; T_KEEPALIVE="$ka"
     T_SNDBUF="${snd:-1024}"; T_RCVBUF="${rcv:-1024}"
-    T_PRESET="$(preset_name "$car" "$win")"
+    T_PRESET="$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF")"
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
     if kernel_transport; then
         # The kernel needs both public addresses whichever end this is, and
