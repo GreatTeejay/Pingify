@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.21.1"
+const version = "5.22.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -100,6 +100,13 @@ type Config struct {
 	// outside. Setting it to 127.0.0.1 keeps the ports off the network, which
 	// is what the tests want and what a host firewall stops asking about.
 	BindAddr string `json:"bind_addr,omitempty"`
+
+	// A real certificate for the WSS transport, when there is one. Without
+	// them a self-signed one is generated - the tunnel trusts its token
+	// rather than the certificate, so this is about looking ordinary to
+	// anything that opens the page, not about proving who we are.
+	CertFile string `json:"cert_file,omitempty"`
+	KeyFile  string `json:"key_file,omitempty"`
 	// origin side: if non-empty, only these host:port targets may be dialled.
 	Allow []string `json:"allow,omitempty"`
 
@@ -210,7 +217,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp", "udp":
+	case "tcp", "icmp", "udp", "ws", "wss":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -963,6 +970,10 @@ func (p *pool) handler() recordHandler {
 // for them. Which transport it is stops mattering here: it answers Dial,
 // Accept and Close, and this function asks for nothing else.
 func (p *pool) start() error {
+	// The decoy answers requests from an http.Handler that has no config, so
+	// give it the key here, once, before anything can be asked.
+	decoyPSK = p.cfg.key()
+
 	t, err := newTransport(p.cfg)
 	if err != nil {
 		return err

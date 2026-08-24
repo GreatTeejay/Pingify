@@ -142,6 +142,10 @@ func newTransport(cfg *Config) (carrierTransport, error) {
 		return newICMPCarrier(cfg)
 	case "udp":
 		return newUDPCarrier(cfg)
+	case "ws":
+		return newWSTransport(cfg, false)
+	case "wss":
+		return newWSTransport(cfg, true)
 	case "tcp", "":
 		return newTCPTransport(cfg)
 	}
