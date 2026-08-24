@@ -10,6 +10,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -390,7 +391,7 @@ func TestWSHangsUpOnAPathThatStopsAnswering(t *testing.T) {
 
 	// Reach the conclusion by hand on the clock the field would take minutes
 	// to reach: pretend the last pong was long ago.
-	w.lastPong = time.Now().Add(-2 * wsPongOverdue).UnixNano()
+	atomic.StoreInt64(&w.lastPong, time.Now().Add(-2*wsPongOverdue).UnixNano())
 
 	// The keepalive ticks on its own interval, so drive one round here rather
 	// than waiting a minute for it.
@@ -398,7 +399,7 @@ func TestWSHangsUpOnAPathThatStopsAnswering(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 200; i++ {
-			if since := time.Since(time.Unix(0, w.lastPong)); since > wsPongOverdue {
+			if since := time.Since(time.Unix(0, atomic.LoadInt64(&w.lastPong))); since > wsPongOverdue {
 				w.Close()
 				return
 			}
@@ -429,14 +430,14 @@ func TestWSAPongKeepsTheConnection(t *testing.T) {
 	go io.Copy(io.Discard, client)
 	go io.Copy(io.Discard, server)
 
-	client.lastPong = time.Now().Add(-time.Hour).UnixNano()
+	atomic.StoreInt64(&client.lastPong, time.Now().Add(-time.Hour).UnixNano())
 	if err := client.writeControl(wsOpPing, []byte("tock")); err != nil {
 		t.Fatal(err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if time.Since(time.Unix(0, client.lastPong)) < time.Minute {
+		if time.Since(time.Unix(0, atomic.LoadInt64(&client.lastPong))) < time.Minute {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
