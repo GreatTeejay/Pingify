@@ -78,9 +78,10 @@ grep -q '@@CORE_FILES@@' "$tmp" || { red "the @@CORE_FILES@@ marker is missing";
 # than turning hundreds of small source files into hundreds of heredocs.
 #
 # The staging pass is deliberate. A module zip may leave CRLF files in a
-# Windows worktree even though Git stores LF; without canonical content and tar
-# metadata, Windows and Ubuntu produce different Pingify.sh files from the same
-# commit and the release freshness check can never pass.
+# Windows worktree even though Git stores LF. Canonical content and tar metadata
+# keep repeat builds stable on one host. The compressed bytes may still differ
+# across gzip implementations, so CI verifies the extracted tree instead of
+# pretending cross-platform byte identity is a source-freshness check.
 cp core/go.mod core/go.sum "$vendor_stage/"
 mkdir -p "$vendor_stage/vendor"
 cp -R core/vendor/. "$vendor_stage/vendor/"
