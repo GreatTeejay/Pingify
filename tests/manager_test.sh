@@ -177,9 +177,35 @@ else
     # ---------------------------------------------------------------------
     # forward mode rather than both: a private link needs /dev/net/tun, which
     # a developer machine does not necessarily have.
-    TP=$(( 20000 + RANDOM % 10000 ))
-    LP=$(( 30000 + RANDOM % 10000 ))
-    EP=$(( 40000 + RANDOM % 10000 ))
+    # Ports the machine says are actually free, rather than a random number
+    # and hope. CI once picked one a runner service already held: the core
+    # logged "address already in use", its status endpoint never came up, and
+    # a test about typed tokens failed for a reason that had nothing to do
+    # with tokens. The probe binds 0.0.0.0 with no SO_REUSEADDR, which is the
+    # strictest question available - it fails if anything holds that port on
+    # any address, including a socket still in TIME_WAIT.
+    free_port() {
+        python - "$1" "$2" <<'PYEOF'
+import random, socket, sys
+lo, span = int(sys.argv[1]), int(sys.argv[2])
+for _ in range(400):
+    p = lo + random.randrange(span)
+    s = socket.socket()
+    try:
+        s.bind(("0.0.0.0", p))
+    except OSError:
+        continue
+    finally:
+        s.close()
+    print(p)
+    sys.exit(0)
+sys.exit(1)
+PYEOF
+    }
+
+    TP=$(free_port 20000 10000)
+    LP=$(free_port 30000 10000)
+    EP=$(free_port 40000 10000)
     LIVE_TOKEN="a token typed on both servers"
 
     cfg_reset
@@ -188,7 +214,7 @@ else
     T_ACCEPTS="server"; T_PORT="$TP"; T_PUBLIC_IP="127.0.0.1"
     T_TOKEN="$LIVE_TOKEN"; T_CARRIERS=4; T_WINDOW=1024
     T_FORWARDS="$(parse_forwards "$LP=$EP")"
-    iran_status="127.0.0.1:$(( 50000 + RANDOM % 5000 ))"
+    iran_status="127.0.0.1:$(free_port 50000 5000)"
     T_STATUS="$iran_status"
     iran_cfg="$(cfg_save)"
 
@@ -197,7 +223,7 @@ else
     T_NAME="live-kh"; T_ROLE="client"; T_TRANSPORT="tcp"
     T_ACCEPTS="server"; T_PORT="$TP"; T_PEER_IP="127.0.0.1"
     T_TOKEN="$LIVE_TOKEN"; T_CARRIERS=4; T_WINDOW=1024
-    T_STATUS="127.0.0.1:$(( 55000 + RANDOM % 5000 ))"
+    T_STATUS="127.0.0.1:$(free_port 55000 5000)"
     kharej_cfg="$(cfg_save)"
 
     "$CORE_BIN" -c "$iran_cfg"   -check >/dev/null 2>&1; check "IRAN config validates"   "$?" "0"
