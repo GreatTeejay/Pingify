@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/tls"
 	"encoding/binary"
@@ -652,3 +653,129 @@ func TestWSPongSurvivesAStaleWriteDeadline(t *testing.T) {
 		t.Fatal("no pong came back at all")
 	}
 }
+
+// A 100 KiB write used to leave as one frame with an eight-byte length field.
+// That field is rare in real WebSocket traffic, and every piece of it has to
+// survive whatever is on the path. Ordinary-sized frames now, and the reader
+// still sees one unbroken stream.
+func TestWSSendsOrdinarySizedFrames(t *testing.T) {
+	payload := make([]byte, 100*1024)
+	for i := range payload {
+		payload[i] = byte(i * 13)
+	}
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	client := newWSConn(a, nil, true)
+
+	frames := make(chan []int, 1)
+	go func() {
+		// read the raw wire and record each frame's declared length
+		var sizes []int
+		br := bufioNewReader(b)
+		for total := 0; total < len(payload); {
+			var h [2]byte
+			if _, err := io.ReadFull(br, h[:]); err != nil {
+				break
+			}
+			n := int(h[1] & 0x7f)
+			switch n {
+			case 126:
+				var e [2]byte
+				io.ReadFull(br, e[:])
+				n = int(binary.BigEndian.Uint16(e[:]))
+			case 127:
+				var e [8]byte
+				io.ReadFull(br, e[:])
+				n = int(binary.BigEndian.Uint64(e[:]))
+				sizes = append(sizes, -1) // an eight-byte length: flag it
+			}
+			if h[1]&0x80 != 0 {
+				var k [4]byte
+				io.ReadFull(br, k[:])
+			}
+			io.CopyN(io.Discard, br, int64(n))
+			sizes = append(sizes, n)
+			total += n
+		}
+		frames <- sizes
+	}()
+
+	a.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if _, err := client.Write(payload); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	select {
+	case sizes := <-frames:
+		total := 0
+		for _, n := range sizes {
+			if n == -1 {
+				t.Fatal("a frame used the eight-byte length field")
+			}
+			if n > wsMaxSend {
+				t.Fatalf("a frame carried %d bytes, over the %d cap", n, wsMaxSend)
+			}
+			total += n
+		}
+		if total != len(payload) {
+			t.Fatalf("the frames carried %d bytes of %d", total, len(payload))
+		}
+		if len(sizes) < 2 {
+			t.Fatal("it did not split at all")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing arrived")
+	}
+}
+
+// The handshake claimed to be Chrome and then sent five headers in an order no
+// browser uses. Header set and order are both fingerprints.
+func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	got := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		buf := make([]byte, 4096)
+		n, _ := c.Read(buf)
+		got <- string(buf[:n])
+	}()
+	go wsDial(ln.Addr().String(), "example.com", "/x", false, 2*time.Second)
+
+	select {
+	case req := <-got:
+		for _, h := range []string{
+			"Host: example.com", "Connection: Upgrade", "Pragma: no-cache",
+			"Cache-Control: no-cache", "User-Agent: Mozilla/5.0",
+			"Upgrade: websocket", "Origin: http://example.com",
+			"Sec-WebSocket-Version: 13", "Accept-Encoding:",
+			"Accept-Language:", "Sec-WebSocket-Key:",
+		} {
+			if !strings.Contains(req, h) {
+				t.Errorf("a browser sends %q and this does not", h)
+			}
+		}
+		// Extensions are deliberately absent: negotiating one means RSV1 on
+		// every frame, which this does not implement.
+		if strings.Contains(req, "Sec-WebSocket-Extensions") {
+			t.Error("it offered an extension it cannot honour")
+		}
+		// and in Chrome's order, because order is a fingerprint too
+		if strings.Index(req, "Pragma:") > strings.Index(req, "Upgrade: websocket") {
+			t.Error("the headers are not in the order a browser sends them")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request arrived")
+	}
+}
+
+func bufioNewReader(c net.Conn) *bufio.Reader { return bufio.NewReaderSize(c, 32*1024) }

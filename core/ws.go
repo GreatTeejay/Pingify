@@ -71,6 +71,20 @@ const (
 	// How long a pong may wait for the writer before it is given up on.
 	// Losing a pong costs nothing. Blocking the reader costs the carrier.
 	wsControlWait = 2 * time.Second
+
+	// The largest frame we put on the wire.
+	//
+	// Not a limit of the protocol - a frame may be enormous - but of what
+	// ordinary WebSocket traffic looks like. A browser sends kilobytes at a
+	// time. Our own records reach 128 KiB, so every large write went out as
+	// one frame with an eight-byte length field, and that field is rare
+	// enough in the wild that plenty of middleboxes have never carried one.
+	//
+	// The layer above is a byte stream with no message boundaries of its own,
+	// so each piece goes out as a whole message rather than a fragment. That
+	// is also what a chat, a dashboard or a live feed looks like: a great
+	// many small binary messages, one after another.
+	wsMaxSend = 16 * 1024
 )
 
 // The close frame's status code: 1000, a normal end.
@@ -210,9 +224,31 @@ func (w *wsConn) Read(p []byte) (int, error) {
 }
 
 func (w *wsConn) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	w.wmu <- struct{}{}
 	defer func() { <-w.wmu }()
-	if err := w.frameOut(wsOpBinary, p); err != nil {
+
+	// Split into ordinary-sized frames, but build them all into one buffer
+	// and put them on the wire in a single write - so looking like everyone
+	// else costs nothing in system calls.
+	b := w.wbuf[:0]
+	var err error
+	for off := 0; off < len(p); {
+		end := off + wsMaxSend
+		if end > len(p) {
+			end = len(p)
+		}
+		if b, err = w.appendFrame(b, wsOpBinary, p[off:end]); err != nil {
+			w.wbuf = b
+			return 0, err
+		}
+		off = end
+	}
+	_, err = w.c.Write(b)
+	w.wbuf = b
+	if err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -312,14 +348,26 @@ func (w *wsConn) readFrame() (wsFrame, error) {
 // an allocation and a copy per frame is not free. Two writes would not be
 // either: the header would leave in its own packet.
 func (w *wsConn) frameOut(op byte, payload []byte) error {
-	n := len(payload)
-	if need := 14 + n; cap(w.wbuf) < need {
-		w.wbuf = make([]byte, 0, need)
+	b, err := w.appendFrame(w.wbuf[:0], op, payload)
+	w.wbuf = b
+	if err != nil {
+		return err
 	}
-	b := w.wbuf[:0]
+	_, err = w.c.Write(b)
+	return err
+}
 
-	// FIN is always set: we hand every write out as one whole message. What
-	// this had to learn was how to READ a fragmented one.
+// appendFrame puts one whole frame on the end of b and hands it back.
+func (w *wsConn) appendFrame(b []byte, op byte, payload []byte) ([]byte, error) {
+	n := len(payload)
+	if need := len(b) + 14 + n; cap(b) < need {
+		grown := make([]byte, len(b), need*2)
+		copy(grown, b)
+		b = grown
+	}
+
+	// FIN is always set: every piece goes out as a whole message. What this
+	// had to learn was how to READ a fragmented one.
 	b = append(b, 0x80|op)
 	var lenByte byte
 	switch {
@@ -353,17 +401,14 @@ func (w *wsConn) frameOut(op byte, payload []byte) error {
 		// frame is entitled to hang up, and some do.
 		var key [4]byte
 		if _, err := rand.Read(key[:]); err != nil {
-			return err
+			return b, err
 		}
 		b = append(b, key[:]...)
 		at := len(b)
 		b = b[:at+n]
 		wsMask(b[at:], payload, key)
 	}
-
-	_, err := w.c.Write(b)
-	w.wbuf = b // keep whatever capacity it grew to
-	return err
+	return b, nil
 }
 
 // writeControl sends a ping, pong or close without ever waiting long for the
@@ -474,14 +519,27 @@ func wsDial(addr, host, path string, useTLS bool, timeout time.Duration) (net.Co
 	}
 	key := base64.StdEncoding.EncodeToString(raw[:])
 
+	scheme := "http"
+	if useTLS {
+		scheme = "https"
+	}
+	// Chrome's own header set, in Chrome's own order. Extensions are the one
+	// thing deliberately left out: advertising permessage-deflate invites a
+	// peer to negotiate it, and then every frame carries RSV1 and means
+	// something this does not implement.
 	req := "GET " + path + " HTTP/1.1\r\n" +
 		"Host: " + host + "\r\n" +
-		"Upgrade: websocket\r\n" +
 		"Connection: Upgrade\r\n" +
-		"Sec-WebSocket-Key: " + key + "\r\n" +
-		"Sec-WebSocket-Version: 13\r\n" +
+		"Pragma: no-cache\r\n" +
+		"Cache-Control: no-cache\r\n" +
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Origin: " + scheme + "://" + host + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Accept-Encoding: gzip, deflate, br\r\n" +
+		"Accept-Language: en-US,en;q=0.9\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\n" +
 		"\r\n"
 	if _, err := c.Write([]byte(req)); err != nil {
 		c.Close()
@@ -643,9 +701,12 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return
 	}
+	id := decoyFor(decoyPSK)
 	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Server: nginx/" + id.version + "\r\n" +
+		"Date: " + time.Now().UTC().Format(http.TimeFormat) + "\r\n" +
+		"Connection: upgrade\r\n" +
 		"Upgrade: websocket\r\n" +
-		"Connection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"
 	if _, err := c.Write([]byte(resp)); err != nil {
 		c.Close()
