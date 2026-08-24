@@ -1598,5 +1598,45 @@ check "it warns whose script it is"    "$(bm | grep -c 'written by someone else'
 check "and nothing runs unasked"       "$(bm | grep -c 'confirm ')"         "1"
 check "it downloads before running"    "$(bm | grep -c 'fetch "\$BENCH_URL"')" "1"
 
+
+# ---------------------------------------------------------------------------
+note "a transport is a seam now, not a branch"
+# ---------------------------------------------------------------------------
+# The pool used to switch on transport in two places - one in start, one in
+# dialCarrier - so a fifth transport meant a fifth branch in each. It asks an
+# interface for three things now, and adding one is writing those three.
+check "udp has a label"        "$(transport_label udp)"  "UDP"
+check "and is offered"         "$(grep -c 'choice 2 "UDP"' Pingify.sh)" "1"
+check "five protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5' Pingify.sh)" "1"
+
+# It carries ports like TCP does, so it is named and addressed like TCP
+nu() { ( T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443; tunnel_default_name ); }
+check "named for its port"     "$(nu server)" "iran-9443"
+check "on the far side too"    "$(nu client)" "kharej-9443"
+ep() { ( cfg_reset; T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443
+         T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+         T_ACCEPTS="server"; cfg_endpoints
+         printf '%s|%s' "$CFG_LISTEN" "$CFG_CONNECT" ); }
+check "IRAN accepts on the port" "$(ep server)" "0.0.0.0:9443|"
+check "KHAREJ dials it"          "$(ep client)" "|198.51.100.4:9443"
+
+# and the core accepts the config it writes
+UDPC="$WORK/udpcfg"; mkdir -p "$UDPC"
+(
+    CFG_DIR="$UDPC"
+    cfg_reset
+    T_ROLE="server"; T_TRANSPORT="udp"; T_ACCEPTS="server"; cfg_mode
+    T_NAME="iran-9443"; T_PORT=9443; T_TOKEN="$TOKEN"
+    T_PUBLIC_IP="203.0.113.9"; T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+    f="$(cfg_save)" && echo "file=$f"
+) > "$WORK/udpcfg.out" 2>&1
+uf="$(grep -m1 '^file=' "$WORK/udpcfg.out" | cut -d= -f2-)"
+check "a udp config is written" "$(basename "${uf:-none}")" "iran-9443.toml"
+check "with the transport set"  "$(toml_get "$uf" transport type)" "udp"
+if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
+    "$CORE_BIN" -c "$uf" -check >/dev/null 2>&1
+    check "and the core accepts it" "$?" "0"
+fi
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

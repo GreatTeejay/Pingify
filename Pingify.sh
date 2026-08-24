@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.20.0"
+PINGIFY_VERSION="5.21.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1225,6 +1225,7 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 transport_label() {
     case "$1" in
         icmp | echo) printf 'TUN-ICMP' ;;
+        udp)         printf 'UDP' ;;
         gre)         printf 'TUN-GRE' ;;
         awg)         printf 'TUN-AWG' ;;
         *)           printf 'TCP' ;;
@@ -1456,15 +1457,26 @@ new_tunnel() {
     # is a protocol you pick, and picking it is what brings up the local link.
     wiz "Protocol"
     choice 1 "TCP" "over the two public addresses - several connections at once"
-    choice 2 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
-    choice 3 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
-    choice 4 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
+    choice 2 "UDP" "the same, on datagrams - no TCP carried inside TCP"
+    choice 3 "TUN-ICMP" "inside ping packets, over a private link - no port at all"
+    choice 4 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
+    choice 5 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
     local proto=""
-    pick proto "select" 1 2 3 4
+    pick proto "select" 1 2 3 4 5
 
     case "$proto" in
-        2)  T_KIND="tun"; T_TRANSPORT="icmp"
+        2)  T_KIND="tcp"; T_TRANSPORT="udp"
+            T_FORWARDER="pingify"
+            say ""
+            dim "One reliability layer instead of two. Our own sits on the"
+            dim "datagrams, so a lost packet is repaired once by the layer that"
+            dim "knows what the tunnel is doing - rather than by TCP inside TCP,"
+            dim "where both ends retransmit the same loss and fight over it."
+            say ""
+            warn "needs UDP to pass between the two servers"
+            dim "some providers throttle or block it; test before committing" ;;
+        3)  T_KIND="tun"; T_TRANSPORT="icmp"
             wiz "Who forwards the ports?"
             choice 1 "PINGIFY" "the core carries every connection itself"
             choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
@@ -1477,7 +1489,7 @@ new_tunnel() {
                 [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
                 T_FORWARDER="pingify"
             fi ;;
-        3)  T_TRANSPORT="gre"
+        4)  T_TRANSPORT="gre"
             # GRE is protocol 47 with no encryption and no disguise. It is the
             # fastest thing here by a distance, and the easiest to recognise,
             # so say so before rather than after.
@@ -1489,7 +1501,7 @@ new_tunnel() {
             say ""
             confirm_yes "use TUN-GRE?" || return 0
             gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
-        4)  T_TRANSPORT="awg"
+        5)  T_TRANSPORT="awg"
             awg_install || { pause; return 1; } ;;
         *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
@@ -1550,7 +1562,7 @@ new_tunnel() {
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if [ "$T_TRANSPORT" = "tcp" ]; then
+    if [ "$T_TRANSPORT" = "tcp" ] || [ "$T_TRANSPORT" = "udp" ]; then
         say ""
         ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
         case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
@@ -5702,8 +5714,16 @@ func arqWindowFor(windowKB, maxPayload int) int {
 	return n
 }
 
-func newARQ(session uint32, carrier uint8, psk []byte, maxPayload, window int, send func([]byte) error) *arqConn {
-	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), psk), []byte("arq header"), 32)
+// arqLabel is the domain separator the header mask key is derived from. Each
+// transport passes its own, so two transports carrying the same tunnel never
+// mask with the same key - and so the derivation is not a constant buried in
+// here that a new transport has to know to copy.
+func arqMaskKey(label string, psk []byte) []byte {
+	return hkdfExpand(hkdfExtract([]byte(label), psk), []byte("arq header"), 32)
+}
+
+func newARQ(session uint32, carrier uint8, psk []byte, label string, maxPayload, window int, send func([]byte) error) *arqConn {
+	k := arqMaskKey(label, psk)
 	blk, err := aes.NewCipher(k)
 	if err != nil {
 		panic(err)
@@ -6520,6 +6540,9 @@ const (
 	icmpTagLen      = 4
 	icmpHdrLen      = 8
 	icmpMaxPayload  = 1200 // conservative: fits inside a 1400-byte path MTU
+
+	// what this transport's header mask key is derived from
+	icmpARQLabel = "pingify/v3 icmp"
 )
 
 var errICMPClosed = errors.New("icmp: transport closed")
@@ -6676,8 +6699,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	// session and carrier can be read out before any connection exists.
 	hdr := make([]byte, arqHdr)
 	copy(hdr, datagram[arqNonce:arqOver])
-	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp"), t.psk), []byte("arq header"), 32)
-	maskHeader(blockFrom(k), datagram[:arqNonce], hdr)
+	maskHeader(blockFrom(arqMaskKey(icmpARQLabel, t.psk)), datagram[:arqNonce], hdr)
 	var h arqHeader
 	h.get(hdr)
 
@@ -6703,7 +6725,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 				h.session, h.carrier, peer)
 			return
 		}
-		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.window, t.sender(peer, id))
+		conn = newARQ(h.session, h.carrier, t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(peer, id))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
@@ -6747,7 +6769,7 @@ func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
 	session := binary.BigEndian.Uint32(b[:])
 	id := uint16(session)
 
-	conn := newARQ(session, uint8(carrier), t.psk, icmpMaxPayload, t.window, t.sender(ip, id))
+	conn := newARQ(session, uint8(carrier), t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(ip, id))
 	conn.remote = ip
 
 	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
@@ -6882,7 +6904,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.20.0"
+const version = "5.21.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -7039,7 +7061,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp":
+	case "tcp", "icmp", "udp":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -7737,8 +7759,9 @@ type pool struct {
 	links [maxCarriers]*link
 	h     recordHandler
 
-	ln        net.Listener
-	icmp      *icmpTransport
+	// Whatever carries the carriers. The pool asks it for three things and
+	// knows nothing else about it.
+	tr        carrierTransport
 	guard     *replayGuard
 	closed    chan struct{}
 	closeOnce sync.Once
@@ -7787,77 +7810,46 @@ func (p *pool) handler() recordHandler {
 	return h
 }
 
+// start brings the transport up and then either dials the carriers or waits
+// for them. Which transport it is stops mattering here: it answers Dial,
+// Accept and Close, and this function asks for nothing else.
 func (p *pool) start() error {
-	// The echo transport owns a single raw socket for every carrier, so it is
-	// set up once here rather than per connection.
-	if p.cfg.Transport == "icmp" {
-		// The listening side stores the address to answer from; the dialling
-		// side has none and takes the default.
-		t, err := newICMPTransport(p.cfg.key(), p.cfg.Listen, p.cfg.WindowKB)
-		if err != nil {
-			return err
-		}
-		p.icmp = t
-		go t.reap()
-		if p.cfg.Connect != "" {
-			for i := 0; i < p.cfg.Carriers; i++ {
-				go p.dialLoop(i)
-			}
-			logInfo("opening %d echo carriers to %s", p.cfg.Carriers, p.cfg.Connect)
-		} else {
-			go p.acceptEcho()
-			logInfo("waiting for echo carriers")
-		}
-		return nil
+	t, err := newTransport(p.cfg)
+	if err != nil {
+		return err
 	}
+	p.tr = t
+
 	if p.cfg.Connect != "" {
 		for i := 0; i < p.cfg.Carriers; i++ {
 			go p.dialLoop(i)
 		}
-		logInfo("dialling %d carriers to %s", p.cfg.Carriers, p.cfg.Connect)
+		logInfo("opening %d %s carriers to %s", p.cfg.Carriers, t.Name(), p.cfg.Connect)
 		return nil
 	}
-	ln, err := net.Listen("tcp", p.cfg.Listen)
-	if err != nil {
-		return err
-	}
-	p.ln = ln
-	go p.acceptLoop(ln)
-	logInfo("waiting for carriers on %s", p.cfg.Listen)
+	// validate insists on exactly one of listen and connect, so reaching here
+	// means listen is set - there is no second case to write.
+	go p.acceptLoop()
+	logInfo("waiting for %s carriers on %s", t.Name(), p.cfg.Listen)
 	return nil
 }
 
-func (p *pool) acceptEcho() {
-	for {
-		c, err := p.icmp.Accept()
-		if err != nil {
-			return
-		}
-		go p.serveInbound(c)
-	}
-}
-
 // dialCarrier opens one carrier with whichever transport is configured.
-func (p *pool) dialCarrier(idx int) (net.Conn, error) {
-	if p.icmp != nil {
-		host := p.cfg.Connect
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		return p.icmp.Dial(host, idx)
-	}
-	return net.DialTimeout("tcp", p.cfg.Connect, time.Duration(p.cfg.DialTimeout)*time.Second)
-}
+func (p *pool) dialCarrier(idx int) (net.Conn, error) { return p.tr.Dial(idx) }
 
-func (p *pool) acceptLoop(ln net.Listener) {
+func (p *pool) acceptLoop() {
 	for {
-		conn, err := ln.Accept()
+		conn, err := p.tr.Accept()
 		if err != nil {
 			select {
 			case <-p.closed:
 				return
 			default:
 			}
+			// A raw socket transport ends its accept loop by returning an
+			// error and has nothing to retry; a listener can hit a transient
+			// one. Backing off covers both without either needing to say
+			// which it is.
 			logWarn("accept: %v", err)
 			time.Sleep(200 * time.Millisecond)
 			continue
@@ -8090,11 +8082,10 @@ func (p *pool) liveLinks() []*link {
 func (p *pool) close() {
 	p.closeOnce.Do(func() {
 		close(p.closed)
-		if p.ln != nil {
-			p.ln.Close()
-		}
-		if p.icmp != nil {
-			p.icmp.Close()
+		// The transport owns whatever it opened - a listener, a raw socket -
+		// and closing it is what ends the accept loop.
+		if p.tr != nil {
+			p.tr.Close()
 		}
 		p.mu.Lock()
 		links := p.links
@@ -10118,6 +10109,157 @@ func carrierRestarted(before, after *statusDoc) bool {
 	return false
 }
 PINGIFY_SRC_EOF
+    cat > "$d/transport.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"fmt"
+	"net"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// what a transport has to be
+//
+// Everything above this line is the same whatever carries it: the handshake,
+// the AES-GCM framing, the credit windows, the stream multiplexing, the
+// keepalive, the status endpoint. All of it takes a net.Conn and does not care
+// where the bytes go. That is not an accident - it is the only reason a second
+// transport was ever cheap to add.
+//
+// What it did care about was one if/else in dialCarrier and another in start,
+// which is fine for two and a mess for five. A transport now answers three
+// questions and nothing else:
+//
+//	dial a carrier          the end that opens the connection
+//	accept carriers         the end that waits for one
+//	shut down               release whatever it holds
+//
+// Adding one means writing those three and nothing above them changes.
+// ---------------------------------------------------------------------------
+
+type carrierTransport interface {
+	// Dial opens carrier idx towards the configured peer. The index matters:
+	// the far end reads it out of the handshake and installs the carrier in
+	// the same slot, so a carrier that dies is replaced rather than duplicated.
+	Dial(idx int) (net.Conn, error)
+
+	// Accept blocks until a carrier arrives. Returning an error ends the
+	// accept loop, so a closed transport must return one.
+	Accept() (net.Conn, error)
+
+	// Close releases the listener or the raw socket. Carriers already open are
+	// closed by the pool, not here.
+	Close() error
+
+	// Name is what the log calls this, in the one line that says the tunnel is
+	// starting.
+	Name() string
+}
+
+// ---------------------------------------------------------------------------
+// TCP
+//
+// The plain case: one socket per carrier, and the kernel does the rest.
+// ---------------------------------------------------------------------------
+
+type tcpTransport struct {
+	cfg *Config
+	ln  net.Listener
+}
+
+func newTCPTransport(cfg *Config) (*tcpTransport, error) {
+	t := &tcpTransport{cfg: cfg}
+	// Only the accepting end binds. The dialling end has nothing to listen on
+	// and must not take a port it will never use.
+	if cfg.Connect == "" {
+		ln, err := net.Listen("tcp", cfg.Listen)
+		if err != nil {
+			return nil, err
+		}
+		t.ln = ln
+	}
+	return t, nil
+}
+
+func (t *tcpTransport) Dial(idx int) (net.Conn, error) {
+	return net.DialTimeout("tcp", t.cfg.Connect,
+		time.Duration(t.cfg.DialTimeout)*time.Second)
+}
+
+func (t *tcpTransport) Accept() (net.Conn, error) {
+	if t.ln == nil {
+		return nil, fmt.Errorf("tcp: this end dials, it does not accept")
+	}
+	return t.ln.Accept()
+}
+
+func (t *tcpTransport) Close() error {
+	if t.ln != nil {
+		return t.ln.Close()
+	}
+	return nil
+}
+
+func (t *tcpTransport) Name() string { return "tcp" }
+
+// ---------------------------------------------------------------------------
+// ICMP
+//
+// One raw socket for every carrier, so the transport is what holds it and the
+// carriers are sessions demultiplexed out of it. The wrapper is thin: it only
+// gives the existing transport the shape the interface asks for, and strips
+// the port off the peer address, which ICMP does not have.
+// ---------------------------------------------------------------------------
+
+type icmpCarrier struct {
+	t   *icmpTransport
+	cfg *Config
+}
+
+func newICMPCarrier(cfg *Config) (*icmpCarrier, error) {
+	// The listening side stores the address to answer from; the dialling side
+	// has none and takes the default.
+	t, err := newICMPTransport(cfg.key(), cfg.Listen, cfg.WindowKB)
+	if err != nil {
+		return nil, err
+	}
+	go t.reap()
+	return &icmpCarrier{t: t, cfg: cfg}, nil
+}
+
+func (c *icmpCarrier) Dial(idx int) (net.Conn, error) {
+	host := c.cfg.Connect
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	return c.t.Dial(host, idx)
+}
+
+func (c *icmpCarrier) Accept() (net.Conn, error) { return c.t.Accept() }
+func (c *icmpCarrier) Close() error              { return c.t.Close() }
+func (c *icmpCarrier) Name() string              { return "echo" }
+
+// ---------------------------------------------------------------------------
+// choosing one
+// ---------------------------------------------------------------------------
+
+// newTransport builds the transport this config asks for. A name it does not
+// know is a configuration error rather than a silent fall back to TCP, because
+// falling back would build a tunnel that cannot possibly reach the other end
+// and then look healthy doing it.
+func newTransport(cfg *Config) (carrierTransport, error) {
+	switch cfg.Transport {
+	case "icmp", "echo":
+		return newICMPCarrier(cfg)
+	case "udp":
+		return newUDPCarrier(cfg)
+	case "tcp", "":
+		return newTCPTransport(cfg)
+	}
+	return nil, fmt.Errorf("unknown transport %q", cfg.Transport)
+}
+PINGIFY_SRC_EOF
     cat > "$d/tun_linux.go" <<'PINGIFY_SRC_EOF'
 //go:build linux
 
@@ -10185,6 +10327,285 @@ import (
 func openTUN(name string, multiqueue bool) (*os.File, error) {
 	return nil, errors.New("tun mode is only available on Linux")
 }
+PINGIFY_SRC_EOF
+    cat > "$d/udp.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
+	"fmt"
+	"net"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// the UDP transport
+//
+// The same reliable layer the echo transport uses, over an ordinary UDP socket
+// instead of a raw ICMP one. That is the whole difference, and it is worth
+// being precise about why it is worth having:
+//
+//	the braid over TCP carries TCP inside TCP. When a packet is lost both
+//	layers retransmit - the outer one because it must, the inner one because
+//	its own timer fired - and they fight. It is called TCP meltdown and it is
+//	why a tunnel can be slower than the path it rides on.
+//
+//	over UDP there is one reliability layer: ours. A loss is repaired once,
+//	by the layer that knows what the tunnel is doing, and the sender's own
+//	congestion control never sees it.
+//
+// This is what a KCP tunnel is: a reliable ARQ over UDP with the timers tuned
+// for latency rather than for throughput. We already had the ARQ - written,
+// tested and carrying an ICMP tunnel - so what was missing was the socket.
+//
+// The session tag is kept even though UDP has ports to demultiplex with. A
+// public port collects scans and strays the same way a raw socket does, and
+// four bytes of HMAC is cheaper than building a connection for one.
+// ---------------------------------------------------------------------------
+
+const (
+	udpTagLen = 4
+	// One datagram, sized to fit inside a path that carries less than a full
+	// packet - which most routes out of Iran do, being inside something else.
+	udpMaxPayload = 1200
+
+	// what this transport's header mask key is derived from
+	udpARQLabel = "pingify/v3 udp"
+)
+
+type udpTransport struct {
+	pc     net.PacketConn
+	psk    []byte
+	window int
+
+	mu       sync.Mutex
+	sessions map[sessionKey]*arqConn
+	inbound  chan net.Conn
+	closed   bool
+	done     chan struct{}
+}
+
+func newUDPTransport(psk []byte, bind string, windowKB int) (*udpTransport, error) {
+	// The accepting end binds the agreed port. The dialling end takes any
+	// port the kernel offers: nothing ever connects to it, and taking a fixed
+	// one would collide with a second tunnel on the same machine.
+	if bind == "" {
+		bind = ":0"
+	}
+	pc, err := net.ListenPacket("udp", bind)
+	if err != nil {
+		return nil, fmt.Errorf("udp socket on %s: %v", bind, err)
+	}
+	t := &udpTransport{
+		pc:       pc,
+		psk:      psk,
+		window:   arqWindowFor(windowKB, udpMaxPayload),
+		sessions: make(map[sessionKey]*arqConn),
+		// Deep enough that a listening end with a busy acceptor does not drop
+		// a carrier it wanted. The reader never waits on it either way - see
+		// dispatch, and the fault that taught us to write it that way.
+		inbound: make(chan net.Conn, 64),
+		done:    make(chan struct{}),
+	}
+	go t.readLoop()
+	go t.reap()
+	return t, nil
+}
+
+// tag is the same cheap pre-filter the echo transport uses: enough to tell our
+// traffic from the noise a public port collects, before anything is spent on it.
+func (t *udpTransport) tag(hdr []byte) []byte {
+	m := hmac.New(sha256.New, t.psk)
+	m.Write([]byte("pingify/v3 udp tag"))
+	m.Write(hdr)
+	return m.Sum(nil)[:udpTagLen]
+}
+
+func (t *udpTransport) sender(peer net.Addr) func([]byte) error {
+	return func(datagram []byte) error {
+		body := make([]byte, udpTagLen+len(datagram))
+		copy(body[:udpTagLen], t.tag(datagram[:min(len(datagram), arqOver)]))
+		copy(body[udpTagLen:], datagram)
+		_, err := t.pc.WriteTo(body, peer)
+		return err
+	}
+}
+
+func (t *udpTransport) readLoop() {
+	buf := make([]byte, 65535)
+	for {
+		n, addr, err := t.pc.ReadFrom(buf)
+		if err != nil {
+			select {
+			case <-t.done:
+				return
+			default:
+			}
+			// A datagram socket reports the odd transient error - an ICMP
+			// port-unreachable coming back, most often - and reading on.
+			continue
+		}
+		if n < udpTagLen+arqOver {
+			continue
+		}
+		pkt := buf[:n]
+		datagram := pkt[udpTagLen:]
+		if !hmac.Equal(pkt[:udpTagLen], t.tag(datagram[:min(len(datagram), arqOver)])) {
+			continue // not ours, and it cost one HMAC to find out
+		}
+		t.dispatch(addr, append([]byte(nil), datagram...))
+	}
+}
+
+// dispatch hands the datagram to its session, creating one if this is a
+// session the listening side has not seen before.
+func (t *udpTransport) dispatch(peer net.Addr, datagram []byte) {
+	hdr := make([]byte, arqHdr)
+	copy(hdr, datagram[arqNonce:arqOver])
+	maskHeader(blockFrom(arqMaskKey(udpARQLabel, t.psk)), datagram[:arqNonce], hdr)
+	var h arqHeader
+	h.get(hdr)
+
+	key := sessionKey{peer: peer.String(), session: h.session, carrier: h.carrier}
+
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return
+	}
+	conn, known := t.sessions[key]
+	if !known {
+		// Room first, before anything is built. This read loop is shared by
+		// every carrier on the transport, and waiting here for an acceptor
+		// that does not exist is what wedged the echo transport: the dialling
+		// end never accepts, so strays filled the queue and the reader
+		// stopped, taking every carrier with it sixty seconds later.
+		if len(t.inbound) == cap(t.inbound) {
+			t.mu.Unlock()
+			logDebug("udp: no room to accept session %08x carrier %d from %s, ignored",
+				h.session, h.carrier, peer)
+			return
+		}
+		conn = newARQ(h.session, h.carrier, t.psk, udpARQLabel, udpMaxPayload, t.window, t.sender(peer))
+		conn.remote = peer
+		t.sessions[key] = conn
+		t.mu.Unlock()
+		select {
+		case t.inbound <- conn:
+		case <-t.done:
+			return
+		}
+	} else {
+		t.mu.Unlock()
+	}
+	conn.onDatagram(datagram)
+}
+
+// Dial opens one carrier towards the peer.
+func (t *udpTransport) Dial(peer string, carrier int) (net.Conn, error) {
+	addr, err := net.ResolveUDPAddr("udp", peer)
+	if err != nil {
+		return nil, err
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return nil, err
+	}
+	session := binary.BigEndian.Uint32(b[:])
+
+	conn := newARQ(session, uint8(carrier), t.psk, udpARQLabel, udpMaxPayload, t.window, t.sender(addr))
+	conn.remote = addr
+
+	key := sessionKey{peer: addr.String(), session: session, carrier: uint8(carrier)}
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		conn.Close()
+		return nil, errICMPClosed
+	}
+	t.sessions[key] = conn
+	t.mu.Unlock()
+	return conn, nil
+}
+
+func (t *udpTransport) Accept() (net.Conn, error) {
+	select {
+	case c := <-t.inbound:
+		return c, nil
+	case <-t.done:
+		return nil, errICMPClosed
+	}
+}
+
+func (t *udpTransport) Close() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	close(t.done)
+	conns := make([]*arqConn, 0, len(t.sessions))
+	for _, c := range t.sessions {
+		conns = append(conns, c)
+	}
+	t.sessions = make(map[sessionKey]*arqConn)
+	t.mu.Unlock()
+	for _, c := range conns {
+		c.Close()
+	}
+	return t.pc.Close()
+}
+
+// reap drops sessions whose connection has failed, so a long-lived listener
+// does not accumulate them.
+func (t *udpTransport) reap() {
+	tk := time.NewTicker(30 * time.Second)
+	defer tk.Stop()
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tk.C:
+			t.mu.Lock()
+			for k, c := range t.sessions {
+				c.mu.Lock()
+				dead := c.err != nil || c.closed
+				c.mu.Unlock()
+				if dead {
+					delete(t.sessions, k)
+				}
+			}
+			t.mu.Unlock()
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// the seam
+// ---------------------------------------------------------------------------
+
+type udpCarrier struct {
+	t   *udpTransport
+	cfg *Config
+}
+
+func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
+	t, err := newUDPTransport(cfg.key(), cfg.Listen, cfg.WindowKB)
+	if err != nil {
+		return nil, err
+	}
+	return &udpCarrier{t: t, cfg: cfg}, nil
+}
+
+func (c *udpCarrier) Dial(idx int) (net.Conn, error) { return c.t.Dial(c.cfg.Connect, idx) }
+func (c *udpCarrier) Accept() (net.Conn, error)      { return c.t.Accept() }
+func (c *udpCarrier) Close() error                   { return c.t.Close() }
+func (c *udpCarrier) Name() string                   { return "udp" }
 PINGIFY_SRC_EOF
     return 0
 }
