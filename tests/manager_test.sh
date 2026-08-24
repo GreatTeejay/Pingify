@@ -1681,16 +1681,62 @@ tp() { grep -m1 "^$1=" "$WORK/tport.out" | cut -d= -f2-; }
 
 check "a udp tunnel names itself"     "$(grep -m1 '^name=' "$WORK/tport.out" | cut -d= -f2-)" "udp-iran-9443"
 check "and tcp keeps the plain name"  "$(grep '^name=' "$WORK/tport.out" | sed -n 2p | cut -d= -f2-)" "iran-9443"
+# What collides is the SOCKET, not the transport name. WS and WSS are HTTP
+# over TCP, so a plain TCP tunnel blocks a WS one on the same port - while a
+# UDP tunnel on that port does not. Asking by name got that backwards and
+# called a real clash free.
+check "ws is a tcp socket"   "$(port_family ws)"   "tcp"
+check "and wss too"          "$(port_family wss)"  "tcp"
+check "udp is its own"       "$(port_family udp)"  "udp"
+check "awg binds udp"        "$(port_family awg)"  "udp"
+check "icmp binds no port"   "$(port_family icmp)" "none"
+check "and neither does gre" "$(port_family gre)"  "none"
+
 check "a taken udp port names its owner" "$(tp udp9443)" "udp-iran-9443"
 check "and the tcp one is separate"      "$(tp tcp9443)" "iran-9443"
 check "an unused port is free"           "$(tp tcp9444)" ""
 check "a tunnel may keep its own"        "$(tp own)"     ""
 check "a dialled port binds nothing here" "$(tp dialled)" ""
 
+# the cases the family mapping exists for
+FAM="$WORK/fam"; mkdir -p "$FAM"
+(
+    CFG_DIR="$FAM"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    mkf() {
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="$1"; T_ACCEPTS="server"
+        [ "$1" = "icmp" ] && T_KIND="tun"
+        cfg_mode
+        T_PORT="$2"; T_NAME="$(tunnel_default_name)"; T_TOKEN="$TOKEN"
+        T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"; T_FORWARDS='"443"'
+        T_TUNLOCAL="10.11.10.1/24"; T_TUNPEER="10.11.10.2/24"
+        kernel_transport || T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+    }
+    mkf tcp 8443
+    mkf udp 9443
+    mkf icmp 0
+    echo "ws_on_tcp=$(tunnel_port_owner 8443 ws)"
+    echo "wss_on_tcp=$(tunnel_port_owner 8443 wss)"
+    echo "udp_on_tcp=$(tunnel_port_owner 8443 udp)"
+    echo "ws_on_udp=$(tunnel_port_owner 9443 ws)"
+    echo "lines=$(show_taken_tunnel_ports | grep -c 'icmp')"
+) > "$WORK/fam.out" 2>&1
+fm() { grep -m1 "^$1=" "$WORK/fam.out" | cut -d= -f2-; }
+
+check "a tcp tunnel blocks a ws one"     "$(fm ws_on_tcp)"  "iran-8443"
+check "and a wss one"                    "$(fm wss_on_tcp)" "iran-8443"
+check "but not a udp one"                "$(fm udp_on_tcp)" ""
+check "and a udp tunnel does not block ws" "$(fm ws_on_udp)" ""
+# ICMP has no port, so listing one was reading an address as a port number
+check "a portless tunnel is not listed"  "$(fm lines)"      "0"
+
 wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the wizard lists what is taken" "$(wz | grep -c 'show_taken_tunnel_ports')" "1"
 check "and refuses a repeat"           "$(wz | grep -c 'tunnel_port_owner')"       "1"
-check "and a port the host has bound"  "$(wz | grep -c 'port_free "\$T_PORT" "\$T_TRANSPORT"')" "1"
+# by socket family, so a ws tunnel is checked against tcp listeners
+check "and a port the host has bound"  "$(wz | grep -c 'port_free "\$T_PORT" "\$(port_family')" "1"
 check "only the end that binds is asked" "$(wz | grep -c 'this_side_accepts && show_taken_tunnel_ports')" "1"
 # udp and tcp are different sockets, and port_free has to know that
 check "port_free takes a protocol" "$(grep -c 'ss -Hlun' Pingify.sh)" "1"

@@ -752,19 +752,19 @@ new_tunnel() {
             if this_side_accepts; then
                 powner="$(tunnel_port_owner "$T_PORT" "$T_TRANSPORT")"
                 if [ -n "$powner" ]; then
-                    fail "${T_PORT}/${T_TRANSPORT} is already $powner's tunnel port"
+                    fail "${T_PORT}/$(port_family "$T_TRANSPORT") is already $powner's tunnel port"
                     dim "pick another, or delete that tunnel first"
                     continue
                 fi
-                if ! port_free "$T_PORT" "$T_TRANSPORT"; then
-                    fail "something is already listening on ${T_PORT}/${T_TRANSPORT}"
+                if ! port_free "$T_PORT" "$(port_family "$T_TRANSPORT")"; then
+                    fail "something is already listening on ${T_PORT}/$(port_family "$T_TRANSPORT")"
                     dim "check with:  ss -lnp | grep :${T_PORT}"
                     continue
                 fi
             fi
             break
         done
-        this_side_accepts && dim "leave ${T_PORT}/${T_TRANSPORT} open in this server's firewall"
+        this_side_accepts && dim "leave ${T_PORT}/$(port_family "$T_TRANSPORT") open in this server's firewall"
     fi
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
