@@ -78,16 +78,22 @@ tunnel_default_name() {
     local extra="${1:-}" base tail=""
     [ -n "$extra" ] && tail="-$extra"
     base="$(printf '%s' "$(side_label "$T_ROLE")" | tr 'A-Z' 'a-z')"
+    # Which server, then what it is, then which one of those. In that
+    # order, because the first thing anybody wants from a list of tunnels
+    # is which end they are looking at - and a list sorted by name then
+    # groups the two sides apart instead of interleaving them.
+    #
+    # TCP is the exception that names no protocol: it is the plain case,
+    # and iran-9443 is clearer than iran-tcp-9443. Everything else says so,
+    # because TCP 9443 and UDP 9443 are two different sockets and can both
+    # exist at once.
     case "$T_TRANSPORT" in
-        icmp) printf 'tun-%s-icmp%s' "$base" "$tail" ;;
-        gre)  printf 'tun-%s-gre%s' "$base" "$tail" ;;
-        awg)  printf 'tun-%s-awg%s' "$base" "$tail" ;;
-        # TCP and UDP can hold the same port at once - they are different
-        # sockets - so the name has to say which, or the second one is
-        # iran-9443-2 and tells you nothing about what it is.
-        udp)  printf 'udp-%s-%s' "$base" "$T_PORT" ;;
-        ws)   printf 'ws-%s-%s' "$base" "$T_PORT" ;;
-        wss)  printf 'wss-%s-%s' "$base" "$T_PORT" ;;
+        icmp) printf '%s-tun-icmp%s' "$base" "$tail" ;;
+        gre)  printf '%s-tun-gre%s' "$base" "$tail" ;;
+        awg)  printf '%s-tun-awg%s' "$base" "$tail" ;;
+        udp)  printf '%s-udp-%s' "$base" "$T_PORT" ;;
+        ws)   printf '%s-ws-%s' "$base" "$T_PORT" ;;
+        wss)  printf '%s-wss-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
 }
@@ -536,7 +542,7 @@ import_tunnel() {
     dim "Printed by the other server when its tunnel was made."
     say ""
     local token=""
-    ask token "token"
+    ask token "token" || { wiz_end; return 0; }
     [ -n "$token" ] || return 1
 
     local raw
@@ -596,7 +602,7 @@ TOKEN
     dim "the token came from IRAN, so this is the KHAREJ side"
     say ""
     [ -n "$SRV_IP" ] && [ "$SRV_IP" != "unknown" ] && T_PUBLIC_IP="$SRV_IP"
-    ask T_PUBLIC_IP "address of this KHAREJ server" "$T_PUBLIC_IP"
+    ask T_PUBLIC_IP "address of this KHAREJ server" "$T_PUBLIC_IP" || { wiz_end; return 0; }
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
     # The domain came in the token, so this end never types it and the two
@@ -677,6 +683,7 @@ TOKEN
 new_tunnel() {
     banner
     head2 "New tunnel"
+    wiz_end   # nothing is half-built until the first question is asked
     ensure_core || { pause; return 1; }
     cfg_reset
     wiz_reset
@@ -688,8 +695,10 @@ new_tunnel() {
     choice 2 "KHAREJ" "your panel and inbounds run here"
     choice 3 "Paste a token" "finish this server from the other one"
     say ""
+    dim "q at any question leaves without building anything"
+    say ""
     local side=""
-    pick side "select" 1 2 3
+    pick side "select" 1 2 3 || { wiz_end; return 0; }
     [ "$side" = "3" ] && { import_tunnel; return $?; }
     if [ "$side" = "2" ]; then T_ROLE="client"; else T_ROLE="server"; fi
     wiz_add "$(side_label "$T_ROLE")"
@@ -708,7 +717,7 @@ new_tunnel() {
     choice 7 "WS" "the same without TLS - only behind something that adds it"
     say ""
     local proto=""
-    pick proto "select" 1 2 3 4 5 6 7
+    pick proto "select" 1 2 3 4 5 6 7 || { wiz_end; return 0; }
 
     case "$proto" in
         2)  T_KIND="tcp"; T_TRANSPORT="udp"
@@ -727,7 +736,7 @@ new_tunnel() {
             choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
             say ""
             local fw=""
-            pick fw "select" 1 2
+            pick fw "select" 1 2 || { wiz_end; return 0; }
             if [ "$fw" = "2" ] && have iptables; then
                 T_FORWARDER="iptables"
             else
@@ -798,7 +807,7 @@ new_tunnel() {
         CHOICE_DEF=""
         say ""
         local dir=""
-        ask dir "select" "1"
+        ask dir "select" "1" || { wiz_end; return 0; }
         if [ "$dir" = "2" ]; then
             T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
         else
@@ -819,7 +828,7 @@ new_tunnel() {
         dim "this machine reports ${C_OFF}${SRV_IP}${C_DIM} - press enter to take it"
         say ""
     fi
-    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP"
+    ask T_PUBLIC_IP "address of this $(side_label "$T_ROLE") server" "$T_PUBLIC_IP" || { wiz_end; return 0; }
     [ -n "$T_PUBLIC_IP" ] || { fail "an address is required"; pause; return 1; }
 
     say ""
@@ -830,7 +839,7 @@ new_tunnel() {
         dim "for WSS behind Cloudflare, give the domain here, not the address"
         say ""
     fi
-    ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
+    ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP" || { wiz_end; return 0; }
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
     case "$T_TRANSPORT" in tcp | udp | ws | wss) has_port=1 ;; *) has_port=0 ;; esac
@@ -842,7 +851,7 @@ new_tunnel() {
         this_side_accepts && show_taken_tunnel_ports
         local powner=""
         while :; do
-            ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
+            ask T_PORT "port for the tunnel itself, same on both" "$T_PORT" || { wiz_end; return 0; }
             case "$T_PORT" in
                 '' | *[!0-9]*) fail "numbers only"; continue ;;
             esac
@@ -868,7 +877,7 @@ new_tunnel() {
     this_side_accepts || ask_edge
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
-        ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT"
+        ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT" || { wiz_end; return 0; }
         case "$T_AWG_PORT" in "" | *[!0-9]*) T_AWG_PORT=51820 ;; esac
         dim "leave ${T_AWG_PORT}/udp open in this server's firewall"
     fi
@@ -902,7 +911,7 @@ new_tunnel() {
         show_taken_nets "$T_NAME"
         local octet="" owner=""
         while :; do
-            ask octet "range 10.x.10.0/24 - pick x" "$(free_link_octet "$T_NAME")"
+            ask octet "range 10.x.10.0/24 - pick x" "$(free_link_octet "$T_NAME")" || { wiz_end; return 0; }
             case "$octet" in
                 '' | *[!0-9]*) fail "a number from 0 to 255"; continue ;;
             esac
@@ -926,8 +935,8 @@ new_tunnel() {
             T_TUNLOCAL="10.${octet}.10.2/24"; T_TUNPEER="10.${octet}.10.1/24"
         fi
         say ""
-        ask T_TUNLOCAL "this server" "$T_TUNLOCAL"
-        ask T_TUNPEER  "the other server" "$T_TUNPEER"
+        ask T_TUNLOCAL "this server" "$T_TUNLOCAL" || { wiz_end; return 0; }
+        ask T_TUNPEER  "the other server" "$T_TUNPEER" || { wiz_end; return 0; }
 
         # Now the name carries the network - always, not only when two of
         # them collide. Ten GRE tunnels where one is bare and nine are
@@ -943,7 +952,7 @@ new_tunnel() {
         if ! kernel_transport; then
             local iface_owner_name=""
             while :; do
-                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME" "$T_NAME")"
+                ask T_TUNIF "device name" "$(free_tun_iface "$T_NAME" "$T_NAME")" || { wiz_end; return 0; }
                 case "$T_TUNIF" in
                     '' | *[!a-zA-Z0-9_-]*) fail "letters, digits, dash and underscore"; continue ;;
                 esac
@@ -960,7 +969,7 @@ new_tunnel() {
                 break
             done
         fi
-        ask T_TUNMTU   "MTU" "$T_TUNMTU"
+        ask T_TUNMTU   "MTU" "$T_TUNMTU" || { wiz_end; return 0; }
         case "$T_TUNMTU" in "" | *[!0-9]*) T_TUNMTU=1380 ;; esac
     fi
 
@@ -1010,7 +1019,7 @@ new_tunnel() {
     esac
     say ""
     while :; do
-        ask T_TOKEN "token"
+        ask T_TOKEN "token" || { wiz_end; return 0; }
         T_TOKEN="$(printf '%s' "$T_TOKEN" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
         [ -n "$T_TOKEN" ] && break
         fail "a token is required"
@@ -1029,7 +1038,7 @@ new_tunnel() {
         say ""
         local raw="" clash=""
         while :; do
-            ask raw "ports, comma separated" "443"
+            ask raw "ports, comma separated" "443" || { wiz_end; return 0; }
             T_FORWARDS="$(parse_forwards "$raw")"
             if [ -z "$T_FORWARDS" ]; then
                 fail "at least one port is required"
@@ -1058,7 +1067,7 @@ new_tunnel() {
     CHOICE_DEF=""
     say ""
     local lg=""
-    ask lg "select" "3"
+    ask lg "select" "3" || { wiz_end; return 0; }
     case "$lg" in
         1) T_LOG="error" ;; 2) T_LOG="warn" ;;
         4) T_LOG="debug" ;; 5) T_LOG="trace" ;;

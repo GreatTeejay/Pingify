@@ -201,7 +201,7 @@ main_menu() {
         local c=""
         ask c "select"
         case "$c" in
-            1) new_tunnel ;;
+            1) new_tunnel; wiz_end ;;
             2) manage_tunnels ;;
             3) health_menu ;;
             4) optimize_menu ;;
