@@ -327,6 +327,57 @@ show_taken_ports() {
 }
 
 # ---------------------------------------------------------------------------
+# the tunnel's own port
+#
+# Not a forwarded port - the one the two servers meet on. It was never checked,
+# so a second tunnel could take a port the first one was already accepting on,
+# and only the second one's log would say why it would not start.
+#
+# Only the accepting end binds it. A dialling end names the same number but it
+# belongs to the far server and this machine binds nothing, so two tunnels
+# dialling one port is not a clash. And TCP 9443 and UDP 9443 are two different
+# sockets - neither blocks the other - so the protocol is part of the question.
+# ---------------------------------------------------------------------------
+
+tunnel_port_owner() {
+    local want="$1" proto="$2" except="${3:-}" f l name
+    case "$want" in '' | *[!0-9]*) return 0 ;; esac
+    cfg_files | while read -r f; do
+        [ "$(toml_get "$f" transport type)" = "$proto" ] || continue
+        l="$(toml_get "$f" transport listen)"
+        [ -n "$l" ] || continue          # this one dials; it binds nothing here
+        [ "${l##*:}" = "$want" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        printf '%s' "$name"
+        break
+    done
+    return 0
+}
+
+show_taken_tunnel_ports() {
+    local except="${1:-}" listing
+    listing="$(
+        cfg_files | while read -r f; do
+            l="$(toml_get "$f" transport listen)"
+            [ -n "$l" ] || continue
+            name="$(cfg_name "$f")"
+            [ -n "$except" ] && [ "$name" = "$except" ] && continue
+            printf '%s %s %s
+' "$name" "$(toml_get "$f" transport type)" "${l##*:}"
+        done
+    )"
+    [ -n "$listing" ] || return 0
+    warn "tunnel ports this server already accepts on"
+    printf '%s
+' "$listing" | while read -r name proto port; do
+        [ -n "$name" ] && dim "$(pad_to "$name" 22)${BX_ARR} ${port}/${proto}"
+    done
+    say ""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # health ports
 #
 # One per tunnel, and it has to be: each tunnel is its own process, and two
