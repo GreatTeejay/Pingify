@@ -83,6 +83,8 @@ tunnel_default_name() {
         # sockets - so the name has to say which, or the second one is
         # iran-9443-2 and tells you nothing about what it is.
         udp)  printf 'udp-%s-%s' "$base" "$T_PORT" ;;
+        ws)   printf 'ws-%s-%s' "$base" "$T_PORT" ;;
+        wss)  printf 'wss-%s-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
 }
@@ -373,6 +375,8 @@ transport_label() {
     case "$1" in
         icmp | echo) printf 'TUN-ICMP' ;;
         udp)         printf 'UDP' ;;
+        ws)          printf 'WS' ;;
+        wss)         printf 'WSS' ;;
         gre)         printf 'TUN-GRE' ;;
         awg)         printf 'TUN-AWG' ;;
         *)           printf 'TCP' ;;
@@ -609,8 +613,11 @@ new_tunnel() {
     choice 4 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
     choice 5 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
+    choice 6 "WSS" "looks like ordinary HTTPS - goes where the web goes, and behind a CDN"
+    choice 7 "WS" "the same without TLS - only behind something that adds it"
+    say ""
     local proto=""
-    pick proto "select" 1 2 3 4 5
+    pick proto "select" 1 2 3 4 5 6 7
 
     case "$proto" in
         2)  T_KIND="tcp"; T_TRANSPORT="udp"
@@ -650,6 +657,25 @@ new_tunnel() {
             gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
         5)  T_TRANSPORT="awg"
             awg_install || { pause; return 1; } ;;
+        6)  T_KIND="tcp"; T_TRANSPORT="wss"
+            T_FORWARDER="pingify"
+            say ""
+            dim "An HTTP request that becomes a WebSocket, which is what a chat"
+            dim "app and a live dashboard look like. Two things follow:"
+            say ""
+            dim "  it goes where HTTP goes - a proxy that passes 443 passes this"
+            dim "  it can sit behind a CDN, and then the KHAREJ address never"
+            dim "  appears on the wire at all"
+            say ""
+            dim "Anything that is not a carrier gets a stock nginx page, so a"
+            dim "scanner finds a web server with nothing on it." ;;
+        7)  T_KIND="tcp"; T_TRANSPORT="ws"
+            T_FORWARDER="pingify"
+            say ""
+            warn "WS is not encrypted by itself"
+            dim "the frames this tunnel carries are, but the WebSocket around"
+            dim "them is in the clear - use it only behind something that adds"
+            dim "TLS, like a CDN you control. On a bare path, pick WSS." ;;
         *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
     esac
@@ -709,7 +735,8 @@ new_tunnel() {
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if [ "$T_TRANSPORT" = "tcp" ] || [ "$T_TRANSPORT" = "udp" ]; then
+    case "$T_TRANSPORT" in tcp | udp | ws | wss) has_port=1 ;; *) has_port=0 ;; esac
+    if [ "$has_port" = "1" ]; then
         say ""
         # The port the two servers meet on. Only the accepting end binds it,
         # so only that end can collide - and TCP 9443 and UDP 9443 are two

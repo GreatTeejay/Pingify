@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.21.1"
+PINGIFY_VERSION="5.22.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -946,6 +946,8 @@ tunnel_default_name() {
         # sockets - so the name has to say which, or the second one is
         # iran-9443-2 and tells you nothing about what it is.
         udp)  printf 'udp-%s-%s' "$base" "$T_PORT" ;;
+        ws)   printf 'ws-%s-%s' "$base" "$T_PORT" ;;
+        wss)  printf 'wss-%s-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
 }
@@ -1236,6 +1238,8 @@ transport_label() {
     case "$1" in
         icmp | echo) printf 'TUN-ICMP' ;;
         udp)         printf 'UDP' ;;
+        ws)          printf 'WS' ;;
+        wss)         printf 'WSS' ;;
         gre)         printf 'TUN-GRE' ;;
         awg)         printf 'TUN-AWG' ;;
         *)           printf 'TCP' ;;
@@ -1472,8 +1476,11 @@ new_tunnel() {
     choice 4 "TUN-GRE" "the kernel's own tunnel - fastest, but plainly visible"
     choice 5 "TUN-AWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
+    choice 6 "WSS" "looks like ordinary HTTPS - goes where the web goes, and behind a CDN"
+    choice 7 "WS" "the same without TLS - only behind something that adds it"
+    say ""
     local proto=""
-    pick proto "select" 1 2 3 4 5
+    pick proto "select" 1 2 3 4 5 6 7
 
     case "$proto" in
         2)  T_KIND="tcp"; T_TRANSPORT="udp"
@@ -1513,6 +1520,25 @@ new_tunnel() {
             gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
         5)  T_TRANSPORT="awg"
             awg_install || { pause; return 1; } ;;
+        6)  T_KIND="tcp"; T_TRANSPORT="wss"
+            T_FORWARDER="pingify"
+            say ""
+            dim "An HTTP request that becomes a WebSocket, which is what a chat"
+            dim "app and a live dashboard look like. Two things follow:"
+            say ""
+            dim "  it goes where HTTP goes - a proxy that passes 443 passes this"
+            dim "  it can sit behind a CDN, and then the KHAREJ address never"
+            dim "  appears on the wire at all"
+            say ""
+            dim "Anything that is not a carrier gets a stock nginx page, so a"
+            dim "scanner finds a web server with nothing on it." ;;
+        7)  T_KIND="tcp"; T_TRANSPORT="ws"
+            T_FORWARDER="pingify"
+            say ""
+            warn "WS is not encrypted by itself"
+            dim "the frames this tunnel carries are, but the WebSocket around"
+            dim "them is in the clear - use it only behind something that adds"
+            dim "TLS, like a CDN you control. On a bare path, pick WSS." ;;
         *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
     esac
@@ -1572,7 +1598,8 @@ new_tunnel() {
     ask T_PEER_IP "address of the $( [ "$T_ROLE" = "server" ] && echo KHAREJ || echo IRAN ) server" "$T_PEER_IP"
     [ -n "$T_PEER_IP" ] || { fail "an address is required"; pause; return 1; }
 
-    if [ "$T_TRANSPORT" = "tcp" ] || [ "$T_TRANSPORT" = "udp" ]; then
+    case "$T_TRANSPORT" in tcp | udp | ws | wss) has_port=1 ;; *) has_port=0 ;; esac
+    if [ "$has_port" = "1" ]; then
         say ""
         # The port the two servers meet on. Only the accepting end binds it,
         # so only that end can collide - and TCP 9443 and UDP 9443 are two
@@ -6990,7 +7017,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.21.1"
+const version = "5.22.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -7037,6 +7064,13 @@ type Config struct {
 	// outside. Setting it to 127.0.0.1 keeps the ports off the network, which
 	// is what the tests want and what a host firewall stops asking about.
 	BindAddr string `json:"bind_addr,omitempty"`
+
+	// A real certificate for the WSS transport, when there is one. Without
+	// them a self-signed one is generated - the tunnel trusts its token
+	// rather than the certificate, so this is about looking ordinary to
+	// anything that opens the page, not about proving who we are.
+	CertFile string `json:"cert_file,omitempty"`
+	KeyFile  string `json:"key_file,omitempty"`
 	// origin side: if non-empty, only these host:port targets may be dialled.
 	Allow []string `json:"allow,omitempty"`
 
@@ -7147,7 +7181,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp", "udp":
+	case "tcp", "icmp", "udp", "ws", "wss":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}
@@ -7900,6 +7934,10 @@ func (p *pool) handler() recordHandler {
 // for them. Which transport it is stops mattering here: it answers Dial,
 // Accept and Close, and this function asks for nothing else.
 func (p *pool) start() error {
+	// The decoy answers requests from an http.Handler that has no config, so
+	// give it the key here, once, before anything can be asked.
+	decoyPSK = p.cfg.key()
+
 	t, err := newTransport(p.cfg)
 	if err != nil {
 		return err
@@ -10340,6 +10378,10 @@ func newTransport(cfg *Config) (carrierTransport, error) {
 		return newICMPCarrier(cfg)
 	case "udp":
 		return newUDPCarrier(cfg)
+	case "ws":
+		return newWSTransport(cfg, false)
+	case "wss":
+		return newWSTransport(cfg, true)
 	case "tcp", "":
 		return newTCPTransport(cfg)
 	}
@@ -10692,6 +10734,638 @@ func (c *udpCarrier) Dial(idx int) (net.Conn, error) { return c.t.Dial(c.cfg.Con
 func (c *udpCarrier) Accept() (net.Conn, error)      { return c.t.Accept() }
 func (c *udpCarrier) Close() error                   { return c.t.Close() }
 func (c *udpCarrier) Name() string                   { return "udp" }
+PINGIFY_SRC_EOF
+    cat > "$d/ws.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"bufio"
+	"crypto/rand"
+	"crypto/sha1"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// the WebSocket transports
+//
+// Everything else here looks like what it is. TCP looks like a long-lived TCP
+// connection, ICMP looks like a great many pings, GRE looks like GRE. On a
+// path that only passes web traffic, none of them go anywhere.
+//
+// This one is an HTTP request that becomes a WebSocket, which is what a chat
+// application, a live dashboard and a stock ticker all look like. Two things
+// follow from that and both matter more than the framing:
+//
+//	it goes where HTTP goes. A proxy that passes 80 and 443 and nothing else
+//	passes this.
+//
+//	it can sit behind a CDN. Point the tunnel at a CDN-proxied hostname and
+//	the Kharej server's address never appears on the wire at all - the Iran
+//	server is talking to Cloudflare, and blocking one address does not end
+//	the tunnel.
+//
+// The frames are RFC 6455 rather than a raw stream after the upgrade, because
+// a CDN parses them. A stream of unframed bytes behind a WebSocket handshake
+// is not a WebSocket and does not survive the first middlebox that looks.
+//
+// Written against the standard library. Not because a module was unavailable -
+// they are - but because this is 300 lines of well-specified framing, and one
+// less dependency in a tool whose job is not being interfered with.
+// ---------------------------------------------------------------------------
+
+// The constant RFC 6455 requires the server to hash with the client's key.
+const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+const (
+	wsOpBinary = 0x2
+	wsOpClose  = 0x8
+	wsOpPing   = 0x9
+	wsOpPong   = 0xA
+)
+
+// wsConn is a net.Conn over WebSocket binary frames. The braid above it sees a
+// byte stream and never learns there is framing underneath.
+type wsConn struct {
+	c    net.Conn
+	br   *bufio.Reader
+	mask bool // clients mask, servers must not
+
+	wmu sync.Mutex
+
+	rmu  sync.Mutex
+	rest []byte // what is left of the frame last read
+}
+
+func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
+	if br == nil {
+		br = bufio.NewReaderSize(c, 32*1024)
+	}
+	return &wsConn{c: c, br: br, mask: clientSide}
+}
+
+func (w *wsConn) Read(p []byte) (int, error) {
+	w.rmu.Lock()
+	defer w.rmu.Unlock()
+	for len(w.rest) == 0 {
+		op, payload, err := w.readFrame()
+		if err != nil {
+			return 0, err
+		}
+		switch op {
+		case wsOpBinary:
+			w.rest = payload
+		case wsOpPing:
+			w.writeFrame(wsOpPong, payload)
+		case wsOpClose:
+			return 0, io.EOF
+		}
+		// anything else - a pong, a continuation we do not use - is read past
+	}
+	n := copy(p, w.rest)
+	w.rest = w.rest[n:]
+	return n, nil
+}
+
+func (w *wsConn) Write(p []byte) (int, error) {
+	if err := w.writeFrame(wsOpBinary, p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *wsConn) readFrame() (byte, []byte, error) {
+	var h [2]byte
+	if _, err := io.ReadFull(w.br, h[:]); err != nil {
+		return 0, nil, err
+	}
+	op := h[0] & 0x0f
+	masked := h[1]&0x80 != 0
+	n := int(h[1] & 0x7f)
+	switch n {
+	case 126:
+		var e [2]byte
+		if _, err := io.ReadFull(w.br, e[:]); err != nil {
+			return 0, nil, err
+		}
+		n = int(binary.BigEndian.Uint16(e[:]))
+	case 127:
+		var e [8]byte
+		if _, err := io.ReadFull(w.br, e[:]); err != nil {
+			return 0, nil, err
+		}
+		v := binary.BigEndian.Uint64(e[:])
+		// A frame this large is not something we send, so it is either a bug
+		// on the other side or somebody probing. Refuse it rather than
+		// allocating whatever was asked for.
+		if v > 1<<20 {
+			return 0, nil, fmt.Errorf("ws: frame of %d bytes refused", v)
+		}
+		n = int(v)
+	}
+	var key [4]byte
+	if masked {
+		if _, err := io.ReadFull(w.br, key[:]); err != nil {
+			return 0, nil, err
+		}
+	}
+	payload := make([]byte, n)
+	if _, err := io.ReadFull(w.br, payload); err != nil {
+		return 0, nil, err
+	}
+	if masked {
+		for i := range payload {
+			payload[i] ^= key[i%4]
+		}
+	}
+	return op, payload, nil
+}
+
+func (w *wsConn) writeFrame(op byte, payload []byte) error {
+	w.wmu.Lock()
+	defer w.wmu.Unlock()
+
+	hdr := make([]byte, 0, 14)
+	hdr = append(hdr, 0x80|op) // FIN set: we never fragment
+	n := len(payload)
+	var lenByte byte
+	switch {
+	case n < 126:
+		lenByte = byte(n)
+	case n < 1<<16:
+		lenByte = 126
+	default:
+		lenByte = 127
+	}
+	if w.mask {
+		lenByte |= 0x80
+	}
+	hdr = append(hdr, lenByte)
+	switch {
+	case n >= 1<<16:
+		var e [8]byte
+		binary.BigEndian.PutUint64(e[:], uint64(n))
+		hdr = append(hdr, e[:]...)
+	case n >= 126:
+		var e [2]byte
+		binary.BigEndian.PutUint16(e[:], uint16(n))
+		hdr = append(hdr, e[:]...)
+	}
+
+	body := payload
+	if w.mask {
+		// RFC 6455 requires a client to mask every frame with a fresh key.
+		// It buys no secrecy - the key travels with the frame - but a proxy
+		// that sees an unmasked client frame is entitled to hang up.
+		var key [4]byte
+		if _, err := rand.Read(key[:]); err != nil {
+			return err
+		}
+		hdr = append(hdr, key[:]...)
+		body = make([]byte, n)
+		for i := range payload {
+			body[i] = payload[i] ^ key[i%4]
+		}
+	}
+	if _, err := w.c.Write(append(hdr, body...)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (w *wsConn) Close() error                       { return w.c.Close() }
+func (w *wsConn) LocalAddr() net.Addr                { return w.c.LocalAddr() }
+func (w *wsConn) RemoteAddr() net.Addr               { return w.c.RemoteAddr() }
+func (w *wsConn) SetDeadline(t time.Time) error      { return w.c.SetDeadline(t) }
+func (w *wsConn) SetReadDeadline(t time.Time) error  { return w.c.SetReadDeadline(t) }
+func (w *wsConn) SetWriteDeadline(t time.Time) error { return w.c.SetWriteDeadline(t) }
+
+// ---------------------------------------------------------------------------
+// the handshake
+// ---------------------------------------------------------------------------
+
+func wsAccept(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key + wsGUID))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// wsDial opens one carrier: a plain TCP or TLS connection, an HTTP upgrade
+// request over it, and the byte stream that follows.
+func wsDial(addr, host, path string, useTLS bool, timeout time.Duration) (net.Conn, error) {
+	var c net.Conn
+	var err error
+	d := &net.Dialer{Timeout: timeout}
+	if useTLS {
+		// The certificate is not verified: it is usually self-signed, and the
+		// tunnel's own token is what proves who is on the other end. See the
+		// handshake the braid runs immediately after this one.
+		c, err = tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+			ServerName:         host,
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"http/1.1"},
+		})
+	} else {
+		c, err = d.Dial("tcp", addr)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		c.Close()
+		return nil, err
+	}
+	key := base64.StdEncoding.EncodeToString(raw[:])
+
+	req := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + key + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n" +
+		"\r\n"
+	if _, err := c.Write([]byte(req)); err != nil {
+		c.Close()
+		return nil, err
+	}
+
+	br := bufio.NewReaderSize(c, 32*1024)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		c.Close()
+		return nil, err
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		c.Close()
+		return nil, fmt.Errorf("ws: the server answered %s, not an upgrade", resp.Status)
+	}
+	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
+		resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
+		c.Close()
+		return nil, fmt.Errorf("ws: the upgrade did not answer our key")
+	}
+	return newWSConn(c, br, true), nil
+}
+
+// ---------------------------------------------------------------------------
+// the transport
+// ---------------------------------------------------------------------------
+
+type wsTransport struct {
+	cfg    *Config
+	useTLS bool
+	path   string
+	host   string
+
+	ln      net.Listener
+	inbound chan net.Conn
+	done    chan struct{}
+	once    sync.Once
+}
+
+func newWSTransport(cfg *Config, useTLS bool) (*wsTransport, error) {
+	t := &wsTransport{
+		cfg:     cfg,
+		useTLS:  useTLS,
+		path:    wsPathFor(cfg),
+		host:    wsHostFor(cfg),
+		inbound: make(chan net.Conn, 64),
+		done:    make(chan struct{}),
+	}
+	if cfg.Connect != "" {
+		return t, nil // this end dials; it binds nothing
+	}
+
+	ln, err := net.Listen("tcp", cfg.Listen)
+	if err != nil {
+		return nil, err
+	}
+	if useTLS {
+		cert, err := wsCertificate(cfg)
+		if err != nil {
+			ln.Close()
+			return nil, err
+		}
+		ln = tls.NewListener(ln, &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"http/1.1"},
+			MinVersion:   tls.VersionTLS12,
+		})
+	}
+	t.ln = ln
+	go t.serve()
+	return t, nil
+}
+
+// The path a carrier asks for. Derived from the token, so it is neither
+// guessable from outside nor something anybody has to agree by hand: both ends
+// reach the same one from the same secret. Anything asking for a different
+// path is answered like an ordinary web server, and learns nothing.
+func wsPathFor(cfg *Config) string {
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 ws path"), cfg.key()), []byte("path"), 9)
+	return "/" + strings.TrimRight(base64.RawURLEncoding.EncodeToString(k), "=")
+}
+
+// The Host header. A CDN routes on it, so it has to be the hostname the tunnel
+// was pointed at rather than an address.
+func wsHostFor(cfg *Config) string {
+	target := cfg.Connect
+	if target == "" {
+		target = cfg.Listen
+	}
+	if h, _, err := net.SplitHostPort(target); err == nil && h != "" {
+		return h
+	}
+	return target
+}
+
+func (t *wsTransport) serve() {
+	srv := &http.Server{
+		ReadHeaderTimeout: 10 * time.Second,
+		Handler:           http.HandlerFunc(t.handle),
+	}
+	srv.Serve(t.ln)
+}
+
+func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Sec-WebSocket-Key")
+	if r.URL.Path != t.path || key == "" ||
+		!strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		// Not a carrier. Answer the way a web server with nothing on it
+		// answers, so a scanner learns that and no more.
+		wsDecoy(w, r)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	c, br, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	resp := "HTTP/1.1 101 Switching Protocols\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Accept: " + wsAccept(key) + "\r\n\r\n"
+	if _, err := c.Write([]byte(resp)); err != nil {
+		c.Close()
+		return
+	}
+	select {
+	case t.inbound <- newWSConn(c, br.Reader, false):
+	case <-t.done:
+		c.Close()
+	default:
+		// Never block the HTTP handler waiting for an acceptor - the same
+		// lesson the echo transport taught, in a different shape.
+		c.Close()
+	}
+}
+
+func (t *wsTransport) Dial(idx int) (net.Conn, error) {
+	return wsDial(t.cfg.Connect, t.host, t.path, t.useTLS,
+		time.Duration(t.cfg.DialTimeout)*time.Second)
+}
+
+func (t *wsTransport) Accept() (net.Conn, error) {
+	if t.ln == nil {
+		return nil, fmt.Errorf("ws: this end dials, it does not accept")
+	}
+	select {
+	case c := <-t.inbound:
+		return c, nil
+	case <-t.done:
+		return nil, io.EOF
+	}
+}
+
+func (t *wsTransport) Close() error {
+	t.once.Do(func() { close(t.done) })
+	if t.ln != nil {
+		return t.ln.Close()
+	}
+	return nil
+}
+
+func (t *wsTransport) Name() string {
+	if t.useTLS {
+		return "wss"
+	}
+	return "ws"
+}
+PINGIFY_SRC_EOF
+    cat > "$d/wsdecoy.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/binary"
+	"fmt"
+	"math/big"
+	"net/http"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// what answers everything that is not a carrier
+//
+// A tunnel that returns nothing to a probe is a port that returns nothing to a
+// probe, and there are not many of those on the internet. What a scanner
+// should find is a web server with nothing interesting on it - because that is
+// the most common thing there is.
+//
+// So: the front page nginx ships with, a normal 404 everywhere else, and the
+// headers a real one sends. The details are derived from the tunnel's own
+// token rather than fixed, so two servers running this do not answer
+// identically and a fleet cannot be found by matching one response against the
+// rest of the internet.
+// ---------------------------------------------------------------------------
+
+const decoyPage = `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+`
+
+const decoy404 = `<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx/%s</center>
+</body>
+</html>
+`
+
+// decoyIdentity is the version string, page date and ETag this install claims.
+// All three come from the token, so they are stable for one server and
+// different from the next - which is the point. A fixed set would be a
+// fingerprint shared by everyone running this.
+type decoyIdentity struct {
+	version string
+	modTime time.Time
+	etag    string
+}
+
+func newDecoyIdentity(psk []byte) decoyIdentity {
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 decoy"), psk), []byte("identity"), 32)
+
+	// A version that exists: these are all real nginx releases, so a scanner
+	// matching against known versions finds an ordinary one.
+	versions := []string{
+		"1.18.0", "1.20.1", "1.20.2", "1.22.0", "1.22.1",
+		"1.24.0", "1.25.3", "1.26.0", "1.26.1", "1.27.0",
+	}
+	v := versions[int(k[0])%len(versions)]
+
+	// A page date somewhere in the last two years, on a whole minute, the way
+	// a file written by a package manager would be.
+	off := time.Duration(binary.BigEndian.Uint32(k[1:5])%(730*24*60)) * time.Minute
+	mod := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC).Add(off)
+
+	return decoyIdentity{
+		version: v,
+		modTime: mod,
+		etag:    fmt.Sprintf(`"%x-%x"`, mod.Unix(), len(decoyPage)),
+	}
+}
+
+var decoyOnce struct {
+	id  decoyIdentity
+	set bool
+}
+
+func decoyFor(psk []byte) decoyIdentity {
+	if !decoyOnce.set {
+		decoyOnce.id = newDecoyIdentity(psk)
+		decoyOnce.set = true
+	}
+	return decoyOnce.id
+}
+
+// wsDecoy answers anything that is not a carrier.
+func wsDecoy(w http.ResponseWriter, r *http.Request) {
+	id := decoyFor(decoyPSK)
+	h := w.Header()
+	h.Set("Server", "nginx/"+id.version)
+	h.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+
+	if r.URL.Path != "/" {
+		h.Set("Content-Type", "text/html")
+		body := fmt.Sprintf(decoy404, id.version)
+		h.Set("Content-Length", fmt.Sprint(len(body)))
+		w.WriteHeader(http.StatusNotFound)
+		if r.Method != http.MethodHead {
+			w.Write([]byte(body))
+		}
+		return
+	}
+
+	h.Set("Content-Type", "text/html")
+	h.Set("Content-Length", fmt.Sprint(len(decoyPage)))
+	h.Set("Last-Modified", id.modTime.Format(http.TimeFormat))
+	h.Set("ETag", id.etag)
+	h.Set("Accept-Ranges", "bytes")
+	// A real static file answers a conditional request rather than resending.
+	if r.Header.Get("If-None-Match") == id.etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		w.Write([]byte(decoyPage))
+	}
+}
+
+// decoyPSK is set once at startup so the handler, which has no config, can
+// derive the same identity every time.
+var decoyPSK []byte
+
+// ---------------------------------------------------------------------------
+// the certificate
+//
+// A real one from Let's Encrypt is better and the manager can arrange it. When
+// there is none, a self-signed certificate is generated and kept, because the
+// alternative is refusing to start - and the tunnel does not trust the
+// certificate anyway. What proves the far end is the token, in the handshake
+// the braid runs immediately after the upgrade.
+// ---------------------------------------------------------------------------
+
+func wsCertificate(cfg *Config) (tls.Certificate, error) {
+	if cfg.CertFile != "" && cfg.KeyFile != "" {
+		return tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	}
+	return selfSignedFor(wsHostFor(cfg), cfg.key())
+}
+
+// selfSignedFor makes a certificate that looks like one a small site would
+// have: a real-looking issuer, a year of validity, the hostname it is for.
+// Derived from the token so it is the same one after a restart - a certificate
+// that changes on every start is itself a signal.
+func selfSignedFor(host string, psk []byte) (tls.Certificate, error) {
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 cert"), psk), []byte("serial"), 16)
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	serial := new(big.Int).SetBytes(k)
+	if host == "" {
+		host = "localhost"
+	}
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: host},
+		DNSNames:     []string{host},
+		NotBefore:    time.Now().Add(-30 * 24 * time.Hour),
+		NotAfter:     time.Now().Add(335 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+}
 PINGIFY_SRC_EOF
     return 0
 }

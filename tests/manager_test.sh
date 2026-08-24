@@ -1695,5 +1695,33 @@ check "only the end that binds is asked" "$(wz | grep -c 'this_side_accepts && s
 # udp and tcp are different sockets, and port_free has to know that
 check "port_free takes a protocol" "$(grep -c 'ss -Hlun' Pingify.sh)" "1"
 
+
+# ---------------------------------------------------------------------------
+note "WebSocket goes where the web goes"
+# ---------------------------------------------------------------------------
+# The only family with no equivalent here before: everything else looks like
+# what it is, and on a path that passes 443 and nothing else, none of them go
+# anywhere. This one is an HTTP request that becomes a WebSocket.
+check "wss has a label"     "$(transport_label wss)" "WSS"
+check "and ws"              "$(transport_label ws)"  "WS"
+check "seven protocols now" "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7' Pingify.sh)" "1"
+check "wss is offered"      "$(grep -c 'choice 6 "WSS"' Pingify.sh)" "1"
+check "and ws under it"     "$(grep -c 'choice 7 "WS"' Pingify.sh)"  "1"
+
+# Each names itself, since several can hold 443 at once on one server
+nw() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=443; tunnel_default_name ); }
+check "a wss tunnel says so"  "$(nw server wss)" "wss-iran-443"
+check "and a ws one"          "$(nw client ws)"  "ws-kharej-443"
+check "tcp keeps the plain name" "$(nw server tcp)" "iran-443"
+
+# they carry a port, so the port question and its clash check must cover them
+wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the port question covers them" "$(wz | grep -c 'tcp | udp | ws | wss) has_port=1')" "1"
+
+# WS is not encrypted by itself and the screen has to say so, because the name
+# looks like WSS with one letter missing
+check "ws warns it is in the clear" "$(wz | grep -c 'WS is not encrypted by itself')" "1"
+check "and points at WSS instead"   "$(wz | grep -c 'On a bare path, pick WSS')"      "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]
