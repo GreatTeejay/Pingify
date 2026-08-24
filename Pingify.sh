@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.19.2"
+PINGIFY_VERSION="5.20.0"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -5564,6 +5564,12 @@ const (
 	// un-updated peer is known to accept.
 	arqWinStart = 64
 
+	// The longest a segment waits before going again. Twelve retries with a
+	// doubling back-off up to this is about forty-seven seconds, which is
+	// inside the minute the braid gives a carrier before declaring the peer
+	// gone - so the ARQ, which knows more, is the one that decides.
+	arqMaxRTO = 5 * time.Second
+
 	flagData = 1 << 0
 	flagFin  = 1 << 1
 	flagRst  = 1 << 2
@@ -6018,21 +6024,36 @@ func (c *arqConn) timerLoop() {
 				c.mu.Unlock()
 				return
 			}
-			// Anything past its timeout goes again, with the timeout doubled
-			// so a dead path is not hammered.
+			// Anything past its timeout goes again. Both the back-off and
+			// the window cut happen ONCE for the pass, not once per segment:
+			// a full window timing out together is one event - the path
+			// stopped carrying - and treating it as sixty-four drove the
+			// timeout from 500ms to its five-second ceiling on the first
+			// pass, and halved the window past its floor in the same instant.
+			// Twelve retries at five seconds is exactly the sixty seconds a
+			// carrier is given before it is declared dead, so every carrier
+			// died together on the first real stall rather than riding it out.
+			lost := false
 			for _, seg := range c.sndBuf {
 				if now.Sub(seg.sentAt) >= c.rto {
 					seg.retries++
-					c.shrink()
+					lost = true
 					if seg.retries > c.maxRetries {
 						c.fail(errARQClosed)
 						c.mu.Unlock()
 						return
 					}
 					c.emit(seg, flagData)
-					if c.rto < 5*time.Second {
-						c.rto *= 2
-					}
+				}
+			}
+			if lost {
+				c.shrink()
+				// Clamped after doubling, not before. Testing first let it
+				// pass the ceiling on the way through - four seconds is under
+				// five, so it doubled to eight.
+				c.rto *= 2
+				if c.rto > arqMaxRTO {
+					c.rto = arqMaxRTO
 				}
 			}
 			if c.needAck {
@@ -6581,8 +6602,10 @@ func newICMPTransport(psk []byte, bind string, windowKB int) (*icmpTransport, er
 		psk:      psk,
 		window:   arqWindowFor(windowKB, icmpMaxPayload),
 		sessions: make(map[sessionKey]*arqConn),
-		inbound:  make(chan net.Conn, 16),
-		done:     make(chan struct{}),
+		// Deep enough that a listening end with a busy acceptor does not drop
+		// a carrier it wanted; the reader never waits on it either way.
+		inbound: make(chan net.Conn, 64),
+		done:    make(chan struct{}),
 	}
 	go t.readLoop()
 	return t, nil
@@ -6667,10 +6690,39 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
+		// Is there anywhere for it to go? Checked before anything is built,
+		// because a connection nobody accepts is a goroutine and a timer for
+		// a session that does not exist - and closing one sends a datagram
+		// back to a stray we have decided to ignore.
+		//
+		// dispatch runs only on the single read loop, so a plain length test
+		// races with nothing.
+		if len(t.inbound) == cap(t.inbound) {
+			t.mu.Unlock()
+			logDebug("icmp: no room to accept session %08x carrier %d from %s, ignored",
+				h.session, h.carrier, peer)
+			return
+		}
 		conn = newARQ(h.session, h.carrier, t.psk, icmpMaxPayload, t.window, t.sender(peer, id))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
+
+		// Never block here. This is the one read loop, shared by every live
+		// carrier on this transport, and it was waiting for somebody to
+		// accept a session nobody had asked for.
+		//
+		// The dialling end never calls Accept at all - it only dials - so the
+		// first sixteen strays filled this channel and the reader stopped
+		// dead. Every carrier then went silent, and sixty seconds later the
+		// braid declared the peer gone and took all of them down together.
+		// Restart, and the same thing a minute later. A raw ICMP socket
+		// receives every echo reply the host sees, so strays are not an edge
+		// case: a peer retransmitting to a session this end has already torn
+		// down is enough.
+		//
+		// If there is no room, the session is not wanted. Drop it - the peer
+		// retries, and a listening end with a live acceptor has room.
 		select {
 		case t.inbound <- conn:
 		case <-t.done:
@@ -6830,7 +6882,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.19.2"
+const version = "5.20.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -7695,6 +7747,13 @@ type pool struct {
 	// only when that changed
 	reported int
 
+	// why the most recent carrier died. Sixteen carriers dropping together
+	// wrote sixteen identical reasons, so the reason was moved to debug - and
+	// then the log said "1 went down" sixteen times and never once said why,
+	// which is the only thing anybody reads a log for. It is kept here
+	// instead, and reported once with the count.
+	lastDown string
+
 	// How many times the far end has told us it could not reach a target.
 	// A stream that ends because the service on the other server hung up and
 	// a stream that ends because there was no service to hang up both arrive
@@ -7936,6 +7995,7 @@ func (p *pool) noteStrength() {
 	}
 	was := p.reported
 	p.reported = n
+	why := p.lastDown
 	p.mu.Unlock()
 
 	switch {
@@ -7947,8 +8007,14 @@ func (p *pool) noteStrength() {
 		logInfo("all %d carriers up", n)
 	case n == 0:
 		logWarn("every carrier is down: nothing can cross the tunnel now")
+		if why != "" {
+			logWarn("the last one went because: %s", why)
+		}
 	case n < was:
 		logWarn("%d of %d carriers up, %d went down", n, p.cfg.Carriers, was-n)
+		if why != "" {
+			logWarn("  because: %s", why)
+		}
 	}
 }
 
@@ -8762,6 +8828,9 @@ func (l *link) close() {
 		logDebug("carrier %d down: %s (up %s)", l.idx, why,
 			time.Since(time.Unix(0, atomic.LoadInt64(&l.upSince))).Round(time.Second))
 		if l.pool != nil {
+			l.pool.mu.Lock()
+			l.pool.lastDown = why
+			l.pool.mu.Unlock()
 			l.pool.noteStrength()
 		}
 	})
