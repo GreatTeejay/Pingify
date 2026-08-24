@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.25.1"
+PINGIFY_VERSION="5.25.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -7249,7 +7249,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.25.1"
+const version = "5.25.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -11461,12 +11461,20 @@ func (w *wsConn) writeControl(op byte, payload []byte) error {
 	// writes, and on an idle carrier that moment is long past - a pong sent
 	// under it fails instantly with i/o timeout. Put a deadline of our own on
 	// for this one write and give the old one back after.
+	//
+	// Held for the whole borrow, because taking the old value and handing it
+	// back are one operation. The braid's writer sets its deadline BEFORE it
+	// asks for the write lock, so a control frame that read the old value
+	// first, and gave it back after, would put an hour-old deadline on a
+	// socket the braid had just set a fresh one on - and the braid's next
+	// write, the one that deadline was for, would fail on the spot with a
+	// timeout no clock had reached. That is a carrier lost to answering a
+	// ping, which is the opposite of what answering it was for.
 	w.dmu.Lock()
-	prev := w.wdl
-	w.dmu.Unlock()
 	w.c.SetWriteDeadline(time.Now().Add(wsControlWait))
 	err := w.frameOut(op, payload)
-	w.c.SetWriteDeadline(prev)
+	w.c.SetWriteDeadline(w.wdl)
+	w.dmu.Unlock()
 	return err
 }
 
@@ -11487,17 +11495,22 @@ func (w *wsConn) netConn() net.Conn { return w.c }
 
 func (w *wsConn) LocalAddr() net.Addr  { return w.c.LocalAddr() }
 func (w *wsConn) RemoteAddr() net.Addr { return w.c.RemoteAddr() }
+
+// The two write-deadline setters hold dmu across the socket call, not just
+// around the field. A control frame borrows the deadline under the same lock,
+// so the borrow and a change from the braid can no longer overlap and end
+// with the older of the two on the socket.
 func (w *wsConn) SetDeadline(t time.Time) error {
 	w.dmu.Lock()
+	defer w.dmu.Unlock()
 	w.wdl = t
-	w.dmu.Unlock()
 	return w.c.SetDeadline(t)
 }
 func (w *wsConn) SetReadDeadline(t time.Time) error { return w.c.SetReadDeadline(t) }
 func (w *wsConn) SetWriteDeadline(t time.Time) error {
 	w.dmu.Lock()
+	defer w.dmu.Unlock()
 	w.wdl = t
-	w.dmu.Unlock()
 	return w.c.SetWriteDeadline(t)
 }
 

@@ -7,9 +7,11 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -779,3 +781,242 @@ func TestWSHandshakeLooksLikeABrowser(t *testing.T) {
 }
 
 func bufioNewReader(c net.Conn) *bufio.Reader { return bufio.NewReaderSize(c, 32*1024) }
+
+// A control frame borrows the write deadline. The braid sets its own deadline
+// before it asks for the write lock, so the borrow has to be given back
+// without stepping on a fresher one - or the braid's very next write dies of a
+// timeout that never came round, and the carrier goes with it.
+func TestWSPongDoesNotRestoreADeadlineTheBraidReplaced(t *testing.T) {
+	setLogLevel("error")
+
+	held := make(chan struct{})
+	release := make(chan struct{})
+	rec := &deadlineConn{onWrite: func() {
+		select {
+		case held <- struct{}{}:
+		default:
+		}
+		<-release
+	}}
+	w := newWSConn(rec, bufio.NewReader(bytes.NewReader(nil)), false)
+
+	stale := time.Now().Add(-time.Hour)
+	fresh := time.Now().Add(time.Minute)
+
+	// What the braid last asked for, long expired: an idle carrier.
+	if err := w.SetWriteDeadline(stale); err != nil {
+		t.Fatal(err)
+	}
+
+	go func() { w.writeControl(wsOpPong, []byte("x")) }()
+	<-held // the pong is on the wire, holding the deadline
+
+	// The braid wakes with something to send and sets its own deadline first,
+	// exactly as writeLoop does.
+	done := make(chan error, 1)
+	go func() { done <- w.SetWriteDeadline(fresh) }()
+
+	// Whether that call goes through now or waits for the pong to finish is
+	// the whole difference: waiting is the fix. Give it the chance to go
+	// through, so that if it does, the pong still has its restore to do.
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+		done = nil
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(release)
+	if done != nil {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give the pong's restore a moment to land if it is going to.
+	time.Sleep(100 * time.Millisecond)
+
+	if got := rec.lastWrite(); !got.Equal(fresh) {
+		t.Fatalf("the socket was left with %v, not the deadline the braid just set (%v);"+
+			" the braid's next write would fail on the spot", got, fresh)
+	}
+}
+
+// deadlineConn is a net.Conn that records the write deadline it was last given
+// and lets a test hold a write open.
+type deadlineConn struct {
+	net.Conn
+	mu      sync.Mutex
+	wdl     time.Time
+	onWrite func()
+}
+
+func (c *deadlineConn) Write(p []byte) (int, error) {
+	if c.onWrite != nil {
+		c.onWrite()
+	}
+	return len(p), nil
+}
+func (c *deadlineConn) Read(p []byte) (int, error) { return 0, io.EOF }
+func (c *deadlineConn) Close() error               { return nil }
+func (c *deadlineConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.wdl = t
+	c.mu.Unlock()
+	return nil
+}
+func (c *deadlineConn) SetDeadline(t time.Time) error { return c.SetWriteDeadline(t) }
+func (c *deadlineConn) lastWrite() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.wdl
+}
+
+// chopper copies a<->b but breaks every write into small pieces, the way a
+// real path with a small MSS does. Local tests deliver whole writes, which is
+// exactly the case a framing bug survives.
+func chopProxy(t *testing.T, target string) string {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			u, err := net.Dial("tcp", target)
+			if err != nil {
+				c.Close()
+				continue
+			}
+			go chop(c, u)
+			go chop(u, c)
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func chop(src, dst net.Conn) {
+	defer src.Close()
+	defer dst.Close()
+	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := src.Read(buf)
+		for off := 0; off < n; {
+			k := 1 + r.Intn(700)
+			if off+k > n {
+				k = n - off
+			}
+			if _, e := dst.Write(buf[off : off+k]); e != nil {
+				return
+			}
+			off += k
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// prng stream both ends can generate and verify.
+func streamAt(seed int64, off int64, n int) []byte {
+	r := rand.New(rand.NewSource(seed))
+	b := make([]byte, off+int64(n))
+	r.Read(b)
+	return b[off:]
+}
+
+// Two wsConns over a real socket, both directions at once, random sizes,
+// through a path that chops every write. If the framing loses or duplicates a
+// byte anywhere, the check fails at the first one.
+func TestWSFullDuplexUnderChopping(t *testing.T) {
+	setLogLevel("error")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	addr := chopProxy(t, ln.Addr().String())
+
+	psk := testPSK(t)
+	cfg := &Config{Role: "server", Mode: "forward", Transport: "ws",
+		Listen: ln.Addr().String(), Token: psk, Carriers: 1}
+	cfg.applyDefaults()
+	tr := &wsTransport{cfg: cfg, path: wsPathFor(cfg), host: "example.com",
+		inbound: make(chan net.Conn, 8), done: make(chan struct{}), ln: ln}
+	go tr.serve()
+
+	const total = 3 << 20
+
+	srvDone := make(chan error, 1)
+	go func() {
+		c, err := tr.Accept()
+		if err != nil {
+			srvDone <- err
+			return
+		}
+		srvDone <- pump(c, 2, 1, total)
+	}()
+
+	c, err := wsDial(addr, "example.com", tr.path, false, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pump(c, 1, 2, total); err != nil {
+		t.Fatalf("client: %v", err)
+	}
+	if err := <-srvDone; err != nil {
+		t.Fatalf("server: %v", err)
+	}
+}
+
+// pump writes stream `send` and verifies stream `recv`, concurrently.
+func pump(c net.Conn, send, recv int64, total int) error {
+	var wg sync.WaitGroup
+	var werr, rerr error
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		r := rand.New(rand.NewSource(send * 977))
+		want := streamAt(send, 0, total)
+		for off := 0; off < total; {
+			k := 1 + r.Intn(70000)
+			if off+k > total {
+				k = total - off
+			}
+			if _, err := c.Write(want[off : off+k]); err != nil {
+				werr = err
+				return
+			}
+			off += k
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		want := streamAt(recv, 0, total)
+		got := make([]byte, total)
+		if _, err := io.ReadFull(c, got); err != nil {
+			rerr = err
+			return
+		}
+		if !bytes.Equal(got, want) {
+			for i := range got {
+				if got[i] != want[i] {
+					rerr = fmt.Errorf("stream diverged at byte %d of %d: got %d want %d", i, total, got[i], want[i])
+					return
+				}
+			}
+		}
+	}()
+	wg.Wait()
+	if werr != nil {
+		return werr
+	}
+	return rerr
+}
