@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.21.0"
+PINGIFY_VERSION="5.21.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -448,10 +448,16 @@ toml_get() {
 json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
 json_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
+# port_free PORT [PROTO] - nothing is listening there. PROTO is tcp unless
+# said otherwise; a UDP socket and a TCP socket on the same number are two
+# different things and neither blocks the other.
 port_free() {
-    local p="$1"
+    local p="$1" proto="${2:-tcp}"
     if have ss; then
-        ! ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || return 1
+        case "$proto" in
+            udp) ! ss -Hlun "sport = :$p" 2>/dev/null | grep -q . || return 1 ;;
+            *)   ! ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || return 1 ;;
+        esac
     fi
     return 0
 }
@@ -936,6 +942,10 @@ tunnel_default_name() {
         icmp) printf 'tun-%s-icmp%s' "$base" "$tail" ;;
         gre)  printf 'tun-%s-gre%s' "$base" "$tail" ;;
         awg)  printf 'tun-%s-awg%s' "$base" "$tail" ;;
+        # TCP and UDP can hold the same port at once - they are different
+        # sockets - so the name has to say which, or the second one is
+        # iran-9443-2 and tells you nothing about what it is.
+        udp)  printf 'udp-%s-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
 }
@@ -1564,10 +1574,35 @@ new_tunnel() {
 
     if [ "$T_TRANSPORT" = "tcp" ] || [ "$T_TRANSPORT" = "udp" ]; then
         say ""
-        ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
-        case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
-        this_side_accepts && dim "leave $T_PORT open in this server's firewall"
-    elif [ "$T_TRANSPORT" = "awg" ]; then
+        # The port the two servers meet on. Only the accepting end binds it,
+        # so only that end can collide - and TCP 9443 and UDP 9443 are two
+        # different sockets, so the protocol is part of the question.
+        this_side_accepts && show_taken_tunnel_ports
+        local powner=""
+        while :; do
+            ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
+            case "$T_PORT" in
+                '' | *[!0-9]*) fail "numbers only"; continue ;;
+            esac
+            [ "$T_PORT" -ge 1 ] && [ "$T_PORT" -le 65535 ] || { fail "1 to 65535"; continue; }
+            if this_side_accepts; then
+                powner="$(tunnel_port_owner "$T_PORT" "$T_TRANSPORT")"
+                if [ -n "$powner" ]; then
+                    fail "${T_PORT}/${T_TRANSPORT} is already $powner's tunnel port"
+                    dim "pick another, or delete that tunnel first"
+                    continue
+                fi
+                if ! port_free "$T_PORT" "$T_TRANSPORT"; then
+                    fail "something is already listening on ${T_PORT}/${T_TRANSPORT}"
+                    dim "check with:  ss -lnp | grep :${T_PORT}"
+                    continue
+                fi
+            fi
+            break
+        done
+        this_side_accepts && dim "leave ${T_PORT}/${T_TRANSPORT} open in this server's firewall"
+    fi
+    if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
         ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT"
         case "$T_AWG_PORT" in "" | *[!0-9]*) T_AWG_PORT=51820 ;; esac
@@ -2433,6 +2468,57 @@ show_taken_ports() {
     warn "ports already forwarded on this server"
     printf '%s\n' "$listing" | while read -r name list; do
         [ -n "$name" ] && dim "$(pad_to "$name" 18)${BX_ARR} $list"
+    done
+    say ""
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# the tunnel's own port
+#
+# Not a forwarded port - the one the two servers meet on. It was never checked,
+# so a second tunnel could take a port the first one was already accepting on,
+# and only the second one's log would say why it would not start.
+#
+# Only the accepting end binds it. A dialling end names the same number but it
+# belongs to the far server and this machine binds nothing, so two tunnels
+# dialling one port is not a clash. And TCP 9443 and UDP 9443 are two different
+# sockets - neither blocks the other - so the protocol is part of the question.
+# ---------------------------------------------------------------------------
+
+tunnel_port_owner() {
+    local want="$1" proto="$2" except="${3:-}" f l name
+    case "$want" in '' | *[!0-9]*) return 0 ;; esac
+    cfg_files | while read -r f; do
+        [ "$(toml_get "$f" transport type)" = "$proto" ] || continue
+        l="$(toml_get "$f" transport listen)"
+        [ -n "$l" ] || continue          # this one dials; it binds nothing here
+        [ "${l##*:}" = "$want" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        printf '%s' "$name"
+        break
+    done
+    return 0
+}
+
+show_taken_tunnel_ports() {
+    local except="${1:-}" listing
+    listing="$(
+        cfg_files | while read -r f; do
+            l="$(toml_get "$f" transport listen)"
+            [ -n "$l" ] || continue
+            name="$(cfg_name "$f")"
+            [ -n "$except" ] && [ "$name" = "$except" ] && continue
+            printf '%s %s %s
+' "$name" "$(toml_get "$f" transport type)" "${l##*:}"
+        done
+    )"
+    [ -n "$listing" ] || return 0
+    warn "tunnel ports this server already accepts on"
+    printf '%s
+' "$listing" | while read -r name proto port; do
+        [ -n "$name" ] && dim "$(pad_to "$name" 22)${BX_ARR} ${port}/${proto}"
     done
     say ""
     return 0
@@ -6904,7 +6990,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.21.0"
+const version = "5.21.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

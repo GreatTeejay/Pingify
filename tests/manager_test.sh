@@ -1611,8 +1611,9 @@ check "five protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5' Pingif
 
 # It carries ports like TCP does, so it is named and addressed like TCP
 nu() { ( T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443; tunnel_default_name ); }
-check "named for its port"     "$(nu server)" "iran-9443"
-check "on the far side too"    "$(nu client)" "kharej-9443"
+# a udp tunnel says so: tcp and udp can hold 9443 at the same time
+check "named for its port and protocol" "$(nu server)" "udp-iran-9443"
+check "on the far side too"             "$(nu client)" "udp-kharej-9443"
 ep() { ( cfg_reset; T_ROLE="$1"; T_TRANSPORT="udp"; T_PORT=9443
          T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
          T_ACCEPTS="server"; cfg_endpoints
@@ -1637,6 +1638,62 @@ if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
     "$CORE_BIN" -c "$uf" -check >/dev/null 2>&1
     check "and the core accepts it" "$?" "0"
 fi
+
+
+# ---------------------------------------------------------------------------
+note "the tunnel's own port is claimed too"
+# ---------------------------------------------------------------------------
+# Only the forwarded ports were ever checked. The port the two servers meet on
+# was not, so a second tunnel could take one the first was already accepting
+# on, and only the second one's log would say why it would not start.
+#
+# TCP 9443 and UDP 9443 are two different sockets and neither blocks the other,
+# so the protocol is half the question - and the names have to say which is
+# which, or the second is iran-9443-2 and tells you nothing.
+TPO="$WORK/tport"; mkdir -p "$TPO"
+(
+    CFG_DIR="$TPO"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    mkp() {
+        cfg_reset
+        T_ROLE="$1"; T_TRANSPORT="$2"; T_ACCEPTS="server"; cfg_mode
+        T_PORT="$3"; T_NAME="$(tunnel_default_name)"; T_TOKEN="$TOKEN"
+        T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+        cfg_save >/dev/null
+        echo "name=$T_NAME"
+    }
+    mkp server udp 9443
+    mkp server tcp 9443
+    echo "udp9443=$(tunnel_port_owner 9443 udp)"
+    echo "tcp9443=$(tunnel_port_owner 9443 tcp)"
+    echo "tcp9444=$(tunnel_port_owner 9444 tcp)"
+    echo "own=$(tunnel_port_owner 9443 udp udp-iran-9443)"
+    # a tunnel that dials binds nothing here, so it cannot be the owner
+    cfg_reset
+    T_ROLE="client"; T_TRANSPORT="tcp"; T_ACCEPTS="server"; cfg_mode
+    T_PORT=7000; T_NAME="kharej-7000"; T_TOKEN="$TOKEN"
+    T_PUBLIC_IP="198.51.100.4"; T_PEER_IP="203.0.113.9"; T_STATUS="127.0.0.1:9701"
+    cfg_save >/dev/null
+    echo "dialled=$(tunnel_port_owner 7000 tcp)"
+) > "$WORK/tport.out" 2>&1
+tp() { grep -m1 "^$1=" "$WORK/tport.out" | cut -d= -f2-; }
+
+check "a udp tunnel names itself"     "$(grep -m1 '^name=' "$WORK/tport.out" | cut -d= -f2-)" "udp-iran-9443"
+check "and tcp keeps the plain name"  "$(grep '^name=' "$WORK/tport.out" | sed -n 2p | cut -d= -f2-)" "iran-9443"
+check "a taken udp port names its owner" "$(tp udp9443)" "udp-iran-9443"
+check "and the tcp one is separate"      "$(tp tcp9443)" "iran-9443"
+check "an unused port is free"           "$(tp tcp9444)" ""
+check "a tunnel may keep its own"        "$(tp own)"     ""
+check "a dialled port binds nothing here" "$(tp dialled)" ""
+
+wz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "the wizard lists what is taken" "$(wz | grep -c 'show_taken_tunnel_ports')" "1"
+check "and refuses a repeat"           "$(wz | grep -c 'tunnel_port_owner')"       "1"
+check "and a port the host has bound"  "$(wz | grep -c 'port_free "\$T_PORT" "\$T_TRANSPORT"')" "1"
+check "only the end that binds is asked" "$(wz | grep -c 'this_side_accepts && show_taken_tunnel_ports')" "1"
+# udp and tcp are different sockets, and port_free has to know that
+check "port_free takes a protocol" "$(grep -c 'ss -Hlun' Pingify.sh)" "1"
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

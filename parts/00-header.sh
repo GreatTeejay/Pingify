@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="5.21.0"
+PINGIFY_VERSION="5.21.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -448,10 +448,16 @@ toml_get() {
 json_str() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$1" | head -n1; }
 json_num() { [ -f "$1" ] || return 0; sed -n "s/^[[:space:]]*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" "$1" | head -n1; }
 
+# port_free PORT [PROTO] - nothing is listening there. PROTO is tcp unless
+# said otherwise; a UDP socket and a TCP socket on the same number are two
+# different things and neither blocks the other.
 port_free() {
-    local p="$1"
+    local p="$1" proto="${2:-tcp}"
     if have ss; then
-        ! ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || return 1
+        case "$proto" in
+            udp) ! ss -Hlun "sport = :$p" 2>/dev/null | grep -q . || return 1 ;;
+            *)   ! ss -Hltn "sport = :$p" 2>/dev/null | grep -q . || return 1 ;;
+        esac
     fi
     return 0
 }

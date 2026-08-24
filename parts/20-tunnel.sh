@@ -79,6 +79,10 @@ tunnel_default_name() {
         icmp) printf 'tun-%s-icmp%s' "$base" "$tail" ;;
         gre)  printf 'tun-%s-gre%s' "$base" "$tail" ;;
         awg)  printf 'tun-%s-awg%s' "$base" "$tail" ;;
+        # TCP and UDP can hold the same port at once - they are different
+        # sockets - so the name has to say which, or the second one is
+        # iran-9443-2 and tells you nothing about what it is.
+        udp)  printf 'udp-%s-%s' "$base" "$T_PORT" ;;
         *)    printf '%s-%s' "$base" "$T_PORT" ;;
     esac
 }
@@ -707,10 +711,35 @@ new_tunnel() {
 
     if [ "$T_TRANSPORT" = "tcp" ] || [ "$T_TRANSPORT" = "udp" ]; then
         say ""
-        ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
-        case "$T_PORT" in "" | *[!0-9]*) T_PORT=9443 ;; esac
-        this_side_accepts && dim "leave $T_PORT open in this server's firewall"
-    elif [ "$T_TRANSPORT" = "awg" ]; then
+        # The port the two servers meet on. Only the accepting end binds it,
+        # so only that end can collide - and TCP 9443 and UDP 9443 are two
+        # different sockets, so the protocol is part of the question.
+        this_side_accepts && show_taken_tunnel_ports
+        local powner=""
+        while :; do
+            ask T_PORT "port for the tunnel itself, same on both" "$T_PORT"
+            case "$T_PORT" in
+                '' | *[!0-9]*) fail "numbers only"; continue ;;
+            esac
+            [ "$T_PORT" -ge 1 ] && [ "$T_PORT" -le 65535 ] || { fail "1 to 65535"; continue; }
+            if this_side_accepts; then
+                powner="$(tunnel_port_owner "$T_PORT" "$T_TRANSPORT")"
+                if [ -n "$powner" ]; then
+                    fail "${T_PORT}/${T_TRANSPORT} is already $powner's tunnel port"
+                    dim "pick another, or delete that tunnel first"
+                    continue
+                fi
+                if ! port_free "$T_PORT" "$T_TRANSPORT"; then
+                    fail "something is already listening on ${T_PORT}/${T_TRANSPORT}"
+                    dim "check with:  ss -lnp | grep :${T_PORT}"
+                    continue
+                fi
+            fi
+            break
+        done
+        this_side_accepts && dim "leave ${T_PORT}/${T_TRANSPORT} open in this server's firewall"
+    fi
+    if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
         ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT"
         case "$T_AWG_PORT" in "" | *[!0-9]*) T_AWG_PORT=51820 ;; esac
