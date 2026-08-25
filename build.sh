@@ -102,6 +102,14 @@ rm -rf "$vendor_stage/vendor/golang.org/x/sys/windows"
 for goos in windows darwin ios js wasip1 wasm plan9 aix solaris illumos             netbsd openbsd freebsd dragonfly zos hurd; do
     find "$vendor_stage/vendor" -type f         \( -name "*_$goos.go"  -o -name "*_$goos.s"         -o -name "*_${goos}_*.go" -o -name "*_${goos}_*.s" \) -delete
 done
+
+# And the same again for architectures. The releases are amd64 and arm64; the
+# 386, arm, mips, ppc, riscv, s390x, loong64 and sparc64 sources in x/sys are
+# another few megabytes Go would never open. _arm64 is a different suffix from
+# _arm and is left alone.
+for goarch in 386 arm mips mipsle mips64 mips64le mips64p32 mips64p32le               ppc ppc64 ppc64le riscv riscv64 s390x loong64 sparc sparc64; do
+    find "$vendor_stage/vendor" -type f         \( -name "*_$goarch.go" -o -name "*_$goarch.s"         -o -name "*_${goarch}_*.go" -o -name "*_${goarch}_*.s" \) -delete
+done
 find "$vendor_stage/vendor" -type d -empty -delete
 while IFS= read -r -d '' f; do
     if grep -Iq . "$f"; then
