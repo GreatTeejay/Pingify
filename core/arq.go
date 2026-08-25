@@ -174,6 +174,7 @@ type arqConn struct {
 	err      error
 	done     chan struct{}
 	deadline time.Time
+	dlTimer  *time.Timer
 
 	// How many times one segment is resent before the carrier is declared
 	// dead. With the doubling backoff below, twelve works out at roughly
@@ -252,6 +253,9 @@ func (c *arqConn) Read(p []byte) (int, error) {
 		if c.closed {
 			return 0, errARQClosed
 		}
+		if c.expired() {
+			return 0, arqTimeout{}
+		}
 		c.cond.Wait()
 	}
 	n := copy(p, c.inbox)
@@ -271,6 +275,10 @@ func (c *arqConn) Write(p []byte) (int, error) {
 				}
 				c.mu.Unlock()
 				return total, e
+			}
+			if c.expired() {
+				c.mu.Unlock()
+				return total, arqTimeout{}
 			}
 			c.cond.Wait()
 		}
@@ -304,6 +312,10 @@ func (c *arqConn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.dlTimer != nil {
+		c.dlTimer.Stop()
+		c.dlTimer = nil
+	}
 	if !c.sentFin {
 		c.sentFin = true
 		c.emit(nil, flagFin)
@@ -317,12 +329,68 @@ func (c *arqConn) Close() error {
 func (c *arqConn) LocalAddr() net.Addr  { return c.remote }
 func (c *arqConn) RemoteAddr() net.Addr { return c.remote }
 
-// The braid layer sets deadlines to detect a wedged carrier. The keepalive and
-// retransmit machinery already covers that, so these are accepted and ignored
-// rather than pretended not to exist.
-func (c *arqConn) SetDeadline(t time.Time) error      { return nil }
-func (c *arqConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *arqConn) SetWriteDeadline(t time.Time) error { return nil }
+// Deadlines.
+//
+// These used to be accepted and ignored, on the grounds that the keepalive and
+// the retransmit counter already noticed a wedged carrier. That was one
+// mechanism where every other transport has two, and the day the keepalive
+// itself got stuck behind a full send queue there was nothing else watching:
+// the reader sat in cond.Wait forever, the carrier stayed "up" with a peer
+// that had gone, and a server reported twenty carriers against a config asking
+// for eight.
+//
+// The braid sets a read deadline before every frame, exactly as it does for
+// TCP. Honouring it costs a timer and gives ICMP and UDP the same second
+// opinion TCP has always had.
+func (c *arqConn) SetDeadline(t time.Time) error {
+	c.setDeadline(t)
+	return nil
+}
+
+func (c *arqConn) SetReadDeadline(t time.Time) error {
+	c.setDeadline(t)
+	return nil
+}
+
+// The writer has its own wait - on window space rather than on data - and the
+// same deadline covers it, because a peer that acknowledges nothing wedges
+// that side first.
+func (c *arqConn) SetWriteDeadline(t time.Time) error {
+	c.setDeadline(t)
+	return nil
+}
+
+func (c *arqConn) setDeadline(t time.Time) {
+	c.mu.Lock()
+	c.deadline = t
+	if c.dlTimer != nil {
+		c.dlTimer.Stop()
+		c.dlTimer = nil
+	}
+	if !t.IsZero() {
+		// Wake whoever is waiting when the moment arrives. cond.Wait has no
+		// timeout of its own, so the timer is the only thing that can.
+		if d := time.Until(t); d > 0 {
+			c.dlTimer = time.AfterFunc(d, func() { c.cond.Broadcast() })
+		} else {
+			c.cond.Broadcast()
+		}
+	}
+	c.mu.Unlock()
+}
+
+// expired reports whether the deadline has passed. The caller holds mu.
+func (c *arqConn) expired() bool {
+	return !c.deadline.IsZero() && !time.Now().Before(c.deadline)
+}
+
+// errARQTimeout is a net.Error that says Timeout, because that is what the
+// layer above checks to tell "nothing arrived" from "the peer went away".
+type arqTimeout struct{}
+
+func (arqTimeout) Error() string   { return "arq: i/o timeout" }
+func (arqTimeout) Timeout() bool   { return true }
+func (arqTimeout) Temporary() bool { return true }
 
 // ---------------------------------------------------------------------------
 // sending

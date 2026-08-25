@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="1.0.4"
+PINGIFY_VERSION="1.0.5"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -4871,6 +4871,34 @@ health_check() {
         fi
     fi
 
+    # --- the other server's version ----------------------------------------
+    #
+    # The check above compares the core with the script on THIS machine, which
+    # is the easy half. The half that has cost real time is the two servers
+    # disagreeing, because neither can see it from where it stands: the far end
+    # opens the carrier count its own preset table says, and this end reports
+    # "20 of 8 carriers up" with nothing to explain it.
+    #
+    # The core learns the peer's version from a record sent when each carrier
+    # comes up, so all this has to do is ask. A peer too old to send one says
+    # nothing, which is itself the answer once carriers are up.
+    if [ "$state" = "active" ] && [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ] &&
+       [ "${up:-0}" != "0" ] && ! kernel_transport; then
+        # awk by field rather than a sed backreference: this file is
+        # assembled into one script by a build that has eaten a backslash
+        # before, turning a backreference into a literal control byte. The
+        # marker line is the only one that carries those words.
+        local peerver
+        peerver="$("$CORE_BIN" -status "$T_STATUS" 2>/dev/null |
+            awk '/UPDATE BOTH ENDS/{print $8; exit}')"
+        if [ -n "$peerver" ]; then
+            hc_bad "the other server runs $peerver, this one runs $PINGIFY_VERSION"
+            hc_note "presets, token format and wire records move together"
+            hc_note "a mismatch shows up as the two ends disagreeing about carriers"
+            hc_fix "update BOTH servers, then restart both tunnels"
+        fi
+    fi
+
     # --- the forwarded ports, on the end that has them ---------------------
     #
     # What "bound" means depends on who forwards. Our core binds the port and
@@ -6794,6 +6822,7 @@ type arqConn struct {
 	err      error
 	done     chan struct{}
 	deadline time.Time
+	dlTimer  *time.Timer
 
 	// How many times one segment is resent before the carrier is declared
 	// dead. With the doubling backoff below, twelve works out at roughly
@@ -6872,6 +6901,9 @@ func (c *arqConn) Read(p []byte) (int, error) {
 		if c.closed {
 			return 0, errARQClosed
 		}
+		if c.expired() {
+			return 0, arqTimeout{}
+		}
 		c.cond.Wait()
 	}
 	n := copy(p, c.inbox)
@@ -6891,6 +6923,10 @@ func (c *arqConn) Write(p []byte) (int, error) {
 				}
 				c.mu.Unlock()
 				return total, e
+			}
+			if c.expired() {
+				c.mu.Unlock()
+				return total, arqTimeout{}
 			}
 			c.cond.Wait()
 		}
@@ -6924,6 +6960,10 @@ func (c *arqConn) Close() error {
 		return nil
 	}
 	c.closed = true
+	if c.dlTimer != nil {
+		c.dlTimer.Stop()
+		c.dlTimer = nil
+	}
 	if !c.sentFin {
 		c.sentFin = true
 		c.emit(nil, flagFin)
@@ -6937,12 +6977,68 @@ func (c *arqConn) Close() error {
 func (c *arqConn) LocalAddr() net.Addr  { return c.remote }
 func (c *arqConn) RemoteAddr() net.Addr { return c.remote }
 
-// The braid layer sets deadlines to detect a wedged carrier. The keepalive and
-// retransmit machinery already covers that, so these are accepted and ignored
-// rather than pretended not to exist.
-func (c *arqConn) SetDeadline(t time.Time) error      { return nil }
-func (c *arqConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *arqConn) SetWriteDeadline(t time.Time) error { return nil }
+// Deadlines.
+//
+// These used to be accepted and ignored, on the grounds that the keepalive and
+// the retransmit counter already noticed a wedged carrier. That was one
+// mechanism where every other transport has two, and the day the keepalive
+// itself got stuck behind a full send queue there was nothing else watching:
+// the reader sat in cond.Wait forever, the carrier stayed "up" with a peer
+// that had gone, and a server reported twenty carriers against a config asking
+// for eight.
+//
+// The braid sets a read deadline before every frame, exactly as it does for
+// TCP. Honouring it costs a timer and gives ICMP and UDP the same second
+// opinion TCP has always had.
+func (c *arqConn) SetDeadline(t time.Time) error {
+	c.setDeadline(t)
+	return nil
+}
+
+func (c *arqConn) SetReadDeadline(t time.Time) error {
+	c.setDeadline(t)
+	return nil
+}
+
+// The writer has its own wait - on window space rather than on data - and the
+// same deadline covers it, because a peer that acknowledges nothing wedges
+// that side first.
+func (c *arqConn) SetWriteDeadline(t time.Time) error {
+	c.setDeadline(t)
+	return nil
+}
+
+func (c *arqConn) setDeadline(t time.Time) {
+	c.mu.Lock()
+	c.deadline = t
+	if c.dlTimer != nil {
+		c.dlTimer.Stop()
+		c.dlTimer = nil
+	}
+	if !t.IsZero() {
+		// Wake whoever is waiting when the moment arrives. cond.Wait has no
+		// timeout of its own, so the timer is the only thing that can.
+		if d := time.Until(t); d > 0 {
+			c.dlTimer = time.AfterFunc(d, func() { c.cond.Broadcast() })
+		} else {
+			c.cond.Broadcast()
+		}
+	}
+	c.mu.Unlock()
+}
+
+// expired reports whether the deadline has passed. The caller holds mu.
+func (c *arqConn) expired() bool {
+	return !c.deadline.IsZero() && !time.Now().Before(c.deadline)
+}
+
+// errARQTimeout is a net.Error that says Timeout, because that is what the
+// layer above checks to tell "nothing arrived" from "the peer went away".
+type arqTimeout struct{}
+
+func (arqTimeout) Error() string   { return "arq: i/o timeout" }
+func (arqTimeout) Timeout() bool   { return true }
+func (arqTimeout) Temporary() bool { return true }
 
 // ---------------------------------------------------------------------------
 // sending
@@ -9261,7 +9357,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.4"
+const version = "1.0.5"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -10348,6 +10444,9 @@ type pool struct {
 	// here as a closed socket; this counter is the only thing that separates
 	// them, and the probe needs that distinction badly.
 	refusals uint64
+	// The version the other server reported, for the status endpoint and for
+	// saying so once when it differs. See link.peerVersion.
+	peerVer atomic.Value
 	// What refusals had reached the last time the log said so, so that the
 	// line can carry the number it stood in for.
 	refusalsSaid uint64
@@ -10736,6 +10835,15 @@ const (
 	cmdUFIN = 10 // UDP session gone
 	cmdTUN  = 11 // one raw IP packet (tun mode)
 	cmdPad  = 12 // random filler, discarded on arrival
+	// cmdVer carries this end's version string, once, when a carrier comes up.
+	//
+	// It is a record rather than a handshake field on purpose. The handshake
+	// is a fixed length that both ends agree on before they have exchanged
+	// anything, so a field added there is a tunnel that will not come up
+	// against a peer running yesterday's build. A record an older peer does
+	// not know falls to the default arm of dispatch, which logs it at debug
+	// and carries on - so this is invisible to one and useful to the other.
+	cmdVer = 13
 )
 
 var errLinkClosed = errors.New("carrier closed")
@@ -11121,6 +11229,9 @@ func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link
 func (l *link) run() {
 	go l.writeLoop()
 	go l.keepaliveLoop()
+	// Say which build this is, once. See cmdVer, and peerVersion below for
+	// why the answer is worth having.
+	l.trySend(ctrlRec(cmdVer, 0, []byte(version)))
 	l.readLoop()
 }
 
@@ -11334,6 +11445,8 @@ func (l *link) dispatch(p []byte) error {
 				sent := int64(binary.BigEndian.Uint64(body))
 				atomic.StoreInt64(&l.rttUS, (time.Now().UnixNano()-sent)/1000)
 			}
+		case cmdVer:
+			l.peerVersion(string(body))
 		case cmdSYN, cmdUSYN, cmdUDP, cmdUFIN, cmdTUN:
 			if h := l.pool.handler(); h != nil {
 				h.onRecord(l, cmd, id, body)
@@ -11397,6 +11510,37 @@ func (l *link) refused(why string) {
 		return
 	}
 	logWarn("the other server refused a connection: %s", why)
+}
+
+// peerVersion says so when the two servers are not running the same build.
+//
+// This is the single thing that has cost the most time in the field, and it is
+// invisible from either end on its own. The presets, the token format and the
+// wire records move together, so two builds disagree quietly: the far end
+// dials the carrier count ITS table says, and this end reports "20 of 8
+// carriers up" against a config that asked for eight. Nothing in that line
+// says why, and both servers look healthy from where they are standing.
+//
+// A peer running a build older than this one never sends its version at all,
+// which is itself the answer - so silence is reported too, once the carrier
+// has been up long enough that the record would have arrived.
+func (l *link) peerVersion(v string) {
+	if v == "" || l.pool == nil {
+		return
+	}
+	if prev := l.pool.peerVer.Swap(v); prev == v {
+		return // already said, and nothing has changed
+	}
+	if v == version {
+		logDebug("the other server runs %s, the same as this one", v)
+		return
+	}
+	if !l.pool.firstIn("peer-version", 10*time.Minute) {
+		return
+	}
+	logWarn("the other server runs %s and this one runs %s", v, version)
+	logWarn("update both ends: presets, token format and wire records move together")
+	logWarn("a mismatch shows up as the two ends disagreeing about how many carriers there are")
 }
 
 func (l *link) idleLimit() time.Duration {
@@ -12421,6 +12565,7 @@ type carrierStatus struct {
 type statusDoc struct {
 	Name      string          `json:"name"`
 	Version   string          `json:"version"`
+	PeerVer   string          `json:"peer_version,omitempty"`
 	Role      string          `json:"role"`
 	Mode      string          `json:"mode"`
 	Transport string          `json:"transport"`
@@ -12530,6 +12675,9 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		d.Detail = append(d.Detail, cs)
 	}
 	d.Refusals = atomic.LoadUint64(&p.refusals)
+	if v, ok := p.peerVer.Load().(string); ok {
+		d.PeerVer = v
+	}
 	d.Healthy = d.Up > 0
 	return d
 }
@@ -12612,6 +12760,9 @@ func printStatus(addr string, brief bool) int {
 		state = "UP"
 	}
 	fmt.Printf("  tunnel     %s  (%s, %s, %s)\n", d.Name, d.Role, d.Mode, d.Transport)
+	if d.PeerVer != "" && d.PeerVer != d.Version {
+		fmt.Printf("  versions   this end %s, the other end %s  -  UPDATE BOTH ENDS\n", d.Version, d.PeerVer)
+	}
 	fmt.Printf("  state      %s  -  %d of %d carriers\n", state, d.Up, d.Carriers)
 	if d.Up == 0 {
 		// The usual reason, by a wide margin, is that only one of the two

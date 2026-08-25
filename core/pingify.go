@@ -58,7 +58,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.4"
+const version = "1.0.5"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -1145,6 +1145,9 @@ type pool struct {
 	// here as a closed socket; this counter is the only thing that separates
 	// them, and the probe needs that distinction badly.
 	refusals uint64
+	// The version the other server reported, for the status endpoint and for
+	// saying so once when it differs. See link.peerVersion.
+	peerVer atomic.Value
 	// What refusals had reached the last time the log said so, so that the
 	// line can carry the number it stood in for.
 	refusalsSaid uint64
@@ -1533,6 +1536,15 @@ const (
 	cmdUFIN = 10 // UDP session gone
 	cmdTUN  = 11 // one raw IP packet (tun mode)
 	cmdPad  = 12 // random filler, discarded on arrival
+	// cmdVer carries this end's version string, once, when a carrier comes up.
+	//
+	// It is a record rather than a handshake field on purpose. The handshake
+	// is a fixed length that both ends agree on before they have exchanged
+	// anything, so a field added there is a tunnel that will not come up
+	// against a peer running yesterday's build. A record an older peer does
+	// not know falls to the default arm of dispatch, which logs it at debug
+	// and carries on - so this is invisible to one and useful to the other.
+	cmdVer = 13
 )
 
 var errLinkClosed = errors.New("carrier closed")
@@ -1918,6 +1930,9 @@ func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link
 func (l *link) run() {
 	go l.writeLoop()
 	go l.keepaliveLoop()
+	// Say which build this is, once. See cmdVer, and peerVersion below for
+	// why the answer is worth having.
+	l.trySend(ctrlRec(cmdVer, 0, []byte(version)))
 	l.readLoop()
 }
 
@@ -2131,6 +2146,8 @@ func (l *link) dispatch(p []byte) error {
 				sent := int64(binary.BigEndian.Uint64(body))
 				atomic.StoreInt64(&l.rttUS, (time.Now().UnixNano()-sent)/1000)
 			}
+		case cmdVer:
+			l.peerVersion(string(body))
 		case cmdSYN, cmdUSYN, cmdUDP, cmdUFIN, cmdTUN:
 			if h := l.pool.handler(); h != nil {
 				h.onRecord(l, cmd, id, body)
@@ -2194,6 +2211,37 @@ func (l *link) refused(why string) {
 		return
 	}
 	logWarn("the other server refused a connection: %s", why)
+}
+
+// peerVersion says so when the two servers are not running the same build.
+//
+// This is the single thing that has cost the most time in the field, and it is
+// invisible from either end on its own. The presets, the token format and the
+// wire records move together, so two builds disagree quietly: the far end
+// dials the carrier count ITS table says, and this end reports "20 of 8
+// carriers up" against a config that asked for eight. Nothing in that line
+// says why, and both servers look healthy from where they are standing.
+//
+// A peer running a build older than this one never sends its version at all,
+// which is itself the answer - so silence is reported too, once the carrier
+// has been up long enough that the record would have arrived.
+func (l *link) peerVersion(v string) {
+	if v == "" || l.pool == nil {
+		return
+	}
+	if prev := l.pool.peerVer.Swap(v); prev == v {
+		return // already said, and nothing has changed
+	}
+	if v == version {
+		logDebug("the other server runs %s, the same as this one", v)
+		return
+	}
+	if !l.pool.firstIn("peer-version", 10*time.Minute) {
+		return
+	}
+	logWarn("the other server runs %s and this one runs %s", v, version)
+	logWarn("update both ends: presets, token format and wire records move together")
+	logWarn("a mismatch shows up as the two ends disagreeing about how many carriers there are")
 }
 
 func (l *link) idleLimit() time.Duration {
@@ -3218,6 +3266,7 @@ type carrierStatus struct {
 type statusDoc struct {
 	Name      string          `json:"name"`
 	Version   string          `json:"version"`
+	PeerVer   string          `json:"peer_version,omitempty"`
 	Role      string          `json:"role"`
 	Mode      string          `json:"mode"`
 	Transport string          `json:"transport"`
@@ -3327,6 +3376,9 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		d.Detail = append(d.Detail, cs)
 	}
 	d.Refusals = atomic.LoadUint64(&p.refusals)
+	if v, ok := p.peerVer.Load().(string); ok {
+		d.PeerVer = v
+	}
 	d.Healthy = d.Up > 0
 	return d
 }
@@ -3409,6 +3461,9 @@ func printStatus(addr string, brief bool) int {
 		state = "UP"
 	}
 	fmt.Printf("  tunnel     %s  (%s, %s, %s)\n", d.Name, d.Role, d.Mode, d.Transport)
+	if d.PeerVer != "" && d.PeerVer != d.Version {
+		fmt.Printf("  versions   this end %s, the other end %s  -  UPDATE BOTH ENDS\n", d.Version, d.PeerVer)
+	}
 	fmt.Printf("  state      %s  -  %d of %d carriers\n", state, d.Up, d.Carriers)
 	if d.Up == 0 {
 		// The usual reason, by a wide margin, is that only one of the two
