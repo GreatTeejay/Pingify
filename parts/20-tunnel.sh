@@ -969,6 +969,17 @@ import_tunnel() {
         fail "$SETUP_TOKEN_ERROR"
         pause; return 1
     fi
+
+    # The token says which transport this is, and AmneziaWG needs tooling on
+    # the machine before any of it means anything. The create path installs it
+    # when the transport is chosen; this path had no equivalent, so pasting a
+    # token on a server without amneziawg-tools wrote a config and a unit that
+    # could never start, and the first thing the operator saw was a failed
+    # service rather than the one sentence that explains it. Install it here,
+    # before anything is written, and stop if it cannot be done.
+    if [ "$T_TRANSPORT" = "awg" ]; then
+        awg_install || { pause; return 1; }
+    fi
     server_info
 
     say ""
