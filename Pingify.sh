@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="1.0.1"
+PINGIFY_VERSION="1.0.2"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1885,6 +1885,17 @@ import_tunnel() {
     if ! setup_token_read "$token"; then
         fail "$SETUP_TOKEN_ERROR"
         pause; return 1
+    fi
+
+    # The token says which transport this is, and AmneziaWG needs tooling on
+    # the machine before any of it means anything. The create path installs it
+    # when the transport is chosen; this path had no equivalent, so pasting a
+    # token on a server without amneziawg-tools wrote a config and a unit that
+    # could never start, and the first thing the operator saw was a failed
+    # service rather than the one sentence that explains it. Install it here,
+    # before anything is written, and stop if it cannot be done.
+    if [ "$T_TRANSPORT" = "awg" ]; then
+        awg_install || { pause; return 1; }
     fi
     server_info
 
@@ -9250,7 +9261,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.1"
+const version = "1.0.2"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -10841,6 +10852,14 @@ func (r *recvBuf) Read(p []byte) (int, error) {
 	return r.buf.Read(p)
 }
 
+// buffered says how much is waiting, so a reader can tell whether its next
+// call would block. See pumpIn: that is the moment credit has to go back.
+func (r *recvBuf) buffered() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.Len()
+}
+
 func (r *recvBuf) closeEOF() {
 	r.mu.Lock()
 	r.eof = true
@@ -10969,6 +10988,35 @@ func (s *stream) pumpOut(local net.Conn) {
 func (s *stream) pumpIn(local net.Conn) {
 	defer s.halfDone()
 	buf := make([]byte, 32*1024)
+
+	// Credit goes back in as few records as the sender can afford to wait for.
+	//
+	// One record per read is one control record for every 32 KiB consumed -
+	// hundreds a second on a busy stream, and dozens of streams do it at once.
+	// Each one is a frame to seal, a wakeup for the writer, and a place in the
+	// queue ahead of data that is actually going somewhere. Under load that is
+	// where the jitter comes from: real traffic waiting behind bookkeeping.
+	//
+	// So it accumulates, and goes out when it is worth a record - or the
+	// moment there is nothing left to read, because the next call blocks there
+	// and credit held past that point is credit the sender is waiting on. An
+	// idle stream therefore still returns its window immediately, and a busy
+	// one returns it in one record instead of sixteen.
+	flushAt := s.l.window() / 2
+	if flushAt < int32(len(buf)) {
+		flushAt = int32(len(buf))
+	}
+	var pending int32
+	give := func() {
+		if pending <= 0 {
+			return
+		}
+		var c [4]byte
+		binary.BigEndian.PutUint32(c[:], uint32(pending))
+		s.l.send(ctrlRec(cmdWND, s.id, c[:]))
+		pending = 0
+	}
+
 	for {
 		n, err := s.rb.Read(buf)
 		if n > 0 {
@@ -10977,11 +11025,13 @@ func (s *stream) pumpIn(local net.Conn) {
 				return
 			}
 			atomic.AddUint64(&s.l.rxBytes, uint64(n))
-			var c [4]byte
-			binary.BigEndian.PutUint32(c[:], uint32(n))
-			s.l.send(ctrlRec(cmdWND, s.id, c[:]))
+			pending += int32(n)
+			if pending >= flushAt || s.rb.buffered() == 0 {
+				give()
+			}
 		}
 		if err != nil {
+			give()
 			// Far side stopped sending: half-close so the local peer sees EOF
 			// but can still finish its own upload.
 			if cw, ok := local.(interface{ CloseWrite() error }); ok {

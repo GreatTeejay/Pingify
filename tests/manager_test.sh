@@ -2258,5 +2258,21 @@ pm() { awk '/^preset_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "websockets are held to two"   "$(pm | grep -c 'ws | wss) T_CARRIERS=2')" "1"
 check "and both skip the number"     "$(pm | grep -c 'T_TRANSPORT" = "wss"')" "1"
 
+head "a pasted token installs what the transport needs"
+
+# The create path installs amneziawg-tools when the transport is chosen. The
+# import path had no equivalent, so pasting a token on a KHAREJ server without
+# it wrote a config and a unit that could never start - and the first thing the
+# operator saw was a failed service instead of the one line explaining why.
+it() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "import installs AmneziaWG"   "$(it | grep -c 'T_TRANSPORT" = "awg" \] *; *then')" "1"
+check "and gives up if it cannot"   "$(it | grep -c 'awg_install || { pause; return 1; }')" "1"
+# Before anything is written, or a half-made tunnel is left behind.
+check "before the config is written" \
+    "$(it | awk '/awg_install/{a=NR} /awg_write_conf/{b=NR} END{print (a && b && a<b) ? "yes" : "no"}')" "yes"
+# And it stays idempotent, so a server that already has it is not reinstalled.
+check "install is a no-op when ready" \
+    "$(awk '/^awg_install\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'awg_ready && return 0')" "1"
+
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"
 [ "$FAILED" = "0" ]

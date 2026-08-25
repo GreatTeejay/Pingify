@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"encoding/binary"
+	"net"
+	"testing"
+	"time"
+)
 
 // A stream is pinned to one carrier for its life, so the segments the ARQ
 // allows in flight decide how fast a single download can go - window * payload
@@ -58,3 +63,94 @@ func TestOneStreamCanNowOutrunTheOldCeiling(t *testing.T) {
 	}
 	t.Logf("one stream at 75ms: was %.0f Mbit/s, now %.0f Mbit/s", old, now)
 }
+
+// Credit has to go back in as few records as the sender can afford to wait
+// for. One per read is a control record for every 32 KiB consumed - hundreds a
+// second on a busy stream, each one a frame to seal, a wakeup for the writer,
+// and a place in the queue ahead of traffic that is actually going somewhere.
+// That is where jitter under load comes from.
+func TestCreditGoesBackInFewRecordsUnderLoad(t *testing.T) {
+	setLogLevel("error")
+	cfg := &Config{WindowKB: 512, KeepaliveSec: 10}
+	cfg.applyDefaults()
+	l := &link{idx: 0, cfg: cfg, closed: make(chan struct{}), sendQ: make(chan *recBuf, 4096)}
+
+	s := &stream{id: 7, l: l, rb: newRecvBuf(), done: make(chan struct{}), winCh: make(chan struct{}, 1)}
+
+	// A megabyte already waiting, and a local side that takes it as fast as it
+	// is offered: the buffer never drains between reads, which is what a busy
+	// stream looks like.
+	const total = 1 << 20
+	chunk := make([]byte, 16*1024)
+	for i := 0; i < total/len(chunk); i++ {
+		s.rb.push(chunk)
+	}
+	s.rb.closeEOF()
+
+	done := make(chan struct{})
+	go func() { s.pumpIn(devNull{}); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("pumpIn never finished")
+	}
+
+	var records, credit int
+	for {
+		select {
+		case r := <-l.sendQ:
+			b := r.bytes()
+			if len(b) >= recHdr && b[0] == cmdWND {
+				records++
+				credit += int(binary.BigEndian.Uint32(b[recHdr : recHdr+4]))
+			}
+			continue
+		default:
+		}
+		break
+	}
+
+	// Every byte consumed has to be given back, or the sender stalls forever.
+	if credit != total {
+		t.Fatalf("returned %d bytes of credit for %d consumed", credit, total)
+	}
+	// A read is 32 KiB and half the window is 256 KiB, so a megabyte should
+	// cost about four records, not thirty-two.
+	if records > 8 {
+		t.Fatalf("%d window records for %d KiB - the bookkeeping is back in front of the traffic",
+			records, total/1024)
+	}
+	t.Logf("%d KiB returned in %d records", total/1024, records)
+}
+
+// And an idle stream must not sit on credit the sender is waiting for.
+func TestCreditIsReturnedAtOnceWhenTheStreamGoesQuiet(t *testing.T) {
+	setLogLevel("error")
+	cfg := &Config{WindowKB: 512, KeepaliveSec: 10}
+	cfg.applyDefaults()
+	l := &link{idx: 0, cfg: cfg, closed: make(chan struct{}), sendQ: make(chan *recBuf, 64)}
+	s := &stream{id: 9, l: l, rb: newRecvBuf(), done: make(chan struct{}), winCh: make(chan struct{}, 1)}
+
+	go s.pumpIn(devNull{})
+
+	// One small record, far below any threshold, and then nothing.
+	s.rb.push([]byte("a page of a subscription file"))
+
+	select {
+	case r := <-l.sendQ:
+		b := r.bytes()
+		if b[0] != cmdWND {
+			t.Fatalf("first record was cmd %d, not a window update", b[0])
+		}
+		if got := binary.BigEndian.Uint32(b[recHdr : recHdr+4]); got != 29 {
+			t.Fatalf("returned %d bytes of credit, want 29", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a quiet stream sat on its credit; the sender would be waiting on it")
+	}
+}
+
+type devNull struct{ net.Conn }
+
+func (devNull) Write(p []byte) (int, error) { return len(p), nil }
+func (devNull) Close() error                { return nil }
