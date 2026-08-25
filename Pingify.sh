@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="1.0.0"
+PINGIFY_VERSION="1.0.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -9250,7 +9250,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.0"
+const version = "1.0.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -11373,7 +11373,23 @@ func (l *link) keepaliveLoop() {
 			binary.BigEndian.PutUint64(b[:], uint64(time.Now().UnixNano()))
 			logTrace("carrier %d tx ping (last heard %s ago)", l.idx,
 				time.Since(time.Unix(0, atomic.LoadInt64(&l.lastRx))).Round(time.Millisecond))
-			l.send(ctrlRec(cmdPing, 0, b[:]))
+			// Never wait for room. send() blocks until the queue drains or
+			// the carrier closes, and on a carrier whose peer has gone the
+			// queue never drains: the writer is stuck in a Write nobody is
+			// acknowledging, so the queue fills, and the keepalive blocks in
+			// send() and never reaches the idle check above again.
+			//
+			// That is the one check that would have noticed. A carrier could
+			// therefore sit "up" forever with a dead peer on the other end -
+			// on the accepting side, holding that peer's address and its slot
+			// in the count, which is how one server came to report twenty
+			// carriers up against a config that asked for eight.
+			//
+			// A ping that cannot be queued is not worth waiting for anyway: a
+			// full queue already means the writer is behind, and the ping is
+			// the least valuable thing in it. Drop it, and let the next tick
+			// reach the idle check.
+			l.trySend(ctrlRec(cmdPing, 0, b[:]))
 		case <-l.closed:
 			return
 		}

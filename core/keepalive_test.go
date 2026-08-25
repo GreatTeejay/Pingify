@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -335,3 +336,71 @@ func TestBothWireShapesRoundTrip(t *testing.T) {
 		})
 	}
 }
+
+// A carrier whose peer has gone away must still be reaped.
+//
+// The write side wedges first: the peer acknowledges nothing, so the writer
+// blocks in a Write that will never complete and the send queue fills behind
+// it. The keepalive then has two jobs on the same tick - notice the silence,
+// and send a ping - and it used to do them in that order only until the queue
+// was full, at which point it blocked in send() and never reached the silence
+// check again.
+//
+// So the one thing watching for a dead peer was stopped by the dead peer. On
+// the accepting side that carrier stayed up forever, holding a slot in the
+// count and the old peer's address, and a server reported twenty carriers up
+// against a config asking for eight.
+func TestAWedgedCarrierIsStillReaped(t *testing.T) {
+	setLogLevel("error")
+	cfg := &Config{KeepaliveSec: 1}
+	cfg.applyDefaults()
+
+	l := &link{
+		idx:    0,
+		cfg:    cfg,
+		conn:   &deadConn{},
+		closed: make(chan struct{}),
+		// One slot, already taken, and nothing draining it: the writer is
+		// stuck on a peer that stopped acknowledging.
+		sendQ: make(chan *recBuf, 1),
+	}
+	l.sendQ <- ctrlRec(cmdPing, 0, nil)
+
+	// Still healthy at the first tick, so the loop goes on to send a ping -
+	// which is where it used to stop, because there is no room and nothing
+	// will ever make room.
+	atomic.StoreInt64(&l.lastRx, time.Now().UnixNano())
+
+	done := make(chan struct{})
+	go func() { l.keepaliveLoop(); close(done) }()
+	time.Sleep(2500 * time.Millisecond) // a few ticks, each one trying to ping
+
+	// And now the peer has been gone for minutes. The next tick has to see it.
+	atomic.StoreInt64(&l.lastRx, time.Now().Add(-3*minIdle).UnixNano())
+
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the keepalive was still blocked on the send queue it was supposed to be watching")
+	}
+	if l.alive() {
+		t.Fatal("a carrier that has heard nothing for minutes is still up")
+	}
+	l.mu.Lock()
+	why := l.downWhy
+	l.mu.Unlock()
+	if !strings.Contains(why, "silent") {
+		t.Errorf("it went down for %q, which does not say the peer stopped speaking", why)
+	}
+}
+
+// deadConn is a socket to a peer that has gone: it accepts writes and never
+// answers, which is what the real one does before anybody notices.
+type deadConn struct{ net.Conn }
+
+func (c *deadConn) Write(p []byte) (int, error)       { return len(p), nil }
+func (c *deadConn) Read(p []byte) (int, error)        { select {} }
+func (c *deadConn) Close() error                      { return nil }
+func (c *deadConn) SetWriteDeadline(time.Time) error  { return nil }
+func (c *deadConn) SetReadDeadline(t time.Time) error { return nil }
+func (c *deadConn) SetDeadline(t time.Time) error     { return nil }
