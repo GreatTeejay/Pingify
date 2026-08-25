@@ -1,11 +1,13 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"net"
 	"sync"
 	"time"
@@ -40,16 +42,20 @@ const (
 	udpTagLen = 4
 	// One datagram, sized to fit inside a path that carries less than a full
 	// packet - which most routes out of Iran do, being inside something else.
-	udpMaxPayload = 1200
+	udpMaxPayload = 1320
+	udpMaxPacket  = 2048
 
 	// what this transport's header mask key is derived from
 	udpARQLabel = "pingify/v3 udp"
 )
 
 type udpTransport struct {
-	pc     net.PacketConn
-	psk    []byte
-	window int
+	pc       net.PacketConn
+	psk      []byte
+	mask     cipher.Block
+	maskOnce sync.Once
+	tagHash  sync.Pool
+	window   int
 
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
@@ -58,7 +64,8 @@ type udpTransport struct {
 	done     chan struct{}
 }
 
-func newUDPTransport(psk []byte, bind string, windowKB int) (*udpTransport, error) {
+func newUDPTransport(cfg *Config) (*udpTransport, error) {
+	bind := cfg.Listen
 	// The accepting end binds the agreed port. The dialling end takes any
 	// port the kernel offers: nothing ever connects to it, and taking a fixed
 	// one would collide with a second tunnel on the same machine.
@@ -71,8 +78,9 @@ func newUDPTransport(psk []byte, bind string, windowKB int) (*udpTransport, erro
 	}
 	t := &udpTransport{
 		pc:       pc,
-		psk:      psk,
-		window:   arqWindowFor(windowKB, udpMaxPayload),
+		psk:      cfg.key(),
+		mask:     blockFrom(arqMaskKey(udpARQLabel, cfg.key())),
+		window:   arqWindowFor(cfg.WindowKB, udpMaxPayload),
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted. The reader never waits on it either way - see
@@ -80,64 +88,77 @@ func newUDPTransport(psk []byte, bind string, windowKB int) (*udpTransport, erro
 		inbound: make(chan net.Conn, 64),
 		done:    make(chan struct{}),
 	}
-	go t.readLoop()
+	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
+	tunePacketSocket(pc, cfg)
+	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, udpMaxPacket,
+		t.handlePacket, func(error) {
+			// A UDP socket can report a transient ICMP port-unreachable. Reading
+			// on is the correct response and per-packet logging is only noise.
+		})
+	logInfo("UDP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
+		workers, batch, udpMaxPayload)
 	go t.reap()
 	return t, nil
 }
 
 // tag is the same cheap pre-filter the echo transport uses: enough to tell our
 // traffic from the noise a public port collects, before anything is spent on it.
-func (t *udpTransport) tag(hdr []byte) []byte {
-	m := hmac.New(sha256.New, t.psk)
+func (t *udpTransport) putTag(dst, hdr []byte) {
+	m := t.tagHash.Get().(hash.Hash)
+	m.Reset()
 	m.Write([]byte("pingify/v3 udp tag"))
 	m.Write(hdr)
-	return m.Sum(nil)[:udpTagLen]
+	var sum [sha256.Size]byte
+	out := m.Sum(sum[:0])
+	copy(dst, out[:udpTagLen])
+	t.tagHash.Put(m)
+}
+
+func (t *udpTransport) validTag(want, hdr []byte) bool {
+	var got [udpTagLen]byte
+	t.putTag(got[:], hdr)
+	return hmac.Equal(want, got[:])
+}
+
+func (t *udpTransport) headerMask() cipher.Block {
+	t.maskOnce.Do(func() {
+		if t.mask == nil {
+			t.mask = blockFrom(arqMaskKey(udpARQLabel, t.psk))
+		}
+	})
+	return t.mask
 }
 
 func (t *udpTransport) sender(peer net.Addr) func([]byte) error {
 	return func(datagram []byte) error {
 		body := make([]byte, udpTagLen+len(datagram))
-		copy(body[:udpTagLen], t.tag(datagram[:min(len(datagram), arqOver)]))
+		t.putTag(body[:udpTagLen], datagram[:min(len(datagram), arqOver)])
 		copy(body[udpTagLen:], datagram)
 		_, err := t.pc.WriteTo(body, peer)
 		return err
 	}
 }
 
-func (t *udpTransport) readLoop() {
-	buf := make([]byte, 65535)
-	for {
-		n, addr, err := t.pc.ReadFrom(buf)
-		if err != nil {
-			select {
-			case <-t.done:
-				return
-			default:
-			}
-			// A datagram socket reports the odd transient error - an ICMP
-			// port-unreachable coming back, most often - and reading on.
-			continue
-		}
-		if n < udpTagLen+arqOver {
-			continue
-		}
-		pkt := buf[:n]
-		datagram := pkt[udpTagLen:]
-		if !hmac.Equal(pkt[:udpTagLen], t.tag(datagram[:min(len(datagram), arqOver)])) {
-			continue // not ours, and it cost one HMAC to find out
-		}
-		t.dispatch(addr, append([]byte(nil), datagram...))
+func (t *udpTransport) handlePacket(pkt []byte, addr net.Addr) {
+	if len(pkt) < udpTagLen+arqOver {
+		return
 	}
+	datagram := pkt[udpTagLen:]
+	if !t.validTag(pkt[:udpTagLen], datagram[:min(len(datagram), arqOver)]) {
+		return // not ours, and it cost one HMAC to find out
+	}
+	// dispatch/onDatagram are synchronous; do not copy the batch buffer.
+	t.dispatch(addr, datagram)
 }
 
 // dispatch hands the datagram to its session, creating one if this is a
 // session the listening side has not seen before.
 func (t *udpTransport) dispatch(peer net.Addr, datagram []byte) {
-	hdr := make([]byte, arqHdr)
-	copy(hdr, datagram[arqNonce:arqOver])
-	maskHeader(blockFrom(arqMaskKey(udpARQLabel, t.psk)), datagram[:arqNonce], hdr)
+	var hdr [arqHdr]byte
+	copy(hdr[:], datagram[arqNonce:arqOver])
+	maskHeader(t.headerMask(), datagram[:arqNonce], hdr[:])
 	var h arqHeader
-	h.get(hdr)
+	h.get(hdr[:])
 
 	key := sessionKey{peer: peer.String(), session: h.session, carrier: h.carrier}
 
@@ -148,7 +169,7 @@ func (t *udpTransport) dispatch(peer net.Addr, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
-		// Room first, before anything is built. This read loop is shared by
+		// Room first, before anything is built. These readers are shared by
 		// every carrier on the transport, and waiting here for an acceptor
 		// that does not exist is what wedged the echo transport: the dialling
 		// end never accepts, so strays filled the queue and the reader
@@ -264,7 +285,7 @@ type udpCarrier struct {
 }
 
 func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
-	t, err := newUDPTransport(cfg.key(), cfg.Listen, cfg.WindowKB)
+	t, err := newUDPTransport(cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -108,7 +108,7 @@ type icmpCarrier struct {
 func newICMPCarrier(cfg *Config) (*icmpCarrier, error) {
 	// The listening side stores the address to answer from; the dialling side
 	// has none and takes the default.
-	t, err := newICMPTransport(cfg.key(), cfg.Listen, cfg.WindowKB)
+	t, err := newICMPTransport(cfg)
 	if err != nil {
 		return nil, err
 	}

@@ -613,6 +613,9 @@ mode = "forward"
 [transport]
 type             = "icmp"
 listen           = "0.0.0.0"
+host             = "tunnel.example.com"
+cert_file        = "/etc/pingify/origin.pem"
+key_file         = "/etc/pingify/origin.key"
 carriers         = 8
 keepalive_sec    = 15
 dial_timeout_sec = 12
@@ -631,7 +634,8 @@ remote_addr = "10.10.10.1/24"
 mtu         = 1320
 
 [tuning]
-window_kb = 10_000
+profile   = "throughput"
+window_kb = 4096
 sndbuf_kb = 2048
 
 [status]
@@ -651,6 +655,11 @@ level = "debug"
 		c.KeepaliveSec != 15 || c.DialTimeout != 12 {
 		t.Fatalf("[transport] wrong: %+v", c)
 	}
+	if c.WSHost != "tunnel.example.com" || c.CertFile != "/etc/pingify/origin.pem" ||
+		c.KeyFile != "/etc/pingify/origin.key" {
+		t.Fatalf("[transport] web fields wrong: host=%q cert=%q key=%q",
+			c.WSHost, c.CertFile, c.KeyFile)
+	}
 	if c.Token != "a shared secret phrase" {
 		t.Fatalf("[security] wrong: %q", c.Token)
 	}
@@ -662,8 +671,8 @@ level = "debug"
 		c.TUN.Peer != "10.10.10.1/24" || c.TUN.MTU != 1320 {
 		t.Fatalf("[tun] wrong: %+v", c.TUN)
 	}
-	if c.WindowKB != 10000 || c.SndBufKB != 2048 {
-		t.Fatalf("[tuning] wrong: %d %d", c.WindowKB, c.SndBufKB)
+	if c.Profile != "throughput" || c.WindowKB != 4096 || c.SndBufKB != 2048 {
+		t.Fatalf("[tuning] wrong: %q %d %d", c.Profile, c.WindowKB, c.SndBufKB)
 	}
 	if c.StatusAddr != "127.0.0.1:9701" || c.LogLevel != "debug" {
 		t.Fatalf("[status]/[logging] wrong: %q %q", c.StatusAddr, c.LogLevel)

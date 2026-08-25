@@ -1,230 +1,165 @@
-# Pingify
+<p align="center"><img src="assets/pingify-cover.png" alt="Pingify high-performance multi-transport tunnel" width="100%"></p>
 
-ابزار تانل نقطه‌به‌نقطه بین **سرور ایران** و **سرور خارج**، در قالب **یک اسکریپت واحد**.
+<h1 align="center">Pingify</h1>
+<p align="center">An encrypted, high-performance multi-transport tunnel manager for difficult and unstable network paths.</p>
+<p align="center"><a href="README.md"><b>English</b></a> · <a href="README_FA.md">فارسی</a></p>
+<p align="center">
+  <a href="https://github.com/GreatTeejay/Pingify/releases/latest"><img src="https://img.shields.io/github/v/release/GreatTeejay/Pingify?style=flat-square" alt="release"></a>
+  <a href="https://github.com/GreatTeejay/Pingify/actions/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/GreatTeejay/Pingify/release.yml?style=flat-square&label=build" alt="build"></a>
+  <a href="https://github.com/GreatTeejay/Pingify/releases"><img src="https://img.shields.io/github/downloads/GreatTeejay/Pingify/total?style=flat-square" alt="downloads"></a>
+</p>
 
-هستهٔ Pingify یک موتور Go است که ترافیک را با **AES-256-GCM** رمز می‌کند و روی **TCP MUX، KCP+FEC، TCP+PCK، ICMP، UDP یا WS/WSS MUX** جابه‌جا می‌کند.
+Pingify connects an **Iran server** to a **Kharej server** and carries TCP services through a selectable transport. It targets high throughput for video and browsing, low and stable latency for games, automatic recovery, and a simple Iran-first setup flow.
 
-```bash
-bash <(wget -qO- https://github.com/GreatTeejay/pingfa/releases/latest/download/Pingify.sh)
+Pingify is built for speed. Transport-specific batching, MUX, bounded queues, socket tuning, optional FEC and five workload presets can provide excellent throughput when the transport matches the route. Results still depend on the servers, congestion, loss, MTU, routing and filtering; no tunnel can guarantee one number on every network.
+
+> **Owner:** [GreatTeejay](https://github.com/GreatTeejay) · Source-available under a custom license. Only attributed GitHub forks are permitted; see [LICENSE](LICENSE).
+
+## How it works
+
+The standard deployment uses reverse establishment: Kharej opens the carrier to Iran, while users connect to forwarded ports on Iran.
+
+```text
+User → Iran :8010  ══ encrypted TCP/UDP/KCP/PCK/ICMP/WS/WSS carrier ══  Kharej → 127.0.0.1:8010
 ```
 
-روی **هر دو سرور** اجرا کن. بعدش هر بار فقط:
+Each incoming TCP connection becomes a logical stream. Pingify multiplexes streams on the active carrier set, protects records, reconstructs them at the far end and reconnects failed carriers automatically. Available modes are **Forward** (port mapping), **TUN** (private routed link) and, where supported, **Both**.
+
+## Highlights
+
+- Nine managed transports: TCP, UDP ARQ, KCP + FEC, PCK, ICMP, WS, WSS, GRE and AmneziaWG.
+- AES-256-GCM core records, authenticated setup, key derivation and replay controls.
+- MUX, keepalive, carrier health, reconnect, status endpoint and systemd supervision.
+- Iran-first `p5` setup token that mirrors the complete configuration on Kharej.
+- Five workload presets and expert custom settings.
+- Independent stream, packet and WebSocket tuning—settings do not leak between transports.
+- Optional frame-length shaping, firewall automation, live logs and paired health checks.
+- Linux amd64/arm64 release binaries.
+
+## Transport guide
+
+| Transport | Best use | Strength | Trade-off |
+|---|---|---|---|
+| **KCP + FEC** | Lossy UDP routes, video/downloads | Fast recovery and high throughput | FEC/CPU overhead; UDP required |
+| **PCK** | Routes that throttle long-lived TCP | Raw TCP-like packets, no kernel TCP session | Linux, IPv4 and root/CAP_NET_RAW |
+| **ICMP** | Restricted routes where ICMP is stable | No carrier port; resilient fallback | Often rate-limited; route-dependent ceiling |
+| **UDP ARQ** | Low-latency packet transport | Responsive with loss recovery | UDP filtering/reordering |
+| **TCP MUX** | Clean, compatible routes | Multiple carrier braid | TCP-over-TCP on lossy links |
+| **WS** | Direct HTTP/proxy paths | One WebSocket with logical MUX | No outer TLS; proxy idle limits |
+| **WSS** | Domain, TLS or CDN path | TLS outer layer and WS MUX | TLS/CDN overhead and policy |
+| **GRE** | Simple kernel link | Very low encapsulation overhead | No encryption; IP protocol 47 required |
+| **AmneziaWG** | Encrypted kernel link | Kernel performance and encryption | AmneziaWG and UDP required |
+
+Suggested test order for difficult routes: **KCP + FEC → PCK → ICMP → WSS**, then TCP/UDP/WS. There is no universal winner: benchmark the same servers at the same hour and compare throughput, loss and jitter—not only average ping.
+
+### MUX behavior
+
+- TCP may braid several physical carriers; a stream stays pinned to preserve ordering.
+- WS/WSS use exactly one physical WebSocket and multiplex logical streams inside it.
+- Packet transports use small carrier sets, bounded batches and session-aware delivery.
+- More carriers are not automatically faster. Start with a preset and measure before increasing them.
+
+## Installation
+
+Requirements: root, systemd-based Linux, and connectivity between both servers. Install on **Iran and Kharej**.
+
+```bash
+bash <(wget -qO- https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh)
+```
+
+Or:
+
+```bash
+bash <(curl -fsSL https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh)
+```
+
+The manager installs `pingify`, the correct core binary, and systemd services. Go is needed only if a prebuilt core is unavailable and a fallback build is required.
+
+## Quick start and setup token
+
+1. Run `sudo pingify` on **Iran** and choose **Create tunnel**.
+2. Choose transport, Iran role, mode, ports and preset.
+3. Copy the complete generated **setup token**.
+4. Run `sudo pingify` on **Kharej**, create the same transport and choose **Paste setup token**.
+5. Paste the token, then run Health Check on both servers.
+
+The `p5` token includes transport, peer relationship, endpoint, carriers, keepalive, MUX window, buffers, mappings, transport options, shaping and key material. It has an integrity checksum and strict validation. Keep it secret and never tune only one side afterward. Older `p2`–`p4` tokens remain compatible. Names are side-first, such as `iran-kcp-443` and `kharej-kcp-443`.
+
+Carrier and service ports are separate. Example: WSS can listen on `443`, forward `:8010 → 127.0.0.1:8010`, and the user's VLESS TCP endpoint remains Iran port `8010`.
+
+## Presets and tuning
+
+| Preset | Goal | Behavior |
+|---|---|---|
+| **Gaming** | Minimum queueing | Small queues/windows and conservative batches |
+| **Low latency** | Interactive traffic | Low delay with more headroom |
+| **Balanced** | Daily use | Browsing, social media, video and games |
+| **Throughput** | Video/large transfers | Larger windows, buffers and batches |
+| **Extreme** | Strong hosts/high-BDP paths | Maximum concurrency; measurement required |
+
+The same preset intentionally produces different parameters:
+
+- **WS/WSS:** one carrier, larger MUX window and record buffers.
+- **KCP/PCK:** small carrier set, packet buffers, MTU near 1280, short flush; KCP adds FEC.
+- **ICMP/UDP:** packet-aware workers and batches, without stream-only knobs.
+- **TCP:** multiple carriers and moderate windows to control head-of-line amplification.
+
+Start with **Balanced**. For games compare Gaming and Low latency using jitter/loss. For video try Throughput before Extreme. Increase KCP FEC only with measured loss. If load causes latency or collapse, test fewer queues/carriers before adding more.
+
+Per-tunnel tuning is stored in each config and mirrored by the token. **Host Tuning** is separate and globally changes Linux socket ceilings, UDP minima, backlog, scheduler budget, MTU probing and related values using Gaming, Balanced or Throughput profiles. **BBR** is also separate. Host-wide changes should be applied deliberately.
+
+## WS, WSS and Cloudflare
+
+**WS** is plain HTTP WebSocket for direct paths or a proxy supporting `Upgrade: websocket`; port 80 is conventional, not mandatory. **WSS** adds TLS and is suitable for domain/CDN paths.
+
+| Origin certificate | Cloudflare proxy | SSL/TLS mode | WebSockets |
+|---|---|---|---|
+| Valid trusted/origin cert | Orange cloud if desired | **Full (strict)** | Enabled |
+| Self-signed cert | Orange cloud if desired | **Full** | Enabled |
+
+Use a Cloudflare-supported HTTPS origin port, normally 443. Use **DNS only** for a direct connection or proxy diagnosis. Both ends must agree on hostname, path and validation policy. Random TLS scanner errors are harmless when the real carrier is healthy.
+
+## Operations and troubleshooting
 
 ```bash
 sudo pingify
+systemctl status pingify@iran-kcp-443 --no-pager
+journalctl -u pingify@iran-kcp-443 -n 100 --no-pager
+curl -s http://127.0.0.1:9702/status
+ss -ltnp
 ```
 
----
+The menu includes live logs, validation, paired Health Check, remote forwarded-port probes, firewall rebuild, restart, edit, update and uninstall.
 
-## نصب چطور کار می‌کند
+- **Carrier up, backend EOF/refused:** the tunnel carried the probe; verify the service listens on the Kharej target address/port.
+- **Periodic reconnect:** compare versions and keepalive/shaping, then check firewall, NAT/CDN idle timeout, clock, proxy and MTU.
+- **Stale forwarding rules:** run **Apply firewall** after changing/removing mappings; an old redirect can swallow traffic.
 
-موتور از قبل کامپایل شده و از **GitHub Releases** دانلود می‌شود — چند ثانیه، بدون نیاز به نصب Go. چک‌سام `SHA256SUMS` هم کنارش منتشر می‌شود و اسکریپت قبل از نصب تطبیقش می‌دهد.
+## Security
 
-اگر سروری به Releases نرسد، **سورس کامل موتور و vendor آفلاین KCP/FEC داخل خود `Pingify.sh` جاسازی شده** و همان‌جا کامپایل می‌شود. بیلد با `GOPROXY=off` انجام می‌شود و به `proxy.golang.org` نیاز ندارد.
+Core transports use authenticated AES-256-GCM records and HKDF-derived session material. WSS adds outer TLS. AmneziaWG uses its encrypted kernel tunnel and preshared material. **GRE is not encrypted**. Protect setup tokens, keys, configs and `/root/Pingify`; disable encryption only when the trust boundary is understood.
 
-و اگر هیچ‌کدام نشد، از منوی `Core` می‌توانی باینری‌ای را که روی سرور خارج ساخته‌ای import کنی.
+## Files and development
 
-| مسیر | نیازمندی | زمان |
-|---|---|---|
-| دانلود باینری آماده | دسترسی به GitHub | چند ثانیه |
-| کامپایل از سورس جاسازی‌شده | Go ≥ ۱.۱۹ (خودش نصب می‌کند) | ~۱ دقیقه |
-| import دستی | یک باینری از جای دیگر | آنی |
-
----
-
-## چرا سریع است
-
-| تکنیک | چه می‌کند |
-|---|---|
-| **MUX واقعی WS/WSS** | در Direct/UDP/ICMP کریرها مسیر را موازی می‌کنند؛ در WS/WSS یک کریر، همهٔ streamها را روی دقیقاً یک WebSocket مالتی‌پلکس می‌کند. |
-| **KCP + Reed–Solomon FEC** | روی مسیر lossy، burstهای کوتاه loss را بدون صبر برای retransmit بازسازی می‌کند و KCP با tick ده میلی‌ثانیه باقی loss را جبران می‌کند. |
-| **TCP + PCK** | روی لینوکس پکت‌های TCP-shaped را با AF_PACKET می‌سازد؛ kernel TCP connection، handshake و stateای وجود ندارد که بعداً throttle یا reset شود. |
-| **ICMP سریع‌تر** | ARQ تطبیقی بعد از ACK تجمعی به‌اندازهٔ تمام سگمنت‌های تأییدشده رشد می‌کند؛ پنجره در چند RTT باز می‌شود و روی loss نصف می‌شود. |
-| **پین‌کردن فلو به کریر** | هر کانکشن با هش ۵-تایی به یک کریر چسبیده می‌شود. عمداً round-robin نیست: جابه‌جایی بین کریرها باعث reorder و فروپاشی TCP داخلی می‌شود. |
-| **بسته‌بندی دسته‌ای فریم‌ها** | هرچه لحظهٔ نوشتن در صف است در **یک فریم** جمع می‌شود: یک بار رمزنگاری، یک syscall — به‌جای ده‌ها تا. |
-| **پنجرهٔ اعتباری (credit window)** | کنترل جریان واقعی per-stream؛ یک کانکشن کُند بقیه را روی همان کریر بلاک نمی‌کند. |
-| **AES-NI** | روی هر CPU مدرن (amd64 و ARMv8) رمزنگاری سخت‌افزاری است، نه نرم‌افزاری. |
-| **تیون کرنل** | BBR + fq + بافرهای متناسب با BDP مسیر، از منوی Optimize. |
-
----
-
-## پروتکل
-
-هسته هفت ترنسپورت دارد: **TCP MUX، KCP+FEC، TCP+PCK، UDP، ICMP، WS و WSS**؛ و wizard دو تونل kernel یعنی GRE و AmneziaWG را هم مدیریت می‌کند.
-
-| ترنسپورت | بهترین کاربرد |
-|---|---|
-| **ICMP** | وقتی همین مسیر شما ICMP را خوب و پایدار عبور می‌دهد؛ همچنان یک انتخاب اصلی است، نه گزینهٔ حذف‌شده. |
-| **KCP+FEC** | loss و jitter، ویدئو، اینستاگرام و بازی؛ UDP باید بین دو سرور باز باشد. |
-| **TCP MUX** | مسیر TCP تمیز؛ کم‌هزینه و معمولاً بهترین throughput خام. |
-| **TCP+PCK** | TCP معمولی وصل می‌شود ولی بعد از مدتی throttle، stall یا reset می‌شود. Linux و root/CAP_NET_RAW لازم است. |
-| **WSS MUX** | مسیر وب/CDN؛ یک WebSocket واقعی روی TLS. |
-
-`TCP+PCK` جعل IP نیست: source/destination واقعی‌اند و در نسخهٔ فعلی فقط IPv4 پشتیبانی می‌شود. پکت‌ها header، checksum، sequence/ack و timestamp معتبر TCP دارند، اما TCP socket یا handshake کرنل ساخته نمی‌شود. source port سمت dialer به‌صورت پایدار از token مشتق می‌شود و هسته برای پورت محلی هر سمت سه قانون محدود `RST DROP` و `NOTRACK` نصب می‌کند. در security group، پورت TCP تونل را روی سمت accept باز کن؛ اگر سرویس‌دهندهٔ سمت dialer پاسخ raw را stateful تشخیص نداد، همان `PCK local port` که ویزارد و log نشان می‌دهند باید inbound مجاز شود.
-
-در Direct، هندشیک و فریم داخلی برای نداشتن امضای ثابت طراحی شده‌اند:
-
-* **هیچ بایت ثابتی وجود نداره.** نه magic number، نه شمارهٔ نسخه، نه نقش، نه تایم‌استمپ. اون ۱۶ بایت هدر با یک بلاک AES که از کلید مشترک و nonce همون اتصال ساخته می‌شه XOR می‌شن.
-* **طول هندشیک هم ثابت نیست** — مقدار padding انتهایی از داخل tag خونده می‌شه؛ برای ناظر غیرقابل‌پیش‌بینی، برای دو طرف معلوم.
-* **طول فریم‌ها ماسک شده‌ست.** پیشوند ۴ بایتی طول با یک بلاک AES مخصوص هر جهت و ایندکس‌شده با شمارندهٔ فریم XOR می‌شه، پس استریم شبیه فریم‌بندی طول‌دار تمیز دیده نمی‌شه.
-* **چند فریم اول padding تصادفی دارن**، چون فینگرپرینت دقیقاً همون‌جا گرفته می‌شه. بقیهٔ فریم‌ها padding ندارن تا پهنای‌باند هدر نره.
-
-> نسخهٔ قبلی هر اتصال رو با چهار بایت `PFY2` شروع می‌کرد — یعنی یک امضای یک‌خطی برای DPI. حالا یک تست رگرسیون داریم که ۱۲ هندشیک می‌گیره و اگه *هر* بایتی در همهٔ اون‌ها یکسان باشه fail می‌شه.
-
-WS و WSS یک پیاده‌سازی مشترک و کامل RFC 6455 دارند: fragmentation، فریم‌های کنترلی، mask سمت client، محدودیت اندازه، Ping/Pong و close درست. در این دو حالت تعداد carrier عمداً روی **۱** قفل می‌شود؛ همان carrier از MUX داخلی Pingify استفاده می‌کند و ده‌ها stream مستقل را با ID و credit window جدا روی **یک WebSocket فیزیکی** می‌برد. در WSS کل این اتصال داخل TLS 1.2+ است، پس فقط یک TLS handshake هم ساخته می‌شود. قطع اتصال همهٔ streamها را سریع fail می‌کند و اتصال تازه با backoff بالا می‌آید.
-
-مسیر Upgrade از security token مشتق می‌شود و handshake HTTP به‌طور سخت‌گیرانه اعتبارسنجی می‌شود. درخواست‌های دیگر صفحهٔ عادی nginx می‌بینند؛ پس اسکنر نه endpoint را پیدا می‌کند و نه از پاسخ HTTP/HTTPS متوجه وجود تانل می‌شود. WSS از SNI و Host مناسب CDN پشتیبانی می‌کند؛ می‌توان certificate/key واقعی داد و اگر داده نشود origin یک گواهی self-signed می‌سازد. payload حتی در WS بدون TLS هم با AES-256-GCM داخلی Pingify محرمانه می‌ماند، اما برای مسیر مستقیم اینترنت **WSS** انتخاب مناسب‌تری است.
-
----
-
-## دو حالت کار
-
-**۱) `forward` — فوروارد پورت** (پیش‌فرض)
-
-کاربر به پورت روی **سرور ایران** وصل می‌شود، ترافیک از تانل رد می‌شود و روی **سرور خارج** به سرویس واقعی (پنل، اینباند xray و…) می‌رسد.
-
+```text
+/usr/local/bin/pingify        manager
+/usr/local/bin/pingify-core   core
+/root/Pingify/*.toml          tunnel configs
+/root/Pingify/.state/         state
+parts/                        ordered manager source
+tests/                        test suites
+build.sh                      assembles Pingify.sh
 ```
-443            همان پورت روی هر دو سمت
-443=8443       می‌آید روی 443، می‌رسد به 8443
-443=10.0.0.5:8443   مقصد دلخواه
-udp:500        پورت UDP
-8000-8010      یک رنج کامل
-```
-
-**۲) `tun` — لینک لایه ۳**
-
-یک اینترفیس TUN روی هر دو سرور می‌سازد (`10.71.x.1/30` ⇄ `10.71.x.2`) و کل ترافیک IP را می‌برد — روتینگ، ICMP، هر پروتکلی.
-
----
-
-## نقش‌ها و جهت اتصال
-
-دو چیز مستقل از هم تنظیم می‌شوند:
-
-* **کدام سرور پورت کاربر را دارد؟** ایران (`edge`) یا خارج (`origin`)
-* **کدام سرور اتصال را باز می‌کند؟** هر کدام که inbound تمیزتری دارد
-
-اگر inbound سرور ایران فیلتر است، بگذار **ایران به خارج دیال کند**. اگر برعکس، برعکس.
-
----
-
-## منو
-
-```
-TUNNEL
-  1  New tunnel       ویزارد + توکن برای سرور مقابل
-  2  Tunnels          وضعیت، ری‌استارت، لاگ، ویرایش پورت‌ها، حذف
-  3  Live status      داشبورد زنده
-
-NETWORK
-  4  Optimize         بافرها، محدودیت‌ها، BBR، swap، ساعت
-  5  Blocking         ICMP، سایت‌های اسپیدتست، QUIC
-  6  Diagnostics      تست دسترسی، اعتبارسنجی کانفیگ
-
-MAINTENANCE
-  7  Update core      دانلود، بیلد محلی، import، export
-  8  Update script    آپدیت خود Pingify
-  9  Remove           حذف بخشی یا کامل
-```
-
-### راه‌اندازی دو سروره
-
-روی سرور اول ویزارد را کامل کن. آخرش یک **setup token** چاپ می‌شود. روی سرور دوم `New tunnel` و بعد `Paste a token` را بزن. پروتکل، جهت، پورت، security token، tuning، FEC و آدرس‌های خصوصی خودکار آینه می‌شوند.
-
----
-
-## روی سرور چه چیزی نصب می‌شود
-
-```
-/root/Pingify/
-  pingify-core     هسته
-  main.json        کانفیگ تانل
-  .state/          وضعیت واچ‌داگ و قوانین مسدودسازی
-/usr/local/bin/pingify   فقط خود دستور، چون باید در PATH باشد
-```
-
-نصب‌های قدیمی‌تر (`/etc/pingify`، `/var/lib/pingify`) در اولین اجرا خودکار منتقل می‌شوند.
-
----
-
-## Blocking
-
-سه سوییچ که معمولاً روی یک سرور تانل لازم می‌شود:
-
-| | کار |
-|---|---|
-| **ICMP** | سرور به پینگ جواب نمی‌دهد (`icmp_echo_ignore_all`) |
-| **Speedtest** | سایت‌های بنچمارک و CDNشان بسته می‌شوند |
-| **QUIC** | UDP 443 رد می‌شود تا مرورگر به TCP برگردد |
-
-قوانین در زنجیره‌های اختصاصی `PINGIFY_IN/OUT/FWD` نوشته می‌شوند، پس هیچ قانون دیگری از تو یا پنلت دست نمی‌خورد. چون iptables با ریبوت پاک می‌شود، یک یونیت بوت دوباره اعمالشان می‌کند.
-
-> بلاک اسپیدتست روی ترافیکی کار می‌کند که **بدون رمز** از این سرور خارج شود — یعنی جایش روی **سرور خارج** است، همان‌جا که پروکسی با سایت حرف می‌زند.
-
----
-
-## سیستم هلث‌چک
-
-سه لایه، روی هم:
-
-1. **داخل موتور** — هر کریر هر ۱۰ ثانیه PING/PONG می‌فرستد. کریری که ۳۰ ثانیه ساکت بماند بسته و با backoff نمایی دوباره وصل می‌شود. تانل تا وقتی **حداقل یک کریر** زنده باشد سرپاست.
-2. **systemd** — `Restart=always` با `RestartSec=2`.
-3. **واچ‌داگ** — تایمر هر ۳۰ ثانیه `/healthz` موتور را می‌خواند؛ بعد از ۳ خطای پشت‌سرهم سرویس را ری‌استارت می‌کند. لاگش در `journalctl -u pingify-health`.
-
-اختیاری: **Scheduled recycle** — ری‌استارت دوره‌ای (مثلاً هر ۶ ساعت) برای ISPهایی که اتصال‌های طولانی را خفه می‌کنند.
-
----
-
-## امنیت
-
-* هندشیک **HMAC-SHA256** روی PSK با تایم‌استمپ ±۱۸۰ ثانیه و محافظ replay.
-* نشست WS/WSS قبل از ساخت stream با nonce تصادفی و HMAC جداگانه احراز هویت می‌شود.
-* هندشیک ناموفق = بستن **بی‌صدای** سوکت با تأخیر تصادفی؛ اسکنر چیزی یاد نمی‌گیرد.
-* کلید هر کریر و هر جهت جداست (HKDF روی nonceهای همان اتصال)، nonce شمارنده‌ای.
-* کانفیگ‌ها `chmod 600` و `/etc/pingify` با `chmod 700`.
-
-> چون هندشیک به ساعت حساس است، منوی Optimize گزینهٔ همگام‌سازی NTP دارد.
-
----
-
-## ساختار مخزن
-
-```
-core/
-  pingify.go       framing، MUX، forwarding، TUN و status
-  arq.go           ARQ تطبیقی ICMP/UDP
-  kcp_transport.go KCP + Reed-Solomon FEC
-  pck_frame.go     ساخت/اعتبارسنجی IPv4/TCP packet
-  pck_linux.go     AF_PACKET، route discovery و firewall guard
-  ws.go            RFC 6455 + نشست MUX مشترک WS/WSS
-  wsdecoy.go       پاسخ nginx و گواهی WSS
-  tun_linux.go     باز کردن دستگاه TUN (جدا، چون build tag کل فایل را می‌گیرد)
-  tun_other.go     استاب غیر-لینوکس تا تست‌ها روی هر OS اجرا شوند
-  pingify_test.go
-parts/             منبع اسکریپت مدیریت، به ترتیب شماره
-tests/             تست سرتاسری تولید کانفیگ + توکن با موتور واقعی
-.github/workflows/ بیلد و انتشار خودکار باینری‌ها روی تگ
-  vendor/          وابستگی‌های MIT/BSD برای بیلد کاملاً آفلاین
-build.sh           parts + core + vendor فشرده  ->  Pingify.sh
-```
-
-**هرگز `Pingify.sh` را مستقیم ویرایش نکن** — تولیدی است.
 
 ```bash
-bash build.sh              # فرمت، vet، بیلد amd64/arm64، تست، تولید Pingify.sh
-bash tests/manager_test.sh # تست سرتاسری اسکریپت + موتور
+bash build.sh
+bash tests/run.sh
 ```
 
-`build.sh` اسکریپتی را که `bash -n` رد کند نمی‌سازد، و بررسی می‌کند سورس Go جاسازی‌شده بایت‌به‌بایت با اصل یکی باشد. انتشار نسخهٔ جدید:
+Edit `parts/`, not generated embedded blocks in `Pingify.sh`, then rebuild.
 
-```bash
-git tag v3.0.0 && git push origin v3.0.0
-```
+## License
 
----
+Copyright © 2026 **GreatTeejay**. All rights reserved except permissions in [LICENSE](LICENSE). An attributed GitHub fork with intact history, license and original link is permitted. Independent copying, mirroring, rebranding, redistribution, relicensing or selling is prohibited without written permission.
 
-## نیازمندی‌ها
-
-* Ubuntu 22.04 / 24.04 / 26.04 (یا هر توزیع systemd-دار)
-* دسترسی root
-* Go فقط در صورتی که مسیر fallback لازم شود — اسکریپت خودش نصبش می‌کند
+<p align="center">Built and maintained by <a href="https://github.com/GreatTeejay">GreatTeejay</a>.</p>

@@ -53,7 +53,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.30.0"
+const version = "5.31.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -153,6 +153,10 @@ type Config struct {
 	DialTimeout int   `json:"dial_timeout_sec,omitempty"`
 	SndBufKB    int   `json:"sndbuf_kb,omitempty"`
 	RcvBufKB    int   `json:"rcvbuf_kb,omitempty"`
+	// Profile selects latency/throughput trade-offs that are not expressible
+	// as a socket buffer alone, notably packet receive batch size and worker
+	// count. Old configs leave it empty and receive the balanced defaults.
+	Profile string `json:"profile,omitempty"`
 
 	// Packet transports use the same low-latency KCP/FEC shape. Keeping the
 	// values in the config makes both ends explicit and lets a lossy route be
@@ -189,15 +193,12 @@ func (c *Config) applyDefaults() {
 		c.Transport = "icmp"
 	}
 	websocket := c.Transport == "ws" || c.Transport == "wss"
-	if c.Carriers <= 0 {
+	if c.Carriers == 0 {
 		if websocket {
 			c.Carriers = 1
 		} else {
 			c.Carriers = 4
 		}
-	}
-	if c.Carriers > 64 {
-		c.Carriers = 64
 	}
 	// ws and wss multiplex: one WebSocket carries the whole tunnel. Twenty of them
 	// opened at once from one address is the most recognisable thing a tunnel
@@ -210,37 +211,43 @@ func (c *Config) applyDefaults() {
 		c.CarriersAsked = c.Carriers
 		c.Carriers = 1
 	}
-	if c.WindowKB <= 0 {
+	if c.WindowKB == 0 {
 		// 512 KiB per stream is roughly 50 Mbit/s on an 80 ms path, and it
 		// bounds what one stalled connection can hold in memory. Raise it for
 		// a very fat link; every open stream can buffer this much.
 		c.WindowKB = 512
 	}
-	if c.WindowKB < 64 {
-		c.WindowKB = 64
-	}
-	if c.KeepaliveSec <= 0 {
+	if c.KeepaliveSec == 0 {
 		c.KeepaliveSec = 10
 	}
-	if c.DialTimeout <= 0 {
+	if c.DialTimeout == 0 {
 		c.DialTimeout = 10
 	}
-	if c.SndBufKB <= 0 {
+	if c.SndBufKB == 0 {
 		c.SndBufKB = 4096
 	}
-	if c.RcvBufKB <= 0 {
+	if c.RcvBufKB == 0 {
 		c.RcvBufKB = 4096
 	}
-	if c.FECData <= 0 {
+	c.Profile = strings.ToLower(strings.TrimSpace(c.Profile))
+	if c.Profile == "" {
+		c.Profile = "balanced"
+	}
+	// 5.29 briefly wrote this label instead of a real profile. Preserve those
+	// configs while making every new/other unknown value a validation error.
+	if c.Profile == "from token" {
+		c.Profile = "custom"
+	}
+	if c.FECData == 0 {
 		c.FECData = 10
 	}
-	if c.FECParity <= 0 {
+	if c.FECParity == 0 {
 		c.FECParity = 3
 	}
-	if c.PacketMTU <= 0 {
+	if c.PacketMTU == 0 {
 		c.PacketMTU = 1200
 	}
-	if c.KCPInterval <= 0 {
+	if c.KCPInterval == 0 {
 		c.KCPInterval = 10
 	}
 	if c.PCKFlags == "" {
@@ -275,6 +282,35 @@ func (c *Config) validate() error {
 	case "tcp", "icmp", "udp", "kcp", "pck", "ws", "wss":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
+	}
+	if c.Carriers < 1 || c.Carriers > 64 {
+		return fmt.Errorf("carriers must be between 1 and 64")
+	}
+	if c.WindowKB < 64 || c.WindowKB > 65536 {
+		return fmt.Errorf("window_kb must be between 64 and 65536")
+	}
+	// Packet engines count a bounded 4096 segments internally. With the
+	// configured MTUs, 4096 KiB stays below that bound; accepting a larger
+	// number would put it in the file and then silently run a smaller window.
+	switch c.Transport {
+	case "icmp", "udp", "kcp", "pck":
+		if c.WindowKB > 4096 {
+			return fmt.Errorf("window_kb for %s must be between 64 and 4096", c.Transport)
+		}
+	}
+	if c.KeepaliveSec < 1 || c.KeepaliveSec > 300 {
+		return fmt.Errorf("keepalive_sec must be between 1 and 300")
+	}
+	if c.DialTimeout < 1 || c.DialTimeout > 300 {
+		return fmt.Errorf("dial_timeout_sec must be between 1 and 300")
+	}
+	if c.SndBufKB < 64 || c.SndBufKB > 65536 || c.RcvBufKB < 64 || c.RcvBufKB > 65536 {
+		return fmt.Errorf("sndbuf_kb and rcvbuf_kb must be between 64 and 65536")
+	}
+	switch c.Profile {
+	case "gaming", "latency", "balanced", "throughput", "extreme", "custom":
+	default:
+		return fmt.Errorf("tuning profile %q is not valid", c.Profile)
 	}
 	if (c.Listen == "") == (c.Connect == "") {
 		return fmt.Errorf("set exactly one of \"listen\" or \"connect\"")
@@ -423,6 +459,8 @@ func main() {
 	logInfo("pingify-core %s starting: tunnel=%s role=%s mode=%s transport=%s carriers=%d keepalive=%ds token=%s",
 		version, cfg.Name, cfg.Role, cfg.Mode, cfg.Transport, cfg.Carriers,
 		cfg.KeepaliveSec, cfg.tokenPrint())
+	logInfo("tuning applied: profile=%s window=%dKiB socket=%d/%dKiB",
+		cfg.Profile, cfg.WindowKB, cfg.SndBufKB, cfg.RcvBufKB)
 	if cfg.CarriersAsked > 0 {
 		logInfo("%s multiplexes the whole tunnel onto one connection, so the %d carriers configured are not used",
 			strings.ToUpper(cfg.Transport), cfg.CarriersAsked)

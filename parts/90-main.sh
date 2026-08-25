@@ -169,8 +169,16 @@ info_panel() {
 first_run() {
     [ -x "$CORE_BIN" ] && return 0
     banner
-    head2 "Setting up"
+    head2 "First-time setup"
+    panel "INSTALL"
+    field "1  Manager" "installed at $SELF_BIN"
+    field "2  Core" "download prebuilt, or compile offline"
+    field "3  Services" "systemd units and health watchdog"
+    panel_end
+    say ""
     if install_core; then
+        write_units
+        ok "Pingify is ready - choose New tunnel from the next screen"
         sleep 1
         return 0
     fi
@@ -178,6 +186,7 @@ first_run() {
     fail "the core could not be installed"
     dim "this server could not reach GitHub and has no Go toolchain to build with"
     pause
+    return 1
 }
 
 main_menu() {
@@ -189,7 +198,7 @@ main_menu() {
         item 2 "Manage tunnels"  "status, ports, logs, remove"
         item 3 "Health"          "live status, watchdog, health log"
         group "NETWORK"
-        item 4 "Optimize"        "buffers, limits, swap, clock"
+        item 4 "Optimize"        "host profiles, BBR, forwarding, swap"
         item 5 "Blocking"        "ICMP, speedtest, UDP 443"
         item 6 "Diagnostics"     "connectivity and configs"
         group "MAINTENANCE"
@@ -245,7 +254,7 @@ main() {
     install_self
     migrate_layout
     server_info
-    first_run
+    first_run || exit 1
     ensure_core_current
     main_menu
 }

@@ -65,5 +65,8 @@ func TestAnUnknownTransportIsRefused(t *testing.T) {
 func TestEveryTransportSatisfiesTheSeam(t *testing.T) {
 	var _ carrierTransport = (*tcpTransport)(nil)
 	var _ carrierTransport = (*icmpCarrier)(nil)
+	var _ carrierTransport = (*udpCarrier)(nil)
+	var _ carrierTransport = (*kcpTransport)(nil)
+	var _ carrierTransport = (*pckTransport)(nil)
 	var _ carrierTransport = (*wsTransport)(nil)
 }

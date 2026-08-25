@@ -7,8 +7,10 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	stdlog "log"
 	"net"
 	"net/http"
 	"strings"
@@ -118,6 +120,27 @@ const (
 // The close frame's status code: 1000, a normal end.
 var wsCloseNormal = []byte{0x03, 0xE8}
 
+// A control frame that could not get the writer promptly is not a broken
+// socket. It usually means a large data frame is still leaving. Keepalive may
+// skip that ping, while a real write error must tear the connection down now.
+var errWSControlBusy = errors.New("ws: data writer busy")
+
+// net/http reports every random TLS scanner as a server error by default.
+// Public port 443 receives old SSL, malformed ClientHello and cipher probes
+// all day; they are not tunnel failures and should not drown the live log.
+// Real listener failures are still reported by serve below.
+type wsHTTPErrorWriter struct{}
+
+func (wsHTTPErrorWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimSpace(string(p))
+	if strings.Contains(msg, "TLS handshake error") {
+		logDebug("wss rejected an invalid TLS probe: %s", msg)
+	} else if msg != "" {
+		logWarn("web server: %s", msg)
+	}
+	return len(p), nil
+}
+
 // wsMask XORs src into dst with the frame's key, eight bytes at a time.
 //
 // A byte at a time is the obvious way and on a full frame it is the difference
@@ -183,7 +206,7 @@ type wsConn struct {
 	dbuf  []byte // data payloads, reused
 	cbuf  []byte // control payloads, kept apart so a ping cannot clobber data
 
-	lastPong int64 // unix nano; see keepalive
+	lastSeen int64 // unix nano; any received frame proves the path is alive
 	done     chan struct{}
 	once     sync.Once
 }
@@ -199,7 +222,7 @@ func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
 		wmu:  make(chan struct{}, 1),
 		done: make(chan struct{}),
 	}
-	atomic.StoreInt64(&w.lastPong, time.Now().UnixNano())
+	atomic.StoreInt64(&w.lastSeen, time.Now().UnixNano())
 	go w.keepalive()
 	return w
 }
@@ -220,25 +243,36 @@ func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
 func (w *wsConn) keepalive() {
 	t := time.NewTicker(wsPingEvery)
 	defer t.Stop()
-	var payload [4]byte
 	for {
 		select {
 		case <-w.done:
 			return
 		case <-t.C:
 		}
-		if since := time.Since(time.Unix(0, atomic.LoadInt64(&w.lastPong))); since > wsPongOverdue {
-			logDebug("ws: no pong from %s for %s - the path is carrying nothing, closing",
-				w.c.RemoteAddr(), since.Round(time.Second))
-			w.Close()
-			return
-		}
-		binary.BigEndian.PutUint32(payload[:], uint32(time.Now().Unix()))
-		if err := w.writeControl(wsOpPing, payload[:]); err != nil {
-			logDebug("ws: ping to %s: %v", w.c.RemoteAddr(), err)
+		if !w.keepaliveStep() {
 			return
 		}
 	}
+}
+
+func (w *wsConn) keepaliveStep() bool {
+	if since := time.Since(time.Unix(0, atomic.LoadInt64(&w.lastSeen))); since > wsPongOverdue {
+		logDebug("ws: no frame from %s for %s - the path is carrying nothing, closing",
+			w.c.RemoteAddr(), since.Round(time.Second))
+		w.abort()
+		return false
+	}
+	var payload [4]byte
+	binary.BigEndian.PutUint32(payload[:], uint32(time.Now().Unix()))
+	if err := w.writeControl(wsOpPing, payload[:]); err != nil {
+		if errors.Is(err, errWSControlBusy) {
+			return true // data is already using the socket; try next tick
+		}
+		logDebug("ws: ping to %s: %v", w.c.RemoteAddr(), err)
+		w.abort()
+		return false
+	}
+	return true
 }
 
 type wsFrame struct {
@@ -279,7 +313,7 @@ func (w *wsConn) Read(p []byte) (int, error) {
 				logDebug("ws: could not answer a ping: %v", err)
 			}
 		case wsOpPong:
-			atomic.StoreInt64(&w.lastPong, time.Now().UnixNano())
+			atomic.StoreInt64(&w.lastSeen, time.Now().UnixNano())
 		case wsOpClose:
 			w.writeControl(wsOpClose, wsCloseNormal)
 			return 0, io.EOF
@@ -409,6 +443,10 @@ func (w *wsConn) readFrame() (wsFrame, error) {
 	if masked {
 		wsMask(body, body, key)
 	}
+	// A data frame is every bit as strong a liveness signal as a pong. Under
+	// heavy one-way traffic a pong can wait behind a large data write; closing
+	// a connection that is visibly delivering data is a false timeout.
+	atomic.StoreInt64(&w.lastSeen, time.Now().UnixNano())
 	f.payload = body
 	return f, nil
 }
@@ -522,7 +560,7 @@ func (w *wsConn) writeControl(op byte, payload []byte) error {
 		select {
 		case w.wmu <- struct{}{}:
 		case <-t.C:
-			return nil
+			return errWSControlBusy
 		}
 	}
 	defer func() { <-w.wmu }()
@@ -550,6 +588,14 @@ func (w *wsConn) Close() error {
 		w.writeControl(wsOpClose, wsCloseNormal)
 	})
 	return w.c.Close()
+}
+
+// abort is for a socket already known to be bad. A graceful close frame would
+// only spend wsControlWait trying to write to the same dead path and delay the
+// reconnect that restores every multiplexed stream.
+func (w *wsConn) abort() {
+	w.once.Do(func() { close(w.done) })
+	_ = w.c.Close()
 }
 
 // netConn is the socket under the framing. tuneSocket walks down to it to turn
@@ -625,11 +671,13 @@ func wsDial(addr, authority, path string, timeout time.Duration) (net.Conn, erro
 	return dialWebSocket(addr, "", authority, path, false, timeout)
 }
 
-func wssDial(addr, serverName, authority, path string, timeout time.Duration) (net.Conn, error) {
-	return dialWebSocket(addr, serverName, authority, path, true, timeout)
+func wssDial(addr, serverName, authority, path string, timeout time.Duration,
+	cache tls.ClientSessionCache) (net.Conn, error) {
+	return dialWebSocket(addr, serverName, authority, path, true, timeout, cache)
 }
 
-func dialWebSocket(addr, serverName, authority, path string, useTLS bool, timeout time.Duration) (net.Conn, error) {
+func dialWebSocket(addr, serverName, authority, path string, useTLS bool, timeout time.Duration,
+	cache ...tls.ClientSessionCache) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
@@ -641,12 +689,17 @@ func dialWebSocket(addr, serverName, authority, path string, useTLS bool, timeou
 		// direct origin also works with Pingify's generated self-signed one. The
 		// outer TLS layer is camouflage and transport encryption; the Pingify
 		// handshake immediately inside it authenticates the peer with the token.
-		c, err = tls.DialWithDialer(d, "tcp", addr, &tls.Config{
+		tlsCfg := &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: true, // authenticated by the inner token handshake
 			MinVersion:         tls.VersionTLS12,
 			NextProtos:         []string{"http/1.1"},
-		})
+			CurvePreferences:   []tls.CurveID{tls.X25519, tls.CurveP256},
+		}
+		if len(cache) > 0 {
+			tlsCfg.ClientSessionCache = cache[0]
+		}
+		c, err = tls.DialWithDialer(d, "tcp", addr, tlsCfg)
 	} else {
 		c, err = d.Dial("tcp", addr)
 	}
@@ -709,11 +762,24 @@ func dialWebSocket(addr, serverName, authority, path string, useTLS bool, timeou
 		c.Close()
 		return nil, err
 	}
-	resp.Body.Close()
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		sample, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		resp.Body.Close()
 		c.Close()
+		detail := strings.Join(strings.Fields(string(sample)), " ")
+		if len(detail) > 160 {
+			detail = detail[:160]
+		}
+		ray := strings.TrimSpace(resp.Header.Get("CF-Ray"))
+		if ray != "" {
+			detail = strings.TrimSpace(detail + " CF-Ray=" + ray)
+		}
+		if detail != "" {
+			return nil, fmt.Errorf("ws: the server answered %s, not an upgrade (%s)", resp.Status, detail)
+		}
 		return nil, fmt.Errorf("ws: the server answered %s, not an upgrade", resp.Status)
 	}
+	resp.Body.Close()
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
 		!hasHTTPToken(resp.Header.Get("Connection"), "upgrade") ||
 		resp.Header.Get("Sec-WebSocket-Accept") != wsAccept(key) {
@@ -733,6 +799,10 @@ type wsTransport struct {
 	auth string
 	host string
 	tls  bool
+	// Reconnects should not pay a full public-key handshake every time a path
+	// blips. Go's cache is concurrency-safe and Cloudflare/origin tickets are
+	// scoped by the SNI name.
+	tlsCache tls.ClientSessionCache
 
 	ln      net.Listener
 	inbound chan net.Conn
@@ -760,6 +830,9 @@ func newWebSocketTransport(cfg *Config, useTLS bool) (*wsTransport, error) {
 		// no more, so a flood of upgrades cannot queue here.
 		inbound: make(chan net.Conn, 4),
 		done:    make(chan struct{}),
+	}
+	if useTLS && cfg.Connect != "" {
+		t.tlsCache = tls.NewLRUClientSessionCache(8)
 	}
 	if cfg.Connect != "" {
 		return t, nil // this end dials; it binds nothing
@@ -839,6 +912,7 @@ func (t *wsTransport) serve() {
 	srv := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
 		Handler:           http.HandlerFunc(t.handle),
+		ErrorLog:          stdlog.New(wsHTTPErrorWriter{}, "", 0),
 	}
 	// Only the header read is bounded. The connection is hijacked out of this
 	// server and then lives for hours, so a read, write or idle timeout here
@@ -899,7 +973,7 @@ func (t *wsTransport) handle(w http.ResponseWriter, r *http.Request) {
 func (t *wsTransport) Dial(idx int) (net.Conn, error) {
 	if t.tls {
 		return wssDial(t.cfg.Connect, t.host, t.auth, t.path,
-			time.Duration(t.cfg.DialTimeout)*time.Second)
+			time.Duration(t.cfg.DialTimeout)*time.Second, t.tlsCache)
 	}
 	return wsDial(t.cfg.Connect, t.auth, t.path,
 		time.Duration(t.cfg.DialTimeout)*time.Second)

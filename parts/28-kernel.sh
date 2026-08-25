@@ -242,7 +242,7 @@ write_gre_unit() {
     cat > "$unit" <<UNIT
 [Unit]
 Description=Pingify tunnel $name (GRE)
-Documentation=https://github.com/GreatTeejay/pingfa
+Documentation=https://github.com/GreatTeejay/Pingify
 After=network-online.target
 Wants=network-online.target
 
@@ -270,7 +270,7 @@ write_awg_unit() {
     cat > "$unit" <<UNIT
 [Unit]
 Description=Pingify tunnel $name (AmneziaWG)
-Documentation=https://github.com/GreatTeejay/pingfa
+Documentation=https://github.com/GreatTeejay/Pingify
 After=network-online.target
 Wants=network-online.target
 

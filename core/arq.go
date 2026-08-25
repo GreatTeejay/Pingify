@@ -146,6 +146,7 @@ type arqConn struct {
 	maxWindow int
 	send      func([]byte) error
 	remote    net.Addr
+	packetBuf sync.Pool // one datagram scratch buffer; returned after send
 
 	mu   sync.Mutex
 	cond *sync.Cond
@@ -225,6 +226,9 @@ func newARQ(session uint32, carrier uint8, psk []byte, label string, maxPayload,
 		rto:        500 * time.Millisecond,
 		done:       make(chan struct{}),
 		maxRetries: 12,
+	}
+	c.packetBuf.New = func() interface{} {
+		return make([]byte, arqOver+maxPayload)
 	}
 	c.cond = sync.NewCond(&c.mu)
 	go c.timerLoop()
@@ -336,15 +340,24 @@ func (c *arqConn) emit(seg *segment, flags uint8) {
 		payload = seg.data
 		seg.sentAt = time.Now()
 	}
-	buf := make([]byte, arqOver+len(payload))
+	raw := c.packetBuf.Get().([]byte)
+	need := arqOver + len(payload)
+	if cap(raw) < need {
+		raw = make([]byte, need)
+	}
+	buf := raw[:need]
+	defer c.packetBuf.Put(raw[:cap(raw)])
 	if _, err := rand.Read(buf[:arqNonce]); err != nil {
+		c.fail(err)
 		return
 	}
 	h.put(buf[arqNonce:arqOver])
 	maskHeader(c.mask, buf[:arqNonce], buf[arqNonce:arqOver])
 	copy(buf[arqOver:], payload)
 	c.needAck = false
-	c.send(buf)
+	if err := c.send(buf); err != nil {
+		c.fail(err)
+	}
 }
 
 // ackOnly sends a bare acknowledgement. Caller holds the lock.
@@ -360,11 +373,11 @@ func (c *arqConn) onDatagram(buf []byte) {
 	if len(buf) < arqOver {
 		return
 	}
-	hdr := make([]byte, arqHdr)
-	copy(hdr, buf[arqNonce:arqOver])
-	maskHeader(c.mask, buf[:arqNonce], hdr)
+	var hdr [arqHdr]byte
+	copy(hdr[:], buf[arqNonce:arqOver])
+	maskHeader(c.mask, buf[:arqNonce], hdr[:])
 	var h arqHeader
-	h.get(hdr)
+	h.get(hdr[:])
 	if h.session != c.session || h.carrier != c.carrier {
 		return
 	}
@@ -477,7 +490,15 @@ func (c *arqConn) deliver(seq uint32, payload []byte) {
 	if _, dup := c.rcvBuf[seq]; dup {
 		return
 	}
-	c.rcvBuf[seq] = append([]byte(nil), payload...)
+	// The common case is in order. Put it straight into the byte stream: the
+	// old map-first path allocated and copied once into the map and then again
+	// into inbox for every packet, even when there was no reordering at all.
+	if seq == c.rcvNext {
+		c.inbox = append(c.inbox, payload...)
+		c.rcvNext++
+	} else {
+		c.rcvBuf[seq] = append([]byte(nil), payload...)
+	}
 	for {
 		seg, ok := c.rcvBuf[c.rcvNext]
 		if !ok {
@@ -525,7 +546,10 @@ func (c *arqConn) sampleRTT(m time.Duration) {
 }
 
 func (c *arqConn) timerLoop() {
-	t := time.NewTicker(20 * time.Millisecond)
+	// Ten milliseconds halves the acknowledgement delay for games and small
+	// web requests. ACKs are cumulative, so a fast transfer still sends at
+	// most one small control datagram per tick rather than one per packet.
+	t := time.NewTicker(10 * time.Millisecond)
 	defer t.Stop()
 	idle := time.Now()
 	for {

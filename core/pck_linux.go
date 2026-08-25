@@ -56,7 +56,7 @@ type pckHub struct {
 
 func networkUint16(v uint16) int { return int(v<<8 | v>>8) }
 
-func newPCKHub(port uint16, key []byte, flags byte, peer net.IP) (*pckHub, error) {
+func newPCKHub(port uint16, key []byte, flags byte, peer net.IP, cfg *Config) (*pckHub, error) {
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, networkUint16(pckEtherTypeIPv4))
 	if err != nil {
 		return nil, fmt.Errorf("pck packet socket: %v (Linux and CAP_NET_RAW/root are required)", err)
@@ -64,6 +64,15 @@ func newPCKHub(port uint16, key []byte, flags byte, peer net.IP) (*pckHub, error
 	if err := attachPCKFilter(fd, port); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("pck packet filter: %v", err)
+	}
+	// The PCK hub is the packet transport's one real socket. Without these,
+	// the large buffers selected by the packet presets stopped at the config
+	// file and a burst could be dropped before KCP/FEC saw it.
+	if cfg.RcvBufKB > 0 {
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, cfg.RcvBufKB*1024)
+	}
+	if cfg.SndBufKB > 0 {
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, cfg.SndBufKB*1024)
 	}
 	h := &pckHub{
 		fd: fd, rawFD: -1, port: port, key: key, flags: flags,
@@ -78,7 +87,11 @@ func newPCKHub(port uint16, key []byte, flags byte, peer net.IP) (*pckHub, error
 		}
 		h.initial = route
 	}
-	go h.readLoop()
+	workers, _ := packetReadTuning(cfg.Profile)
+	for i := 0; i < workers; i++ {
+		go h.readLoop()
+	}
+	logInfo("PCK packet I/O: %d receive workers on one filtered AF_PACKET socket", workers)
 	return h, nil
 }
 
@@ -412,7 +425,7 @@ func newPCKTransport(cfg *Config) (*pckTransport, error) {
 			return nil, fmt.Errorf("pck supports IPv4 peers only")
 		}
 	}
-	hub, err := newPCKHub(localPort, envelopeKey, flags, peerIP)
+	hub, err := newPCKHub(localPort, envelopeKey, flags, peerIP, cfg)
 	if err != nil {
 		return nil, err
 	}

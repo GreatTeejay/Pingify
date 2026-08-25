@@ -1,0 +1,60 @@
+PINGIFY SOURCE-AVAILABLE LICENSE 1.0
+
+Copyright (c) 2026 GreatTeejay. All rights reserved.
+
+The source code, documentation, artwork, binaries and associated files
+(the "Software") are publicly viewable but are not open-source software under
+an OSI-approved license.
+
+1. PERMISSION
+
+You may view and study the Software, use unmodified official releases for
+personal non-commercial operation, and create a fork through GitHub's standard
+fork mechanism for study, testing, contribution or adaptation.
+
+2. CONDITIONS FOR EVERY FORK
+
+Every permitted fork must retain this license unchanged, the full repository
+history and all copyright notices. Near the beginning of every README and
+project description it must prominently display "Original project by
+GreatTeejay" and a visible working link to:
+https://github.com/GreatTeejay/Pingify
+
+Modifications must be clearly identified and must not imply endorsement by
+GreatTeejay. The project must remain hosted as a GitHub fork unless GreatTeejay
+provides prior written permission.
+
+3. PROHIBITED WITHOUT WRITTEN PERMISSION
+
+You may not copy, mirror, republish, redistribute, sublicense or relicense the
+Software outside a permitted GitHub fork; remove or obscure attribution;
+rebrand it under another identity; sell, rent, monetize or commercially host
+it; publish derived binaries, installers, releases, images or packages; or use
+a substantial part to create a competing tunnel-management product or service.
+
+4. CONTRIBUTIONS
+
+Unless agreed otherwise in writing, a contribution to the original repository
+grants GreatTeejay a perpetual, worldwide, irrevocable, royalty-free right to
+use, modify, reproduce, distribute, sublicense and relicense it as part of the
+Software. Contributors retain copyright in their original contributions.
+
+5. NAME AND BRAND
+
+No permission is granted to use the Pingify or GreatTeejay names, logos or
+branding except for the attribution required by this license.
+
+6. TERMINATION
+
+Permission terminates immediately upon breach. The breaching party must stop
+using the Software and remove all unauthorized copies and derivatives under
+their control.
+
+7. WARRANTY AND LIABILITY
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. TO THE MAXIMUM
+EXTENT PERMITTED BY LAW, THE COPYRIGHT HOLDER IS NOT LIABLE FOR ANY CLAIM, DAMAGE OR OTHER
+LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+Any permission not expressly granted requires prior written authorization from
+GreatTeejay.

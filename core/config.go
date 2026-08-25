@@ -79,6 +79,10 @@ func stripComment(s string) string {
 	inQ := false
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case '\\':
+			if inQ && i+1 < len(s) {
+				i++
+			}
 		case '"':
 			inQ = !inQ
 		case '#':
@@ -127,6 +131,10 @@ func splitTop(s string) []string {
 	inQ, start := false, 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case '\\':
+			if inQ && i+1 < len(s) {
+				i++
+			}
 		case '"':
 			inQ = !inQ
 		case ',':
@@ -197,6 +205,10 @@ func assign(c *Config, section, key, val string) error {
 			c.Connect = unquote(val)
 		case "host", "ws_host":
 			c.WSHost = unquote(val)
+		case "cert_file":
+			c.CertFile = unquote(val)
+		case "key_file":
+			c.KeyFile = unquote(val)
 		case "carriers":
 			err = num(&c.Carriers)
 		case "keepalive_sec":
@@ -233,6 +245,8 @@ func assign(c *Config, section, key, val string) error {
 	switch section {
 	case "", "tuning":
 		switch key {
+		case "profile":
+			c.Profile = strings.ToLower(unquote(val))
 		case "window_kb":
 			err = num(&c.WindowKB)
 		case "sndbuf_kb":

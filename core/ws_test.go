@@ -408,22 +408,13 @@ func TestWSHangsUpOnAPathThatStopsAnswering(t *testing.T) {
 
 	// Reach the conclusion by hand on the clock the field would take minutes
 	// to reach: pretend the last pong was long ago.
-	atomic.StoreInt64(&w.lastPong, time.Now().Add(-2*wsPongOverdue).UnixNano())
+	atomic.StoreInt64(&w.lastSeen, time.Now().Add(-2*wsPongOverdue).UnixNano())
 
-	// The keepalive ticks on its own interval, so drive one round here rather
-	// than waiting a minute for it.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < 200; i++ {
-			if since := time.Since(time.Unix(0, atomic.LoadInt64(&w.lastPong))); since > wsPongOverdue {
-				w.Close()
-				return
-			}
-			time.Sleep(5 * time.Millisecond)
-		}
-	}()
-	<-done
+	// Drive one real keepalive round instead of reimplementing its decision in
+	// the test and accidentally testing the copy rather than the code.
+	if w.keepaliveStep() {
+		t.Fatal("an overdue connection was kept alive")
+	}
 
 	if _, err := w.Read(make([]byte, 4)); err == nil {
 		t.Fatal("the connection is still readable after the path went silent")
@@ -447,19 +438,59 @@ func TestWSAPongKeepsTheConnection(t *testing.T) {
 	go io.Copy(io.Discard, client)
 	go io.Copy(io.Discard, server)
 
-	atomic.StoreInt64(&client.lastPong, time.Now().Add(-time.Hour).UnixNano())
+	atomic.StoreInt64(&client.lastSeen, time.Now().Add(-time.Hour).UnixNano())
 	if err := client.writeControl(wsOpPing, []byte("tock")); err != nil {
 		t.Fatal(err)
 	}
 
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		if time.Since(time.Unix(0, atomic.LoadInt64(&client.lastPong))) < time.Minute {
+		if time.Since(time.Unix(0, atomic.LoadInt64(&client.lastSeen))) < time.Minute {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("the server answered the ping and the clock was not put forward")
+}
+
+// A failed control write used to stop the WS keepalive goroutine while
+// leaving the socket open. The link then looked UP but carried nothing until
+// its separate one-minute timeout expired. One physical WebSocket is every
+// stream, so a real socket error must trigger reconnect immediately.
+func TestWSControlWriteFailureAbortsTheConnection(t *testing.T) {
+	a, b := net.Pipe()
+	w := newWSConn(a, nil, true)
+	b.Close()
+
+	if w.keepaliveStep() {
+		t.Fatal("a ping write to a closed path was reported healthy")
+	}
+	select {
+	case <-w.done:
+	case <-time.After(time.Second):
+		t.Fatal("the failed WebSocket was not aborted")
+	}
+}
+
+// Incoming tunnel data is proof that the path is alive even if its pong is
+// temporarily queued behind a large outgoing frame. Closing a busy, visibly
+// receiving tunnel was the worst possible interpretation of that delay.
+func TestWSDataRefreshesTheLivenessClock(t *testing.T) {
+	a, b := net.Pipe()
+	client := newWSConn(a, nil, true)
+	server := newWSConn(b, nil, false)
+	defer client.Close()
+	defer server.Close()
+
+	atomic.StoreInt64(&server.lastSeen, time.Now().Add(-time.Hour).UnixNano())
+	go client.Write([]byte("alive"))
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(server, got); err != nil {
+		t.Fatal(err)
+	}
+	if since := time.Since(time.Unix(0, atomic.LoadInt64(&server.lastSeen))); since > time.Second {
+		t.Fatalf("data arrived but the liveness clock is still %s old", since)
+	}
 }
 
 // A control frame borrows the write deadline. The layer above sets its own

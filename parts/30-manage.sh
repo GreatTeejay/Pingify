@@ -22,6 +22,8 @@ cfg_load() {
     T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
     T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=false}"
+    T_CERT_FILE="$(toml_get "$f" transport cert_file)"
+    T_KEY_FILE="$(toml_get "$f" transport key_file)"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
     T_SNDBUF="$(toml_get "$f" tuning sndbuf_kb)";           : "${T_SNDBUF:=$T_WINDOW}"
     T_RCVBUF="$(toml_get "$f" tuning rcvbuf_kb)";           : "${T_RCVBUF:=$T_WINDOW}"
@@ -254,8 +256,10 @@ manage_tunnels() {
 }
 
 tunnel_menu() {
-    local name="$1"
+    local name="$1" is_kernel=0
     while :; do
+        is_kernel=0
+        cfg_load "$name" >/dev/null 2>&1 && kernel_transport && is_kernel=1
         banner
         head2 "Tunnel: $name"
         tunnel_status_block "$name"
@@ -270,7 +274,11 @@ tunnel_menu() {
         item 6 "Live log"
         group "Settings"
         item 7 "Ports" "$(printf '%s' "$(toml_arr "$(cfg_file "$name")" ports)" | tr -d '"' | tr ',' ' ')"
-        item 8 "Tuning" "carriers, window, keepalive, shaping"
+        if [ "$is_kernel" = "1" ]; then
+            item 8 "Kernel link" "MTU and kernel-owned transport settings"
+        else
+            item 8 "Tuning" "transport preset, window, buffers, shaping"
+        fi
         item 9 "Scheduled restart"
         say ""
         item 0 "Back"
@@ -285,11 +293,33 @@ tunnel_menu() {
             5) health_check "$name" ;;
             6) live_log "$name" ;;
             7) edit_forwards "$name" ;;
-            8) tuning_menu "$name" ;;
+            8) if [ "$is_kernel" = "1" ]; then kernel_link_info "$name"; else tuning_menu "$name"; fi ;;
             9) recycle_menu "$name" ;;
             0|"") return ;;
         esac
     done
+}
+
+kernel_link_info() {
+    local name="$1"
+    cfg_load "$name" || return 1
+    banner
+    head2 "Kernel link: $name"
+    say ""
+    panel "LINUX DATA PATH"
+    field "Transport" "$(transport_label "$T_TRANSPORT")" "MTU" "$T_TUNMTU"
+    field "Private link" "$T_TUNLOCAL ${BX_ARR} $T_TUNPEER"
+    case "$T_TRANSPORT" in
+        gre) field "GRE TTL" "$T_GRE_TTL" ;;
+        awg) field "AWG port" "$T_AWG_PORT/udp" ;;
+    esac
+    panel_end
+    say ""
+    dim "Linux carries this tunnel directly. Core carriers, MUX windows,"
+    dim "socket buffers and traffic shaping do not exist on this path."
+    dim "The MTU and peer parameters above are the transport's tuning and"
+    dim "were mirrored by the setup token when both ends were created."
+    pause
 }
 
 # journald puts its own timestamp, the hostname and unit[pid] in front of
@@ -558,17 +588,20 @@ tuning_menu() {
         rtt="$(tuning_rtt "$name")" && measured="measured" || measured="assumed"
         ceiling="$(stream_ceiling "$T_WINDOW" "$rtt")"
 
-        panel "both servers must agree"
+        panel "IDENTITY"
         field "Token" "$(token_print "$T_TOKEN")" "Shaping" "$(shaping_label "$name")"
         field "Type" "$(transport_label "$T_TRANSPORT")" "Forwarder" "$(forwarder_label "$T_FORWARDER")"
         panel_end
         say ""
-        panel "local to this server"
+        panel "PERFORMANCE - KEEP BOTH SERVERS THE SAME"
         field "Profile" "$T_PRESET"
         field "Carriers" "$T_CARRIERS" "Window" "${T_WINDOW} KB"
         field "Buffers" "${T_SNDBUF} / ${T_RCVBUF} KB" "Keepalive" "${T_KEEPALIVE} s"
-        field "Health port" "$T_STATUS"
+        if [ "$T_TRANSPORT" = "kcp" ] || [ "$T_TRANSPORT" = "pck" ]; then
+            field "FEC" "${T_FEC_DATA}+${T_FEC_PARITY}" "Packet" "${T_PACKET_MTU} B / ${T_KCP_INTERVAL} ms"
+        fi
         panel_end
+        dim "Local health endpoint: $T_STATUS"
         say ""
 
         # The one number worth reading off this screen.
@@ -647,8 +680,8 @@ edit_buffers() {
     head2 "Buffers: $name"
     say ""
     case "$T_TRANSPORT" in
-        ws | wss)
-            dim "The one physical WebSocket gets one send and receive socket buffer."
+        ws | wss | icmp | udp | pck)
+            dim "This transport uses one shared socket for its send and receive buffers."
             ;;
         *)
             dim "Each carrier gets a send and a receive buffer of this size, so a"
@@ -657,7 +690,7 @@ edit_buffers() {
     esac
     say ""
     case "$T_TRANSPORT" in
-        ws | wss) total_buf="$(( (T_SNDBUF + T_RCVBUF) / 1024 )) MB" ;;
+        ws | wss | icmp | udp | pck) total_buf="$(( (T_SNDBUF + T_RCVBUF) / 1024 )) MB" ;;
         *)        total_buf="$(( (T_SNDBUF + T_RCVBUF) * T_CARRIERS / 1024 )) MB" ;;
     esac
     field "Now" "${T_SNDBUF} / ${T_RCVBUF} KB" "In total" "$total_buf"
@@ -672,17 +705,28 @@ edit_buffers() {
 
 # tuning_write <name> <carriers> <window> <keepalive> [sndbuf] [rcvbuf]
 tuning_write() {
-    local name="$1" car="$2" win="$3" ka="$4" snd="${5:-}" rcv="${6:-}" f
+    local name="$1" car="$2" win="$3" ka="$4" snd="${5:-}" rcv="${6:-}" f n max_window
     f="$(cfg_file "$name")"
     [ -n "$snd" ] || snd="$win"
     [ -n "$rcv" ] || rcv="$win"
     case "$T_TRANSPORT" in ws | wss) car=1 ;; esac
-    case "$car$win$ka$snd$rcv" in *[!0-9]* | "") fail "numbers only"; pause; return ;; esac
+    for n in "$car" "$win" "$ka" "$snd" "$rcv"; do
+        case "$n" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
+    done
     [ "$car" -ge 1 ] && [ "$car" -le 64 ] || { fail "carriers must be 1 to 64"; pause; return; }
-    [ "$win" -ge 16 ] || { fail "a window under 16 KB stalls every connection"; pause; return; }
+    max_window="$(transport_window_max)"
+    [ "$win" -ge 64 ] && [ "$win" -le "$max_window" ] || {
+        fail "window must be 64 to $max_window KB for $(transport_label "$T_TRANSPORT")"
+        pause; return
+    }
+    [ "$ka" -ge 1 ] && [ "$ka" -le 300 ] || { fail "keepalive must be 1 to 300 seconds"; pause; return; }
     # 64 MB a socket is already past anything a real path can use, and 64 of
     # them is 4 GB of a server that has other work to do.
-    [ "$snd" -le 65536 ] && [ "$rcv" -le 65536 ] || { fail "a buffer over 64 MB is not a tuning, it is a leak"; pause; return; }
+    [ "$snd" -ge 64 ] && [ "$rcv" -ge 64 ] &&
+    [ "$snd" -le 65536 ] && [ "$rcv" -le 65536 ] || {
+        fail "buffers must be 64 KB to 64 MB"
+        pause; return
+    }
 
     cp -f "$f" "$f.bak"
     sed -i "s#^carriers.*#carriers         = $car#" "$f"
@@ -690,8 +734,17 @@ tuning_write() {
     sed -i "s#^keepalive_sec.*#keepalive_sec    = $ka#" "$f"
     sed -i "s#^sndbuf_kb.*#sndbuf_kb        = $snd#" "$f"
     sed -i "s#^rcvbuf_kb.*#rcvbuf_kb        = $rcv#" "$f"
+    if [ "$T_TRANSPORT" = "kcp" ] || [ "$T_TRANSPORT" = "pck" ]; then
+        sed -i "/^\[kcp\]/,/^\[/ {
+            s#^data_shards.*#data_shards      = $T_FEC_DATA#
+            s#^parity_shards.*#parity_shards    = $T_FEC_PARITY#
+            s#^mtu.*#mtu              = $T_PACKET_MTU#
+            s#^interval_ms.*#interval_ms      = $T_KCP_INTERVAL#
+        }" "$f"
+    fi
     # A hand-set profile is no longer whichever preset it started as.
-    sed -i "s#^profile.*#profile          = \"$(preset_name "$car" "$win" "$ka" "$snd" "$rcv")\"#" "$f"
+    sed -i "s#^profile.*#profile          = \"$(preset_name "$car" "$win" "$ka" "$snd" "$rcv" \
+        "$T_FEC_DATA" "$T_FEC_PARITY" "$T_PACKET_MTU" "$T_KCP_INTERVAL")\"#" "$f"
     if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         rm -f "$f.bak"
         systemctl restart "pingify@$name"

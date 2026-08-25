@@ -49,8 +49,35 @@ func TestPacketTransportConfigRejectsUnsafeShapes(t *testing.T) {
 	bad[2].KCPInterval = 1
 	bad[3].PCKFlags = "R"
 	for i := range bad {
+		bad[i].applyDefaults()
 		if err := bad[i].validate(); err == nil {
 			t.Fatalf("invalid packet config %d was accepted: %+v", i, bad[i])
+		}
+	}
+}
+
+func TestTuningRejectsValuesTheRuntimeWouldNotApplyExactly(t *testing.T) {
+	base := Config{
+		Role: "server", Mode: "forward", Transport: "kcp", Listen: ":9443",
+		Token: "secret", Forwards: []string{"8010"},
+	}
+	base.applyDefaults()
+	tests := []struct {
+		name string
+		edit func(*Config)
+	}{
+		{"too many carriers", func(c *Config) { c.Carriers = 65 }},
+		{"window below runtime floor", func(c *Config) { c.WindowKB = 63 }},
+		{"packet window above engine cap", func(c *Config) { c.WindowKB = 4097 }},
+		{"keepalive above bound", func(c *Config) { c.KeepaliveSec = 301 }},
+		{"send buffer below bound", func(c *Config) { c.SndBufKB = 63 }},
+		{"unknown profile", func(c *Config) { c.Profile = "magic" }},
+	}
+	for _, tc := range tests {
+		c := base
+		tc.edit(&c)
+		if err := c.validate(); err == nil {
+			t.Errorf("%s was accepted: %+v", tc.name, c)
 		}
 	}
 }

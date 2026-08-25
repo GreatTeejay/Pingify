@@ -1,12 +1,14 @@
 package main
 
 import (
+	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -16,10 +18,10 @@ import (
 // ---------------------------------------------------------------------------
 // the echo transport
 //
-// Carries the same braid stream inside ICMP echo packets, for a path where
-// TCP is simply not allowed out. It is the fallback, not the fast option:
-// every datagram is about 1.4 KB and has to be acknowledged, so expect a
-// fraction of what braid does over TCP.
+// Carries the same braid stream inside ICMP echo packets. Some Iran routes
+// carry ICMP more cleanly than TCP or UDP, so this is a first-class transport,
+// not merely an emergency fallback. Its packet path is batch-read and its ARQ
+// window is shared across several lightweight sessions to fill a fast link.
 //
 // Data travels in Echo *Reply* packets (type 0) in both directions rather
 // than requests. Two reasons: the kernel answers an echo request by itself,
@@ -38,7 +40,11 @@ const (
 	icmpEchoRequest = 8
 	icmpTagLen      = 4
 	icmpHdrLen      = 8
-	icmpMaxPayload  = 1200 // conservative: fits inside a 1400-byte path MTU
+	// 1320 bytes of ARQ payload produces a 1372-byte IPv4 packet after the
+	// ICMP, tag and ARQ headers. It stays below the 1400-byte paths this
+	// transport targets while carrying ten percent more useful data.
+	icmpMaxPayload = 1320
+	icmpMaxPacket  = 2048 // our packet is < 1400; larger traffic is not ours
 
 	// what this transport's header mask key is derived from
 	icmpARQLabel = "pingify/v3 icmp"
@@ -59,17 +65,6 @@ func icmpChecksum(b []byte) uint16 {
 		sum = (sum & 0xffff) + (sum >> 16)
 	}
 	return ^uint16(sum)
-}
-
-func buildEcho(typ byte, id, seq uint16, payload []byte) []byte {
-	b := make([]byte, icmpHdrLen+len(payload))
-	b[0] = typ
-	b[1] = 0
-	binary.BigEndian.PutUint16(b[4:6], id)
-	binary.BigEndian.PutUint16(b[6:8], seq)
-	copy(b[icmpHdrLen:], payload)
-	binary.BigEndian.PutUint16(b[2:4], icmpChecksum(b))
-	return b
 }
 
 // stripIP removes an IPv4 header if the kernel handed us one. Raw sockets do
@@ -93,8 +88,11 @@ type sessionKey struct {
 // icmpTransport owns the one raw socket and fans packets out to the ARQ
 // connection they belong to.
 type icmpTransport struct {
-	pc  net.PacketConn
-	psk []byte
+	pc       net.PacketConn
+	psk      []byte
+	mask     cipher.Block // header key is constant for the transport
+	maskOnce sync.Once
+	tagHash  sync.Pool // keyed HMAC states reused on the packet hot path
 	// Segments in flight per ARQ connection, from the tunnel's window_kb.
 	window int
 
@@ -111,7 +109,8 @@ type icmpTransport struct {
 // is right on a server with one. On a server with several the kernel picks
 // the source itself, and a reply that leaves from an address the far end is
 // not expecting is a reply the far end throws away - so the wizard asks.
-func newICMPTransport(psk []byte, bind string, windowKB int) (*icmpTransport, error) {
+func newICMPTransport(cfg *Config) (*icmpTransport, error) {
+	bind := cfg.Listen
 	if bind == "" || bind == "0.0.0.0" {
 		bind = "0.0.0.0"
 	}
@@ -121,23 +120,48 @@ func newICMPTransport(psk []byte, bind string, windowKB int) (*icmpTransport, er
 	}
 	t := &icmpTransport{
 		pc:       pc,
-		psk:      psk,
-		window:   arqWindowFor(windowKB, icmpMaxPayload),
+		psk:      cfg.key(),
+		mask:     blockFrom(arqMaskKey(icmpARQLabel, cfg.key())),
+		window:   arqWindowFor(cfg.WindowKB, icmpMaxPayload),
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
 		inbound: make(chan net.Conn, 64),
 		done:    make(chan struct{}),
 	}
-	go t.readLoop()
+	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
+	tunePacketSocket(pc, cfg)
+	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, icmpMaxPacket,
+		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
+	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
+		workers, batch, icmpMaxPayload)
 	return t, nil
 }
 
-func (t *icmpTransport) tag(hdr []byte) []byte {
-	m := hmac.New(sha256.New, t.psk)
+func (t *icmpTransport) putTag(dst, hdr []byte) {
+	m := t.tagHash.Get().(hash.Hash)
+	m.Reset()
 	m.Write([]byte("pingify/v3 icmp tag"))
 	m.Write(hdr)
-	return m.Sum(nil)[:icmpTagLen]
+	var sum [sha256.Size]byte
+	out := m.Sum(sum[:0])
+	copy(dst, out[:icmpTagLen])
+	t.tagHash.Put(m)
+}
+
+func (t *icmpTransport) validTag(want, hdr []byte) bool {
+	var got [icmpTagLen]byte
+	t.putTag(got[:], hdr)
+	return hmac.Equal(want, got[:])
+}
+
+func (t *icmpTransport) headerMask() cipher.Block {
+	t.maskOnce.Do(func() {
+		if t.mask == nil {
+			t.mask = blockFrom(arqMaskKey(icmpARQLabel, t.psk))
+		}
+	})
+	return t.mask
 }
 
 // sender returns the function one ARQ connection uses to put a datagram on
@@ -145,50 +169,44 @@ func (t *icmpTransport) tag(hdr []byte) []byte {
 func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
 	var seq uint32
 	return func(datagram []byte) error {
-		body := make([]byte, icmpTagLen+len(datagram))
-		copy(body[:icmpTagLen], t.tag(datagram[:min(len(datagram), arqOver)]))
-		copy(body[icmpTagLen:], datagram)
+		// Header, tag and payload are built in one buffer. This used to create a
+		// tagged body and then copy it into a second allocation in buildEcho for
+		// every packet on the path.
+		pkt := make([]byte, icmpHdrLen+icmpTagLen+len(datagram))
+		pkt[0] = icmpEchoReply
+		binary.BigEndian.PutUint16(pkt[4:6], id)
 		s := uint16(atomic.AddUint32(&seq, 1))
-		_, err := t.pc.WriteTo(buildEcho(icmpEchoReply, id, s, body), peer)
+		binary.BigEndian.PutUint16(pkt[6:8], s)
+		body := pkt[icmpHdrLen:]
+		t.putTag(body[:icmpTagLen], datagram[:min(len(datagram), arqOver)])
+		copy(body[icmpTagLen:], datagram)
+		binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
+		_, err := t.pc.WriteTo(pkt, peer)
 		return err
 	}
 }
 
-func (t *icmpTransport) readLoop() {
-	buf := make([]byte, 65535)
-	for {
-		n, addr, err := t.pc.ReadFrom(buf)
-		if err != nil {
-			select {
-			case <-t.done:
-				return
-			default:
-			}
-			logDebug("icmp read: %v", err)
-			continue
-		}
-		msg := stripIP(buf[:n])
-		if len(msg) < icmpHdrLen+icmpTagLen+arqOver {
-			continue
-		}
-		if msg[0] != icmpEchoReply && msg[0] != icmpEchoRequest {
-			continue
-		}
-		body := msg[icmpHdrLen:]
-		datagram := body[icmpTagLen:]
-
-		// Reject the ordinary pings a public address collects before doing
-		// any real work on them.
-		if !hmac.Equal(body[:icmpTagLen], t.tag(datagram[:min(len(datagram), arqOver)])) {
-			continue
-		}
-
-		ip, _ := addr.(*net.IPAddr)
-		if ip == nil {
-			continue
-		}
-		t.dispatch(ip, binary.BigEndian.Uint16(msg[4:6]), append([]byte(nil), datagram...))
+func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
+	msg := stripIP(pkt)
+	if len(msg) < icmpHdrLen+icmpTagLen+arqOver {
+		return
 	}
+	if msg[0] != icmpEchoReply && msg[0] != icmpEchoRequest {
+		return
+	}
+	body := msg[icmpHdrLen:]
+	datagram := body[icmpTagLen:]
+
+	// handlePacket and onDatagram finish synchronously, so the batch buffer
+	// can be used in place. Copying every received packet here only fed the GC.
+	if !t.validTag(body[:icmpTagLen], datagram[:min(len(datagram), arqOver)]) {
+		return
+	}
+	ip, _ := addr.(*net.IPAddr)
+	if ip == nil {
+		return
+	}
+	t.dispatch(ip, binary.BigEndian.Uint16(msg[4:6]), datagram)
 }
 
 // dispatch hands the datagram to its connection, creating one if this is a
@@ -196,11 +214,11 @@ func (t *icmpTransport) readLoop() {
 func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	// The header is masked with a key both ends derive from the PSK, so the
 	// session and carrier can be read out before any connection exists.
-	hdr := make([]byte, arqHdr)
-	copy(hdr, datagram[arqNonce:arqOver])
-	maskHeader(blockFrom(arqMaskKey(icmpARQLabel, t.psk)), datagram[:arqNonce], hdr)
+	var hdr [arqHdr]byte
+	copy(hdr[:], datagram[arqNonce:arqOver])
+	maskHeader(t.headerMask(), datagram[:arqNonce], hdr[:])
 	var h arqHeader
-	h.get(hdr)
+	h.get(hdr[:])
 
 	key := sessionKey{peer: peer.String(), session: h.session, carrier: h.carrier}
 
@@ -216,8 +234,8 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 		// a session that does not exist - and closing one sends a datagram
 		// back to a stray we have decided to ignore.
 		//
-		// dispatch runs only on the single read loop, so a plain length test
-		// races with nothing.
+		// The length test is under t.mu, so parallel receive workers cannot
+		// overbook the channel.
 		if len(t.inbound) == cap(t.inbound) {
 			t.mu.Unlock()
 			logDebug("icmp: no room to accept session %08x carrier %d from %s, ignored",
