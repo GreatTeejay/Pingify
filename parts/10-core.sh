@@ -2,12 +2,11 @@
 # ---------------------------------------------------------------------------
 # the core
 #
-# Three ways to get it, tried in this order:
+# Two ways to get it, tried in this order:
 #   1. download the prebuilt binary for this CPU from GitHub Releases - the
 #      normal path, a couple of seconds and no toolchain
 #   2. compile the sources embedded in this script - needs Go but downloads
 #      nothing, for a server that cannot reach the release files
-#   3. import a binary you built elsewhere and copied across
 # ---------------------------------------------------------------------------
 
 release_base() { printf 'https://github.com/%s/releases/latest/download' "$PINGIFY_REPO"; }
@@ -20,10 +19,17 @@ core_version() {
 
 # Accept a candidate binary only once it has proved it runs on this machine.
 adopt_core() {
-    local tmp="$1"
+    local tmp="$1" got=""
     chmod +x "$tmp" 2>/dev/null
     if ! "$tmp" -version >/dev/null 2>&1; then
         fail "that binary does not run on this server (wrong architecture?)"
+        rm -f "$tmp"
+        return 1
+    fi
+    got="$("$tmp" -version 2>/dev/null | awk '{print $2}')"
+    if [ "$got" != "$PINGIFY_VERSION" ]; then
+        warn "downloaded core is $got, but this manager is $PINGIFY_VERSION"
+        dim "the release is older than this script; using the embedded source instead"
         rm -f "$tmp"
         return 1
     fi
@@ -35,7 +41,7 @@ adopt_core() {
 
 download_core() {
     [ -n "$GOARCH" ] || { warn "no prebuilt core for $ARCH"; return 1; }
-    have curl || return 1
+    have curl || have wget || return 1
     local base tmp="/tmp/pingify-core.dl" sums="/tmp/pingify-core.sums"
     base="$(release_base)"
 
@@ -49,7 +55,7 @@ download_core() {
     # not fatal, a wrong one is.
     if fetch "$base/SHA256SUMS" "$sums" 30 2>/dev/null; then
         local want got
-        want="$(awk -v a="$(core_asset)" '$2 ~ a {print $1; exit}' "$sums")"
+        want="$(awk -v a="$(core_asset)" '$2 == a || $2 == "*" a {print $1; exit}' "$sums")"
         got="$(sha256sum "$tmp" | awk '{print $1}')"
         rm -f "$sums"
         if [ -n "$want" ] && [ "$want" != "$got" ]; then
@@ -87,7 +93,7 @@ build_core() {
 # install_core is the full ladder; ensure_core only runs it when needed.
 install_core() {
     if download_core; then return 0; fi
-    warn "GitHub is not reachable - compiling the core here instead"
+    warn "a matching prebuilt core was unavailable - compiling the embedded core"
     build_core
 }
 
@@ -114,7 +120,7 @@ ensure_core_current() {
     warn "the core is $(core_version), this script is $PINGIFY_VERSION"
     dim "they have to match - the config format is shared between them"
     say ""
-    if download_core; then
+    if install_core; then
         restart_all "the core was updated"
     else
         say ""
@@ -133,7 +139,7 @@ write_units() {
     cat > "$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
-Documentation=https://github.com/GreatTeejay/pingfa
+Documentation=https://github.com/GreatTeejay/Pingify
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0

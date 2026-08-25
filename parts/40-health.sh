@@ -120,6 +120,20 @@ health_check() {
         fi
     fi
 
+    if [ "$T_TRANSPORT" = "wss" ] && this_side_accepts; then
+        if [ -n "$T_CERT_FILE" ] || [ -n "$T_KEY_FILE" ]; then
+            if [ -r "$T_CERT_FILE" ] && [ -r "$T_KEY_FILE" ]; then
+                hc_ok "the configured WSS certificate and key are readable"
+            else
+                hc_bad "the configured WSS certificate pair is missing or unreadable"
+                hc_fix "Manage ${BX_ARR} $name ${BX_ARR} Config, or rebuild with Automatic certificate"
+            fi
+        else
+            hc_ok "WSS uses its automatic origin certificate"
+            hc_note "behind Cloudflare this needs SSL mode Full, not Full (strict)"
+        fi
+    fi
+
     # --- carriers, or the one link a kernel tunnel has ---------------------
     local up=0 total="$T_CARRIERS" rtt="-" brief=""
     if [ "$state" = "active" ]; then
@@ -159,8 +173,14 @@ health_check() {
                     hc_fix "open ${T_PORT}/tcp in the provider firewall and inspect the live log"
                     hc_note "PCK has no TCP listener; do not test it with ss or /dev/tcp"
                     hc_note "both servers need Linux, CAP_NET_RAW/root and iptables" ;;
+                udp)
+                    hc_fix "open ${T_PORT}/udp here and in the provider firewall"
+                    hc_note "ss -lunp | grep :${T_PORT}" ;;
+                ws | wss)
+                    hc_fix "open ${T_PORT}/tcp here and inspect the other server's live log"
+                    [ "$T_TRANSPORT" = "wss" ] && hc_note "Cloudflare: Proxy on; SSL Full for automatic cert, Full (strict) for a valid origin cert" ;;
                 *)
-                    hc_fix "check the other server is running and can ping this one" ;;
+                    hc_fix "check the other server is running and inspect both live logs" ;;
             esac
         else
             hc_note "this end dials ${CFG_CONNECT}"
@@ -173,8 +193,13 @@ health_check() {
                 pck)
                     hc_fix "inspect both live logs for packet-socket or firewall-rule errors"
                     hc_note "PCK deliberately has no TCP handshake for /dev/tcp to test" ;;
+                udp)
+                    hc_fix "open ${T_PORT}/udp on the other server and its provider firewall" ;;
+                ws | wss)
+                    hc_fix "run Diagnostics ${BX_ARR} Full check for the exact HTTP/Cloudflare status"
+                    hc_note "the live log now includes the HTTP status and CF-Ray when available" ;;
                 *)
-                    hc_fix "check the other server answers a ping:  ping -c3 ${CFG_CONNECT}" ;;
+                    hc_fix "inspect both live logs and verify the transport's firewall protocol" ;;
             esac
         fi
         hc_note "and that both ends have the same security token"

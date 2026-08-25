@@ -3,7 +3,7 @@
 # update / remove
 # ---------------------------------------------------------------------------
 
-RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/pingfa/main"
+RAW_BASE="https://raw.githubusercontent.com/GreatTeejay/Pingify/main"
 
 restart_all() {
     local n any=0
@@ -173,6 +173,44 @@ tcp_probe() {
     timeout 5 bash -c ": < /dev/tcp/$1/$2" 2>/dev/null
 }
 
+# A WS/WSS endpoint should answer like a web server even when the secret
+# Upgrade path is not known. The status code tells an operator which layer
+# failed: 52x is Cloudflare-to-origin, 525/526 is TLS, and 000 is reachability.
+web_probe_code() {
+    local scheme="$1" host="$2" port="$3" edge="${4:-}"
+    local code=""
+    local -a args=()
+    have curl || { printf 'curl-missing'; return; }
+    # --connect-to accepts either an IP or a hostname for the edge while the
+    # URL keeps the real Host/SNI name, exactly like the core's WSS dialer.
+    [ -n "$edge" ] && args=(--connect-to "${host}:${port}:${edge}:${port}")
+    code="$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 6 --max-time 10 \
+        "${args[@]}" "${scheme}://${host}:${port}/" 2>/dev/null)" || true
+    printf '%s' "${code:-000}"
+}
+
+web_probe_explain() {
+    local code="$1" transport="${2:-wss}"
+    case "$code" in
+        200|304|404) check_pass "web front answered HTTP $code" ;;
+        301|302|307|308)
+            if [ "$transport" = "ws" ]; then
+                check_warn "plain WS is being redirected (HTTP $code)"
+                check_note "disable Always Use HTTPS for this host, or use WSS"
+            else
+                check_pass "web front answered HTTP $code"
+            fi ;;
+        521|522|523) check_fail "Cloudflare answered $1 - it cannot reach the origin"
+                     check_note "open the tunnel port at the origin and verify the DNS address" ;;
+        525|526) check_fail "Cloudflare TLS failed with $1"
+                 check_note "use SSL mode Full for automatic cert, or install a valid origin cert for Full (strict)" ;;
+        403) check_fail "the web front answered 403"
+             check_note "a Cloudflare WAF/Access rule may be blocking the tunnel host" ;;
+        curl-missing) check_warn "curl is missing, so the WebSocket front was not tested" ;;
+        *) check_fail "the web front did not answer (HTTP ${1:-000})" ;;
+    esac
+}
+
 diag_tunnel() {
     local name="$1" f
     f="$(cfg_file "$name")"
@@ -181,7 +219,9 @@ diag_tunnel() {
     printf '\n  %s%s%s\n' "$C_B" "$name" "$C_OFF"
 
     # 1. the config the core will actually read
-    if "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
+    if kernel_transport; then
+        check_pass "kernel tunnel config is present"
+    elif "$CORE_BIN" -c "$f" -check >/dev/null 2>&1; then
         check_pass "config is valid"
     else
         check_fail "the core rejects this config"
@@ -196,9 +236,13 @@ diag_tunnel() {
         *)        check_fail "service is not enabled"; return ;;
     esac
 
-    # 3. the link itself, straight from the core
+    # 3. the link itself, straight from the core or kernel
     local brief state up total rtt
-    brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    if kernel_transport; then
+        brief="$(kernel_brief "$name")"
+    else
+        brief="$("$CORE_BIN" -status "$T_STATUS" -brief 2>/dev/null)"
+    fi
     set -- $brief
     state="${1:-down}"; up="${2:-0}"; total="${3:-0}"; rtt="${4:-0}"
     if [ "$state" = "up" ]; then
@@ -208,38 +252,63 @@ diag_tunnel() {
         check_fail "no connection to the other server"
     fi
 
+    if kernel_transport; then
+        [ "$up" = "1" ] || check_note "inspect the interface and private route from Manage tunnels"
+        return
+    fi
+
     # 4. the path, so a down link points at a cause
     cfg_endpoints
     if [ -n "$CFG_CONNECT" ]; then
         local host="${CFG_CONNECT%:*}" port="${CFG_CONNECT##*:}"
-        if [ "$T_TRANSPORT" = "icmp" ]; then
-            host="$CFG_CONNECT"
-            if have ping && ping -c 2 -W 2 "$host" >/dev/null 2>&1; then
-                check_pass "$host answers a ping - the ICMP path is open"
-            else
-                check_fail "$host does not answer a ping"
-                check_note "an ICMP tunnel cannot work if ping does not get through"
-            fi
-            return
-        fi
-        if tcp_probe "$host" "$port"; then
-            check_pass "port $port on $host accepts connections"
-        else
-            check_fail "cannot reach $host:$port"
-            check_note "is the other server running, and is the port open there?"
-        fi
+        case "$T_TRANSPORT" in
+            icmp)
+                check_note "ICMP uses authenticated echo replies; ordinary ping may be intentionally blocked"
+                [ "$state" = "up" ] || check_note "inspect both live logs for raw socket or wrong-address errors" ;;
+            udp | kcp)
+                [ "$state" = "up" ] && check_pass "UDP packet path is carrying the tunnel" || {
+                    check_fail "the UDP packet path has no live session"
+                    check_note "open ${T_PORT}/udp on the accepting server and provider firewall"
+                } ;;
+            pck)
+                [ "$state" = "up" ] && check_pass "raw TCP-shaped packet path is carrying the tunnel" || {
+                    check_fail "PCK has no live raw-packet session"
+                    check_note "check CAP_NET_RAW, iptables guards and the PCK local port on both servers"
+                } ;;
+            ws | wss)
+                local scheme="http" code edge=""
+                [ "$T_TRANSPORT" = "wss" ] && scheme="https"
+                [ -n "$T_EDGE" ] && edge="$T_EDGE"
+                code="$(web_probe_code "$scheme" "$T_PEER_IP" "$port" "$edge")"
+                web_probe_explain "$code" "$T_TRANSPORT" ;;
+            *)
+                if tcp_probe "$host" "$port"; then
+                    check_pass "port $port on $host accepts connections"
+                else
+                    check_fail "cannot reach $host:$port"
+                    check_note "is the other server running, and is the port open there?"
+                fi ;;
+        esac
     else
         local port="${CFG_LISTEN##*:}"
-        if [ "$T_TRANSPORT" = "icmp" ]; then
-            check_pass "ICMP needs no port to be open here"
-            return
-        fi
-        if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
-            check_pass "listening on port $port"
-            [ "$state" = "up" ] || check_note "open $port in your firewall and check the other server"
-        else
-            check_fail "nothing is listening on port $port"
-        fi
+        case "$T_TRANSPORT" in
+            icmp) check_pass "ICMP needs no port; one raw socket serves every session" ;;
+            udp | kcp)
+                if ss -Hlun "sport = :$port" 2>/dev/null | grep -q .; then
+                    check_pass "listening on UDP port $port"
+                else
+                    check_fail "nothing is listening on UDP port $port"
+                fi ;;
+            pck)
+                check_note "PCK has no TCP listener; its filtered AF_PACKET socket is checked in Health" ;;
+            *)
+                if ss -Hltn "sport = :$port" 2>/dev/null | grep -q .; then
+                    check_pass "listening on TCP port $port"
+                    [ "$state" = "up" ] || check_note "open $port in your firewall and check the other server"
+                else
+                    check_fail "nothing is listening on TCP port $port"
+                fi ;;
+        esac
     fi
 
     # 5. the ports clients are told to use

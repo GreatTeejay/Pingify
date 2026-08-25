@@ -320,6 +320,8 @@ wget() {
 }
 fetch "http://example.invalid/x" "$WORK/fetched" 5
 check "fetch falls back to wget" "$(cat "$WORK/fetched" 2>/dev/null)" "downloaded"
+dc() { awk '/^download_core\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
+check "core download also accepts wget" "$(dc | grep -c 'have curl || have wget')" "1"
 
 have() { case "$1" in curl|wget) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
 fetch "http://example.invalid/x" "$WORK/none" 5
@@ -339,9 +341,19 @@ note "the setup token carries a whole tunnel"
 decode() {
     local raw
     raw="$(printf '%s' "$1" | base64 -d)"
-    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV TOK_TL TOK_TP TOK_MTU TOK_TTL TOK_AWGPORT TOK_AWGPRIV TOK_AWGPUB TOK_AWGOBF TOK_FEC_DATA TOK_FEC_PARITY TOK_PACKET_MTU TOK_KCP_INTERVAL TOK_PCK_FLAGS <<EOF
+    IFS='|' read -r TOK_V TOK_KIND TOK_TR TOK_MODE TOK_FWD TOK_DIAL TOK_HOST TOK_PORT TOK_TOKEN TOK_CAR TOK_WIN TOK_KA TOK_SND TOK_RCV TOK_TL TOK_TP TOK_MTU TOK_TTL TOK_AWGPORT TOK_AWGPRIV TOK_AWGPUB TOK_AWGOBF TOK_FEC_DATA TOK_FEC_PARITY TOK_PACKET_MTU TOK_KCP_INTERVAL TOK_PCK_FLAGS TOK_PROFILE TOK_OBF TOK_SUM <<EOF
 $raw
 EOF
+    if [ "$TOK_V" = "p5" ]; then
+        TOK_HOST="$(setup_token_text_decode "$TOK_HOST")"
+        TOK_TOKEN="$(setup_token_text_decode "$TOK_TOKEN")"
+        TOK_TL="$(setup_token_text_decode "$TOK_TL")"
+        TOK_TP="$(setup_token_text_decode "$TOK_TP")"
+        TOK_AWGPRIV="$(setup_token_text_decode "$TOK_AWGPRIV")"
+        TOK_AWGPUB="$(setup_token_text_decode "$TOK_AWGPUB")"
+        TOK_AWGOBF="$(setup_token_text_decode "$TOK_AWGOBF")"
+        TOK_PCK_FLAGS="$(setup_token_text_decode "$TOK_PCK_FLAGS")"
+    fi
 }
 
 # --- TCP, reverse: IRAN accepts, so the peer is told to dial us -------------
@@ -352,7 +364,7 @@ T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"
 T_CARRIERS=14; T_WINDOW=1024; T_KEEPALIVE=10; T_SNDBUF=1024; T_RCVBUF=1024
 T_FORWARDS='"6526"'; T_STATUS="127.0.0.1:9700"
 decode "$(cfg_setup_token)"
-check "token version"           "$TOK_V"      "p4"
+check "token version"           "$TOK_V"      "p5"
 check "transport travels"       "$TOK_TR"     "tcp"
 check "forwarder travels"       "$TOK_FWD"    "pingify"
 check "the peer is told to dial" "$TOK_DIAL"  "1"
@@ -410,6 +422,114 @@ if [ -n "${CORE_BIN:-}" ] && [ -x "${CORE_BIN:-}" ]; then
     check "the core accepts it"  "$?"                                   "0"
 fi
 
+# ---------------------------------------------------------------------------
+note "every transport makes one matching Iran / Kharej pair"
+# ---------------------------------------------------------------------------
+# This uses the production decoder, not positional test parsing. Each source
+# config is written first, its actual setup token is imported, and the KHAREJ
+# config is then written from those decoded values. A password containing all
+# three characters that broke the old format (pipe, quote and hash) must make
+# the round trip unchanged too.
+PAIR="$WORK/token-pairs"; mkdir -p "$PAIR"
+(
+    CFG_DIR="$PAIR"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    secret='sec|ret"#\path'
+    for tr in tcp udp kcp pck icmp ws wss gre awg; do
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="$tr"; T_ACCEPTS="server"
+        case "$tr" in icmp) T_KIND="tun" ;; esac
+        cfg_mode
+        T_PORT=8543
+        if [ "$tr" = "wss" ]; then T_PUBLIC_IP="iran.example.com"
+        else T_PUBLIC_IP="203.0.113.9"; fi
+        T_PEER_IP="198.51.100.4"; T_TOKEN="$secret"; T_FORWARDS='"8010"'
+        T_TUNLOCAL="10.77.10.1/24"; T_TUNPEER="10.77.10.2/24"; T_TUNMTU=1320
+        T_GRE_TTL=64; T_AWG_PORT=51888
+        T_AWG_PRIV="IRAN-PRIVATE"; T_AWG_PUB="KHAREJ-PUBLIC"
+        awg_peer_priv="KHAREJ-PRIVATE"; awg_self_pub="IRAN-PUBLIC"
+        T_AWG_OBF="5,50,1000,68,91,101,102,103,104"
+        if kernel_transport; then T_PRESET="kernel"
+        else apply_preset throughput; T_OBFUSCATE="true"; fi
+        T_NAME="$(tunnel_default_name)"
+        oct="$(link_octet)" && T_NAME="$(tunnel_default_name "$oct")"
+        cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
+        kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:9700"
+        iran_name="$T_NAME"
+        iran_file="$(cfg_save)" || { echo "$tr.read=no"; continue; }
+        if kernel_transport; then iran_core="kernel"
+        elif [ -x "$CORE_BIN" ] && "$CORE_BIN" -c "$iran_file" -check >/dev/null 2>&1; then iran_core="yes"
+        else iran_core="no"; fi
+
+        expected="$T_CARRIERS/$T_WINDOW/$T_KEEPALIVE/$T_SNDBUF/$T_RCVBUF/$T_FEC_DATA/$T_FEC_PARITY/$T_PACKET_MTU/$T_KCP_INTERVAL/$T_PRESET/$T_OBFUSCATE"
+        setup="$(cfg_setup_token)"
+        if ! setup_token_read "$setup"; then
+            echo "$tr.read=no"
+            continue
+        fi
+        got="$T_CARRIERS/$T_WINDOW/$T_KEEPALIVE/$T_SNDBUF/$T_RCVBUF/$T_FEC_DATA/$T_FEC_PARITY/$T_PACKET_MTU/$T_KCP_INTERVAL/$T_PRESET/$T_OBFUSCATE"
+        [ "$got" = "$expected" ] && mirror=yes || mirror=no
+        [ "$T_TOKEN" = "$secret" ] && secret_ok=yes || secret_ok=no
+        [ "$T_ROLE" = "client" ] && role_ok=yes || role_ok=no
+        T_PUBLIC_IP="198.51.100.4"
+        T_NAME="$(tunnel_default_name)"
+        oct="$(link_octet)" && T_NAME="$(tunnel_default_name "$oct")"
+        cfg_needs_link && T_TUNIF="$(link_iface "$T_NAME")"
+        kernel_transport && T_STATUS="" || T_STATUS="127.0.0.1:9701"
+        kh_name="$T_NAME"
+        kh_file="$(cfg_save)" || { echo "$tr.read=no"; continue; }
+        if kernel_transport; then
+            kh_core="kernel"
+            grep -q '^\[tuning\]' "$kh_file" && clean_kernel=no || clean_kernel=yes
+        elif [ -x "$CORE_BIN" ] && "$CORE_BIN" -c "$kh_file" -check >/dev/null 2>&1; then
+            kh_core="yes"; clean_kernel="n/a"
+        else
+            kh_core="no"; clean_kernel="n/a"
+        fi
+        cfg_load "$kh_name"
+        [ "$T_TOKEN" = "$secret" ] && reload=yes || reload=no
+
+        echo "$tr.read=yes"
+        echo "$tr.role=$role_ok"
+        echo "$tr.secret=$secret_ok/$reload"
+        echo "$tr.mirror=$mirror"
+        echo "$tr.names=$iran_name/$kh_name"
+        echo "$tr.core=$iran_core/$kh_core"
+        echo "$tr.kernel-clean=$clean_kernel"
+    done
+
+    # A token whose payload changed after it was printed must be rejected
+    # before any variables from it are trusted.
+    cfg_reset; T_ROLE=server; T_TRANSPORT=tcp; T_ACCEPTS=server; cfg_mode
+    T_PUBLIC_IP=203.0.113.9; T_TOKEN="$secret"; T_PORT=9443; apply_preset balanced
+    good="$(cfg_setup_token)"; raw="$(printf '%s' "$good" | base64 -d)"
+    raw="${raw/|balanced|/|gaming|}"
+    bad="$(printf '%s' "$raw" | base64 | tr -d '\n')"
+    if setup_token_read "$bad"; then echo "tamper=accepted"
+    else echo "tamper=$SETUP_TOKEN_ERROR"; fi
+) > "$WORK/token-pairs.out" 2>&1
+pair() { grep -m1 "^$1=" "$WORK/token-pairs.out" | cut -d= -f2-; }
+
+for tr in tcp udp kcp pck icmp ws wss gre awg; do
+    check "$tr token imports"       "$(pair "$tr.read")"   "yes"
+    check "$tr becomes KHAREJ"      "$(pair "$tr.role")"   "yes"
+    check "$tr keeps the secret"    "$(pair "$tr.secret")" "yes/yes"
+    check "$tr mirrors its tuning"  "$(pair "$tr.mirror")" "yes"
+    case "$tr" in
+        tcp) want_names="iran-8543/kharej-8543" ;;
+        icmp | gre | awg) want_names="iran-tun-$tr-77/kharej-tun-$tr-77" ;;
+        *) want_names="iran-$tr-8543/kharej-$tr-8543" ;;
+    esac
+    check "$tr names start with side" "$(pair "$tr.names")" "$want_names"
+    if [ "$tr" = "gre" ] || [ "$tr" = "awg" ]; then
+        check "$tr uses the kernel only" "$(pair "$tr.core")" "kernel/kernel"
+        check "$tr has no fake core tuning" "$(pair "$tr.kernel-clean")" "yes"
+    else
+        check "$tr configs validate" "$(pair "$tr.core")" "yes/yes"
+    fi
+done
+check "a changed token is rejected" "$(pair tamper)" "the token checksum does not match"
+
 
 # ---------------------------------------------------------------------------
 note "the wizard's first question"
@@ -431,7 +551,7 @@ check "the wizard offers three ways in" \
 # tunnel with no address to dial and no explanation of why it would not run.
 check "the importer asks nothing" "$(importer_q | wc -l | tr -d ' ')" "0"
 imp() { awk '/^import_tunnel\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "it knows this is KHAREJ" "$(imp | grep -c 'T_ROLE="client"')" "1"
+check "it knows this is KHAREJ" "$(awk '/^setup_token_read\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'T_ROLE="client"')" "1"
 check "and never asks for ports" "$(imp | grep -c 'ports, comma separated')" "0"
 check "and three is the token"         \
       "$(awk '/^new_tunnel\(\) \{/{f=1} f&&/side" = "3"/{print; exit}' Pingify.sh | grep -c import_tunnel)" "1"
@@ -528,7 +648,7 @@ check "the tunnel menu leads with service" \
       "$(menu_block | grep -m1 -o 'group "[A-Za-z]*"')" 'group "Service"'
 check "restart is 1"     "$(menu_block | grep -c 'item 1 "Restart"')"            "1"
 check "delete is 4"      "$(menu_block | grep -c 'item 4 "Delete this tunnel"')" "1"
-check "and nine at most" "$(menu_block | grep -cE '^        item [1-9] ')"       "9"
+check "and nine at most" "$(menu_block | grep -oE 'item [1-9]' | sort -u | wc -l | tr -d ' ')" "9"
 check "no letter keys"   "$(menu_block | grep -c 'item d ')"                     "0"
 check "the core menu is gone"     "$(grep -c 'Core options' Pingify.sh)"         "0"
 check "and nothing still calls it" "$(grep -c 'update_menu' Pingify.sh)"         "0"
@@ -567,6 +687,27 @@ check "wss balanced receive room" "$T_RCVBUF" "8192"
 apply_preset extreme >/dev/null 2>&1
 check "wss extreme window"  "$T_WINDOW" "8192"
 check "wss extreme buffers" "$T_SNDBUF/$T_RCVBUF" "32768/32768"
+
+# Packet presets include more than carriers and a credit window. Their FEC,
+# MTU and KCP tick have to round-trip too; otherwise a hand-edited FEC ratio
+# can be labelled Balanced and silently select the wrong receive profile.
+T_TRANSPORT="kcp"
+for _p in gaming latency balanced throughput extreme; do
+    apply_preset "$_p" >/dev/null 2>&1
+    check "kcp $_p names all packet tuning back" \
+        "$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
+            "$T_FEC_DATA" "$T_FEC_PARITY" "$T_PACKET_MTU" "$T_KCP_INTERVAL")" "$_p"
+done
+apply_preset balanced >/dev/null 2>&1
+T_FEC_PARITY=$((T_FEC_PARITY + 1))
+check "hand-set KCP FEC is custom" \
+    "$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
+        "$T_FEC_DATA" "$T_FEC_PARITY" "$T_PACKET_MTU" "$T_KCP_INTERVAL")" "custom"
+
+T_TRANSPORT="icmp"
+apply_preset balanced >/dev/null 2>&1
+check "icmp balanced uses four sessions" "$T_CARRIERS" "4"
+check "icmp balanced has burst room" "$T_SNDBUF/$T_RCVBUF" "16384/16384"
 T_TRANSPORT="tcp"
 
 # ---------------------------------------------------------------------------
@@ -747,7 +888,7 @@ check "and both addresses"      "$(toml_get "$gre_file" gre peer_public)" "198.5
 check "the interface is named"  "$(toml_get "$gre_file" tun name)"        "gre-iran"
 
 decode "$(cfg_setup_token)"
-check "the token is p4"          "$TOK_V"     "p4"
+check "the token is p5"          "$TOK_V"     "p5"
 check "gre travels"              "$TOK_TR"    "gre"
 check "the ttl travels"          "$TOK_TTL"   "255"
 check "and our address, always"  "$TOK_HOST"  "203.0.113.9"
@@ -1047,7 +1188,7 @@ STA="$WORK/state"; mkdir -p "$STA"
     echo "name=$T_NAME"
     echo "net=$T_TUNLOCAL"
     echo "token=$T_TOKEN"
-    printf 'carried=%s\n' "$(cfg_setup_token | base64 -d | cut -d'|' -f15)"
+    printf 'carried=%s\n' "$(cfg_setup_token | base64 -d | cut -d'|' -f15 | base64 -d)"
 ) > "$WORK/state.out" 2>&1
 st() { grep -m1 "^$1=" "$WORK/state.out" | cut -d= -f2-; }
 
@@ -1561,9 +1702,11 @@ su() { awk '/^self_update\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "the script comes from the release" "$(su | grep -c 'release_base.*Pingify.sh')" "1"
 check "the branch is only a fallback"     "$(su | grep -c 'trying the branch')"        "1"
 check "and it is tried second"                  "$([ "$(su | grep -n 'release_base' | cut -d: -f1)" -lt "$(su | grep -n 'RAW_BASE' | cut -d: -f1)" ] && echo y)" "y"
-# and whatever happens, a mismatched core is corrected on the next run
+# and whatever happens, a mismatched core is corrected on the next run. The
+# full install ladder is intentional: matching release, embedded offline build,
+# then the existing recovery paths rather than download-only.
 ec() { awk '/^ensure_core_current\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "a mismatch downloads a new core"   "$(ec | grep -c 'download_core')" "1"
+check "a mismatch installs a matching core" "$(ec | grep -c 'install_core')" "1"
 check "and it names no menu that is gone" "$(ec | grep -c 'Update core in the menu')" "0"
 
 # ---------------------------------------------------------------------------
@@ -1664,7 +1807,7 @@ note "a transport is a seam now, not a branch"
 # dialCarrier - so a fifth transport meant a fifth branch in each. It asks an
 # interface for three things now, and adding one is writing those three.
 check "udp has a label"        "$(transport_label udp)"  "UDP"
-check "and is offered"         "$(grep -c 'choice 2 "UDP"' Pingify.sh)" "1"
+check "and is offered"         "$(grep -c 'choice 6 "UDP ARQ"' Pingify.sh)" "1"
 check "nine protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7 8 9' Pingify.sh)" "1"
 
 # It carries ports like TCP does, so it is named and addressed like TCP
@@ -1701,8 +1844,8 @@ fi
 # socket families and are never silently rendered as legacy UDP/TCP.
 check "kcp has its own label" "$(transport_label kcp)" "KCP+FEC"
 check "pck has its own label" "$(transport_label pck)" "TCP+PCK"
-check "kcp is offered" "$(grep -c 'choice 8 "KCP+FEC"' Pingify.sh)" "1"
-check "pck is offered" "$(grep -c 'choice 9 "TCP+PCK"' Pingify.sh)" "1"
+check "kcp is offered first" "$(grep -c 'choice 1 "KCP + FEC"' Pingify.sh)" "1"
+check "pck is offered"       "$(grep -c 'choice 5 "TCP + PCK"' Pingify.sh)" "1"
 check "pck source port matches core" "$(pck_source_port "$TOKEN" 443)" "28817"
 check "pck avoids the remote port" "$(pck_source_port "$TOKEN" 28817)" "28818"
 check "pck health checks outbound NOTRACK" "$(grep -c 'iptables -t raw -C OUTPUT -p tcp --sport.*NOTRACK' Pingify.sh)" "1"
@@ -1837,7 +1980,7 @@ check "and refuses a repeat"           "$(wz | grep -c 'tunnel_port_owner')"    
 check "and a port the host has bound"  "$(wz | grep -c 'port_free "\$T_PORT" "\$(port_family')" "1"
 check "only the end that binds is asked" "$(wz | grep -c 'this_side_accepts && show_taken_tunnel_ports')" "1"
 # udp and tcp are different sockets, and port_free has to know that
-check "port_free takes a protocol" "$(grep -c 'ss -Hlun' Pingify.sh)" "1"
+check "port_free takes a protocol" "$(grep -c 'udp) ! ss -Hlun' Pingify.sh)" "1"
 
 
 # ---------------------------------------------------------------------------
@@ -1850,8 +1993,8 @@ note "WebSocket goes where the web goes"
 check "ws has a label"      "$(transport_label ws)"  "WS"
 check "wss has a label"     "$(transport_label wss)" "WSS"
 check "nine protocols now"  "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7 8 9' Pingify.sh)" "1"
-check "wss is offered"      "$(grep -c 'choice 6 "WSS"' Pingify.sh)" "1"
-check "ws is offered"       "$(grep -c 'choice 7 "WS"' Pingify.sh)" "1"
+check "wss is offered"      "$(grep -c 'choice 3 "WSS MUX"' Pingify.sh)" "1"
+check "ws is offered"       "$(grep -c 'choice 7 "WS MUX"' Pingify.sh)" "1"
 
 # Each names itself, since several can hold 443 at once on one server
 nw() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=443; tunnel_default_name ); }
@@ -2016,7 +2159,7 @@ EDGE="$WORK/edge"; mkdir -p "$EDGE"
     T_NAME="$(tunnel_default_name)"; T_STATUS="127.0.0.1:9700"
     cfg_save > /dev/null
     raw="$(cfg_setup_token | base64 -d)"
-    echo "token_host=$(printf '%s' "$raw" | awk -F'|' '{print $7}')"
+    echo "token_host=$(printf '%s' "$raw" | awk -F'|' '{print $7}' | base64 -d)"
     echo "token_port=$(printf '%s' "$raw" | awk -F'|' '{print $8}')"
     echo "token_fields=$(printf '%s' "$raw" | awk -F'|' '{print NF}')"
 
@@ -2059,7 +2202,7 @@ eg() { grep -m1 "^$1=" "$WORK/edge.out" | cut -d= -f2-; }
 check "the address travels as the address" "$(eg token_host)"   "tunnel.example.com"
 check "with its port beside it"            "$(eg token_port)"   "8443"
 # no field was added for the domain, because the address already was one
-check "and the token carries packet tuning" "$(eg token_fields)" "27"
+check "and the token carries all tuning" "$(eg token_fields)" "30"
 
 check "KHAREJ dials the domain"       "$(eg plain_connect)" "tunnel.example.com:8443"
 check "and says it only once"         "$(eg plain_host)"    ""
