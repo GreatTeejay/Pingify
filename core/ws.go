@@ -59,6 +59,19 @@ import (
 // first middlebox that looks.
 // ---------------------------------------------------------------------------
 
+// How many WebSockets a ws or wss tunnel opens, and the most it will.
+//
+// Each one multiplexes every stream that lands on it, so this is not "how many
+// connections the traffic needs" - it is how many places the tunnel can be cut
+// at once and carry on. Two is the default: one is the quietest shape there is
+// and also a tunnel with no spare, and a second costs nothing anybody is
+// looking for, because a browser holds two or three open all day. Four is the
+// ceiling, because twenty was the shape that got the braided version noticed.
+const (
+	wsConnsDefault = 2
+	wsMaxConns     = 4
+)
+
 // The constant RFC 6455 requires the server to hash with the client's key.
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -207,8 +220,12 @@ type wsConn struct {
 	cbuf  []byte // control payloads, kept apart so a ping cannot clobber data
 
 	lastSeen int64 // unix nano; any received frame proves the path is alive
-	done     chan struct{}
-	once     sync.Once
+
+	// Why this end closed, when this end is the one that closed. See reason.
+	whyMu sync.Mutex
+	why   string
+	done  chan struct{}
+	once  sync.Once
 }
 
 func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
@@ -240,6 +257,35 @@ func newWSConn(c net.Conn, br *bufio.Reader, clientSide bool) *wsConn {
 // and one of them must not hang up on the other for being slower. A single
 // connection cannot afford that minute, so this end reaches the same
 // conclusion sooner and closes, which turns a silent hole into a reconnect.
+// giveUp closes the connection and remembers what for, so that the read which
+// finds out says something an operator can act on.
+func (w *wsConn) giveUp(format string, a ...interface{}) {
+	w.whyMu.Lock()
+	if w.why == "" {
+		w.why = fmt.Sprintf(format, a...)
+	}
+	w.whyMu.Unlock()
+	w.abort()
+}
+
+// reason puts our words on the socket's error when the close was ours.
+//
+// Go reports a read on a socket somebody in this process has shut as "use of
+// closed network connection", which is true and useless: it names the symptom
+// of a decision taken elsewhere and leaves an operator reading a log that
+// looks like a network fault when it is this end giving up on purpose. That
+// line cost real time in the field. When the decision was ours, say what it
+// was.
+func (w *wsConn) reason(err error) error {
+	w.whyMu.Lock()
+	why := w.why
+	w.whyMu.Unlock()
+	if why == "" {
+		return err
+	}
+	return errors.New(why)
+}
+
 func (w *wsConn) keepalive() {
 	t := time.NewTicker(wsPingEvery)
 	defer t.Stop()
@@ -259,7 +305,8 @@ func (w *wsConn) keepaliveStep() bool {
 	if since := time.Since(time.Unix(0, atomic.LoadInt64(&w.lastSeen))); since > wsPongOverdue {
 		logDebug("ws: no frame from %s for %s - the path is carrying nothing, closing",
 			w.c.RemoteAddr(), since.Round(time.Second))
-		w.abort()
+		w.giveUp("nothing arrived for %s, not even an answer to a ping - "+
+			"this end gave up on the path and closed", since.Round(time.Second))
 		return false
 	}
 	var payload [4]byte
@@ -289,7 +336,7 @@ func (w *wsConn) Read(p []byte) (int, error) {
 	for len(w.rest) == 0 {
 		f, err := w.readFrame()
 		if err != nil {
-			return 0, err
+			return 0, w.reason(err)
 		}
 		switch f.op {
 		case wsOpBinary, wsOpText:
@@ -355,7 +402,7 @@ func (w *wsConn) Write(p []byte) (int, error) {
 	err = writeFull(w.c, b)
 	w.wbuf = b
 	if err != nil {
-		return 0, err
+		return 0, w.reason(err)
 	}
 	return len(p), nil
 }

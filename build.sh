@@ -85,6 +85,24 @@ grep -q '@@CORE_FILES@@' "$tmp" || { red "the @@CORE_FILES@@ marker is missing";
 cp core/go.mod core/go.sum "$vendor_stage/"
 mkdir -p "$vendor_stage/vendor"
 cp -R core/vendor/. "$vendor_stage/vendor/"
+
+# Drop what this bundle can never compile.
+#
+# The releases are linux/amd64 and linux/arm64, and the fallback build inside
+# the script is the same two. Better than half the vendored bytes are Windows,
+# macOS, BSD, plan9 and wasm sources that Go excludes by filename before it
+# reads a line of them - x/sys/windows alone is bigger than the engine. They
+# were riding along in every download of this script for nothing.
+#
+# Only GOOS-suffixed names are touched, which is exactly the set Go decides by
+# filename. Anything with a real build constraint inside it is left alone, and
+# section 5 proves the result by compiling both targets out of the extracted
+# bundle rather than trusting this list.
+rm -rf "$vendor_stage/vendor/golang.org/x/sys/windows"
+for goos in windows darwin ios js wasip1 wasm plan9 aix solaris illumos             netbsd openbsd freebsd dragonfly zos hurd; do
+    find "$vendor_stage/vendor" -type f         \( -name "*_$goos.go"  -o -name "*_$goos.s"         -o -name "*_${goos}_*.go" -o -name "*_${goos}_*.s" \) -delete
+done
+find "$vendor_stage/vendor" -type d -empty -delete
 while IFS= read -r -d '' f; do
     if grep -Iq . "$f"; then
         sed -i 's/\r$//' "$f"
@@ -130,6 +148,21 @@ if ! diff -qr "$vendor_stage/vendor" "$check_dir/vendor" >/dev/null ||
     red "embedded vendored modules differ from the originals"
     rm -rf "$check_dir"
     exit 1
+fi
+
+# The fallback build is the whole reason the vendor tree ships, so prove it
+# rather than assume it: compile both release targets out of the extracted
+# bundle. This is the only check that would catch a prune above taking a file
+# some Linux build actually needed.
+if command -v "$GO_BIN" >/dev/null 2>&1; then
+    for arch in amd64 arm64; do
+        info "offline build from the bundle: linux/$arch"
+        if ! ( cd "$check_dir" && GOFLAGS=-mod=vendor GOOS=linux GOARCH="$arch"                 CGO_ENABLED=0 "$GO_BIN" build -o /dev/null . ); then
+            red "the embedded sources cannot build linux/$arch offline"
+            rm -rf "$check_dir"
+            exit 1
+        fi
+    done
 fi
 rm -rf "$check_dir"
 

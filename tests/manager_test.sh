@@ -676,7 +676,7 @@ check "nothing assigns it" "$(grep -c 'T_PRESET="from token"' Pingify.sh)" "0"
 T_TRANSPORT="wss"
 for _p in gaming latency balanced throughput extreme; do
     apply_preset "$_p" >/dev/null 2>&1
-    check "wss $_p stays one carrier" "$T_CARRIERS" "1"
+    check "wss $_p stays at two carriers" "$T_CARRIERS" "2"
     check "wss $_p names itself back" \
         "$(preset_name "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF")" "$_p"
 done
@@ -846,8 +846,8 @@ check "tcp is not"                 "$(T_TRANSPORT=tcp;  kernel_transport && echo
 check "and neither is icmp"        "$(T_TRANSPORT=icmp; kernel_transport && echo y)" ""
 
 # The label goes in front of the name, so a list reads as what it is
-check "gre wears the TUN label"    "$(transport_label gre)"  "TUN-GRE"
-check "awg too"                    "$(transport_label awg)"  "TUN-AWG"
+check "gre is named plainly"       "$(transport_label gre)"  "GRE"
+check "awg too"                    "$(transport_label awg)"  "AmneziaWG"
 
 # The interface is named after the tunnel and has to stay readable and under
 # the fifteen characters Linux allows.
@@ -1806,8 +1806,8 @@ note "a transport is a seam now, not a branch"
 # The pool used to switch on transport in two places - one in start, one in
 # dialCarrier - so a fifth transport meant a fifth branch in each. It asks an
 # interface for three things now, and adding one is writing those three.
-check "udp has a label"        "$(transport_label udp)"  "UDP"
-check "and is offered"         "$(grep -c 'choice 6 "UDP ARQ"' Pingify.sh)" "1"
+check "udp has a label"        "$(transport_label udp)"  "UDP ARQ"
+check "and is offered"         "$(grep -c 'choice 4 "UDP ARQ"' Pingify.sh)" "1"
 check "nine protocols"         "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7 8 9' Pingify.sh)" "1"
 
 # It carries ports like TCP does, so it is named and addressed like TCP
@@ -1842,10 +1842,10 @@ fi
 
 # KCP+FEC and PCK share the low-latency packet engine, but claim different
 # socket families and are never silently rendered as legacy UDP/TCP.
-check "kcp has its own label" "$(transport_label kcp)" "KCP+FEC"
-check "pck has its own label" "$(transport_label pck)" "TCP+PCK"
-check "kcp is offered first" "$(grep -c 'choice 1 "KCP + FEC"' Pingify.sh)" "1"
-check "pck is offered"       "$(grep -c 'choice 5 "TCP + PCK"' Pingify.sh)" "1"
+check "kcp has its own label" "$(transport_label kcp)" "KCP FEC"
+check "pck has its own label" "$(transport_label pck)" "TCP PCK"
+check "kcp is offered"       "$(grep -c 'choice 3 "KCP FEC"' Pingify.sh)" "1"
+check "pck is offered"       "$(grep -c 'choice 2 "TCP PCK"' Pingify.sh)" "1"
 check "pck source port matches core" "$(pck_source_port "$TOKEN" 443)" "28817"
 check "pck avoids the remote port" "$(pck_source_port "$TOKEN" 28817)" "28818"
 check "pck health checks outbound NOTRACK" "$(grep -c 'iptables -t raw -C OUTPUT -p tcp --sport.*NOTRACK' Pingify.sh)" "1"
@@ -1990,11 +1990,15 @@ note "WebSocket goes where the web goes"
 # what it is, and on a path that passes 80 and nothing else, none of them go
 # anywhere. This one is an HTTP request that becomes a WebSocket.
 #
-check "ws has a label"      "$(transport_label ws)"  "WS"
-check "wss has a label"     "$(transport_label wss)" "WSS"
+check "ws has a label"      "$(transport_label ws)"  "WS MUX"
+check "wss has a label"     "$(transport_label wss)" "WSS MUX"
+check "forwarding is its own group" "$(grep -c 'group "FORWARDING"' Pingify.sh)" "1"
+check "and tun is the other"        "$(grep -c 'group "TUN"' Pingify.sh)" "1"
+check "tcp leads the list"          "$(grep -c 'choice 1 "TCP MUX"' Pingify.sh)" "1"
+check "icmp opens the tun group"    "$(grep -c 'choice 7 "ICMP"' Pingify.sh)" "1"
 check "nine protocols now"  "$(grep -c 'pick proto "select" 1 2 3 4 5 6 7 8 9' Pingify.sh)" "1"
-check "wss is offered"      "$(grep -c 'choice 3 "WSS MUX"' Pingify.sh)" "1"
-check "ws is offered"       "$(grep -c 'choice 7 "WS MUX"' Pingify.sh)" "1"
+check "wss is offered"      "$(grep -c 'choice 6 "WSS MUX"' Pingify.sh)" "1"
+check "ws is offered"       "$(grep -c 'choice 5 "WS MUX"' Pingify.sh)" "1"
 
 # Each names itself, since several can hold 443 at once on one server
 nw() { ( T_ROLE="$1"; T_TRANSPORT="$2"; T_PORT=443; tunnel_default_name ); }
@@ -2251,7 +2255,7 @@ check "and points to WSS"            "$(wz | grep -c 'Choose WSS when TLS or a C
 # offer a number that the core will then ignore, and the preset it lands on
 # must not leave sixteen behind either.
 pm() { awk '/^preset_menu\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
-check "websockets are pinned to one" "$(pm | grep -c 'ws | wss) T_CARRIERS=1')" "1"
+check "websockets are held to two"   "$(pm | grep -c 'ws | wss) T_CARRIERS=2')" "1"
 check "and both skip the number"     "$(pm | grep -c 'T_TRANSPORT" = "wss"')" "1"
 
 printf '\n%s passed, %s failed\n\n' "$PASS" "$FAILED"

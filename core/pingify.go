@@ -1,11 +1,16 @@
 // Pingify engine - one encrypted tunnel between an Iran server and a server
 // abroad, carried over several parallel TCP connections.
 //
-// Everything lives in this one file on purpose. It is standard-library only:
-// Iranian servers frequently cannot reach proxy.golang.org, so the engine has
-// to compile with GOPROXY=off and no module downloads of any kind. The only
-// companions are tun_linux.go and tun_other.go, which cannot be merged in
-// because a Go build constraint applies to a whole file.
+// The rule this file was written under still holds: an Iranian server
+// frequently cannot reach proxy.golang.org, so the engine must compile with
+// GOPROXY=off and no module download of any kind.
+//
+// It is no longer standard-library only. KCP, its Reed-Solomon parity and the
+// raw-packet transport brought real dependencies, and they are vendored under
+// core/vendor and shipped inside Pingify.sh - which is how the rule is kept
+// rather than broken: nothing is ever fetched, it is already there. Everything
+// hand-rolled here that a module could have provided stays hand-rolled,
+// because replacing working code with a dependency buys nothing.
 //
 // Layout:
 //     1. configuration and entry point
@@ -53,7 +58,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "5.31.0"
+const version = "1.0.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -195,21 +200,33 @@ func (c *Config) applyDefaults() {
 	websocket := c.Transport == "ws" || c.Transport == "wss"
 	if c.Carriers == 0 {
 		if websocket {
-			c.Carriers = 1
+			c.Carriers = wsConnsDefault
 		} else {
 			c.Carriers = 4
 		}
 	}
-	// ws and wss multiplex: one WebSocket carries the whole tunnel. Twenty of them
-	// opened at once from one address is the most recognisable thing a tunnel
-	// can do, and a carrier here is already a multiplexer - streams by id,
-	// with a credit window each - so one of them is not one stream, it is
-	// every stream on one connection. What the config asked for is kept, so
-	// that startup can say the setting was not used rather than quietly
-	// running something else.
-	if websocket && c.Carriers != 1 {
+	// ws and wss multiplex, so they need very few connections and must not be
+	// allowed many.
+	//
+	// Twenty WebSockets opened at once from one address is the most
+	// recognisable thing a tunnel can do, and a carrier here is already a
+	// multiplexer - streams by id, with a credit window each - so a couple of
+	// them is not a couple of streams, it is every stream shared over two
+	// connections.
+	//
+	// Two rather than one. One is the quietest shape there is and it is also
+	// a tunnel with no spare: the moment that connection goes, every stream
+	// on it goes with it and nothing crosses until it is back. The field
+	// report that read "it still drops" was exactly that. A second connection
+	// costs nothing anybody is looking for - a browser holds two or three
+	// open all day - and it turns a cut into a hiccup. Four is the ceiling,
+	// because twenty was the shape that got noticed.
+	//
+	// What the config asked for is kept, so that startup can say the setting
+	// was cut rather than quietly running something else.
+	if websocket && c.Carriers > wsMaxConns {
 		c.CarriersAsked = c.Carriers
-		c.Carriers = 1
+		c.Carriers = wsMaxConns
 	}
 	if c.WindowKB == 0 {
 		// 512 KiB per stream is roughly 50 Mbit/s on an 80 ms path, and it
@@ -462,8 +479,8 @@ func main() {
 	logInfo("tuning applied: profile=%s window=%dKiB socket=%d/%dKiB",
 		cfg.Profile, cfg.WindowKB, cfg.SndBufKB, cfg.RcvBufKB)
 	if cfg.CarriersAsked > 0 {
-		logInfo("%s multiplexes the whole tunnel onto one connection, so the %d carriers configured are not used",
-			strings.ToUpper(cfg.Transport), cfg.CarriersAsked)
+		logInfo("%s multiplexes every stream onto each connection, so the %d configured were cut to %d",
+			strings.ToUpper(cfg.Transport), cfg.CarriersAsked, cfg.Carriers)
 	}
 	if cfg.Transport == "kcp" || cfg.Transport == "pck" {
 		logInfo("packet engine: KCP fast mode %dms, Reed-Solomon FEC %d+%d, MTU %d",
@@ -733,7 +750,10 @@ func logTrace(f string, a ...interface{}) { logAt(lvlTrace, f, a...) }
 // ==========================================================================
 
 // HKDF (RFC 5869) over HMAC-SHA256, hand-rolled on crypto/hmac because
-// golang.org/x/crypto is off-limits: the engine must build with GOPROXY=off.
+// hand-rolled rather than taken from golang.org/x/crypto, which is thirty
+// lines against a dependency in the one part of the engine that must never
+// surprise anybody. It predates the vendored modules and has no reason to
+// change now that they exist.
 
 func hkdfExtract(salt, ikm []byte) []byte {
 	if len(salt) == 0 {
@@ -2360,6 +2380,11 @@ type forwarder struct {
 	// time it said anything. See noteRefusal.
 	refused     uint64
 	refusedSaid uint64
+
+	// The same, for connections dropped because nothing was up to carry
+	// them. See noteNoCarrier.
+	dropped     uint64
+	droppedSaid uint64
 }
 
 func startForward(cfg *Config, p *pool) (*forwarder, error) {
@@ -2444,7 +2469,7 @@ func (f *forwarder) openStream(c net.Conn, r fwdRule) {
 	tuneSocket(c, f.cfg)
 	l := f.p.pick()
 	if l == nil {
-		logWarn("no carrier up, dropping connection to :%d", r.lport)
+		f.noteNoCarrier(r.lport)
 		c.Close()
 		return
 	}
@@ -2554,6 +2579,34 @@ func (f *forwarder) onRecord(l *link, cmd byte, id uint32, body []byte) {
 // target that is down refuses every connection there is, and a line per
 // connection is thousands a minute into a journal that then stops keeping up
 // with anything else.
+// noteNoCarrier says the tunnel is down and connections are being dropped, at
+// most once a minute, with a count of the ones it stood for.
+//
+// A tunnel that is down is precisely the state a client retries hardest in, so
+// the line that appears thousands of times a minute is the one that says
+// nothing - and it lands on top of the handful that say WHY it went down,
+// which are the only ones worth reading when it is down. Field logs came back
+// as page after page of this with the reason nowhere in them. The volume has
+// to follow the clock, which is the rule the carrier count and the refusals
+// below already keep.
+func (f *forwarder) noteNoCarrier(lport int) {
+	if f.p == nil {
+		logWarn("no carrier up, dropping connection to :%d", lport)
+		return
+	}
+	n := atomic.AddUint64(&f.dropped, 1)
+	if !f.p.firstIn("no-carrier", time.Minute) {
+		return
+	}
+	quiet := n - atomic.SwapUint64(&f.droppedSaid, n)
+	if quiet > 1 {
+		logWarn("no carrier up, dropping connection to :%d (and %d more since the last time this said so)",
+			lport, quiet-1)
+		return
+	}
+	logWarn("no carrier up, dropping connection to :%d", lport)
+}
+
 func (f *forwarder) noteRefusal(target, why string) {
 	if f.p == nil {
 		logWarn("stream to %s: %s", target, why)

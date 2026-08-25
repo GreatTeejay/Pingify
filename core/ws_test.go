@@ -24,28 +24,50 @@ import (
 // what a ws tunnel has to be
 // ---------------------------------------------------------------------------
 
-// One connection, and every stream on it. That is what mux means, and the
-// point of the transport: twenty WebSockets from one address is the shape that
-// gets a flow looked at.
-func TestWSIsOneConnectionCarryingEverything(t *testing.T) {
-	testWebSocketIsOneConnectionCarryingEverything(t, "ws")
+// Very few connections, and every stream shared across them. That is what mux
+// means, and the point of the transport: twenty WebSockets from one address is
+// the shape that gets a flow looked at.
+func TestWSIsAFewConnectionsCarryingEverything(t *testing.T) {
+	testWebSocketIsAFewConnectionsCarryingEverything(t, "ws")
 }
 
-func TestWSSIsOneTLSConnectionCarryingEverything(t *testing.T) {
-	testWebSocketIsOneConnectionCarryingEverything(t, "wss")
+func TestWSSIsAFewTLSConnectionsCarryingEverything(t *testing.T) {
+	testWebSocketIsAFewConnectionsCarryingEverything(t, "wss")
 }
 
-func TestWebSocketDefaultsToOneWithoutInventingARequest(t *testing.T) {
+// A couple, not one and not four.
+//
+// One is the quietest shape there is and it is also a tunnel with no spare:
+// the moment that connection goes, every stream on it goes and nothing
+// crosses until it is back. A second costs nothing anybody is looking for -
+// a browser holds two or three open all day - and it turns a cut into a
+// hiccup instead of an outage.
+func TestWebSocketDefaultsToACoupleWithoutInventingARequest(t *testing.T) {
 	for _, transport := range []string{"ws", "wss"} {
 		cfg := &Config{Transport: transport}
 		cfg.applyDefaults()
-		if cfg.Carriers != 1 || cfg.CarriersAsked != 0 {
-			t.Errorf("%s default: carriers=%d asked=%d, want 1 and 0", transport, cfg.Carriers, cfg.CarriersAsked)
+		if cfg.Carriers != wsConnsDefault || cfg.CarriersAsked != 0 {
+			t.Errorf("%s default: carriers=%d asked=%d, want %d and 0",
+				transport, cfg.Carriers, cfg.CarriersAsked, wsConnsDefault)
 		}
 	}
 }
 
-func testWebSocketIsOneConnectionCarryingEverything(t *testing.T, transport string) {
+// And twenty is still refused, because twenty is the shape that got noticed.
+func TestWebSocketRefusesABraidOfConnections(t *testing.T) {
+	for _, transport := range []string{"ws", "wss"} {
+		cfg := &Config{Transport: transport, Carriers: 20}
+		cfg.applyDefaults()
+		if cfg.Carriers != wsMaxConns {
+			t.Errorf("%s: 20 became %d, want %d", transport, cfg.Carriers, wsMaxConns)
+		}
+		if cfg.CarriersAsked != 20 {
+			t.Errorf("%s forgot that 20 were asked for, so startup cannot say the setting was cut", transport)
+		}
+	}
+}
+
+func testWebSocketIsAFewConnectionsCarryingEverything(t *testing.T, transport string) {
 	setLogLevel("error")
 	echo := echoServer(t)
 	local := freePort(t)
@@ -68,18 +90,18 @@ func testWebSocketIsOneConnectionCarryingEverything(t *testing.T, transport stri
 		if err := c.validate(); err != nil {
 			t.Fatal(err)
 		}
-		if c.Carriers != 1 {
-			t.Fatalf("%s %s asked for 20 carriers and got %d - it must be one connection",
+		if c.Carriers != wsMaxConns {
+			t.Fatalf("%s %s asked for 20 carriers and got %d - it must hold very few",
 				c.Role, transport, c.Carriers)
 		}
 		if c.CarriersAsked != 20 {
-			t.Errorf("%s forgot that 20 were asked for, so startup cannot say the setting was ignored", c.Role)
+			t.Errorf("%s forgot that 20 were asked for, so startup cannot say the setting was cut", c.Role)
 		}
 	}
 
 	ip, kp, cleanup := twoEnds(t, iran, kharej)
 	defer cleanup()
-	waitUp(t, ip, 1, 10*time.Second)
+	waitUp(t, ip, wsMaxConns, 10*time.Second)
 
 	// Many streams at once, all of them on the one connection.
 	const streams = 40
@@ -114,13 +136,14 @@ func testWebSocketIsOneConnectionCarryingEverything(t *testing.T, transport stri
 		t.Fatalf("%v", err)
 	}
 
-	if up, _, _, _ := ip.stats(); up != 1 {
-		t.Fatalf("iran reports %d connections, want exactly 1", up)
+	if up, _, _, _ := ip.stats(); up != wsMaxConns {
+		t.Fatalf("iran reports %d connections, want %d", up, wsMaxConns)
 	}
-	if up, _, _, _ := kp.stats(); up != 1 {
-		t.Fatalf("kharej reports %d connections, want exactly 1", up)
+	if up, _, _, _ := kp.stats(); up != wsMaxConns {
+		t.Fatalf("kharej reports %d connections, want %d", up, wsMaxConns)
 	}
-	t.Logf("%d streams and %d KiB through one %s connection", streams, streams*8, strings.ToUpper(transport))
+	t.Logf("%d streams and %d KiB over %d %s connections",
+		streams, streams*8, wsMaxConns, strings.ToUpper(transport))
 }
 
 func TestWriteFullRepairsShortSocketWrites(t *testing.T) {

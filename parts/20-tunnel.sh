@@ -85,7 +85,7 @@ cfg_mode() {
     # A WebSocket transport is one physical connection by construction. Set
     # that invariant as soon as the transport shape is derived so programmatic
     # config creation and the interactive wizard produce the same file.
-    case "$T_TRANSPORT" in ws | wss) T_CARRIERS=1 ;; esac
+    case "$T_TRANSPORT" in ws | wss) T_CARRIERS=2 ;; esac
 }
 
 cfg_needs_link() { [ "$T_MODE" != "forward" ]; }
@@ -343,8 +343,10 @@ apply_preset() {
             # One ordinary-looking WebSocket remains one physical carrier.
             # The presets buy throughput with enough per-stream credit and a
             # larger aggregate socket buffer instead of pretending that the
-            # 8-24 carriers used by the other transports exist here.
-            T_CARRIERS=1
+            # 8-24 carriers used by the other transports exist here. Two
+            # connections rather than one: a browser holds that many open all
+            # day, and one is a tunnel with no spare, where every cut is total.
+            T_CARRIERS=2
             case "$1" in
                 gaming)     T_WINDOW=256;  T_SNDBUF=1024;  T_RCVBUF=1024 ;;
                 latency)    T_WINDOW=512;  T_SNDBUF=2048;  T_RCVBUF=2048 ;;
@@ -454,7 +456,10 @@ tuning_values_valid() {
         case "$n" in "" | *[!0-9]*) return 1 ;; esac
     done
     [ "$T_CARRIERS" -ge 1 ] && [ "$T_CARRIERS" -le 64 ] || return 1
-    case "$T_TRANSPORT" in ws | wss) [ "$T_CARRIERS" = "1" ] || return 1 ;; esac
+    # A WebSocket tunnel holds very few connections and the engine will not
+    # honour more than four, so a token or an edit carrying more than that is
+    # a config that would silently run as something else.
+    case "$T_TRANSPORT" in ws | wss) [ "$T_CARRIERS" -le 4 ] || return 1 ;; esac
     max="$(transport_window_max)"
     [ "$T_WINDOW" -ge 64 ] && [ "$T_WINDOW" -le "$max" ] || return 1
     [ "$T_KEEPALIVE" -ge 1 ] && [ "$T_KEEPALIVE" -le 300 ] || return 1
@@ -543,7 +548,7 @@ preset_menu() {
         [ "$T_KCP_INTERVAL" -ge 5 ] && [ "$T_KCP_INTERVAL" -le 100 ] || T_KCP_INTERVAL=10
     fi
     # Whatever the preset said, WS/WSS carries the whole tunnel on one connection.
-    case "$T_TRANSPORT" in ws | wss) T_CARRIERS=1 ;; esac
+    case "$T_TRANSPORT" in ws | wss) T_CARRIERS=2 ;; esac
 
     # Presets chose their own transport-aware buffers above. Custom starts
     # from a safe value derived from its window and can be edited afterwards.
@@ -708,17 +713,20 @@ side_label()      { [ "$1" = "server" ] && printf 'IRAN' || printf 'KHAREJ'; }
 # BRAID is what the TCP transport does: several carriers woven together, each
 # flow pinned to one strand so nothing arrives out of order. The protocol is
 # still plain TCP - the name describes the weave, not a new protocol.
+# The name a transport is known by on screen. The config still writes the short
+# slug - tcp, kcp, pck, ws, wss, icmp, gre, awg - so an existing tunnel keeps
+# working and its service name never changes. Only what an operator reads moves.
 transport_label() {
     case "$1" in
-        icmp | echo) printf 'TUN-ICMP' ;;
-        udp)         printf 'UDP' ;;
-        kcp)         printf 'KCP+FEC' ;;
-        pck)         printf 'TCP+PCK' ;;
-        ws)          printf 'WS' ;;
-        wss)         printf 'WSS' ;;
-        gre)         printf 'TUN-GRE' ;;
-        awg)         printf 'TUN-AWG' ;;
-        *)           printf 'TCP' ;;
+        icmp | echo) printf 'ICMP' ;;
+        udp)         printf 'UDP ARQ' ;;
+        kcp)         printf 'KCP FEC' ;;
+        pck)         printf 'TCP PCK' ;;
+        ws)          printf 'WS MUX' ;;
+        wss)         printf 'WSS MUX' ;;
+        gre)         printf 'GRE' ;;
+        awg)         printf 'AmneziaWG' ;;
+        *)           printf 'TCP MUX' ;;
     esac
 }
 
@@ -1085,27 +1093,28 @@ new_tunnel() {
     wiz_add "$(side_label "$T_ROLE")"
 
     # -- transport ----------------------------------------------------------
-    # Put the choices in operational order: the three most useful Iran-path
-    # options first, ordinary direct carriers next, and kernel links last.
-    wiz "Transport" "Start with the recommended group; change only when the path requires it."
-    group "RECOMMENDED"
-    choice 1 "KCP + FEC" "best first try for speed, video and low jitter on a lossy path"
-    choice 2 "ICMP MUX" "no port; strongest fallback where TCP/UDP paths are filtered"
-    choice 3 "WSS MUX" "one TLS WebSocket; best fit for a domain or Cloudflare"
-    group "DIRECT / SPECIAL PATHS"
-    choice 4 "TCP MUX" "widely compatible parallel TCP carriers"
-    choice 5 "TCP + PCK" "KCP/FEC inside established-looking raw TCP packets"
-    choice 6 "UDP ARQ" "userspace reliability without TCP-inside-TCP"
-    choice 7 "WS MUX" "plain HTTP WebSocket on port 80; use only when WSS is unavailable"
-    group "KERNEL LINKS"
-    choice 8 "AmneziaWG" "fast encrypted kernel tunnel with WireGuard obfuscation"
-    choice 9 "GRE" "fastest and lightest, but unencrypted and easy to identify"
+    # Two groups, because they are two different things. FORWARDING carries
+    # the ports you name over an ordinary connection, and the engine is the
+    # only thing in the path. TUN builds a private link the kernel routes
+    # over, which is a bigger hammer and a different set of requirements.
+    wiz "Transport" "FORWARDING carries your ports over a connection. TUN builds a private link."
+    group "FORWARDING"
+    choice 1 "TCP MUX" "every stream over a few plain TCP carriers - the compatible default"
+    choice 2 "TCP PCK" "the same reliability inside raw TCP packets the kernel never sees"
+    choice 3 "KCP FEC" "repairs loss without waiting for a resend - best on a lossy path"
+    choice 4 "UDP ARQ" "reliability in userspace, so nothing runs TCP inside TCP"
+    choice 5 "WS MUX" "an ordinary WebSocket on port 80 - goes where HTTP goes"
+    choice 6 "WSS MUX" "the same inside TLS - a domain or a CDN, and the origin stays hidden"
+    group "TUN"
+    choice 7 "ICMP" "inside ping packets - no port at all, for a path that filters the rest"
+    choice 8 "GRE" "the kernel's own tunnel: fastest, and plainly visible"
+    choice 9 "AmneziaWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
     say ""
     local proto=""
     pick proto "select" 1 2 3 4 5 6 7 8 9 || { wiz_end; return 0; }
 
     case "$proto" in
-        6)  T_KIND="tcp"; T_TRANSPORT="udp"
+        4)  T_KIND="tcp"; T_TRANSPORT="udp"
             T_FORWARDER="pingify"
             say ""
             dim "One reliability layer instead of two. Our own sits on the"
@@ -1115,7 +1124,7 @@ new_tunnel() {
             say ""
             warn "needs UDP to pass between the two servers"
             dim "some providers throttle or block it; test before committing" ;;
-        2)  T_KIND="tun"; T_TRANSPORT="icmp"
+        7)  T_KIND="tun"; T_TRANSPORT="icmp"
             wiz "Who forwards the ports?"
             choice 1 "PINGIFY" "the core carries every connection itself"
             choice 2 "IPTABLES" "the kernel does it - lighter on a busy link"
@@ -1128,7 +1137,7 @@ new_tunnel() {
                 [ "$fw" = "2" ] && warn "iptables is not installed here - using PINGIFY"
                 T_FORWARDER="pingify"
             fi ;;
-        9)  T_TRANSPORT="gre"
+        8)  T_TRANSPORT="gre"
             # GRE is protocol 47 with no encryption and no disguise. It is the
             # fastest thing here by a distance, and the easiest to recognise,
             # so say so before rather than after.
@@ -1140,11 +1149,11 @@ new_tunnel() {
             say ""
             confirm_yes "use TUN-GRE?" || return 0
             gre_ready || { fail "this kernel has no GRE support"; pause; return 1; } ;;
-        8)  T_TRANSPORT="awg"
+        9)  T_TRANSPORT="awg"
             awg_install || { pause; return 1; } ;;
-        3)  T_KIND="tcp"; T_TRANSPORT="wss"
+        6)  T_KIND="tcp"; T_TRANSPORT="wss"
             T_FORWARDER="pingify"
-            T_CARRIERS=1
+            T_CARRIERS=2
             say ""
             dim "One TLS handshake, one HTTP Upgrade, and one long-lived WebSocket."
             dim "Every forwarded stream is multiplexed inside that single connection;"
@@ -1159,9 +1168,9 @@ new_tunnel() {
             say ""
             dim "Anything outside the secret path sees an ordinary HTTPS nginx page."
             dim "Port 443 is the natural choice." ;;
-        7)  T_KIND="tcp"; T_TRANSPORT="ws"
+        5)  T_KIND="tcp"; T_TRANSPORT="ws"
             T_FORWARDER="pingify"
-            T_CARRIERS=1
+            T_CARRIERS=2
             say ""
             dim "An HTTP request that becomes a WebSocket, which is what a chat"
             dim "app and a live dashboard look like. It goes where HTTP goes:"
@@ -1181,7 +1190,7 @@ new_tunnel() {
             say ""
             dim "Port 80 is the one to use. A WebSocket on an unusual port is"
             dim "a WebSocket nothing else on the internet looks like." ;;
-        1)  T_KIND="tcp"; T_TRANSPORT="kcp"
+        3)  T_KIND="tcp"; T_TRANSPORT="kcp"
             T_FORWARDER="pingify"
             say ""
             dim "KCP repairs loss on a 10 ms clock and Reed-Solomon FEC can"
@@ -1189,7 +1198,7 @@ new_tunnel() {
             dim "Use this for video, Instagram and games on a lossy route."
             say ""
             warn "needs UDP to pass between both servers" ;;
-        5)  T_KIND="tcp"; T_TRANSPORT="pck"
+        2)  T_KIND="tcp"; T_TRANSPORT="pck"
             T_FORWARDER="pingify"
             say ""
             dim "Builds established-looking TCP packets directly, then runs"
@@ -1198,9 +1207,18 @@ new_tunnel() {
             say ""
             warn "Linux and root/CAP_NET_RAW are required on both servers"
             dim "Pingify installs narrow RST and NOTRACK rules automatically." ;;
-        4)  T_KIND="tcp"; T_TRANSPORT="tcp"
-            T_FORWARDER="pingify" ;;
-        *)  T_KIND="tcp"; T_TRANSPORT="kcp"
+        1)  T_KIND="tcp"; T_TRANSPORT="tcp"
+            T_FORWARDER="pingify"
+            say ""
+            dim "Several plain TCP connections, with every forwarded stream"
+            dim "multiplexed across them by id and given its own credit window."
+            dim "A stall on one carrier does not hold up the others, and a"
+            dim "carrier that dies is replaced without dropping the tunnel."
+            say ""
+            dim "Nothing to install and nothing to open: it is a TCP connection"
+            dim "between two servers. Start here, and move only if the path"
+            dim "gives you a reason to." ;;
+        *)  T_KIND="tcp"; T_TRANSPORT="tcp"
             T_FORWARDER="pingify" ;;
     esac
     cfg_mode
