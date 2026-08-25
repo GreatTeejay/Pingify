@@ -7,6 +7,8 @@
   <a href="https://github.com/GreatTeejay/Pingify/releases"><img src="https://img.shields.io/github/downloads/GreatTeejay/Pingify/total?style=flat-square" alt="downloads"></a>
 </p>
 
+<p align="center"><b><a href="docs/README.md">📖 Documentation</a></b> · <a href="docs/quick-start.md">Quick start</a> · <a href="docs/transports/README.md">Transports</a> · <a href="docs/tuning.md">Tuning</a> · <a href="docs/troubleshooting.md">Troubleshooting</a></p>
+
 ## Installation
 
 Requirements: root, a systemd-based Linux, and connectivity between the two servers. Install on **both Iran and Kharej**.
@@ -55,12 +57,12 @@ The engine is the only thing in the path. Nothing is added to the routing table 
 
 | Transport | What it is | Reach for it when | Costs |
 |---|---|---|---|
-| **TCP MUX** | Several plain TCP connections, with every stream multiplexed across them by id. A stall on one carrier does not hold up the rest. | The route is clean and you want the fewest moving parts. **Start here.** | TCP inside TCP on a lossy link: both stacks retransmit the same loss. |
-| **TCP PCK** | The KCP + FEC engine inside TCP packets this process builds and reads on the device itself, upstream of conntrack and every netfilter chain. Nothing is forged; what does not exist is the kernel connection. | A plain TCP tunnel connects and then stalls, dies or is throttled for no reason the logs explain. | Linux, IPv4 and root/CAP_NET_RAW on **both** ends. Installs narrow RST and NOTRACK rules, and removes them again. |
-| **KCP FEC** | KCP over UDP on a 10 ms clock, with Reed-Solomon parity so a short loss burst is repaired immediately instead of waiting a full round trip for a resend. | The route loses packets: video, calls, games, anything where a stall hurts more than a little overhead. | UDP must pass. Parity is real bandwidth and real CPU. |
-| **UDP ARQ** | Pingify's own reliability layer on raw datagrams — sequence numbers, cumulative acks, fast retransmit, a send window. One repair layer instead of two. | UDP is clean and you want reliability without TCP inside TCP. | UDP filtering, throttling and reordering. |
-| **WS MUX** | An HTTP request that becomes a WebSocket, then RFC 6455 frames. A couple of connections, every stream multiplexed inside them. Anything that is not the tunnel gets a stock nginx page. | Only HTTP gets through, or something in front of you terminates TLS already. | Not encrypted by itself — the tunnel's own records are, the WebSocket around them is not. Proxy idle limits apply. Port 80 is the one to use. |
-| **WSS MUX** | The same inside TLS, with the tunnel domain in SNI, Host and Origin. Behind a CDN the Kharej address never appears on the wire at all. | You have a domain, or you want to sit behind Cloudflare. | TLS and CDN overhead, and CDN policy. Certificate handling to arrange once. |
+| **[TCP MUX](docs/transports/tcp-mux.md)** | Several plain TCP connections, with every stream multiplexed across them by id. A stall on one carrier does not hold up the rest. | The route is clean and you want the fewest moving parts. **Start here.** | TCP inside TCP on a lossy link: both stacks retransmit the same loss. |
+| **[TCP PCK](docs/transports/tcp-pck.md)** | The KCP + FEC engine inside TCP packets this process builds and reads on the device itself, upstream of conntrack and every netfilter chain. Nothing is forged; what does not exist is the kernel connection. | A plain TCP tunnel connects and then stalls, dies or is throttled for no reason the logs explain. | Linux, IPv4 and root/CAP_NET_RAW on **both** ends. Installs narrow RST and NOTRACK rules, and removes them again. |
+| **[KCP FEC](docs/transports/kcp-fec.md)** | KCP over UDP on a 10 ms clock, with Reed-Solomon parity so a short loss burst is repaired immediately instead of waiting a full round trip for a resend. | The route loses packets: video, calls, games, anything where a stall hurts more than a little overhead. | UDP must pass. Parity is real bandwidth and real CPU. |
+| **[UDP ARQ](docs/transports/udp-arq.md)** | Pingify's own reliability layer on raw datagrams — sequence numbers, cumulative acks, fast retransmit, a send window. One repair layer instead of two. | UDP is clean and you want reliability without TCP inside TCP. | UDP filtering, throttling and reordering. |
+| **[WS MUX](docs/transports/ws-mux.md)** | An HTTP request that becomes a WebSocket, then RFC 6455 frames. A couple of connections, every stream multiplexed inside them. Anything that is not the tunnel gets a stock nginx page. | Only HTTP gets through, or something in front of you terminates TLS already. | Not encrypted by itself — the tunnel's own records are, the WebSocket around them is not. Proxy idle limits apply. Port 80 is the one to use. |
+| **[WSS MUX](docs/transports/wss-mux.md)** | The same inside TLS, with the tunnel domain in SNI, Host and Origin. Behind a CDN the Kharej address never appears on the wire at all. | You have a domain, or you want to sit behind Cloudflare. | TLS and CDN overhead, and CDN policy. Certificate handling to arrange once. |
 
 ### TUN — a private link the kernel routes over
 
@@ -68,15 +70,17 @@ These build an interface. Forwarding can be done by the engine or by the kernel 
 
 | Transport | What it is | Reach for it when | Costs |
 |---|---|---|---|
-| **ICMP** | The reliable transport carried inside ping packets. No port exists at all; each tunnel derives a session tag from its token so several can share one host. | TCP and UDP are filtered but ICMP still answers — because ping is how a network proves itself reachable. | The slowest thing here and subject to ICMP rate limits. A fallback, not a default. Linux and root. |
-| **GRE** | The kernel's own tunnel, IP protocol 47. The fastest and lightest option by a distance. | The path still passes protocol 47 and you want raw speed on a link you already trust. | **No encryption and no disguise.** Anything watching the path can see exactly what it is. |
-| **AmneziaWG** | Obfuscated WireGuard: kernel-speed, encrypted, and deliberately shaped not to look like WireGuard. | You want a full encrypted link with kernel performance and real resistance to fingerprinting. | The AmneziaWG tooling must install, and UDP must pass. |
+| **[ICMP](docs/transports/icmp.md)** | The reliable transport carried inside ping packets. No port exists at all; each tunnel derives a session tag from its token so several can share one host. | TCP and UDP are filtered but ICMP still answers — because ping is how a network proves itself reachable. | The slowest thing here and subject to ICMP rate limits. A fallback, not a default. Linux and root. |
+| **[GRE](docs/transports/gre.md)** | The kernel's own tunnel, IP protocol 47. The fastest and lightest option by a distance. | The path still passes protocol 47 and you want raw speed on a link you already trust. | **No encryption and no disguise.** Anything watching the path can see exactly what it is. |
+| **[AmneziaWG](docs/transports/amneziawg.md)** | Obfuscated WireGuard: kernel-speed, encrypted, and deliberately shaped not to look like WireGuard. | You want a full encrypted link with kernel performance and real resistance to fingerprinting. | The AmneziaWG tooling must install, and UDP must pass. |
+
+Each name links to its own page: what it is, when to reach for it, how to set it up, what to tune and what it costs.
 
 ### Choosing one
 
 There is no universal winner, and a table cannot know your route. Start with **TCP MUX**: it needs nothing and it works on most paths. If it is slow on a lossy link, try **KCP FEC**. If it connects and then dies for no reason you can find in a log, that is what **TCP PCK** is for. If only web traffic crosses, use **WSS MUX** with a domain — and **WS MUX** on port 80 only when TLS is genuinely unavailable.
 
-Benchmark the same two servers at the same hour and compare throughput, loss and jitter — not only average ping.
+Benchmark the same two servers at the same hour and compare throughput, loss and jitter — not only average ping. There is more in [Choosing a transport](docs/transports/README.md).
 
 ### What MUX means here
 
@@ -86,6 +90,8 @@ A carrier has always been a multiplexer: streams are opened, fed and closed on i
 - **WS/WSS** hold two by default and four at most. Twenty WebSockets opened at once from one address is the most recognisable thing a tunnel can do; two is what a browser holds open all day.
 - **Packet transports** use small carrier sets with bounded batches and session-aware delivery.
 - More carriers are not automatically faster. Start with a preset and measure before raising anything.
+
+How a byte actually crosses — carriers, streams, credit windows, framing — is in [Architecture](docs/architecture.md).
 
 ## Quick start and setup token
 
@@ -118,7 +124,7 @@ The same preset deliberately produces different numbers per transport, because t
 
 Every preset uses the **same keepalive**, on purpose. What keeps a carrier alive is how often the *peer* speaks, so two ends on different presets used to disagree about how long to wait — and the more impatient one hung up on a healthy tunnel.
 
-Start with **Balanced**. For games, compare Gaming and Latency on jitter and loss. For video, try Download before Extreme. Raise KCP parity only against measured loss. If load causes latency or collapse, try *fewer* queues and carriers before adding more.
+Start with **Balanced**. For games, compare Gaming and Latency on jitter and loss. For video, try Download before Extreme. Raise KCP parity only against measured loss. If load causes latency or collapse, try *fewer* queues and carriers before adding more. Every knob is explained in [Tuning and presets](docs/tuning.md).
 
 Per-tunnel tuning lives in each config and is mirrored by the token. **Host Tuning** is separate: it changes Linux socket ceilings, UDP minima, backlog, scheduler budget and MTU probing for the whole machine. **BBR** is separate again. Apply host-wide changes deliberately.
 
@@ -147,13 +153,15 @@ The menu carries live logs, config validation, a paired Health Check, remote for
 
 - **Carrier up, backend EOF or refused** — the tunnel carried the probe. Check that the service is actually listening on the Kharej target address and port.
 - **Periodic reconnects** — compare versions and keepalive on both ends, then firewall, NAT or CDN idle timeout, clock skew, proxy and MTU.
+More cases, and how to read the status endpoint, in [Troubleshooting](docs/troubleshooting.md).
+
 - **Stale forwarding rules** — run **Apply firewall** after changing or removing mappings. An old redirect pointing at an address that has gone will swallow every packet for that port, which looks exactly like a broken tunnel.
 
 ## Security
 
 The core records are authenticated AES-256-GCM with HKDF-derived session material, and the token itself is never sent on the wire — each side proves it holds the token with an HMAC over a fresh nonce. WSS adds an outer TLS layer. AmneziaWG uses its own encrypted kernel tunnel. **GRE is not encrypted.**
 
-Protect setup tokens, keys, configs and `/root/Pingify`. Turn shaping or encryption off only when you understand the trust boundary you are changing.
+Protect setup tokens, keys, configs and `/root/Pingify`. Turn shaping or encryption off only when you understand the trust boundary you are changing. The full picture, per transport, is in [Security](docs/security.md).
 
 ## Files and development
 
