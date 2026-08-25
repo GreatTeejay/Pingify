@@ -44,7 +44,13 @@ func bringPair(t *testing.T, forwards []string) *Config {
 	if err != nil {
 		t.Fatal(err)
 	}
-	startStatusServer(iran.StatusAddr, iran, ip)
+	if err := startStatusServer(iran.StatusAddr, iran, ip); err != nil {
+		// freePort hands back a port it has just released, so on a busy
+		// machine something else can take it in between. Say that, rather
+		// than letting a later question to a socket nobody is listening on
+		// look like a tunnel fault.
+		t.Fatalf("the status endpoint could not bind %s: %v", iran.StatusAddr, err)
+	}
 	kp := newPool(kharej)
 	if err := kp.start(); err != nil {
 		t.Fatal(err)
@@ -55,14 +61,29 @@ func bringPair(t *testing.T, forwards []string) *Config {
 	}
 	t.Cleanup(func() { ifw.Close(); kf.Close(); kp.close(); ip.close() })
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
+	up := 0
 	for time.Now().Before(deadline) {
-		if up, _, _, _ := ip.stats(); up >= 2 {
+		if up, _, _, _ = ip.stats(); up >= 2 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if up < 2 {
+		t.Fatalf("only %d of 2 carriers came up", up)
+	}
+
+	// And wait for the endpoint to answer, not merely to be bound. Serve runs
+	// in its own goroutine, so a question asked immediately after start can
+	// arrive before it is accepting - which reads as "the status endpoint
+	// would not answer" and has nothing to do with what the test is checking.
+	for time.Now().Before(deadline) {
+		if _, ok := refusalCount(iran.StatusAddr); ok {
 			return iran
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatal("carriers never came up")
+	t.Fatalf("the status endpoint on %s never answered", iran.StatusAddr)
 	return nil
 }
 

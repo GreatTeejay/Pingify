@@ -534,7 +534,7 @@ func main() {
 	}
 
 	if cfg.StatusAddr != "" {
-		startStatusServer(cfg.StatusAddr, cfg, p)
+		_ = startStatusServer(cfg.StatusAddr, cfg, p) // a tunnel runs without it
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -3236,11 +3236,16 @@ type statusDoc struct {
 	Detail    []carrierStatus `json:"detail"`
 }
 
-func startStatusServer(addr string, cfg *Config, p *pool) {
+// startStatusServer binds the status endpoint. The error is returned as well
+// as logged: a tunnel carries on perfectly well without it, so run() only says
+// so and keeps going - but a test that is about to ask the endpoint a question
+// needs to fail on the spot, naming the port it could not have, rather than
+// timing out later against something that was never listening.
+func startStatusServer(addr string, cfg *Config, p *pool) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		logWarn("status endpoint %s: %v", addr, err)
-		return
+		return err
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -3259,6 +3264,7 @@ func startStatusServer(addr string, cfg *Config, p *pool) {
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go srv.Serve(ln)
 	logInfo("status endpoint on http://%s/status", addr)
+	return nil
 }
 
 func snapshot(cfg *Config, p *pool) statusDoc {
