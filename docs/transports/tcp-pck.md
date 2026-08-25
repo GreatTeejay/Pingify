@@ -40,3 +40,23 @@ The `pck_flags` setting controls which TCP flags the segments carry. The default
 ## Trade-off
 
 Root, Linux and IPv4 on both servers. It is the least portable transport here and the one with the most moving parts between it and the network. Reach for it when the ordinary one has demonstrably failed, not before.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+همان موتور KCP + FEC، ولی داخل بسته‌های TCP که خودِ این پروسه می‌سازد و مستقیم از کارت شبکه می‌خواند — بالادست conntrack و همهٔ زنجیره‌های netfilter.
+
+**چیزی جعل نمی‌شود.** آدرس‌ها و پورت‌ها واقعی‌اند و جواب‌ها عادی route می‌شوند. چیزی که وجود ندارد **خودِ اتصال** است: نه handshake، نه سوکت، نه state در کرنل. پس ماشینی که یک flow طولانی را reset یا throttle می‌کند، چیزی برای عمل کردن رویش ندارد.
+
+**فقط یک علامت، و مشخص است:**
+
+> تانل TCP وصل می‌شود، مدتی کار می‌کند، و بعد بی‌دلیلی که در هیچ لاگی پیدا شود می‌ایستد یا می‌میرد یا throttle می‌شود.
+
+اگر TCP MUX روی مسیر شما پایدار است، PCK چیزی نمی‌خرد و root هزینه می‌کند.
+
+**نیاز:** لینوکس، IPv4 و root/CAP_NET_RAW روی **هر دو** طرف. دو قانون باریک iptables (drop کردن RST روی پورت خودش، و NOTRACK) خودکار نصب و موقع حذف تانل پاک می‌شوند.
+
+</div>

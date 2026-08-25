@@ -72,3 +72,25 @@ From the menu, **Remove** offers three levels:
 | **Full uninstall** | Every tunnel, unit, rule and file it ever wrote |
 
 Removing a tunnel takes its forwarding rules with it. If you delete one by hand instead, run **Apply firewall** afterwards — a leftover redirect pointing at an address that has gone will swallow every packet for that port, and it looks exactly like a broken tunnel.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+روی **هر دو سرور** یک دستور:
+
+```bash
+bash <(wget -qO- https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh)
+```
+
+همین دستور هم نصب می‌کند، هم آپدیت، هم منو را باز می‌کند.
+
+**پیش‌نیاز:** لینوکس با systemd، دسترسی root، و ارتباط بین دو سرور. بعضی ترنسپورت‌ها بیشتر می‌خواهند (PCK و ICMP: root و سوکت خام — AmneziaWG: ابزار خودش — GRE: پشتیبانی کرنل).
+
+**Go فقط وقتی لازم است** که هیچ باینری آماده‌ای دانلود نشود. برای همان حالت، اسکریپت سورس هسته و **همهٔ ماژول‌های وابسته** را داخل خودش حمل می‌کند و با `GOPROXY=off` می‌سازد — چون سرور ایران معمولاً به `proxy.golang.org` نمی‌رسد.
+
+**آپدیت:** همان دستور روی هر دو سرور، بعد restart هر دو. **همیشه هر دو با هم** — نسخهٔ متفاوت روی دو سر، باگی می‌سازد که از لاگ خواندنش سخت است.
+
+</div>

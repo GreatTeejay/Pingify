@@ -71,3 +71,26 @@ It is not a substitute for choosing the right transport. What gets a tunnel noti
 Pingify protects what it carries and makes the tunnel awkward to identify. It does not make you anonymous, it cannot hide that two servers are exchanging traffic, and no transport here is proof against a determined operator who controls the path.
 
 Pick a transport that fits your route, keep both ends on the same version, keep the token secret, and use the health check.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+**خلاصهٔ کوتاه:**
+
+- هر ترنسپورتی به‌جز **GRE** رکوردهای احراز‌شدهٔ AES-256-GCM حمل می‌کند
+- **توکن امنیتی هرگز روی سیم نمی‌رود** — روی هیچ ترنسپورتی
+- **GRE هیچ رمزنگاری‌ای ندارد** — حتی لایهٔ رکورد، چون موتور در مسیرش نیست
+- توکن نصب یک راز است؛ توکن امنیتی داخلش است
+
+**handshake:** هر طرف یک nonce تازه و یک HMAC روی آن می‌فرستد. تطابق HMAC راز مشترک را ثابت می‌کند بدون انتقالش. یک replay guard نانس تکراری را رد می‌کند، و توکن اشتباه جواب مفیدی نمی‌گیرد و تأخیر تصادفی می‌بیند — پس یک کاوشگر نه از محتوا چیزی می‌فهمد و نه از زمان‌بندی.
+
+**WSS:** گواهی تأیید **نمی‌شود** و این عمدی است. چیزی که طرف مقابل را ثابت می‌کند توکن است. یعنی چیزی که TLS را در مسیر تمام می‌کند (مثلاً CDN) هرچند TLS را می‌بیند، **نمی‌تواند به تانل بپیوندد** چون توکن ندارد و توکن هرگز عبور نمی‌کند.
+
+**چه چیزی را نگه دارید:** توکن نصب، محتویات `/root/Pingify/`، و توکن امنیتی. هر کسی که توکن را داشته باشد می‌تواند به تانل شما بپیوندد.
+
+**انتظار معقول:** Pingify از چیزی که حمل می‌کند محافظت می‌کند و تانل را سخت‌شناسایی می‌کند. شما را ناشناس نمی‌کند، نمی‌تواند پنهان کند که دو سرور با هم ترافیک رد و بدل می‌کنند، و هیچ ترنسپورتی اینجا در برابر کسی که مسیر را کنترل می‌کند مصون نیست.
+
+</div>

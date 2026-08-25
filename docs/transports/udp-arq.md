@@ -33,3 +33,21 @@ The window matters more than the carrier count here. A stream is pinned to one c
 ## Trade-off
 
 UDP filtering, throttling and reordering. Many providers treat sustained UDP differently from TCP and some throttle it hard. Test before committing.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+لایهٔ قابلیت اطمینان خود Pingify روی دیتاگرام خام: شماره ترتیب، ACK تجمعی، بازارسال با تایم‌اوت اندازه‌گیری‌شده، بازارسال سریع، و پنجرهٔ ارسال.
+
+**یک لایهٔ ترمیم به‌جای دو تا.** تانل TCP که TCP حمل می‌کند یعنی هر دو سر همان گم‌شدن را دوباره می‌فرستند و سر زمان‌بندی با هم می‌جنگند. اینجا ترمیم یک بار اتفاق می‌افتد، در لایه‌ای که می‌داند تانل چه می‌کند.
+
+**کِی:** UDP روی مسیر شما تمیز است و قابلیت اطمینان می‌خواهید بدون TCP داخل TCP.
+
+اگر مسیر **Loss** هم دارد، **KCP FEC** جواب بهتری است: آن انفجار معمولی را بدون رفت‌وبرگشت ترمیم می‌کند، این منتظر بازارسال می‌ماند.
+
+**پنجره از تعداد Carrier مهم‌تر است.** هر Stream برای تمام عمرش به یک Carrier سنجاق می‌شود، پس سقف یک دانلود این است: `پنجره × payload ÷ رفت‌وبرگشت` — هر چند Carrier که داشته باشید.
+
+</div>

@@ -71,3 +71,29 @@ curl -s http://127.0.0.1:9702/status
 Per carrier: bytes on the wire in each direction, streams open, round-trip time, uptime. For KCP and PCK it also reports retransmits, lost and duplicated segments, and FEC repairs.
 
 Those are the numbers to compare before and after a change. A preset that raises throughput and doubles jitter has not helped if the traffic is a video call.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+**با Balanced شروع کنید.** یک چیز را عوض کنید، اندازه بگیرید، نگه دارید یا برگردانید.
+
+پنج پریست: Gaming (کمترین صف)، Latency (ترافیک تعاملی)، Balanced (روزمره)، Download (ویدئو و انتقال حجیم)، Extreme (سرور قوی و مسیر پرظرفیت).
+
+**یک پریست برای هر ترنسپورت عدد متفاوتی می‌دهد** و این عمدی است، چون ترنسپورت‌ها هم‌شکل نیستند. «Balanced» روی WebSocket و روی KCP به دو سؤال متفاوت جواب می‌دهند.
+
+**معنی هر عدد:**
+
+- `carriers` — چند اتصال. **نه** پهنای باند؛ یعنی تانل هم‌زمان از چند جا بریده شود و باز کار کند
+- `window_kb` — اعتبار هر Stream. سقف یک دانلود: `پنجره × payload ÷ رفت‌وبرگشت`
+- `keepalive_sec` — هر چند وقت این طرف حرف می‌زند (کف تشخیص مرگ یک دقیقه است، هرچه اینجا بنویسید)
+- `sndbuf_kb` / `rcvbuf_kb` — بافر سوکت کرنل. پنجرهٔ بزرگ بی‌فایده است اگر کرنل انفجار را قبل از خواندن دور بریزد
+- `fec_data` / `fec_parity` — فقط KCP و PCK. بودجهٔ ترمیم
+
+**قواعد سرانگشتی:** Carrier بیشتر سریع‌تر نیست — اگر زیر بار تأخیر دیدید **کمتر** را اول امتحان کنید. parity را فقط در برابر Loss اندازه‌گیری‌شده بالا ببرید. برای بازی، Gaming و Latency را روی Jitter مقایسه کنید نه پینگ بیکار.
+
+**Host Tuning چیز دیگری است** — کل سرور را عوض می‌کند، نه فقط Pingify. آگاهانه اعمالش کنید.
+
+</div>

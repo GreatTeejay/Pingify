@@ -43,3 +43,23 @@ The WebSocket also runs its own keepalive: a Ping frame every twenty seconds, an
 ## Trade-off
 
 No outer encryption. Proxy and CDN idle timeouts apply. And with everything multiplexed onto very few connections, one congestion window carries the lot: a lost segment holds up every stream behind it.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+یک درخواست HTTP که تبدیل به WebSocket می‌شود، و بعد فریم‌های واقعی RFC 6455. هر جا HTTP می‌رود این هم می‌رود.
+
+**دو اتصال، نه بیست** — و این مهم‌ترین چیز این صفحه است. بیست WebSocket که هم‌زمان از یک آدرس باز شوند و هر ده ثانیه یک فریم باینری کوچک بفرستند، کاری است که هیچ اپلیکیشن وبی نمی‌کند. روی یک مسیر واقعی ایران–اروپا همین چیزی بود که نسخهٔ قبلی را از کار انداخت: اتصال‌ها بالا می‌آمدند، چند کیلوبایت می‌بردند، و در هر دو جهت کر می‌شدند.
+
+یکی هم درست نیست: یک اتصال یعنی تانل بدون یدک، و هر بریدنی قطع کامل. دو تا همان چیزی است که یک مرورگر تمام روز باز نگه می‌دارد.
+
+**پورت ۸۰ را استفاده کنید.** WebSocket روی پورت غیرمعمول، WebSocketی است که هیچ چیز دیگری در اینترنت شبیهش نیست.
+
+**رمزنگاری ندارد** — رکوردهای خود تانل رمز شده‌اند، WebSocket دورشان نه. اگر دامنه یا CDN دارید، **WSS MUX** را بردارید.
+
+هر چیزی که تانل نباشد یک صفحهٔ nginx معمولی می‌گیرد.
+
+</div>

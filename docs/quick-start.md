@@ -75,3 +75,25 @@ The menu also carries live logs, config validation, a paired health check that t
 - Not sure the transport is right? [Choosing a transport](transports/README.md)
 - Video stalling, or ping too high under load? [Tuning and presets](tuning.md)
 - Want to know what is actually happening on the wire? [Architecture](architecture.md)
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+پنج قدم:
+
+۱. روی **ایران**: `sudo pingify` ← **Create tunnel** ← ترنسپورت (اگر دلیلی ندارید **TCP MUX**)، پورت، پورت‌های forward، پریست (**Balanced**)
+۲. **کل** توکن نصب را کپی کنید
+۳. روی **خارج**: `sudo pingify` ← **Create tunnel ← Paste a token**
+۴. توکن را بچسبانید و فقط دو چیز محلی را جواب دهید: آدرس خودش، و برای CDN اینکه به کدام edge وصل شود
+۵. روی **هر دو** سرور **Health Check** بگیرید
+
+پورت carrier و پورت سرویس دو چیز جدا هستند: تانل می‌تواند روی `443` گوش بدهد و `:8010` را forward کند، و آدرس کاربر همان پورت `8010` ایران بماند.
+
+نام‌ها همیشه با side شروع می‌شوند: `iran-kcp-443` و `kharej-kcp-443`.
+
+> توکن را مثل رمز عبور نگه دارید — توکن امنیتی داخلش است.
+
+</div>

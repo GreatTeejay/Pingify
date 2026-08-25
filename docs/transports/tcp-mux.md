@@ -44,3 +44,21 @@ More carriers are not automatically faster. Each one is another congestion windo
 ## Trade-off
 
 TCP inside TCP. When the outer connection retransmits a segment, the inner stream's own reliability is retransmitting too, and the two back off against each other. On a clean link this costs nothing measurable. On a lossy one it is the reason KCP exists.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+چند اتصال TCP ساده، با همهٔ Streamها که با شناسه رویشان مالتی‌پلکس می‌شوند.
+
+**از اینجا شروع کنید.** چیزی برای نصب ندارد، دسترسی خاصی نمی‌خواهد، و روی مسیر تمیز به‌اندازهٔ هر چیز دیگری در Pingify سریع است.
+
+TCP تنها ترنسپورتی است که می‌پرسد **کدام طرف اتصال را باز کند**: حالت Reverse (خارج به ایران وصل می‌شود، پیش‌فرض) یا Direct (ایران به خارج، وقتی اتصال ورودی به سرور ایران دوام نمی‌آورد). پورت‌ها در هر دو حالت روی ایران هستند.
+
+**هزینه‌اش:** TCP داخل TCP. روی لینک پرافت، هر دو استک همان بستهٔ گم‌شده را دوباره می‌فرستند و سر زمان‌بندی با هم می‌جنگند. روی لینک تمیز این هزینه قابل اندازه‌گیری نیست؛ روی لینک پرافت دلیل وجود KCP همین است.
+
+اگر زیر بار تأخیر یا فروپاشی دیدید، **کمتر** کردن Carrier را قبل از بیشتر کردن امتحان کنید.
+
+</div>
