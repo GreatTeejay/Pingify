@@ -55,3 +55,23 @@ One honest limitation: the TLS ClientHello is Go's, not a browser's. It is a rea
 ## Occasional log noise
 
 Public port 443 collects old SSL, malformed ClientHellos and cipher probes all day. Those are logged at debug and are not tunnel failures. As long as the carriers are up, ignore them.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+همان WS MUX داخل TLS، با دامنهٔ تانل در SNI و Host و Origin.
+
+**پشت CDN بیشتر از استتار است:** تانل به edge وصل می‌شود، پس **آدرس سرور خارج اصلاً روی سیم نمی‌آید**. بستن یک آدرس تانل را تمام نمی‌کند.
+
+**گواهی:** یا خودکار (self-signed، با Cloudflare حالت **Full**) یا فایل گواهی (برای **Full (strict)**). تانل گواهی را **تأیید نمی‌کند** و این عمدی است — چیزی که طرف مقابل را ثابت می‌کند توکن است، در handshake بلافاصله بعد از upgrade. TLS اینجا استتار و رمزنگاری انتقال است، نه مرز اعتماد.
+
+پورت **۴۴۳** انتخاب طبیعی است. برای اتصال مستقیم یا عیب‌یابی پراکسی، **DNS only**.
+
+**یک محدودیت صادقانه:** ClientHello مال Go است نه مرورگر. یک handshake واقعی TLS است و کار می‌کند، ولی فیلترینگی که ClientHello را انگشت‌نگاری کند تفاوت را می‌فهمد. پشت CDN این کمتر اهمیت دارد، چون handshake به CDN می‌رود.
+
+خطاهای پراکندهٔ اسکنر TLS روی پورت ۴۴۳ عادی است و در سطح debug لاگ می‌شود.
+
+</div>

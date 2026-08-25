@@ -51,3 +51,23 @@ pingify --version
 ```
 
 The **Health Check** in the menu is the fastest way to find out what is wrong. It checks the core and script versions, the service, the config, carrier count, round-trip time, forwarded ports, firewall rules, and whether traffic actually crosses — and it names the fix for anything it finds.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+این پوشه مرجع کامل Pingify است.
+
+- **[نصب](installation.md)** — پیش‌نیازها، دستور نصب، چه چیزی کجا نوشته می‌شود، آپدیت و حذف
+- **[شروع سریع](quick-start.md)** — ساخت اولین تانل، توکن نصب، و چک کردن هر دو سر
+- **[ترنسپورت‌ها](transports/README.md)** — هر نُه تا، با یک صفحهٔ جدا برای هرکدام
+- **[تنظیمات](tuning.md)** — پریست‌ها و معنی هر عدد
+- **[معماری](architecture.md)** — یک بایت واقعاً چطور عبور می‌کند
+- **[عیب‌یابی](troubleshooting.md)** — خواندن لاگ و پیدا کردن علت
+- **[امنیت](security.md)** — چه چیزی رمز است و چه چیزی نیست
+
+**دو نکته قبل از شروع:** هر دو سرور باید یک نسخه باشند — اختلاف نسخه خودش را به شکل «دو طرف سر تعداد کریر اختلاف دارند» نشان می‌دهد. و توکن نصب کل کانفیگ را می‌برد، پس یک‌بار روی ایران می‌سازید و یک توکن روی خارج می‌چسبانید.
+
+</div>

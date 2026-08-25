@@ -98,3 +98,25 @@ The log path itself cannot block the tunnel either. Under systemd, stderr is a p
 On the WebSocket transports, anything that is not the tunnel gets a web server with nothing on it: the stock nginx page at `/`, a normal 404 elsewhere, with the headers a real one sends.
 
 A port that answers nothing is rare, and rare is what gets examined. The nginx version, page date and ETag are derived from the tunnel's own token, so no two servers answer identically and a fleet cannot be found by matching one response against the rest of the internet.
+
+---
+
+<div dir="rtl">
+
+## خلاصهٔ فارسی
+
+لایه‌ها، از بالا به پایین:
+
+**Stream** (یک شناسه، یک پنجرهٔ اعتبار) ← **رکورد** (SYN/Data/WND/FIN/RST/Ping/Pong) ← **فریم** (چند رکورد با هم، مهر و موم AES-256-GCM) ← **Carrier** (یک net.Conn: TCP، نشست KCP، WebSocket، ARQ روی ICMP) ← سیم
+
+هر چیزی بالای Carrier برای همهٔ ترنسپورت‌ها یکسان است. به همین دلیل اضافه کردن یک ترنسپورت تازه ارزان است: سه سؤال جواب می‌دهد و نه بیشتر.
+
+**هر Carrier سه goroutine دارد:** خواننده، نویسنده، keepalive. نویسنده چند رکورد را در یک فریم بسته‌بندی می‌کند و یک‌بار مهر می‌زند — بیشترِ مزیت سرعت نسبت به یک تانل ساده از همین است.
+
+**پنجرهٔ اعتبار** جلوی این را می‌گیرد که یک اتصال گیرکرده حافظهٔ کل تانل را بخورد. اعتبار در کمترین تعداد رکورد ممکن برمی‌گردد — نصف پنجره، یا لحظه‌ای که چیزی برای خواندن نمانده.
+
+**handshake توکن را نمی‌فرستد.** هر طرف یک nonce تازه و یک HMAC روی آن می‌فرستد؛ تطابق HMAC راز مشترک را ثابت می‌کند بدون اینکه هیچ‌کدام آن را روی سیم بگذارند. توکن اشتباه جواب مفیدی نمی‌گیرد و تأخیر تصادفی می‌بیند.
+
+**قانونی که پروژه عمداً نگه می‌دارد:** حجم لاگ باید تابع تعداد کریرها و ساعت باشد، **نه تعداد رویدادها** — و خودِ مسیر لاگ هم نمی‌تواند تونل را نگه دارد.
+
+</div>
