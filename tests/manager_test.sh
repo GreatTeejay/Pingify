@@ -1299,8 +1299,18 @@ note "the health check asks the right question of the right forwarder"
 hcf() { awk '/^health_check\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "it splits on the forwarder"   "$(hcf | grep -c 'T_FORWARDER" = "iptables"')" "3"
 check "and looks for a rule instead" "$(hcf | grep -c 'no forwarding rule for')"    "1"
+# Twice now: once so a kernel tunnel is probed over its own private link
+# instead, and once so it is not asked for a peer version it has no engine to
+# report.
 check "the core probe is skipped for kernel tunnels" \
-      "$(hcf | grep -c '! kernel_transport')" "1"
+      "$(hcf | grep -c '! kernel_transport')" "2"
+
+# The two servers disagreeing about their version is the one fault neither end
+# can see from where it stands, and it is what "20 of 8 carriers up" means.
+check "the two servers' versions are compared" \
+      "$(hcf | grep -c 'the other server runs')" "1"
+check "and it says to update both" \
+      "$(hcf | grep -c 'update BOTH servers')" "1"
 check "which get their own instead"  "$(hcf | grep -c 'kernel_probe')"              "1"
 
 # The kernel probe crosses the private link, the way real traffic does.

@@ -217,6 +217,34 @@ health_check() {
         fi
     fi
 
+    # --- the other server's version ----------------------------------------
+    #
+    # The check above compares the core with the script on THIS machine, which
+    # is the easy half. The half that has cost real time is the two servers
+    # disagreeing, because neither can see it from where it stands: the far end
+    # opens the carrier count its own preset table says, and this end reports
+    # "20 of 8 carriers up" with nothing to explain it.
+    #
+    # The core learns the peer's version from a record sent when each carrier
+    # comes up, so all this has to do is ask. A peer too old to send one says
+    # nothing, which is itself the answer once carriers are up.
+    if [ "$state" = "active" ] && [ -n "$T_STATUS" ] && [ -x "$CORE_BIN" ] &&
+       [ "${up:-0}" != "0" ] && ! kernel_transport; then
+        # awk by field rather than a sed backreference: this file is
+        # assembled into one script by a build that has eaten a backslash
+        # before, turning a backreference into a literal control byte. The
+        # marker line is the only one that carries those words.
+        local peerver
+        peerver="$("$CORE_BIN" -status "$T_STATUS" 2>/dev/null |
+            awk '/UPDATE BOTH ENDS/{print $8; exit}')"
+        if [ -n "$peerver" ]; then
+            hc_bad "the other server runs $peerver, this one runs $PINGIFY_VERSION"
+            hc_note "presets, token format and wire records move together"
+            hc_note "a mismatch shows up as the two ends disagreeing about carriers"
+            hc_fix "update BOTH servers, then restart both tunnels"
+        fi
+    fi
+
     # --- the forwarded ports, on the end that has them ---------------------
     #
     # What "bound" means depends on who forwards. Our core binds the port and
