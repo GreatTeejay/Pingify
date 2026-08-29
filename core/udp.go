@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash"
 	"net"
@@ -62,6 +63,13 @@ type udpTransport struct {
 	// unknown session arriving there cannot be a carrier - see dispatch.
 	dials bool
 
+	// Where a bare packet goes when one arrives, and who to send one to. The
+	// peer is learned from any datagram that carried a valid tag, because the
+	// accepting end has no address until somebody talks to it.
+	pktMu sync.Mutex
+	pktTo net.Addr
+	onPkt func([]byte)
+
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
 	inbound  chan net.Conn
@@ -109,10 +117,23 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 
 // tag is the same cheap pre-filter the echo transport uses: enough to tell our
 // traffic from the noise a public port collects, before anything is spent on it.
-func (t *udpTransport) putTag(dst, hdr []byte) {
+// Two kinds of thing travel on this socket: a datagram belonging to an ARQ
+// session, and a bare packet from the private link, which has no session under
+// it. They are told apart by which key made the tag, so neither needs a byte
+// on the wire to say which it is.
+// A bare packet needs somewhere to go, and the accepting end has nowhere
+// to send one until it has heard from the other server at least once.
+var errUDPNoPeer = errors.New("udp: no peer to send a packet to yet")
+
+const (
+	udpTagARQ    = "pingify/v3 udp tag"
+	udpTagDirect = "pingify/v3 udp packet"
+)
+
+func (t *udpTransport) putTagFor(label string, dst, hdr []byte) {
 	m := t.tagHash.Get().(hash.Hash)
 	m.Reset()
-	m.Write([]byte("pingify/v3 udp tag"))
+	m.Write([]byte(label))
 	m.Write(hdr)
 	var sum [sha256.Size]byte
 	out := m.Sum(sum[:0])
@@ -120,10 +141,54 @@ func (t *udpTransport) putTag(dst, hdr []byte) {
 	t.tagHash.Put(m)
 }
 
-func (t *udpTransport) validTag(want, hdr []byte) bool {
+func (t *udpTransport) putTag(dst, hdr []byte) { t.putTagFor(udpTagARQ, dst, hdr) }
+
+func (t *udpTransport) validTagFor(label string, want, hdr []byte) bool {
 	var got [udpTagLen]byte
-	t.putTag(got[:], hdr)
+	t.putTagFor(label, got[:], hdr)
 	return hmac.Equal(want, got[:])
+}
+
+func (t *udpTransport) validTag(want, hdr []byte) bool {
+	return t.validTagFor(udpTagARQ, want, hdr)
+}
+
+// SetPacketHandler installs where a bare packet goes, and names the peer to
+// send to when this end is the one that dials.
+func (t *udpTransport) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
+	t.pktMu.Lock()
+	t.onPkt = h
+	if peer != nil && t.pktTo == nil {
+		t.pktTo = &net.UDPAddr{IP: peer.IP, Zone: peer.Zone}
+	}
+	t.pktMu.Unlock()
+}
+
+func (t *udpTransport) packetHandler() func([]byte) {
+	t.pktMu.Lock()
+	defer t.pktMu.Unlock()
+	return t.onPkt
+}
+
+func (t *udpTransport) rememberPeer(a net.Addr) {
+	t.pktMu.Lock()
+	t.pktTo = a
+	t.pktMu.Unlock()
+}
+
+// SendPacket puts one whole packet on the wire, with no session under it.
+func (t *udpTransport) SendPacket(b []byte) error {
+	t.pktMu.Lock()
+	peer := t.pktTo
+	t.pktMu.Unlock()
+	if peer == nil {
+		return errUDPNoPeer
+	}
+	body := make([]byte, udpTagLen+len(b))
+	t.putTagFor(udpTagDirect, body[:udpTagLen], b[:min(len(b), arqOver)])
+	copy(body[udpTagLen:], b)
+	_, err := t.pc.WriteTo(body, peer)
+	return err
 }
 
 func (t *udpTransport) headerMask() cipher.Block {
@@ -150,9 +215,20 @@ func (t *udpTransport) handlePacket(pkt []byte, addr net.Addr) {
 		return
 	}
 	datagram := pkt[udpTagLen:]
-	if !t.validTag(pkt[:udpTagLen], datagram[:min(len(datagram), arqOver)]) {
-		return // not ours, and it cost one HMAC to find out
+	head := datagram[:min(len(datagram), arqOver)]
+	if !t.validTag(pkt[:udpTagLen], head) {
+		// Not a session datagram. It may still be a packet from the private
+		// link, which is tagged with a different key and has no session.
+		if t.packetHandler() == nil || !t.validTagFor(udpTagDirect, pkt[:udpTagLen], head) {
+			return // not ours, and it cost one HMAC to find out
+		}
+		t.rememberPeer(addr)
+		if h := t.packetHandler(); h != nil {
+			h(datagram)
+		}
+		return
 	}
+	t.rememberPeer(addr)
 	// dispatch/onDatagram are synchronous; do not copy the batch buffer.
 	t.dispatch(addr, datagram)
 }

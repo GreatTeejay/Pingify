@@ -59,7 +59,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.9"
+const version = "1.1.0"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -3043,6 +3043,19 @@ type tunnel struct {
 	wrIdx  uint32
 	closed chan struct{}
 	once   sync.Once
+
+	// When the transport can carry a whole packet with no session under it,
+	// this is how the private link travels: one packet, one datagram, no
+	// reliability layer. See tunfast.go for why that is the right shape for
+	// something carrying IP.
+	fast *tunFast
+}
+
+// packetCarrier is a transport that can put one whole packet on the wire
+// without a session underneath it.
+type packetCarrier interface {
+	SendPacket([]byte) error
+	SetPacketHandler(func([]byte), *net.IPAddr)
 }
 
 func startTUN(cfg *Config, p *pool) (*tunnel, error) {
@@ -3067,6 +3080,7 @@ func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 		return nil, err
 	}
 	p.setHandler(t)
+	t.startFast()
 	for i := range t.queues {
 		go t.readQueue(t.queues[i])
 	}
@@ -3120,13 +3134,23 @@ func (t *tunnel) readQueue(f *os.File) {
 		r := getRec()
 		n, err := f.Read(r.body())
 		if n > 0 {
-			r.seal(cmdTUN, 0, n)
-			l := t.p.pickHash(flowHash(r.body()[:n]))
-			if l == nil {
+			if t.fast != nil {
+				// Straight onto the wire. No braid, no window, no ordering -
+				// the packet is its own datagram and arrives or does not,
+				// which is what IP has always promised the layers above it.
+				if e := t.fast.Send(r.body()[:n]); e != nil {
+					logDebug("tun send: %v", e)
+				}
 				putRec(r)
 			} else {
-				atomic.AddUint64(&l.txBytes, uint64(n))
-				l.send(r)
+				r.seal(cmdTUN, 0, n)
+				l := t.p.pickHash(flowHash(r.body()[:n]))
+				if l == nil {
+					putRec(r)
+				} else {
+					atomic.AddUint64(&l.txBytes, uint64(n))
+					l.send(r)
+				}
 			}
 		} else {
 			putRec(r)
@@ -3147,8 +3171,62 @@ func (t *tunnel) onRecord(l *link, cmd byte, id uint32, body []byte) {
 		return
 	}
 	atomic.AddUint64(&l.rxBytes, uint64(len(body)))
+	t.toDevice(body)
+}
+
+// startFast puts the private link on the direct path when the transport can
+// carry a whole packet on its own.
+//
+// Only the packet transports can: a stream transport has no packet boundaries
+// to put one in, and TCP is already reliable and ordered whatever we do, so
+// there is nothing to gain there anyway.
+func (t *tunnel) startFast() {
+	pc, ok := t.p.tr.(packetCarrier)
+	if !ok {
+		return
+	}
+
+	// Its own keys, and a different label from anything the braid derives, so
+	// the two paths cannot be confused for one another even in principle.
+	var tx, rx cipher.AEAD
+	if t.cfg.encrypted() {
+		prk := hkdfExtract([]byte("pingify/v3 tun packets"), t.cfg.key())
+		out := hkdfExpand(prk, []byte("iran to kharej"), 32)
+		in := hkdfExpand(prk, []byte("kharej to iran"), 32)
+		if t.cfg.Role != "server" {
+			out, in = in, out
+		}
+		tx, rx = aeadFrom(out), aeadFrom(in)
+	}
+
+	var peer *net.IPAddr
+	if host := t.cfg.Connect; host != "" {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if ip, err := net.ResolveIPAddr("ip4", host); err == nil {
+			peer = ip
+		}
+	}
+
+	t.fast = newTunFast(tx, rx, pc.SendPacket, t.toDevice)
+	pc.SetPacketHandler(t.fast.Deliver, peer)
+
+	how := "encrypted"
+	if !t.cfg.encrypted() {
+		how = "in the clear"
+	}
+	logInfo("private link goes straight onto the wire, %s: one packet per datagram,"+
+		" nothing ordering or resending them", how)
+}
+
+// toDevice writes one IP packet to the interface, whichever path brought it.
+func (t *tunnel) toDevice(pkt []byte) {
+	if len(t.queues) == 0 {
+		return
+	}
 	q := t.queues[int(atomic.AddUint32(&t.wrIdx, 1))%len(t.queues)]
-	if _, err := q.Write(body); err != nil {
+	if _, err := q.Write(pkt); err != nil {
 		logDebug("tun write: %v", err)
 	}
 }

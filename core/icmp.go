@@ -52,6 +52,10 @@ const (
 
 var errICMPClosed = errors.New("icmp: transport closed")
 
+// A bare packet needs somewhere to go, and the accepting end has nowhere to
+// send one until it has heard from the other server at least once.
+var errICMPNoPeer = errors.New("icmp: no peer to send a packet to yet")
+
 // icmpChecksum is the standard one's-complement sum from RFC 1071.
 func icmpChecksum(b []byte) uint16 {
 	var sum uint32
@@ -105,6 +109,17 @@ type icmpTransport struct {
 	// unknown session arriving there cannot be a carrier - see dispatch.
 	dials bool
 
+	// Where a bare packet goes when one arrives, and who to send one to.
+	//
+	// The peer is learned rather than configured: the accepting end has no
+	// address until somebody talks to it, and by the time a private link is
+	// carrying anything the braid's handshake has already been through here.
+	// Only a datagram that carried a valid tag can set it.
+	pktMu  sync.Mutex
+	pktTo  *net.IPAddr
+	onPkt  func([]byte)
+	pktSeq uint32
+
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
 	inbound  chan net.Conn
@@ -154,10 +169,20 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	return t, nil
 }
 
-func (t *icmpTransport) putTag(dst, hdr []byte) {
+// Two kinds of thing travel on this socket: a datagram belonging to an ARQ
+// session, and a bare packet from the private link, which has no session under
+// it at all. They are told apart by which key the tag was made with, so
+// neither needs a byte on the wire to say which it is, and neither can be
+// mistaken for the other by anything that does not hold the token.
+const (
+	icmpTagARQ    = "pingify/v3 icmp tag"
+	icmpTagDirect = "pingify/v3 icmp packet"
+)
+
+func (t *icmpTransport) putTagFor(label string, dst, hdr []byte) {
 	m := t.tagHash.Get().(hash.Hash)
 	m.Reset()
-	m.Write([]byte("pingify/v3 icmp tag"))
+	m.Write([]byte(label))
 	m.Write(hdr)
 	var sum [sha256.Size]byte
 	out := m.Sum(sum[:0])
@@ -165,10 +190,16 @@ func (t *icmpTransport) putTag(dst, hdr []byte) {
 	t.tagHash.Put(m)
 }
 
-func (t *icmpTransport) validTag(want, hdr []byte) bool {
+func (t *icmpTransport) putTag(dst, hdr []byte) { t.putTagFor(icmpTagARQ, dst, hdr) }
+
+func (t *icmpTransport) validTagFor(label string, want, hdr []byte) bool {
 	var got [icmpTagLen]byte
-	t.putTag(got[:], hdr)
+	t.putTagFor(label, got[:], hdr)
 	return hmac.Equal(want, got[:])
+}
+
+func (t *icmpTransport) validTag(want, hdr []byte) bool {
+	return t.validTagFor(icmpTagARQ, want, hdr)
 }
 
 func (t *icmpTransport) headerMask() cipher.Block {
@@ -243,8 +274,15 @@ func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 
 	// handlePacket and onDatagram finish synchronously, so the batch buffer
 	// can be used in place. Copying every received packet here only fed the GC.
-	if !t.validTag(body[:icmpTagLen], datagram[:min(len(datagram), arqOver)]) {
-		return
+	head := datagram[:min(len(datagram), arqOver)]
+	direct := false
+	if !t.validTag(body[:icmpTagLen], head) {
+		// Not a session datagram. It may still be a packet from the private
+		// link, which is tagged with a different key and has no session.
+		if t.packetHandler() == nil || !t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
+			return
+		}
+		direct = true
 	}
 	ip := addrIP(addr)
 	if ip == nil {
@@ -256,7 +294,61 @@ func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 		})
 		return
 	}
+	if direct {
+		t.rememberPeer(ip)
+		if h := t.packetHandler(); h != nil {
+			h(datagram)
+		}
+		return
+	}
+	// A session datagram tells us who to answer as well.
+	t.rememberPeer(ip)
 	t.dispatch(ip, datagram)
+}
+
+func (t *icmpTransport) packetHandler() func([]byte) {
+	t.pktMu.Lock()
+	defer t.pktMu.Unlock()
+	return t.onPkt
+}
+
+func (t *icmpTransport) rememberPeer(ip *net.IPAddr) {
+	t.pktMu.Lock()
+	if t.pktTo == nil || t.pktTo.IP.String() != ip.IP.String() {
+		t.pktTo = ip
+	}
+	t.pktMu.Unlock()
+}
+
+// SetPacketHandler installs where a bare packet goes, and names the peer to
+// send to when this end is the one that dials.
+func (t *icmpTransport) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
+	t.pktMu.Lock()
+	t.onPkt = h
+	if peer != nil {
+		t.pktTo = peer
+	}
+	t.pktMu.Unlock()
+}
+
+// SendPacket puts one whole packet on the wire, with no session under it.
+func (t *icmpTransport) SendPacket(b []byte) error {
+	t.pktMu.Lock()
+	peer := t.pktTo
+	t.pktMu.Unlock()
+	if peer == nil {
+		return errICMPNoPeer
+	}
+	pkt := make([]byte, icmpHdrLen+icmpTagLen+len(b))
+	pkt[0] = icmpEchoReply
+	binary.BigEndian.PutUint16(pkt[4:6], t.id)
+	binary.BigEndian.PutUint16(pkt[6:8], uint16(atomic.AddUint32(&t.pktSeq, 1)))
+	tagged := pkt[icmpHdrLen:]
+	t.putTagFor(icmpTagDirect, tagged[:icmpTagLen], b[:min(len(b), arqOver)])
+	copy(tagged[icmpTagLen:], b)
+	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
+	_, err := t.pc.WriteTo(pkt, peer)
+	return err
 }
 
 // dispatch hands the datagram to its connection, creating one if this is a
