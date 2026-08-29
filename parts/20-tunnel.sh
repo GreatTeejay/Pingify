@@ -846,16 +846,34 @@ setup_token_read() {
         { setup_token_bad "that is not valid base64"; return 1; }
     case "$raw" in
         p5\|*)
+            # Thirty is a token printed before the encryption setting existed,
+            # thirty-one is one printed after. Both are read: the two servers are
+            # updated one at a time, and a token printed five minutes ago should
+            # not stop working halfway through that.
             fields="$(printf '%s' "$raw" | awk -F'|' '{print NF}')"
-            [ "$fields" = "31" ] || { setup_token_bad "the token is incomplete"; return 1; }
+            case "$fields" in
+                30 | 31) ;;
+                *) setup_token_bad "the token is incomplete"; return 1 ;;
+            esac
             body="${raw%|*}"; sum="${raw##*|}"
             want="$(printf '%s' "$body" | sha256sum | awk '{print $1}')"
             [ "$sum" = "$want" ] || { setup_token_bad "the token checksum does not match"; return 1; }
-            IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu \
-                ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval \
-                pckflags profile obfuscate encrypt sum <<TOKEN
+            if [ "$fields" = "31" ]; then
+                IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu \
+                    ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval \
+                    pckflags profile obfuscate encrypt sum <<TOKEN
 $raw
 TOKEN
+            else
+                # There is no such field, and every tunnel that predates it was
+                # encrypted - so its absence has to mean yes, not no.
+                IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu \
+                    ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval \
+                    pckflags profile obfuscate sum <<TOKEN
+$raw
+TOKEN
+                encrypt="true"
+            fi
             host="$(setup_token_text_decode "$host")" || { setup_token_bad "the address field is damaged"; return 1; }
             tok="$(setup_token_text_decode "$tok")" || { setup_token_bad "the security field is damaged"; return 1; }
             tl="$(setup_token_text_decode "$tl")" || { setup_token_bad "the private address is damaged"; return 1; }
@@ -1375,6 +1393,17 @@ new_tunnel() {
     # It is not, however, where the weight is. Measured: 8.8 GB/s sealing on an
     # ordinary machine, against 12.5 MB/s for a hundred-megabit tunnel.
     # ---------------------------------------------------------------------
+    # Asked on a private link and nowhere else.
+    #
+    # A forwarded port carries whatever the service behind it speaks, and on
+    # this tool that is Xray or something like it - already encrypted end to
+    # end, where a second cipher is redundant but also not ours to remove: the
+    # operator did not choose what crosses it. A private link is different.
+    # It carries raw IP between two machines the same person runs, they know
+    # what is on it, and it is the one that is judged on speed.
+    if [ "$T_KIND" != "tun" ] && [ "$T_MODE" != "tun" ] && [ "$T_MODE" != "both" ]; then
+        T_ENCRYPT="true"
+    else
     wiz "Encryption"
     choice 1 "Encrypted" "AES-256-GCM on every frame  (recommended)"
     choice 2 "In the clear" "faster on paper, and the shape is visible"
@@ -1393,6 +1422,7 @@ new_tunnel() {
         warn "frames will not be encrypted, and both servers must agree"
     else
         T_ENCRYPT="true"
+    fi
     fi
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
