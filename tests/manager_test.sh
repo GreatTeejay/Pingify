@@ -2215,8 +2215,55 @@ eg() { grep -m1 "^$1=" "$WORK/edge.out" | cut -d= -f2-; }
 
 check "the address travels as the address" "$(eg token_host)"   "tunnel.example.com"
 check "with its port beside it"            "$(eg token_port)"   "8443"
-# no field was added for the domain, because the address already was one
-check "and the token carries all tuning" "$(eg token_fields)" "30"
+# no field was added for the domain, because the address already was one -
+# the thirty-first is whether the frames are encrypted
+check "and the token carries all tuning" "$(eg token_fields)" "31"
+
+# ---------------------------------------------------------------------------
+note "encryption is a question, not an assumption"
+# ---------------------------------------------------------------------------
+# A tunnel in front of Xray carries traffic that is already encrypted end to
+# end, so a second cipher over the top buys nothing the first did not. What it
+# buys is the shape - with it off, our framing is on the wire for anything that
+# looks - and the proof that a frame arrived unaltered. Worth asking about, and
+# worth defaulting to on.
+ENC="$WORK/enc"; mkdir -p "$ENC"
+(
+    CFG_DIR="$ENC"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    cfg_reset
+    echo "default=$T_ENCRYPT"
+    for e in true false; do
+        cfg_reset
+        T_ROLE="server"; T_TRANSPORT="tcp"; T_ACCEPTS="server"; cfg_mode
+        T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+        T_TOKEN="$TOKEN"; T_FORWARDS='"8009"'; T_ENCRYPT="$e"
+        T_NAME="ir-$e"; T_STATUS="127.0.0.1:9700"
+        cfg_save > /dev/null
+        echo "cfg_$e=$(toml_get "$(cfg_file "$T_NAME")" transport encrypt)"
+        tok="$(cfg_setup_token)"
+        # and what the far end actually reads out of it
+        cfg_reset
+        if setup_token_read "$tok" > /dev/null 2>&1; then
+            echo "read_$e=$T_ENCRYPT"
+        else
+            echo "read_$e=PARSE FAILED"
+        fi
+    done
+) > "$WORK/enc.out" 2>&1
+ez() { grep -m1 "^$1=" "$WORK/enc.out" | cut -d= -f2-; }
+
+check "a new tunnel is encrypted"  "$(ez default)"    "true"
+check "and the config says so"     "$(ez cfg_true)"   "true"
+check "off is recorded too"        "$(ez cfg_false)"  "false"
+# Both ends read it from the same token, because a tunnel where one seals and
+# the other does not fails in a way that looks exactly like a wrong password.
+check "the token carries yes"      "$(ez read_true)"  "true"
+check "and carries no"             "$(ez read_false)" "false"
+
+encwz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
+check "the wizard has an encryption step"       "$(encwz | grep -c 'wiz "Encryption"')" "1"
+check "and says what it actually costs"       "$(encwz | grep -c 'tenth of one percent')" "1"
 
 check "KHAREJ dials the domain"       "$(eg plain_connect)" "tunnel.example.com:8443"
 check "and says it only once"         "$(eg plain_host)"    ""

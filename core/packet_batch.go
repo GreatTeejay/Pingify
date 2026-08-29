@@ -79,22 +79,40 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 		msgs[i].Buffers = [][]byte{bufs[i]}
 	}
 
+	// Until this reader has delivered its first packet we do not know the
+	// socket does recvmmsg at all. Three failures before that point and we
+	// stop guessing: the plain reader works everywhere, and it is what this
+	// transport used before batching existed.
+	delivered := false
+	fails := 0
+
 	for {
 		n, err := p.ReadBatch(msgs, 0)
 		for i := 0; i < n; i++ {
 			if msgs[i].N > 0 {
+				delivered = true
 				handle(bufs[i][:msgs[i].N], msgs[i].Addr)
 			}
 		}
 		if err == nil {
+			fails = 0
 			continue
 		}
 		select {
 		case <-done:
 			return
 		default:
-			onError(err)
 		}
+		if !delivered {
+			fails++
+			if fails >= 3 {
+				logWarn("batched receive is not working on this socket (%v) - "+
+					"falling back to the plain reader", err)
+				packetSingleReadLoop(pc, done, maxPacket, handle, onError)
+				return
+			}
+		}
+		onError(err)
 	}
 }
 

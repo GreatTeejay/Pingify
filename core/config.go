@@ -215,6 +215,8 @@ func assign(c *Config, section, key, val string) error {
 			err = num(&c.KeepaliveSec)
 		case "dial_timeout_sec":
 			err = num(&c.DialTimeout)
+		case "encrypt":
+			err = boolean(&c.Encrypt)
 		case "obfuscate":
 			err = boolean(&c.Obfuscate)
 		}

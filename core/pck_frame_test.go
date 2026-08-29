@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
+	"sync"
 	"testing"
 )
 
@@ -72,5 +74,72 @@ func TestPCKStableSourcePortMatchesManager(t *testing.T) {
 	}
 	if got := pckStableSourcePort(cfg, 28817); got != 28818 {
 		t.Fatalf("collision-safe PCK source port = %d, want 28818", got)
+	}
+}
+
+// The envelope check runs on every packet the kernel filter lets through, so
+// the keyed state is pooled rather than rebuilt each time. Pooling is only
+// worth anything if it still gives the same answer under concurrent use: a
+// reset missed between two users would pass a forged packet or reject a real
+// one, and either is worse than the allocation it saved.
+func TestPCKEnvelopePoolAgreesWithItselfUnderLoad(t *testing.T) {
+	keyA := []byte("the first tunnel's packet key...")
+	keyB := []byte("a different tunnel on this host!")
+
+	var wg sync.WaitGroup
+	fail := make(chan string, 8)
+	say := func(why string) {
+		select {
+		case fail <- why:
+		default:
+		}
+	}
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			key, other := keyA, keyB
+			if w%2 == 1 {
+				key, other = keyB, keyA
+			}
+			for i := 0; i < 500; i++ {
+				carrier := uint16(w*100 + i%97)
+				payload := []byte(fmt.Sprintf("worker %d packet %d", w, i))
+				pkt := pckEnvelope(key, carrier, payload)
+
+				gotCarrier, gotBody, ok := openPCKEnvelope(key, pkt)
+				if !ok {
+					say("a packet this key sealed did not open")
+					return
+				}
+				if gotCarrier != carrier || !bytes.Equal(gotBody, payload) {
+					say("the envelope came back different")
+					return
+				}
+				if _, _, ok := openPCKEnvelope(other, pkt); ok {
+					say("another tunnel's key opened this packet")
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	select {
+	case why := <-fail:
+		t.Fatal(why)
+	default:
+	}
+}
+
+// A packet whose body has been touched must not open, however hot the path.
+func TestPCKEnvelopeRefusesATamperedBody(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	pkt := pckEnvelope(key, 7, []byte("the original payload"))
+	if _, _, ok := openPCKEnvelope(key, pkt); !ok {
+		t.Fatal("the untouched packet did not open")
+	}
+	pkt[len(pkt)-1] ^= 0x01
+	if _, _, ok := openPCKEnvelope(key, pkt); ok {
+		t.Fatal("a changed body still opened")
 	}
 }

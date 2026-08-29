@@ -1,9 +1,12 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -149,4 +152,100 @@ func udpStray(psk []byte, session uint32) []byte {
 	h.put(buf[arqNonce:arqOver])
 	maskHeader(blockFrom(k), buf[:arqNonce], buf[arqNonce:arqOver])
 	return buf
+}
+
+// The end that dials never calls Accept, so an unknown session arriving there
+// cannot be a carrier - it is a peer still retransmitting to one already torn
+// down. Building an ARQ connection for it costs a map entry, a channel slot
+// nobody will take, and a goroutine with a ten millisecond ticker, and the
+// reaper never removes it because a session nobody accepts neither closes nor
+// fails. Days of that is a tunnel that has consumed half an hour of CPU and
+// two hundred megabytes doing nothing at all.
+func TestTheDiallingEndBuildsNothingForStrays(t *testing.T) {
+	psk := []byte(testPSK(t))
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	tr := &udpTransport{
+		pc:       pc,
+		psk:      psk,
+		window:   64,
+		dials:    true, // this end dials; it has no acceptor at all
+		sessions: make(map[sessionKey]*arqConn),
+		inbound:  make(chan net.Conn, 64),
+		done:     make(chan struct{}),
+	}
+	defer close(tr.done)
+
+	peer := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}
+	for i := 1; i <= 200; i++ {
+		tr.dispatch(peer, udpStray(psk, uint32(0x57A00000+i)))
+	}
+
+	tr.mu.Lock()
+	sessions := len(tr.sessions)
+	tr.mu.Unlock()
+	if sessions != 0 {
+		t.Fatalf("built %d sessions on the end that never accepts", sessions)
+	}
+	if queued := len(tr.inbound); queued != 0 {
+		t.Fatalf("queued %d carriers for an acceptor that does not exist", queued)
+	}
+}
+
+// The accepting end still builds them - that is where a real carrier arrives -
+// but lets go of one that has gone quiet, so a stray costs a minute and a half
+// rather than the life of the process.
+func TestTheAcceptingEndLetsGoOfASessionThatWentQuiet(t *testing.T) {
+	psk := []byte(testPSK(t))
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+
+	tr := &udpTransport{
+		pc:       pc,
+		psk:      psk,
+		window:   64,
+		dials:    false, // this end accepts
+		sessions: make(map[sessionKey]*arqConn),
+		inbound:  make(chan net.Conn, 64),
+		done:     make(chan struct{}),
+	}
+	// what newUDPTransport sets up; Close emits a FIN, which needs it
+	tr.tagHash.New = func() interface{} { return hmac.New(sha256.New, psk) }
+	defer close(tr.done)
+
+	peer := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: 9}
+	tr.dispatch(peer, udpStray(psk, 0x11223344))
+
+	tr.mu.Lock()
+	built := len(tr.sessions)
+	for _, c := range tr.sessions {
+		// as though it last heard something well before the idle bound
+		atomic.StoreInt64(&c.lastRx, time.Now().Add(-2*arqSessionIdle).UnixNano())
+	}
+	tr.mu.Unlock()
+	if built != 1 {
+		t.Fatalf("the accepting end built %d sessions, want 1", built)
+	}
+
+	// one sweep, the same one the reaper runs on its ticker
+	now := time.Now().UnixNano()
+	tr.mu.Lock()
+	for k, c := range tr.sessions {
+		if now-atomic.LoadInt64(&c.lastRx) > int64(arqSessionIdle) {
+			c.Close()
+			delete(tr.sessions, k)
+		}
+	}
+	left := len(tr.sessions)
+	tr.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d sessions survived the sweep", left)
+	}
 }

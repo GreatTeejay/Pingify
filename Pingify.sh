@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="1.0.5"
+PINGIFY_VERSION="1.0.6"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -955,6 +955,7 @@ cfg_reset() {
     T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1200; T_KCP_INTERVAL=10
     T_PCK_FLAGS="PA"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
+    T_ENCRYPT="true"     # AES-256-GCM on every frame; see the Encryption step
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
     # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
@@ -1508,6 +1509,7 @@ cfg_render() {
         printf 'carriers         = %s\n' "$T_CARRIERS"
         printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
         printf 'obfuscate        = %s\n' "$T_OBFUSCATE"
+        printf 'encrypt          = %s\n' "$T_ENCRYPT"
     fi
     if [ "$T_TRANSPORT" = "kcp" ] || [ "$T_TRANSPORT" = "pck" ]; then
         printf '\n[kcp]\n'
@@ -1659,7 +1661,7 @@ transport_label() {
 # there is nothing to copy by hand and nothing to get wrong:
 #
 #   p5|kind|transport|mode|forwarder|dial|b64(host)|port|b64(token)|...|
-#      b64(pck-flags)|profile|obfuscate|sha256
+#      b64(pck-flags)|profile|obfuscate|encrypt|sha256
 #
 # dial says what the far end does about the connection: 1 means it dials us
 # and host is where, 0 means it accepts and supplies its own address. The
@@ -1722,7 +1724,7 @@ cfg_setup_token() {
             awgobf="$T_AWG_OBF"
         fi
     fi
-    body="$(printf 'p5|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    body="$(printf 'p5|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$T_KIND" "$T_TRANSPORT" "$T_MODE" "$T_FORWARDER" \
         "$dial" "$(setup_token_text_encode "$host")" "$port" "$(setup_token_text_encode "$T_TOKEN")" \
         "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
@@ -1730,7 +1732,7 @@ cfg_setup_token() {
         "$ttl" "$awgport" "$(setup_token_text_encode "$awgpriv")" \
         "$(setup_token_text_encode "$awgpub")" "$(setup_token_text_encode "$awgobf")" \
         "$T_FEC_DATA" "$T_FEC_PARITY" "$T_PACKET_MTU" "$T_KCP_INTERVAL" \
-        "$(setup_token_text_encode "$T_PCK_FLAGS")" "$T_PRESET" "$T_OBFUSCATE")"
+        "$(setup_token_text_encode "$T_PCK_FLAGS")" "$T_PRESET" "$T_OBFUSCATE" "$T_ENCRYPT")"
     sum="$(printf '%s' "$body" | sha256sum | awk '{print $1}')"
     printf '%s|%s' "$body" "$sum" | base64 | tr -d '\n'
 }
@@ -1743,7 +1745,7 @@ setup_token_read() {
     local encoded="$1" raw fields body sum want
     local v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu
     local ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval pckflags
-    local profile="" obfuscate="false"
+    local profile="" obfuscate="false" encrypt="true"
     SETUP_TOKEN_ERROR=""
 
     raw="$(printf '%s' "$encoded" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)" ||
@@ -1751,13 +1753,13 @@ setup_token_read() {
     case "$raw" in
         p5\|*)
             fields="$(printf '%s' "$raw" | awk -F'|' '{print NF}')"
-            [ "$fields" = "30" ] || { setup_token_bad "the token is incomplete"; return 1; }
+            [ "$fields" = "31" ] || { setup_token_bad "the token is incomplete"; return 1; }
             body="${raw%|*}"; sum="${raw##*|}"
             want="$(printf '%s' "$body" | sha256sum | awk '{print $1}')"
             [ "$sum" = "$want" ] || { setup_token_bad "the token checksum does not match"; return 1; }
             IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu \
                 ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval \
-                pckflags profile obfuscate sum <<TOKEN
+                pckflags profile obfuscate encrypt sum <<TOKEN
 $raw
 TOKEN
             host="$(setup_token_text_decode "$host")" || { setup_token_bad "the address field is damaged"; return 1; }
@@ -1789,6 +1791,9 @@ TOKEN
     T_FEC_DATA="${fecdata:-10}"; T_FEC_PARITY="${fecparity:-3}"
     T_PACKET_MTU="${packetmtu:-1200}"; T_KCP_INTERVAL="${kcpinterval:-10}"
     T_PCK_FLAGS="${pckflags:-PA}"; T_OBFUSCATE="$obfuscate"
+    # An older token has no such field, and a tunnel that predates the
+    # setting was encrypted - so empty has to mean yes, not no.
+    case "$encrypt" in false) T_ENCRYPT="false" ;; *) T_ENCRYPT="true" ;; esac
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
     T_GRE_TTL="${ttl:-255}"; T_AWG_PORT="${awgport:-51820}"
     T_AWG_PRIV="$awgpriv"; T_AWG_PUB="$awgpub"; T_AWG_OBF="$awgobf"
@@ -2258,6 +2263,43 @@ new_tunnel() {
     cdn_port_warn
     this_side_accepts || ask_edge
     ask_wss_certificate || { wiz_end; return 0; }
+
+    # ---------------------------------------------------------------------
+    # Encryption
+    #
+    # Worth asking rather than assuming, because the honest answer depends on
+    # what is being carried. A tunnel in front of Xray carries traffic that is
+    # already encrypted end to end, and a second cipher over the top of it
+    # buys nothing the first one did not already give.
+    #
+    # What it does buy is the shape: with the cipher on, everything past the
+    # handshake is indistinguishable from noise; with it off our framing is on
+    # the wire for anything that looks. And GCM is what proves a frame arrived
+    # unaltered, so without it anything that can put a packet on the carrier
+    # can put data into the tunnel.
+    #
+    # It is not, however, where the weight is. Measured: 8.8 GB/s sealing on an
+    # ordinary machine, against 12.5 MB/s for a hundred-megabit tunnel.
+    # ---------------------------------------------------------------------
+    wiz "Encryption"
+    choice 1 "Encrypted" "AES-256-GCM on every frame  (recommended)"
+    choice 2 "In the clear" "faster on paper, and the shape is visible"
+    say ""
+    dim "The cipher costs about a tenth of one percent of a core at 100 Mbit/s,"
+    dim "so this is not the setting that makes a tunnel fast. What it changes is"
+    dim "whether the traffic looks like anything, and whether a frame can be"
+    dim "altered on the way. Turn it off only when what you carry - Xray, a VPN,"
+    dim "anything with its own TLS - is already encrypted."
+    say ""
+    local enc=""
+    pick enc "select" 1 2 || { wiz_end; return 0; }
+    if [ "$enc" = "2" ]; then
+        T_ENCRYPT="false"
+        say ""
+        warn "frames will not be encrypted, and both servers must agree"
+    else
+        T_ENCRYPT="true"
+    fi
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
         ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT" || { wiz_end; return 0; }
@@ -3845,6 +3887,7 @@ cfg_load() {
     T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
     T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=false}"
+    T_ENCRYPT="$(toml_get "$f" transport encrypt)";         : "${T_ENCRYPT:=true}"
     T_CERT_FILE="$(toml_get "$f" transport cert_file)"
     T_KEY_FILE="$(toml_get "$f" transport key_file)"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"
@@ -6657,6 +6700,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -6713,6 +6757,12 @@ const (
 	// inside the minute the braid gives a carrier before declaring the peer
 	// gone - so the ARQ, which knows more, is the one that decides.
 	arqMaxRTO = 5 * time.Second
+
+	// How long a packet-transport session may hear nothing before it is
+	// let go of. Longer than the ARQ's own forty-seven seconds of retries
+	// and far longer than a ten-second keepalive, so nothing live is ever
+	// swept up by it.
+	arqSessionIdle = 90 * time.Second
 
 	flagData = 1 << 0
 	flagFin  = 1 << 1
@@ -6824,6 +6874,11 @@ type arqConn struct {
 	deadline time.Time
 	dlTimer  *time.Timer
 
+	// When something last arrived, so a session that turns out to be nobody
+	// can be told from one that is simply quiet. Written without the lock -
+	// the reaper reads it from another goroutine.
+	lastRx int64
+
 	// How many times one segment is resent before the carrier is declared
 	// dead. With the doubling backoff below, twelve works out at roughly
 	// half a minute - long enough to ride out a blip, short enough that the
@@ -6873,6 +6928,7 @@ func newARQ(session uint32, carrier uint8, psk []byte, label string, maxPayload,
 		sndBuf:     make(map[uint32]*segment),
 		rcvBuf:     make(map[uint32][]byte),
 		rto:        500 * time.Millisecond,
+		lastRx:     time.Now().UnixNano(),
 		done:       make(chan struct{}),
 		maxRetries: 12,
 	}
@@ -7089,6 +7145,7 @@ func (c *arqConn) onDatagram(buf []byte) {
 	if len(buf) < arqOver {
 		return
 	}
+	atomic.StoreInt64(&c.lastRx, time.Now().UnixNano())
 	var hdr [arqHdr]byte
 	copy(hdr[:], buf[arqNonce:arqOver])
 	maskHeader(c.mask, buf[:arqNonce], hdr[:])
@@ -7545,6 +7602,8 @@ func assign(c *Config, section, key, val string) error {
 			err = num(&c.KeepaliveSec)
 		case "dial_timeout_sec":
 			err = num(&c.DialTimeout)
+		case "encrypt":
+			err = boolean(&c.Encrypt)
 		case "obfuscate":
 			err = boolean(&c.Obfuscate)
 		}
@@ -7868,6 +7927,15 @@ type icmpTransport struct {
 	// Segments in flight per ARQ connection, from the tunnel's window_kb.
 	window int
 
+	// The identifier every echo of this tunnel carries. Both ends derive the
+	// same one from the token, which is what lets the kernel keep our packets
+	// and drop every other echo this host sees before it is ever queued.
+	id uint16
+
+	// Whether this end dials. The end that dials never accepts, so an
+	// unknown session arriving there cannot be a carrier - see dispatch.
+	dials bool
+
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
 	inbound  chan net.Conn
@@ -7895,6 +7963,8 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		psk:      cfg.key(),
 		mask:     blockFrom(arqMaskKey(icmpARQLabel, cfg.key())),
 		window:   arqWindowFor(cfg.WindowKB, icmpMaxPayload),
+		id:       icmpIDFor(cfg.key()),
+		dials:    cfg.Connect != "",
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
@@ -7903,6 +7973,11 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	}
 	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
 	tunePacketSocket(pc, cfg)
+	// Best effort. Everything this filters is still checked in Go afterwards,
+	// so a kernel that will not take it costs speed and nothing else.
+	if err := attachICMPFilter(pc, t.id); err != nil {
+		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
+	}
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, icmpMaxPacket,
 		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
@@ -7938,7 +8013,7 @@ func (t *icmpTransport) headerMask() cipher.Block {
 
 // sender returns the function one ARQ connection uses to put a datagram on
 // the wire, addressed to its peer.
-func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
+func (t *icmpTransport) sender(peer *net.IPAddr) func([]byte) error {
 	var seq uint32
 	return func(datagram []byte) error {
 		// Header, tag and payload are built in one buffer. This used to create a
@@ -7946,7 +8021,7 @@ func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
 		// every packet on the path.
 		pkt := make([]byte, icmpHdrLen+icmpTagLen+len(datagram))
 		pkt[0] = icmpEchoReply
-		binary.BigEndian.PutUint16(pkt[4:6], id)
+		binary.BigEndian.PutUint16(pkt[4:6], t.id)
 		s := uint16(atomic.AddUint32(&seq, 1))
 		binary.BigEndian.PutUint16(pkt[6:8], s)
 		body := pkt[icmpHdrLen:]
@@ -7957,6 +8032,34 @@ func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
 		return err
 	}
 }
+
+// addrIP pulls the peer out of whatever the reader handed back. ReadFrom on a
+// raw socket gives a *net.IPAddr; a batched read need not, and the transport
+// only ever wants the address itself.
+func addrIP(a net.Addr) *net.IPAddr {
+	switch v := a.(type) {
+	case nil:
+		return nil
+	case *net.IPAddr:
+		return v
+	case *net.UDPAddr:
+		return &net.IPAddr{IP: v.IP, Zone: v.Zone}
+	case *net.TCPAddr:
+		return &net.IPAddr{IP: v.IP, Zone: v.Zone}
+	}
+	str := a.String()
+	if ip := net.ParseIP(str); ip != nil {
+		return &net.IPAddr{IP: ip}
+	}
+	if host, _, err := net.SplitHostPort(str); err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			return &net.IPAddr{IP: ip}
+		}
+	}
+	return nil
+}
+
+var icmpAddrOnce sync.Once
 
 func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 	msg := stripIP(pkt)
@@ -7974,16 +8077,22 @@ func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 	if !t.validTag(body[:icmpTagLen], datagram[:min(len(datagram), arqOver)]) {
 		return
 	}
-	ip, _ := addr.(*net.IPAddr)
+	ip := addrIP(addr)
 	if ip == nil {
+		// Said once rather than never. A packet dropped because its address
+		// was not the shape we expected looks, from every other vantage
+		// point, exactly like a peer that has gone quiet.
+		icmpAddrOnce.Do(func() {
+			logWarn("icmp: cannot read a peer address out of %T - packets are being dropped", addr)
+		})
 		return
 	}
-	t.dispatch(ip, binary.BigEndian.Uint16(msg[4:6]), datagram)
+	t.dispatch(ip, datagram)
 }
 
 // dispatch hands the datagram to its connection, creating one if this is a
 // session the listening side has not seen before.
-func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
+func (t *icmpTransport) dispatch(peer *net.IPAddr, datagram []byte) {
 	// The header is masked with a key both ends derive from the PSK, so the
 	// session and carrier can be read out before any connection exists.
 	var hdr [arqHdr]byte
@@ -8001,6 +8110,24 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
+		// A session this end has never seen before is only ever real on the
+		// end that accepts. The end that dials never calls Accept at all, so
+		// anything arriving there for an unknown session is a stray: a peer
+		// still retransmitting to a session already torn down, or noise on a
+		// raw socket that sees every echo the host does.
+		//
+		// Building an ARQ connection for one is not free. It is a map entry, a
+		// channel slot nobody will ever take, and a goroutine with a ten
+		// millisecond ticker - and none of the three is ever released, because
+		// the reaper only removes what has closed or failed and a session
+		// nobody accepts does neither. Days of that is what "Consumed 32min
+		// CPU, 194.8M memory peak" looks like.
+		if t.dials {
+			t.mu.Unlock()
+			logDebug("icmp: ignoring unknown session %08x carrier %d from %s - this end only dials",
+				h.session, h.carrier, peer)
+			return
+		}
 		// Is there anywhere for it to go? Checked before anything is built,
 		// because a connection nobody accepts is a goroutine and a timer for
 		// a session that does not exist - and closing one sends a datagram
@@ -8014,7 +8141,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 				h.session, h.carrier, peer)
 			return
 		}
-		conn = newARQ(h.session, h.carrier, t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(peer, id))
+		conn = newARQ(h.session, h.carrier, t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(peer))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
@@ -8056,9 +8183,8 @@ func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
 		return nil, err
 	}
 	session := binary.BigEndian.Uint32(b[:])
-	id := uint16(session)
 
-	conn := newARQ(session, uint8(carrier), t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(ip, id))
+	conn := newARQ(session, uint8(carrier), t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(ip))
 	conn.remote = ip
 
 	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
@@ -8117,15 +8243,34 @@ func (t *icmpTransport) reap() {
 			return
 		case <-tick.C:
 			t.mu.Lock()
+			var closing []*arqConn
+			now := time.Now().UnixNano()
 			for k, c := range t.sessions {
 				c.mu.Lock()
 				dead := c.err != nil || c.closed
 				c.mu.Unlock()
+				// A session that has heard nothing for this long is finished
+				// whatever it once was. The ARQ gives up on its own after
+				// about forty-seven seconds and a carrier the braid still
+				// wants exchanges keepalives every ten, so anything quieter
+				// than this is a stray or already dead - and either way it is
+				// holding a goroutine and a ticker for nothing.
+				if !dead && now-atomic.LoadInt64(&c.lastRx) > int64(arqSessionIdle) {
+					dead = true
+					closing = append(closing, c)
+				}
 				if dead {
 					delete(t.sessions, k)
 				}
 			}
 			t.mu.Unlock()
+			// Closed after the lock is let go. Close sends a final datagram,
+			// and a socket write can block - holding the transport through one
+			// would stop dispatch, which is on the read path, and take every
+			// carrier with it.
+			for _, c := range closing {
+				c.Close()
+			}
 		}
 	}
 }
@@ -8136,6 +8281,168 @@ func min(a, b int) int {
 	}
 	return b
 }
+PINGIFY_SRC_EOF
+    cat > "$d/icmpfilter.go" <<'PINGIFY_SRC_EOF'
+package main
+
+import (
+	"encoding/binary"
+	"errors"
+	"runtime"
+)
+
+// errNoFilter means the kernel would not sort our packets for us, so Go still
+// has to. Not an error anybody needs to act on - see attachICMPFilter.
+var errNoFilter = errors.New("icmp: no socket filter on this platform")
+
+// icmpIDFor is the identifier both ends put in every echo they send.
+//
+// It used to be the low half of a random session number, which meant every
+// carrier used a different one and nothing outside this process could tell our
+// echoes from anybody else's. Derived from the token instead, it is the same
+// on both servers and different on every tunnel - so the kernel can be told
+// exactly what to keep, and two tunnels between the same pair of servers still
+// do not collect each other's packets.
+//
+// Zero is stepped over: plenty of tools send pings with an identifier of zero,
+// and matching them all back would defeat the point.
+func icmpIDFor(psk []byte) uint16 {
+	k := hkdfExpand(hkdfExtract([]byte("pingify/v3 icmp id"), psk), []byte("id"), 2)
+	id := binary.BigEndian.Uint16(k)
+	if id == 0 {
+		id = 1
+	}
+	return id
+}
+
+// runtimeKeepAlive is runtime.KeepAlive under a name that says why it is here.
+func runtimeKeepAlive(v interface{}) { runtime.KeepAlive(v) }
+PINGIFY_SRC_EOF
+    cat > "$d/icmpfilter_linux.go" <<'PINGIFY_SRC_EOF'
+//go:build linux
+
+package main
+
+import (
+	"net"
+	"syscall"
+	"unsafe"
+)
+
+// ---------------------------------------------------------------------------
+// keeping other people's pings out of our socket
+//
+// A raw ICMP socket receives every echo the host sees. Ours, everybody else's,
+// every monitoring ping, every scanner - all of it arrives here and is sorted
+// out in Go, one HMAC at a time. On a public address that is most of the work
+// the transport does, and it is worse than wasted: a stray for a session this
+// end has already forgotten used to have a whole ARQ connection built for it,
+// with a goroutine and a ten millisecond ticker, and nothing ever took it away.
+//
+// The kernel can do this sorting for nothing. A socket filter runs before the
+// packet is ever queued, so what does not match is not copied, not scheduled,
+// and not seen. This is the one thing flagtun does that we did not, and it is
+// the reason its ICMP tunnel does not drown in the noise of its own address.
+//
+// Written with the syscall package and a hand-assembled program rather than a
+// BPF library, because this core compiles from source on a server with no
+// module proxy, and one dependency is one more thing that has to be there.
+// ---------------------------------------------------------------------------
+
+const (
+	soAttachFilter = 26
+
+	// classic BPF, the pieces this program needs
+	bpfLD   = 0x00
+	bpfLDX  = 0x01
+	bpfJMP  = 0x05
+	bpfRET  = 0x06
+	bpfB    = 0x10
+	bpfH    = 0x08
+	bpfIND  = 0x40
+	bpfMSH  = 0xa0
+	bpfJEQ  = 0x10
+	bpfK    = 0x00
+	bpfPass = 0xffffffff
+)
+
+type sockFilter struct {
+	code uint16
+	jt   uint8
+	jf   uint8
+	k    uint32
+}
+
+// Laid out to match the kernel's struct sock_fprog. The padding between the
+// two fields is left to the compiler on purpose: Go aligns a struct the same
+// way C does, so this is right on every architecture, where writing the gap
+// out by hand would be right on exactly the one it was written for.
+type sockFprog struct {
+	length uint16
+	filter *sockFilter
+}
+
+// attachICMPFilter tells the kernel to deliver only echo requests and replies
+// carrying our identifier, and to drop everything else before it arrives.
+//
+// Failing is not fatal. Every check this replaces is still there in Go - the
+// filter only means they are reached far less often - so a kernel that will
+// not take it costs performance and nothing else.
+func attachICMPFilter(pc net.PacketConn, id uint16) error {
+	raw, ok := pc.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return errNoFilter
+	}
+	rc, err := raw.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	// The packet starts at the IP header, so the ICMP header's offset is the
+	// header length the packet itself declares - not a guess at 20, which is
+	// wrong the moment anything on the path adds an option.
+	prog := []sockFilter{
+		{code: bpfLDX | bpfB | bpfMSH, k: 0},        // X = IP header length
+		{code: bpfLD | bpfB | bpfIND, k: 0},         // A = ICMP type
+		{code: bpfJMP | bpfJEQ | bpfK, jt: 1, k: 0}, // echo reply?
+		{code: bpfJMP | bpfJEQ | bpfK, jf: 3, k: 8}, // echo request? else drop
+		{code: bpfLD | bpfH | bpfIND, k: 4},         // A = ICMP identifier
+		{code: bpfJMP | bpfJEQ | bpfK, jf: 1, k: uint32(id)},
+		{code: bpfRET | bpfK, k: bpfPass},
+		{code: bpfRET | bpfK, k: 0},
+	}
+	fprog := sockFprog{length: uint16(len(prog)), filter: &prog[0]}
+
+	var serr error
+	err = rc.Control(func(fd uintptr) {
+		_, _, e := syscall.Syscall6(syscall.SYS_SETSOCKOPT, fd,
+			uintptr(syscall.SOL_SOCKET), uintptr(soAttachFilter),
+			uintptr(unsafe.Pointer(&fprog)), unsafe.Sizeof(fprog), 0)
+		if e != 0 {
+			serr = e
+		}
+	})
+	if err != nil {
+		return err
+	}
+	// prog must outlive the syscall; naming it here says so to the reader as
+	// well as to the compiler.
+	runtimeKeepAlive(prog)
+	return serr
+}
+PINGIFY_SRC_EOF
+    cat > "$d/icmpfilter_other.go" <<'PINGIFY_SRC_EOF'
+//go:build !linux
+
+package main
+
+import "net"
+
+// Everywhere else the sorting stays in Go, which is where it was before this
+// existed. Only Linux has the socket filter, and only Linux runs these tunnels.
+func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
 PINGIFY_SRC_EOF
     cat > "$d/kcp_transport.go" <<'PINGIFY_SRC_EOF'
 package main
@@ -8174,8 +8481,14 @@ func newKCPTransport(cfg *Config) (*kcpTransport, error) {
 		t.ln = ln
 		// These apply to the shared UDP socket. A large userspace KCP window is
 		// useless if the kernel drops the burst before KCP can read it.
-		_ = ln.SetReadBuffer(cfg.RcvBufKB * 1024)
-		_ = ln.SetWriteBuffer(cfg.SndBufKB * 1024)
+		// Guarded, the way tunePacketSocket guards it: unset means "leave the
+		// kernel default alone", not "ask for a buffer of nothing".
+		if cfg.RcvBufKB > 0 {
+			_ = ln.SetReadBuffer(cfg.RcvBufKB * 1024)
+		}
+		if cfg.SndBufKB > 0 {
+			_ = ln.SetWriteBuffer(cfg.SndBufKB * 1024)
+		}
 	}
 	return t, nil
 }
@@ -8203,8 +8516,14 @@ func tuneKCPSession(s *kcp.UDPSession, cfg *Config) {
 		wnd = 4096
 	}
 	s.SetWindowSize(wnd, wnd)
-	_ = s.SetReadBuffer(cfg.RcvBufKB * 1024)
-	_ = s.SetWriteBuffer(cfg.SndBufKB * 1024)
+	// Guarded, the way tunePacketSocket guards it: unset means "leave the
+	// kernel default alone", not "ask for a buffer of nothing".
+	if cfg.RcvBufKB > 0 {
+		_ = s.SetReadBuffer(cfg.RcvBufKB * 1024)
+	}
+	if cfg.SndBufKB > 0 {
+		_ = s.SetWriteBuffer(cfg.SndBufKB * 1024)
+	}
 }
 
 func (t *kcpTransport) Dial(idx int) (net.Conn, error) {
@@ -8319,22 +8638,40 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 		msgs[i].Buffers = [][]byte{bufs[i]}
 	}
 
+	// Until this reader has delivered its first packet we do not know the
+	// socket does recvmmsg at all. Three failures before that point and we
+	// stop guessing: the plain reader works everywhere, and it is what this
+	// transport used before batching existed.
+	delivered := false
+	fails := 0
+
 	for {
 		n, err := p.ReadBatch(msgs, 0)
 		for i := 0; i < n; i++ {
 			if msgs[i].N > 0 {
+				delivered = true
 				handle(bufs[i][:msgs[i].N], msgs[i].Addr)
 			}
 		}
 		if err == nil {
+			fails = 0
 			continue
 		}
 		select {
 		case <-done:
 			return
 		default:
-			onError(err)
 		}
+		if !delivered {
+			fails++
+			if fails >= 3 {
+				logWarn("batched receive is not working on this socket (%v) - "+
+					"falling back to the plain reader", err)
+				packetSingleReadLoop(pc, done, maxPacket, handle, onError)
+				return
+			}
+		}
+		onError(err)
 	}
 }
 
@@ -8376,8 +8713,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -8477,14 +8816,40 @@ func pckEnvelope(key []byte, carrier uint16, payload []byte) []byte {
 	return out
 }
 
+// Every packet the filter lets through is checked here, so this is as hot as
+// any path in the transport. The keyed state is reused rather than built anew
+// each time - the same reason the ICMP tag has a pool behind it.
+var pckMACs sync.Map // string(key) -> *sync.Pool of hash.Hash
+
+func pckMAC(key []byte) hash.Hash {
+	k := string(key)
+	p, ok := pckMACs.Load(k)
+	if !ok {
+		p, _ = pckMACs.LoadOrStore(k, &sync.Pool{
+			New: func() interface{} { return hmac.New(sha256.New, key) },
+		})
+	}
+	return p.(*sync.Pool).Get().(hash.Hash)
+}
+
+func putPCKMAC(key []byte, m hash.Hash) {
+	if p, ok := pckMACs.Load(string(key)); ok {
+		p.(*sync.Pool).Put(m)
+	}
+}
+
 func openPCKEnvelope(key, packet []byte) (uint16, []byte, bool) {
 	if len(packet) < pckHdrLen {
 		return 0, nil, false
 	}
-	m := hmac.New(sha256.New, key)
+	m := pckMAC(key)
+	m.Reset()
 	m.Write(packet[:2])
 	m.Write(packet[pckHdrLen:])
-	if !hmac.Equal(packet[2:pckHdrLen], m.Sum(nil)[:pckHdrLen-2]) {
+	var sum [sha256.Size]byte
+	got := m.Sum(sum[:0])
+	putPCKMAC(key, m)
+	if !hmac.Equal(packet[2:pckHdrLen], got[:pckHdrLen-2]) {
 		return 0, nil, false
 	}
 	return binary.BigEndian.Uint16(packet[:2]), packet[pckHdrLen:], true
@@ -8634,6 +8999,34 @@ type pckFlow struct {
 	ack   uint32
 	ts    uint32
 	id    uint16
+	seen  time.Time
+}
+
+const (
+	// One flow is remembered per peer address and carrier. Nothing removed
+	// them, and on the accepting end there is no unregister to hang a removal
+	// on - so a server behind a NAT that rotates the peer's source port grew
+	// this map for as long as it ran.
+	pckMaxFlows  = 4096
+	pckFlowIdle  = 5 * time.Minute
+	pckErrorRest = 20 * time.Millisecond
+)
+
+// sweepFlows drops what has not been heard from in a while. Caller holds mu.
+func (h *pckHub) sweepFlows(now time.Time) {
+	for k, f := range h.flows {
+		if now.Sub(f.seen) > pckFlowIdle {
+			delete(h.flows, k)
+		}
+	}
+	if len(h.flows) < pckMaxFlows {
+		return
+	}
+	// Still full of things that are all recent. Better to forget the lot and
+	// rebuild than to keep growing: a flow costs one round trip to re-learn,
+	// and a map with no ceiling costs the machine.
+	logWarn("pck: %d live flows, more than this expects - forgetting them", len(h.flows))
+	h.flows = make(map[string]*pckFlow)
 }
 
 // pckHub owns one AF_PACKET socket for the whole carrier pool. A tiny keyed
@@ -8720,6 +9113,7 @@ func attachPCKFilter(fd int, port uint16) error {
 
 func (h *pckHub) readLoop() {
 	buf := make([]byte, 65536)
+	fails := 0
 	for {
 		n, from, err := unix.Recvfrom(h.fd, buf, 0)
 		if err != nil {
@@ -8727,9 +9121,22 @@ func (h *pckHub) readLoop() {
 			case <-h.done:
 				return
 			default:
+			}
+			if err == unix.EINTR || err == unix.EAGAIN {
 				continue
 			}
+			// A socket that keeps refusing is not going to relent because we
+			// asked it faster. This used to `continue` straight round, which
+			// on a persistent error was one core at a hundred percent, the
+			// transport dead, and not a line in the log at any level.
+			fails++
+			if fails == 1 || fails%500 == 0 {
+				logWarn("pck: raw receive failed (%d times): %v", fails, err)
+			}
+			time.Sleep(pckErrorRest)
+			continue
 		}
+		fails = 0
 		ll, ok := from.(*unix.SockaddrLinklayer)
 		if !ok || ll.Pkttype == unix.PACKET_OUTGOING {
 			continue
@@ -8745,12 +9152,17 @@ func (h *pckHub) readLoop() {
 		addr := pckAddress{IP: seg.srcIP, Port: seg.srcPort, Carrier: carrier}
 		key := addr.String()
 
+		now := time.Now()
 		h.mu.Lock()
 		flow := h.flows[key]
 		if flow == nil {
+			if len(h.flows) >= pckMaxFlows {
+				h.sweepFlows(now)
+			}
 			flow = &pckFlow{seq: pckRandom32(), id: uint16(pckRandom32())}
 			h.flows[key] = flow
 		}
+		flow.seen = now
 		// A reply follows the exact L2 path the valid inbound frame used. This
 		// works behind VPS NAT too: the destination IP seen here is the actual
 		// local address, even when the configured address is public.
@@ -9357,7 +9769,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.5"
+const version = "1.0.6"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -9453,7 +9865,22 @@ type Config struct {
 	// exactly the same size on exactly the same schedule across eight
 	// connections at once. Whatever removed that traffic, masking the lengths
 	// did not help, and v2.1.1 without any of it worked on the same path.
-	Obfuscate   *bool `json:"obfuscate,omitempty"`
+	Obfuscate *bool `json:"obfuscate,omitempty"`
+
+	// Encrypt seals every frame with AES-256-GCM. A pointer so leaving it out
+	// means yes: a config written before the setting existed keeps what it had.
+	//
+	// Turning it off is a real choice, not a free one. GCM is what proves a
+	// frame came from the other server unaltered, so without it anything that
+	// can put a packet on the carrier can put data into the tunnel - and the
+	// shape of our framing is on the wire for anything that looks, which is
+	// what the WebSocket transports exist to avoid.
+	//
+	// What it is not is expensive. Measured here it seals around 8.8 GB/s and
+	// opens at 9.5; a hundred-megabit tunnel is 12.5 MB/s, so the cipher is
+	// roughly a tenth of one percent of one core. If a tunnel feels heavy,
+	// this is not where the weight is.
+	Encrypt     *bool `json:"encrypt,omitempty"`
 	DialTimeout int   `json:"dial_timeout_sec,omitempty"`
 	SndBufKB    int   `json:"sndbuf_kb,omitempty"`
 	RcvBufKB    int   `json:"rcvbuf_kb,omitempty"`
@@ -9685,6 +10112,10 @@ func (c *Config) tokenPrint() string {
 // Off unless asked for: see the note on Config.Obfuscate.
 func (c *Config) obfuscated() bool { return c.Obfuscate != nil && *c.Obfuscate }
 
+// encrypted is true unless the config says otherwise, so every tunnel that
+// predates the setting keeps its cipher.
+func (c *Config) encrypted() bool { return c.Encrypt == nil || *c.Encrypt }
+
 func (c *Config) key() []byte {
 	if c.Token != "" {
 		return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
@@ -9787,6 +10218,11 @@ func main() {
 	}
 	if !cfg.obfuscated() {
 		logInfo("traffic shaping is off: frame lengths are in the clear, and both servers must agree")
+	}
+	if !cfg.encrypted() {
+		logWarn("frames are NOT encrypted: both servers must agree, and anything on the")
+		logWarn("path can read and alter what crosses - only sound when what you carry")
+		logWarn("is already encrypted, which Xray and the like are")
 	}
 
 	p := newPool(cfg)
@@ -10543,8 +10979,21 @@ func (p *pool) serveInbound(conn net.Conn) {
 		conn.Close()
 		logDebug("rejected %s: %v", ra, err)
 		if p.firstIn("rejected", time.Minute) {
-			logWarn("turned away a connection from %s: %v", ra, err)
-			logWarn("if that address is the other server, the two security tokens differ")
+			// Nothing arrived is not the same as something wrong arrived. A
+			// handshake that times out here is almost always a peer still
+			// retransmitting to a session already torn down - and saying
+			// "your tokens differ" to that, once a minute, on a tunnel that
+			// is carrying gigabytes, sends the reader to check the one thing
+			// that was never wrong.
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				logWarn("a connection from %s went quiet before it said anything: %v", ra, err)
+				logWarn("usually a peer retransmitting to a carrier that has already gone -")
+				logWarn("only worth chasing when no carrier is up at all")
+			} else {
+				logWarn("turned away a connection from %s: %v", ra, err)
+				logWarn("if that address is the other server, the two security tokens differ")
+			}
 		}
 		return
 	}
@@ -10589,8 +11038,20 @@ func (p *pool) dialLoop(idx int) {
 		if err != nil {
 			conn.Close()
 			if p.firstIn("handshake", time.Minute) {
-				logWarn("reached %s but the handshake failed: %v", p.cfg.Connect, err)
-				logWarn("the two servers disagree - almost always a different security token")
+				// A handshake that is refused and a handshake that is never
+				// answered are different faults on different machines, and
+				// saying "different token" for both sends the reader to check
+				// something that was right all along. Nothing came back means
+				// nothing could disagree.
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					logWarn("reached %s but nothing came back: %v", p.cfg.Connect, err)
+					logWarn("the far end is not answering on this transport - check it is")
+					logWarn("running, on the same transport, and that nothing is dropping it")
+				} else {
+					logWarn("reached %s but the handshake failed: %v", p.cfg.Connect, err)
+					logWarn("the two servers disagree - almost always a different security token")
+				}
 			}
 			logDebug("carrier %d handshake: %v", idx, err)
 			p.sleepBackoff(&backoff)
@@ -11190,6 +11651,7 @@ type link struct {
 	nextID  uint32
 
 	obf     bool   // mask frame lengths and pad the opening frames
+	plain   bool   // frames go out unsealed - see Config.Encrypt
 	downWhy string // why the carrier died; read once, when it is logged
 
 	txBytes uint64 // payload carried for streams, tun and UDP
@@ -11208,6 +11670,7 @@ type link struct {
 func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link {
 	l := &link{
 		idx: idx, cfg: cfg, conn: conn, pool: p, obf: cfg.obfuscated(),
+		plain:   !cfg.encrypted(),
 		keys:    k,
 		sendQ:   make(chan *recBuf, sendQueue),
 		closed:  make(chan struct{}),
@@ -11314,7 +11777,13 @@ func (l *link) writeLoop() {
 		l.txCtr++
 		n := nonceFor(ctr)
 		out = out[:4]
-		out = l.keys.tx.Seal(out, n[:], frame, nil)
+		if l.plain {
+			// Length-prefixed and nothing else. The nonce is still counted so
+			// that length masking, which uses it, behaves the same either way.
+			out = append(out, frame...)
+		} else {
+			out = l.keys.tx.Seal(out, n[:], frame, nil)
+		}
 		binary.BigEndian.PutUint32(out[:4], uint32(len(out)-4))
 		if l.obf {
 			maskLen(l.keys.maskTx, ctr, out[:4])
@@ -11365,7 +11834,16 @@ func (l *link) readLoop() {
 			maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
 		}
 		n := int(binary.BigEndian.Uint32(hdr[:]))
-		if n < 16 || n > maxFrame {
+		// A sealed frame always carries at least a sixteen-byte GCM tag, so
+		// anything shorter was impossible and worth refusing. An unsealed one
+		// has no tag: the smallest thing it can hold is a single record
+		// header, and a keepalive is exactly that. Judging both by the sealed
+		// minimum killed every carrier on its first ping.
+		least := 16
+		if l.plain {
+			least = recHdr
+		}
+		if n < least || n > maxFrame {
 			l.died("bad frame length %d - the two ends disagree or something rewrote the stream", n)
 			return
 		}
@@ -11381,12 +11859,25 @@ func (l *link) readLoop() {
 		logTrace("carrier %d rx frame %d: %d bytes on the wire", l.idx, l.rxCtr, len(hdr)+n)
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
-		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
-		if err != nil {
-			l.died("authentication failed - the token does not match, or a middlebox altered the stream")
-			return
+		var p []byte
+		if l.plain {
+			p = ct
+		} else {
+			var err error
+			p, err = l.keys.rx.Open(plain[:0], nc[:], ct, nil)
+			if err != nil {
+				// One end sealing and the other not looks exactly like this,
+				// so the message has to name it: the tokens can be identical
+				// and the tunnel still fail here.
+				l.died("could not read a frame - the token does not match, one end " +
+					"has encryption off while the other has it on, or a middlebox altered the stream")
+				return
+			}
+			// Keep whatever capacity Open grew it to. Not in plain mode: p is
+			// the frame buffer there, and pointing the cipher's scratch at it
+			// would quietly make one buffer out of two.
+			plain = p[:0]
 		}
-		plain = p[:0]
 		atomic.StoreInt64(&l.lastRx, time.Now().UnixNano())
 		if err := l.dispatch(p); err != nil {
 			l.died("%v", err)
@@ -13267,6 +13758,7 @@ import (
 	"hash"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -13314,6 +13806,10 @@ type udpTransport struct {
 	tagHash  sync.Pool
 	window   int
 
+	// Whether this end dials. The end that dials never accepts, so an
+	// unknown session arriving there cannot be a carrier - see dispatch.
+	dials bool
+
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
 	inbound  chan net.Conn
@@ -13338,6 +13834,7 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 		psk:      cfg.key(),
 		mask:     blockFrom(arqMaskKey(udpARQLabel, cfg.key())),
 		window:   arqWindowFor(cfg.WindowKB, udpMaxPayload),
+		dials:    cfg.Connect != "",
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted. The reader never waits on it either way - see
@@ -13426,6 +13923,24 @@ func (t *udpTransport) dispatch(peer net.Addr, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
+		// A session this end has never seen before is only ever real on the
+		// end that accepts. The end that dials never calls Accept at all, so
+		// anything arriving there for an unknown session is a stray: a peer
+		// still retransmitting to a session already torn down, or noise on a
+		// raw socket that sees every echo the host does.
+		//
+		// Building an ARQ connection for one is not free. It is a map entry, a
+		// channel slot nobody will ever take, and a goroutine with a ten
+		// millisecond ticker - and none of the three is ever released, because
+		// the reaper only removes what has closed or failed and a session
+		// nobody accepts does neither. Days of that is what "Consumed 32min
+		// CPU, 194.8M memory peak" looks like.
+		if t.dials {
+			t.mu.Unlock()
+			logDebug("udp: ignoring unknown session %08x carrier %d from %s - this end only dials",
+				h.session, h.carrier, peer)
+			return
+		}
 		// Room first, before anything is built. These readers are shared by
 		// every carrier on the transport, and waiting here for an acceptor
 		// that does not exist is what wedged the echo transport: the dialling
@@ -13519,15 +14034,34 @@ func (t *udpTransport) reap() {
 			return
 		case <-tk.C:
 			t.mu.Lock()
+			var closing []*arqConn
+			now := time.Now().UnixNano()
 			for k, c := range t.sessions {
 				c.mu.Lock()
 				dead := c.err != nil || c.closed
 				c.mu.Unlock()
+				// A session that has heard nothing for this long is finished
+				// whatever it once was. The ARQ gives up on its own after
+				// about forty-seven seconds and a carrier the braid still
+				// wants exchanges keepalives every ten, so anything quieter
+				// than this is a stray or already dead - and either way it is
+				// holding a goroutine and a ticker for nothing.
+				if !dead && now-atomic.LoadInt64(&c.lastRx) > int64(arqSessionIdle) {
+					dead = true
+					closing = append(closing, c)
+				}
 				if dead {
 					delete(t.sessions, k)
 				}
 			}
 			t.mu.Unlock()
+			// Closed after the lock is let go. Close sends a final datagram,
+			// and a socket write can block - holding the transport through one
+			// would stop dispatch, which is on the read path, and take every
+			// carrier with it.
+			for _, c := range closing {
+				c.Close()
+			}
 		}
 	}
 }

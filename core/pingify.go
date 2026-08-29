@@ -58,7 +58,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.5"
+const version = "1.0.6"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -154,7 +154,22 @@ type Config struct {
 	// exactly the same size on exactly the same schedule across eight
 	// connections at once. Whatever removed that traffic, masking the lengths
 	// did not help, and v2.1.1 without any of it worked on the same path.
-	Obfuscate   *bool `json:"obfuscate,omitempty"`
+	Obfuscate *bool `json:"obfuscate,omitempty"`
+
+	// Encrypt seals every frame with AES-256-GCM. A pointer so leaving it out
+	// means yes: a config written before the setting existed keeps what it had.
+	//
+	// Turning it off is a real choice, not a free one. GCM is what proves a
+	// frame came from the other server unaltered, so without it anything that
+	// can put a packet on the carrier can put data into the tunnel - and the
+	// shape of our framing is on the wire for anything that looks, which is
+	// what the WebSocket transports exist to avoid.
+	//
+	// What it is not is expensive. Measured here it seals around 8.8 GB/s and
+	// opens at 9.5; a hundred-megabit tunnel is 12.5 MB/s, so the cipher is
+	// roughly a tenth of one percent of one core. If a tunnel feels heavy,
+	// this is not where the weight is.
+	Encrypt     *bool `json:"encrypt,omitempty"`
 	DialTimeout int   `json:"dial_timeout_sec,omitempty"`
 	SndBufKB    int   `json:"sndbuf_kb,omitempty"`
 	RcvBufKB    int   `json:"rcvbuf_kb,omitempty"`
@@ -386,6 +401,10 @@ func (c *Config) tokenPrint() string {
 // Off unless asked for: see the note on Config.Obfuscate.
 func (c *Config) obfuscated() bool { return c.Obfuscate != nil && *c.Obfuscate }
 
+// encrypted is true unless the config says otherwise, so every tunnel that
+// predates the setting keeps its cipher.
+func (c *Config) encrypted() bool { return c.Encrypt == nil || *c.Encrypt }
+
 func (c *Config) key() []byte {
 	if c.Token != "" {
 		return hkdfExpand(hkdfExtract([]byte("pingify/v3 token"),
@@ -488,6 +507,11 @@ func main() {
 	}
 	if !cfg.obfuscated() {
 		logInfo("traffic shaping is off: frame lengths are in the clear, and both servers must agree")
+	}
+	if !cfg.encrypted() {
+		logWarn("frames are NOT encrypted: both servers must agree, and anything on the")
+		logWarn("path can read and alter what crosses - only sound when what you carry")
+		logWarn("is already encrypted, which Xray and the like are")
 	}
 
 	p := newPool(cfg)
@@ -1244,8 +1268,21 @@ func (p *pool) serveInbound(conn net.Conn) {
 		conn.Close()
 		logDebug("rejected %s: %v", ra, err)
 		if p.firstIn("rejected", time.Minute) {
-			logWarn("turned away a connection from %s: %v", ra, err)
-			logWarn("if that address is the other server, the two security tokens differ")
+			// Nothing arrived is not the same as something wrong arrived. A
+			// handshake that times out here is almost always a peer still
+			// retransmitting to a session already torn down - and saying
+			// "your tokens differ" to that, once a minute, on a tunnel that
+			// is carrying gigabytes, sends the reader to check the one thing
+			// that was never wrong.
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				logWarn("a connection from %s went quiet before it said anything: %v", ra, err)
+				logWarn("usually a peer retransmitting to a carrier that has already gone -")
+				logWarn("only worth chasing when no carrier is up at all")
+			} else {
+				logWarn("turned away a connection from %s: %v", ra, err)
+				logWarn("if that address is the other server, the two security tokens differ")
+			}
 		}
 		return
 	}
@@ -1290,8 +1327,20 @@ func (p *pool) dialLoop(idx int) {
 		if err != nil {
 			conn.Close()
 			if p.firstIn("handshake", time.Minute) {
-				logWarn("reached %s but the handshake failed: %v", p.cfg.Connect, err)
-				logWarn("the two servers disagree - almost always a different security token")
+				// A handshake that is refused and a handshake that is never
+				// answered are different faults on different machines, and
+				// saying "different token" for both sends the reader to check
+				// something that was right all along. Nothing came back means
+				// nothing could disagree.
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					logWarn("reached %s but nothing came back: %v", p.cfg.Connect, err)
+					logWarn("the far end is not answering on this transport - check it is")
+					logWarn("running, on the same transport, and that nothing is dropping it")
+				} else {
+					logWarn("reached %s but the handshake failed: %v", p.cfg.Connect, err)
+					logWarn("the two servers disagree - almost always a different security token")
+				}
 			}
 			logDebug("carrier %d handshake: %v", idx, err)
 			p.sleepBackoff(&backoff)
@@ -1891,6 +1940,7 @@ type link struct {
 	nextID  uint32
 
 	obf     bool   // mask frame lengths and pad the opening frames
+	plain   bool   // frames go out unsealed - see Config.Encrypt
 	downWhy string // why the carrier died; read once, when it is logged
 
 	txBytes uint64 // payload carried for streams, tun and UDP
@@ -1909,6 +1959,7 @@ type link struct {
 func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link {
 	l := &link{
 		idx: idx, cfg: cfg, conn: conn, pool: p, obf: cfg.obfuscated(),
+		plain:   !cfg.encrypted(),
 		keys:    k,
 		sendQ:   make(chan *recBuf, sendQueue),
 		closed:  make(chan struct{}),
@@ -2015,7 +2066,13 @@ func (l *link) writeLoop() {
 		l.txCtr++
 		n := nonceFor(ctr)
 		out = out[:4]
-		out = l.keys.tx.Seal(out, n[:], frame, nil)
+		if l.plain {
+			// Length-prefixed and nothing else. The nonce is still counted so
+			// that length masking, which uses it, behaves the same either way.
+			out = append(out, frame...)
+		} else {
+			out = l.keys.tx.Seal(out, n[:], frame, nil)
+		}
 		binary.BigEndian.PutUint32(out[:4], uint32(len(out)-4))
 		if l.obf {
 			maskLen(l.keys.maskTx, ctr, out[:4])
@@ -2066,7 +2123,16 @@ func (l *link) readLoop() {
 			maskLen(l.keys.maskRx, l.rxCtr, hdr[:]) // XOR is its own inverse
 		}
 		n := int(binary.BigEndian.Uint32(hdr[:]))
-		if n < 16 || n > maxFrame {
+		// A sealed frame always carries at least a sixteen-byte GCM tag, so
+		// anything shorter was impossible and worth refusing. An unsealed one
+		// has no tag: the smallest thing it can hold is a single record
+		// header, and a keepalive is exactly that. Judging both by the sealed
+		// minimum killed every carrier on its first ping.
+		least := 16
+		if l.plain {
+			least = recHdr
+		}
+		if n < least || n > maxFrame {
 			l.died("bad frame length %d - the two ends disagree or something rewrote the stream", n)
 			return
 		}
@@ -2082,12 +2148,25 @@ func (l *link) readLoop() {
 		logTrace("carrier %d rx frame %d: %d bytes on the wire", l.idx, l.rxCtr, len(hdr)+n)
 		nc := nonceFor(l.rxCtr)
 		l.rxCtr++
-		p, err := l.keys.rx.Open(plain[:0], nc[:], ct, nil)
-		if err != nil {
-			l.died("authentication failed - the token does not match, or a middlebox altered the stream")
-			return
+		var p []byte
+		if l.plain {
+			p = ct
+		} else {
+			var err error
+			p, err = l.keys.rx.Open(plain[:0], nc[:], ct, nil)
+			if err != nil {
+				// One end sealing and the other not looks exactly like this,
+				// so the message has to name it: the tokens can be identical
+				// and the tunnel still fail here.
+				l.died("could not read a frame - the token does not match, one end " +
+					"has encryption off while the other has it on, or a middlebox altered the stream")
+				return
+			}
+			// Keep whatever capacity Open grew it to. Not in plain mode: p is
+			// the frame buffer there, and pointing the cipher's scratch at it
+			// would quietly make one buffer out of two.
+			plain = p[:0]
 		}
-		plain = p[:0]
 		atomic.StoreInt64(&l.lastRx, time.Now().UnixNano())
 		if err := l.dispatch(p); err != nil {
 			l.died("%v", err)

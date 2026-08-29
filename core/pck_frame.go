@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"hash"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -106,14 +108,40 @@ func pckEnvelope(key []byte, carrier uint16, payload []byte) []byte {
 	return out
 }
 
+// Every packet the filter lets through is checked here, so this is as hot as
+// any path in the transport. The keyed state is reused rather than built anew
+// each time - the same reason the ICMP tag has a pool behind it.
+var pckMACs sync.Map // string(key) -> *sync.Pool of hash.Hash
+
+func pckMAC(key []byte) hash.Hash {
+	k := string(key)
+	p, ok := pckMACs.Load(k)
+	if !ok {
+		p, _ = pckMACs.LoadOrStore(k, &sync.Pool{
+			New: func() interface{} { return hmac.New(sha256.New, key) },
+		})
+	}
+	return p.(*sync.Pool).Get().(hash.Hash)
+}
+
+func putPCKMAC(key []byte, m hash.Hash) {
+	if p, ok := pckMACs.Load(string(key)); ok {
+		p.(*sync.Pool).Put(m)
+	}
+}
+
 func openPCKEnvelope(key, packet []byte) (uint16, []byte, bool) {
 	if len(packet) < pckHdrLen {
 		return 0, nil, false
 	}
-	m := hmac.New(sha256.New, key)
+	m := pckMAC(key)
+	m.Reset()
 	m.Write(packet[:2])
 	m.Write(packet[pckHdrLen:])
-	if !hmac.Equal(packet[2:pckHdrLen], m.Sum(nil)[:pckHdrLen-2]) {
+	var sum [sha256.Size]byte
+	got := m.Sum(sum[:0])
+	putPCKMAC(key, m)
+	if !hmac.Equal(packet[2:pckHdrLen], got[:pckHdrLen-2]) {
 		return 0, nil, false
 	}
 	return binary.BigEndian.Uint16(packet[:2]), packet[pckHdrLen:], true

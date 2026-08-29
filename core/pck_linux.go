@@ -32,6 +32,34 @@ type pckFlow struct {
 	ack   uint32
 	ts    uint32
 	id    uint16
+	seen  time.Time
+}
+
+const (
+	// One flow is remembered per peer address and carrier. Nothing removed
+	// them, and on the accepting end there is no unregister to hang a removal
+	// on - so a server behind a NAT that rotates the peer's source port grew
+	// this map for as long as it ran.
+	pckMaxFlows  = 4096
+	pckFlowIdle  = 5 * time.Minute
+	pckErrorRest = 20 * time.Millisecond
+)
+
+// sweepFlows drops what has not been heard from in a while. Caller holds mu.
+func (h *pckHub) sweepFlows(now time.Time) {
+	for k, f := range h.flows {
+		if now.Sub(f.seen) > pckFlowIdle {
+			delete(h.flows, k)
+		}
+	}
+	if len(h.flows) < pckMaxFlows {
+		return
+	}
+	// Still full of things that are all recent. Better to forget the lot and
+	// rebuild than to keep growing: a flow costs one round trip to re-learn,
+	// and a map with no ceiling costs the machine.
+	logWarn("pck: %d live flows, more than this expects - forgetting them", len(h.flows))
+	h.flows = make(map[string]*pckFlow)
 }
 
 // pckHub owns one AF_PACKET socket for the whole carrier pool. A tiny keyed
@@ -118,6 +146,7 @@ func attachPCKFilter(fd int, port uint16) error {
 
 func (h *pckHub) readLoop() {
 	buf := make([]byte, 65536)
+	fails := 0
 	for {
 		n, from, err := unix.Recvfrom(h.fd, buf, 0)
 		if err != nil {
@@ -125,9 +154,22 @@ func (h *pckHub) readLoop() {
 			case <-h.done:
 				return
 			default:
+			}
+			if err == unix.EINTR || err == unix.EAGAIN {
 				continue
 			}
+			// A socket that keeps refusing is not going to relent because we
+			// asked it faster. This used to `continue` straight round, which
+			// on a persistent error was one core at a hundred percent, the
+			// transport dead, and not a line in the log at any level.
+			fails++
+			if fails == 1 || fails%500 == 0 {
+				logWarn("pck: raw receive failed (%d times): %v", fails, err)
+			}
+			time.Sleep(pckErrorRest)
+			continue
 		}
+		fails = 0
 		ll, ok := from.(*unix.SockaddrLinklayer)
 		if !ok || ll.Pkttype == unix.PACKET_OUTGOING {
 			continue
@@ -143,12 +185,17 @@ func (h *pckHub) readLoop() {
 		addr := pckAddress{IP: seg.srcIP, Port: seg.srcPort, Carrier: carrier}
 		key := addr.String()
 
+		now := time.Now()
 		h.mu.Lock()
 		flow := h.flows[key]
 		if flow == nil {
+			if len(h.flows) >= pckMaxFlows {
+				h.sweepFlows(now)
+			}
 			flow = &pckFlow{seq: pckRandom32(), id: uint16(pckRandom32())}
 			h.flows[key] = flow
 		}
+		flow.seen = now
 		// A reply follows the exact L2 path the valid inbound frame used. This
 		// works behind VPS NAT too: the destination IP seen here is the actual
 		// local address, even when the configured address is public.

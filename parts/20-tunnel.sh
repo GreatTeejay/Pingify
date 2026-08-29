@@ -38,6 +38,7 @@ cfg_reset() {
     T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1200; T_KCP_INTERVAL=10
     T_PCK_FLAGS="PA"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
+    T_ENCRYPT="true"     # AES-256-GCM on every frame; see the Encryption step
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
     # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
@@ -591,6 +592,7 @@ cfg_render() {
         printf 'carriers         = %s\n' "$T_CARRIERS"
         printf 'keepalive_sec    = %s\n' "$T_KEEPALIVE"
         printf 'obfuscate        = %s\n' "$T_OBFUSCATE"
+        printf 'encrypt          = %s\n' "$T_ENCRYPT"
     fi
     if [ "$T_TRANSPORT" = "kcp" ] || [ "$T_TRANSPORT" = "pck" ]; then
         printf '\n[kcp]\n'
@@ -742,7 +744,7 @@ transport_label() {
 # there is nothing to copy by hand and nothing to get wrong:
 #
 #   p5|kind|transport|mode|forwarder|dial|b64(host)|port|b64(token)|...|
-#      b64(pck-flags)|profile|obfuscate|sha256
+#      b64(pck-flags)|profile|obfuscate|encrypt|sha256
 #
 # dial says what the far end does about the connection: 1 means it dials us
 # and host is where, 0 means it accepts and supplies its own address. The
@@ -805,7 +807,7 @@ cfg_setup_token() {
             awgobf="$T_AWG_OBF"
         fi
     fi
-    body="$(printf 'p5|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
+    body="$(printf 'p5|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \
         "$T_KIND" "$T_TRANSPORT" "$T_MODE" "$T_FORWARDER" \
         "$dial" "$(setup_token_text_encode "$host")" "$port" "$(setup_token_text_encode "$T_TOKEN")" \
         "$T_CARRIERS" "$T_WINDOW" "$T_KEEPALIVE" "$T_SNDBUF" "$T_RCVBUF" \
@@ -813,7 +815,7 @@ cfg_setup_token() {
         "$ttl" "$awgport" "$(setup_token_text_encode "$awgpriv")" \
         "$(setup_token_text_encode "$awgpub")" "$(setup_token_text_encode "$awgobf")" \
         "$T_FEC_DATA" "$T_FEC_PARITY" "$T_PACKET_MTU" "$T_KCP_INTERVAL" \
-        "$(setup_token_text_encode "$T_PCK_FLAGS")" "$T_PRESET" "$T_OBFUSCATE")"
+        "$(setup_token_text_encode "$T_PCK_FLAGS")" "$T_PRESET" "$T_OBFUSCATE" "$T_ENCRYPT")"
     sum="$(printf '%s' "$body" | sha256sum | awk '{print $1}')"
     printf '%s|%s' "$body" "$sum" | base64 | tr -d '\n'
 }
@@ -826,7 +828,7 @@ setup_token_read() {
     local encoded="$1" raw fields body sum want
     local v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu
     local ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval pckflags
-    local profile="" obfuscate="false"
+    local profile="" obfuscate="false" encrypt="true"
     SETUP_TOKEN_ERROR=""
 
     raw="$(printf '%s' "$encoded" | tr -d ' \t\r\n' | base64 -d 2>/dev/null)" ||
@@ -834,13 +836,13 @@ setup_token_read() {
     case "$raw" in
         p5\|*)
             fields="$(printf '%s' "$raw" | awk -F'|' '{print NF}')"
-            [ "$fields" = "30" ] || { setup_token_bad "the token is incomplete"; return 1; }
+            [ "$fields" = "31" ] || { setup_token_bad "the token is incomplete"; return 1; }
             body="${raw%|*}"; sum="${raw##*|}"
             want="$(printf '%s' "$body" | sha256sum | awk '{print $1}')"
             [ "$sum" = "$want" ] || { setup_token_bad "the token checksum does not match"; return 1; }
             IFS='|' read -r v kind tr mode fwd dial host port tok car win ka snd rcv tl tp mtu \
                 ttl awgport awgpriv awgpub awgobf fecdata fecparity packetmtu kcpinterval \
-                pckflags profile obfuscate sum <<TOKEN
+                pckflags profile obfuscate encrypt sum <<TOKEN
 $raw
 TOKEN
             host="$(setup_token_text_decode "$host")" || { setup_token_bad "the address field is damaged"; return 1; }
@@ -872,6 +874,9 @@ TOKEN
     T_FEC_DATA="${fecdata:-10}"; T_FEC_PARITY="${fecparity:-3}"
     T_PACKET_MTU="${packetmtu:-1200}"; T_KCP_INTERVAL="${kcpinterval:-10}"
     T_PCK_FLAGS="${pckflags:-PA}"; T_OBFUSCATE="$obfuscate"
+    # An older token has no such field, and a tunnel that predates the
+    # setting was encrypted - so empty has to mean yes, not no.
+    case "$encrypt" in false) T_ENCRYPT="false" ;; *) T_ENCRYPT="true" ;; esac
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
     T_GRE_TTL="${ttl:-255}"; T_AWG_PORT="${awgport:-51820}"
     T_AWG_PRIV="$awgpriv"; T_AWG_PUB="$awgpub"; T_AWG_OBF="$awgobf"
@@ -1341,6 +1346,43 @@ new_tunnel() {
     cdn_port_warn
     this_side_accepts || ask_edge
     ask_wss_certificate || { wiz_end; return 0; }
+
+    # ---------------------------------------------------------------------
+    # Encryption
+    #
+    # Worth asking rather than assuming, because the honest answer depends on
+    # what is being carried. A tunnel in front of Xray carries traffic that is
+    # already encrypted end to end, and a second cipher over the top of it
+    # buys nothing the first one did not already give.
+    #
+    # What it does buy is the shape: with the cipher on, everything past the
+    # handshake is indistinguishable from noise; with it off our framing is on
+    # the wire for anything that looks. And GCM is what proves a frame arrived
+    # unaltered, so without it anything that can put a packet on the carrier
+    # can put data into the tunnel.
+    #
+    # It is not, however, where the weight is. Measured: 8.8 GB/s sealing on an
+    # ordinary machine, against 12.5 MB/s for a hundred-megabit tunnel.
+    # ---------------------------------------------------------------------
+    wiz "Encryption"
+    choice 1 "Encrypted" "AES-256-GCM on every frame  (recommended)"
+    choice 2 "In the clear" "faster on paper, and the shape is visible"
+    say ""
+    dim "The cipher costs about a tenth of one percent of a core at 100 Mbit/s,"
+    dim "so this is not the setting that makes a tunnel fast. What it changes is"
+    dim "whether the traffic looks like anything, and whether a frame can be"
+    dim "altered on the way. Turn it off only when what you carry - Xray, a VPN,"
+    dim "anything with its own TLS - is already encrypted."
+    say ""
+    local enc=""
+    pick enc "select" 1 2 || { wiz_end; return 0; }
+    if [ "$enc" = "2" ]; then
+        T_ENCRYPT="false"
+        say ""
+        warn "frames will not be encrypted, and both servers must agree"
+    else
+        T_ENCRYPT="true"
+    fi
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
         ask T_AWG_PORT "UDP port for the tunnel, same on both" "$T_AWG_PORT" || { wiz_end; return 0; }

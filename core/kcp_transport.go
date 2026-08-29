@@ -34,8 +34,14 @@ func newKCPTransport(cfg *Config) (*kcpTransport, error) {
 		t.ln = ln
 		// These apply to the shared UDP socket. A large userspace KCP window is
 		// useless if the kernel drops the burst before KCP can read it.
-		_ = ln.SetReadBuffer(cfg.RcvBufKB * 1024)
-		_ = ln.SetWriteBuffer(cfg.SndBufKB * 1024)
+		// Guarded, the way tunePacketSocket guards it: unset means "leave the
+		// kernel default alone", not "ask for a buffer of nothing".
+		if cfg.RcvBufKB > 0 {
+			_ = ln.SetReadBuffer(cfg.RcvBufKB * 1024)
+		}
+		if cfg.SndBufKB > 0 {
+			_ = ln.SetWriteBuffer(cfg.SndBufKB * 1024)
+		}
 	}
 	return t, nil
 }
@@ -63,8 +69,14 @@ func tuneKCPSession(s *kcp.UDPSession, cfg *Config) {
 		wnd = 4096
 	}
 	s.SetWindowSize(wnd, wnd)
-	_ = s.SetReadBuffer(cfg.RcvBufKB * 1024)
-	_ = s.SetWriteBuffer(cfg.SndBufKB * 1024)
+	// Guarded, the way tunePacketSocket guards it: unset means "leave the
+	// kernel default alone", not "ask for a buffer of nothing".
+	if cfg.RcvBufKB > 0 {
+		_ = s.SetReadBuffer(cfg.RcvBufKB * 1024)
+	}
+	if cfg.SndBufKB > 0 {
+		_ = s.SetWriteBuffer(cfg.SndBufKB * 1024)
+	}
 }
 
 func (t *kcpTransport) Dial(idx int) (net.Conn, error) {

@@ -96,6 +96,15 @@ type icmpTransport struct {
 	// Segments in flight per ARQ connection, from the tunnel's window_kb.
 	window int
 
+	// The identifier every echo of this tunnel carries. Both ends derive the
+	// same one from the token, which is what lets the kernel keep our packets
+	// and drop every other echo this host sees before it is ever queued.
+	id uint16
+
+	// Whether this end dials. The end that dials never accepts, so an
+	// unknown session arriving there cannot be a carrier - see dispatch.
+	dials bool
+
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
 	inbound  chan net.Conn
@@ -123,6 +132,8 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		psk:      cfg.key(),
 		mask:     blockFrom(arqMaskKey(icmpARQLabel, cfg.key())),
 		window:   arqWindowFor(cfg.WindowKB, icmpMaxPayload),
+		id:       icmpIDFor(cfg.key()),
+		dials:    cfg.Connect != "",
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
@@ -131,6 +142,11 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	}
 	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
 	tunePacketSocket(pc, cfg)
+	// Best effort. Everything this filters is still checked in Go afterwards,
+	// so a kernel that will not take it costs speed and nothing else.
+	if err := attachICMPFilter(pc, t.id); err != nil {
+		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
+	}
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, icmpMaxPacket,
 		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
@@ -166,7 +182,7 @@ func (t *icmpTransport) headerMask() cipher.Block {
 
 // sender returns the function one ARQ connection uses to put a datagram on
 // the wire, addressed to its peer.
-func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
+func (t *icmpTransport) sender(peer *net.IPAddr) func([]byte) error {
 	var seq uint32
 	return func(datagram []byte) error {
 		// Header, tag and payload are built in one buffer. This used to create a
@@ -174,7 +190,7 @@ func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
 		// every packet on the path.
 		pkt := make([]byte, icmpHdrLen+icmpTagLen+len(datagram))
 		pkt[0] = icmpEchoReply
-		binary.BigEndian.PutUint16(pkt[4:6], id)
+		binary.BigEndian.PutUint16(pkt[4:6], t.id)
 		s := uint16(atomic.AddUint32(&seq, 1))
 		binary.BigEndian.PutUint16(pkt[6:8], s)
 		body := pkt[icmpHdrLen:]
@@ -185,6 +201,34 @@ func (t *icmpTransport) sender(peer *net.IPAddr, id uint16) func([]byte) error {
 		return err
 	}
 }
+
+// addrIP pulls the peer out of whatever the reader handed back. ReadFrom on a
+// raw socket gives a *net.IPAddr; a batched read need not, and the transport
+// only ever wants the address itself.
+func addrIP(a net.Addr) *net.IPAddr {
+	switch v := a.(type) {
+	case nil:
+		return nil
+	case *net.IPAddr:
+		return v
+	case *net.UDPAddr:
+		return &net.IPAddr{IP: v.IP, Zone: v.Zone}
+	case *net.TCPAddr:
+		return &net.IPAddr{IP: v.IP, Zone: v.Zone}
+	}
+	str := a.String()
+	if ip := net.ParseIP(str); ip != nil {
+		return &net.IPAddr{IP: ip}
+	}
+	if host, _, err := net.SplitHostPort(str); err == nil {
+		if ip := net.ParseIP(host); ip != nil {
+			return &net.IPAddr{IP: ip}
+		}
+	}
+	return nil
+}
+
+var icmpAddrOnce sync.Once
 
 func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 	msg := stripIP(pkt)
@@ -202,16 +246,22 @@ func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 	if !t.validTag(body[:icmpTagLen], datagram[:min(len(datagram), arqOver)]) {
 		return
 	}
-	ip, _ := addr.(*net.IPAddr)
+	ip := addrIP(addr)
 	if ip == nil {
+		// Said once rather than never. A packet dropped because its address
+		// was not the shape we expected looks, from every other vantage
+		// point, exactly like a peer that has gone quiet.
+		icmpAddrOnce.Do(func() {
+			logWarn("icmp: cannot read a peer address out of %T - packets are being dropped", addr)
+		})
 		return
 	}
-	t.dispatch(ip, binary.BigEndian.Uint16(msg[4:6]), datagram)
+	t.dispatch(ip, datagram)
 }
 
 // dispatch hands the datagram to its connection, creating one if this is a
 // session the listening side has not seen before.
-func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
+func (t *icmpTransport) dispatch(peer *net.IPAddr, datagram []byte) {
 	// The header is masked with a key both ends derive from the PSK, so the
 	// session and carrier can be read out before any connection exists.
 	var hdr [arqHdr]byte
@@ -229,6 +279,24 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
+		// A session this end has never seen before is only ever real on the
+		// end that accepts. The end that dials never calls Accept at all, so
+		// anything arriving there for an unknown session is a stray: a peer
+		// still retransmitting to a session already torn down, or noise on a
+		// raw socket that sees every echo the host does.
+		//
+		// Building an ARQ connection for one is not free. It is a map entry, a
+		// channel slot nobody will ever take, and a goroutine with a ten
+		// millisecond ticker - and none of the three is ever released, because
+		// the reaper only removes what has closed or failed and a session
+		// nobody accepts does neither. Days of that is what "Consumed 32min
+		// CPU, 194.8M memory peak" looks like.
+		if t.dials {
+			t.mu.Unlock()
+			logDebug("icmp: ignoring unknown session %08x carrier %d from %s - this end only dials",
+				h.session, h.carrier, peer)
+			return
+		}
 		// Is there anywhere for it to go? Checked before anything is built,
 		// because a connection nobody accepts is a goroutine and a timer for
 		// a session that does not exist - and closing one sends a datagram
@@ -242,7 +310,7 @@ func (t *icmpTransport) dispatch(peer *net.IPAddr, id uint16, datagram []byte) {
 				h.session, h.carrier, peer)
 			return
 		}
-		conn = newARQ(h.session, h.carrier, t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(peer, id))
+		conn = newARQ(h.session, h.carrier, t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(peer))
 		conn.remote = peer
 		t.sessions[key] = conn
 		t.mu.Unlock()
@@ -284,9 +352,8 @@ func (t *icmpTransport) Dial(peer string, carrier int) (net.Conn, error) {
 		return nil, err
 	}
 	session := binary.BigEndian.Uint32(b[:])
-	id := uint16(session)
 
-	conn := newARQ(session, uint8(carrier), t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(ip, id))
+	conn := newARQ(session, uint8(carrier), t.psk, icmpARQLabel, icmpMaxPayload, t.window, t.sender(ip))
 	conn.remote = ip
 
 	key := sessionKey{peer: ip.String(), session: session, carrier: uint8(carrier)}
@@ -345,15 +412,34 @@ func (t *icmpTransport) reap() {
 			return
 		case <-tick.C:
 			t.mu.Lock()
+			var closing []*arqConn
+			now := time.Now().UnixNano()
 			for k, c := range t.sessions {
 				c.mu.Lock()
 				dead := c.err != nil || c.closed
 				c.mu.Unlock()
+				// A session that has heard nothing for this long is finished
+				// whatever it once was. The ARQ gives up on its own after
+				// about forty-seven seconds and a carrier the braid still
+				// wants exchanges keepalives every ten, so anything quieter
+				// than this is a stray or already dead - and either way it is
+				// holding a goroutine and a ticker for nothing.
+				if !dead && now-atomic.LoadInt64(&c.lastRx) > int64(arqSessionIdle) {
+					dead = true
+					closing = append(closing, c)
+				}
 				if dead {
 					delete(t.sessions, k)
 				}
 			}
 			t.mu.Unlock()
+			// Closed after the lock is let go. Close sends a final datagram,
+			// and a socket write can block - holding the transport through one
+			// would stop dispatch, which is on the read path, and take every
+			// carrier with it.
+			for _, c := range closing {
+				c.Close()
+			}
 		}
 	}
 }

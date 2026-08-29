@@ -22,6 +22,7 @@ cfg_load() {
     T_CARRIERS="$(toml_get "$f" transport carriers)";       : "${T_CARRIERS:=4}"
     T_KEEPALIVE="$(toml_get "$f" transport keepalive_sec)"; : "${T_KEEPALIVE:=10}"
     T_OBFUSCATE="$(toml_get "$f" transport obfuscate)";     : "${T_OBFUSCATE:=false}"
+    T_ENCRYPT="$(toml_get "$f" transport encrypt)";         : "${T_ENCRYPT:=true}"
     T_CERT_FILE="$(toml_get "$f" transport cert_file)"
     T_KEY_FILE="$(toml_get "$f" transport key_file)"
     T_WINDOW="$(toml_get "$f" tuning window_kb)";           : "${T_WINDOW:=512}"

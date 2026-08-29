@@ -52,7 +52,7 @@ func TestStraySessionsCannotWedgeTheReader(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 1; i <= 40; i++ {
-			tr.dispatch(peer, uint16(i), strayDatagram(psk, uint32(0x57A00000+i), 0))
+			tr.dispatch(peer, strayDatagram(psk, uint32(0x57A00000+i), 0))
 		}
 	}()
 

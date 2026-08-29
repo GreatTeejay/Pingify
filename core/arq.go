@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -65,6 +66,12 @@ const (
 	// inside the minute the braid gives a carrier before declaring the peer
 	// gone - so the ARQ, which knows more, is the one that decides.
 	arqMaxRTO = 5 * time.Second
+
+	// How long a packet-transport session may hear nothing before it is
+	// let go of. Longer than the ARQ's own forty-seven seconds of retries
+	// and far longer than a ten-second keepalive, so nothing live is ever
+	// swept up by it.
+	arqSessionIdle = 90 * time.Second
 
 	flagData = 1 << 0
 	flagFin  = 1 << 1
@@ -176,6 +183,11 @@ type arqConn struct {
 	deadline time.Time
 	dlTimer  *time.Timer
 
+	// When something last arrived, so a session that turns out to be nobody
+	// can be told from one that is simply quiet. Written without the lock -
+	// the reaper reads it from another goroutine.
+	lastRx int64
+
 	// How many times one segment is resent before the carrier is declared
 	// dead. With the doubling backoff below, twelve works out at roughly
 	// half a minute - long enough to ride out a blip, short enough that the
@@ -225,6 +237,7 @@ func newARQ(session uint32, carrier uint8, psk []byte, label string, maxPayload,
 		sndBuf:     make(map[uint32]*segment),
 		rcvBuf:     make(map[uint32][]byte),
 		rto:        500 * time.Millisecond,
+		lastRx:     time.Now().UnixNano(),
 		done:       make(chan struct{}),
 		maxRetries: 12,
 	}
@@ -441,6 +454,7 @@ func (c *arqConn) onDatagram(buf []byte) {
 	if len(buf) < arqOver {
 		return
 	}
+	atomic.StoreInt64(&c.lastRx, time.Now().UnixNano())
 	var hdr [arqHdr]byte
 	copy(hdr[:], buf[arqNonce:arqOver])
 	maskHeader(c.mask, buf[:arqNonce], hdr[:])

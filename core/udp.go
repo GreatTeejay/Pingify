@@ -10,6 +10,7 @@ import (
 	"hash"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -57,6 +58,10 @@ type udpTransport struct {
 	tagHash  sync.Pool
 	window   int
 
+	// Whether this end dials. The end that dials never accepts, so an
+	// unknown session arriving there cannot be a carrier - see dispatch.
+	dials bool
+
 	mu       sync.Mutex
 	sessions map[sessionKey]*arqConn
 	inbound  chan net.Conn
@@ -81,6 +86,7 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 		psk:      cfg.key(),
 		mask:     blockFrom(arqMaskKey(udpARQLabel, cfg.key())),
 		window:   arqWindowFor(cfg.WindowKB, udpMaxPayload),
+		dials:    cfg.Connect != "",
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted. The reader never waits on it either way - see
@@ -169,6 +175,24 @@ func (t *udpTransport) dispatch(peer net.Addr, datagram []byte) {
 	}
 	conn, known := t.sessions[key]
 	if !known {
+		// A session this end has never seen before is only ever real on the
+		// end that accepts. The end that dials never calls Accept at all, so
+		// anything arriving there for an unknown session is a stray: a peer
+		// still retransmitting to a session already torn down, or noise on a
+		// raw socket that sees every echo the host does.
+		//
+		// Building an ARQ connection for one is not free. It is a map entry, a
+		// channel slot nobody will ever take, and a goroutine with a ten
+		// millisecond ticker - and none of the three is ever released, because
+		// the reaper only removes what has closed or failed and a session
+		// nobody accepts does neither. Days of that is what "Consumed 32min
+		// CPU, 194.8M memory peak" looks like.
+		if t.dials {
+			t.mu.Unlock()
+			logDebug("udp: ignoring unknown session %08x carrier %d from %s - this end only dials",
+				h.session, h.carrier, peer)
+			return
+		}
 		// Room first, before anything is built. These readers are shared by
 		// every carrier on the transport, and waiting here for an acceptor
 		// that does not exist is what wedged the echo transport: the dialling
@@ -262,15 +286,34 @@ func (t *udpTransport) reap() {
 			return
 		case <-tk.C:
 			t.mu.Lock()
+			var closing []*arqConn
+			now := time.Now().UnixNano()
 			for k, c := range t.sessions {
 				c.mu.Lock()
 				dead := c.err != nil || c.closed
 				c.mu.Unlock()
+				// A session that has heard nothing for this long is finished
+				// whatever it once was. The ARQ gives up on its own after
+				// about forty-seven seconds and a carrier the braid still
+				// wants exchanges keepalives every ten, so anything quieter
+				// than this is a stray or already dead - and either way it is
+				// holding a goroutine and a ticker for nothing.
+				if !dead && now-atomic.LoadInt64(&c.lastRx) > int64(arqSessionIdle) {
+					dead = true
+					closing = append(closing, c)
+				}
 				if dead {
 					delete(t.sessions, k)
 				}
 			}
 			t.mu.Unlock()
+			// Closed after the lock is let go. Close sends a final datagram,
+			// and a socket write can block - holding the transport through one
+			// would stop dispatch, which is on the read path, and take every
+			// carrier with it.
+			for _, c := range closing {
+				c.Close()
+			}
 		}
 	}
 }
