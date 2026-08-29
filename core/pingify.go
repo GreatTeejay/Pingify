@@ -46,6 +46,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,7 +59,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.8"
+const version = "1.0.9"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -1520,7 +1521,17 @@ func (p *pool) close() {
 	})
 }
 
+// stats summarises the pool. The round trip is the median of the carriers
+// that have one, not the largest.
+//
+// It used to be the largest, and a carrier's figure is a last value that
+// nothing ever clears - so one slow sample on one carrier of sixteen became
+// the number shown for the whole tunnel, and stayed there. A tunnel whose
+// path pings at 75 ms would report 2777, which is true of one carrier at one
+// moment and of nothing else. The per-carrier table still shows every one, so
+// the worst is a line away when it is wanted.
 func (p *pool) stats() (up int, tx, rx uint64, rttUS int64) {
+	var seen []int64
 	for _, l := range p.liveLinks() {
 		if !l.alive() {
 			continue
@@ -1528,11 +1539,20 @@ func (p *pool) stats() (up int, tx, rx uint64, rttUS int64) {
 		up++
 		tx += atomic.LoadUint64(&l.txBytes)
 		rx += atomic.LoadUint64(&l.rxBytes)
-		if r := atomic.LoadInt64(&l.rttUS); r > rttUS {
-			rttUS = r
+		if r := atomic.LoadInt64(&l.rttUS); r > 0 {
+			seen = append(seen, r)
 		}
 	}
-	return
+	return up, tx, rx, medianRTT(seen)
+}
+
+// medianRTT is the middle sample, or zero when nothing has been measured.
+func medianRTT(v []int64) int64 {
+	if len(v) == 0 {
+		return 0
+	}
+	sort.Slice(v, func(i, j int) bool { return v[i] < v[j] })
+	return v[len(v)/2]
 }
 
 // ==========================================================================
@@ -1931,7 +1951,20 @@ type link struct {
 	txCtr uint64
 	rxCtr uint64
 
-	sendQ     chan *recBuf
+	sendQ chan *recBuf
+	// Control that must not queue behind bulk.
+	//
+	// sendQ holds up to 128 records of up to 32 KiB, so a keepalive handed to
+	// it can sit behind four megabytes of somebody's download - a third of a
+	// second on a hundred-megabit path, before the ARQ or the wire have seen
+	// it at all. That is measured as round-trip time, and felt as a video
+	// that stutters while a file copies.
+	//
+	// Only records that carry no stream position go here: a ping, a pong, a
+	// window credit. Those mean the same thing whenever they arrive, so
+	// letting them past the queue costs nothing. An open, a close or a byte
+	// of data has a place in its stream and keeps it.
+	priQ      chan *recBuf
 	closed    chan struct{}
 	closeOnce sync.Once
 
@@ -1962,6 +1995,7 @@ func newLink(idx int, cfg *Config, conn net.Conn, k *sessionKeys, p *pool) *link
 		plain:   !cfg.encrypted(),
 		keys:    k,
 		sendQ:   make(chan *recBuf, sendQueue),
+		priQ:    make(chan *recBuf, sendQueue),
 		closed:  make(chan struct{}),
 		streams: make(map[uint32]*stream),
 	}
@@ -2008,9 +2042,29 @@ func (l *link) died(format string, a ...interface{}) {
 	l.close()
 }
 
+// jumpsQueue is true for the records that carry no position in any stream, so
+// nothing is reordered by letting them go first.
+func jumpsQueue(cmd byte) bool {
+	return cmd == cmdPing || cmd == cmdPong || cmd == cmdWND
+}
+
+func (l *link) queueFor(r *recBuf) chan *recBuf {
+	// A link without the second queue - one built by hand in a test - still
+	// has to send. A nil channel blocks for ever, which is not a failure any
+	// caller here is prepared for.
+	if l.priQ == nil {
+		return l.sendQ
+	}
+	if b := r.bytes(); len(b) > 0 && jumpsQueue(b[0]) {
+		return l.priQ
+	}
+	return l.sendQ
+}
+
 func (l *link) send(r *recBuf) bool {
+	q := l.queueFor(r)
 	select {
-	case l.sendQ <- r:
+	case q <- r:
 		return true
 	case <-l.closed:
 		putRec(r)
@@ -2019,8 +2073,9 @@ func (l *link) send(r *recBuf) bool {
 }
 
 func (l *link) trySend(r *recBuf) bool {
+	q := l.queueFor(r)
 	select {
-	case l.sendQ <- r:
+	case q <- r:
 		return true
 	default:
 		putRec(r)
@@ -2041,21 +2096,33 @@ func (l *link) writeLoop() {
 	for {
 		var r *recBuf
 		select {
-		case r = <-l.sendQ:
+		case r = <-l.priQ:
 		case <-l.closed:
 			return
+		default:
+			select {
+			case r = <-l.priQ:
+			case r = <-l.sendQ:
+			case <-l.closed:
+				return
+			}
 		}
 		frame = append(frame[:0], r.bytes()...)
 		putRec(r)
 	drain:
 		for len(frame) <= maxPlain-recHdr-maxRecord {
+			var r2 *recBuf
 			select {
-			case r2 := <-l.sendQ:
-				frame = append(frame, r2.bytes()...)
-				putRec(r2)
+			case r2 = <-l.priQ:
 			default:
-				break drain
+				select {
+				case r2 = <-l.sendQ:
+				default:
+					break drain
+				}
 			}
+			frame = append(frame, r2.bytes()...)
+			putRec(r2)
 		}
 		// Only the opening frames are padded. That is where a fingerprint
 		// would be taken, and padding every frame would cost real bandwidth.
@@ -3429,6 +3496,9 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		d.Peer = "listen " + cfg.Listen
 	}
 	now := time.Now().UnixNano()
+	// Collected and taken the middle of, rather than kept as a running
+	// maximum: one slow sample on one carrier is not the tunnel's round trip.
+	var rtts []int64
 	for _, l := range p.liveLinks() {
 		cs := carrierStatus{
 			Index:   l.idx,
@@ -3444,8 +3514,8 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		if cs.Up {
 			d.Up++
 			d.Streams += cs.Streams
-			if cs.RTTms > d.RTTms {
-				d.RTTms = cs.RTTms
+			if cs.RTTms > 0 {
+				rtts = append(rtts, int64(cs.RTTms*1000))
 			}
 		}
 		d.TxBytes += cs.TxBytes
@@ -3454,6 +3524,7 @@ func snapshot(cfg *Config, p *pool) statusDoc {
 		d.WireRx += cs.WireRx
 		d.Detail = append(d.Detail, cs)
 	}
+	d.RTTms = float64(medianRTT(rtts)) / 1000
 	d.Refusals = atomic.LoadUint64(&p.refusals)
 	if v, ok := p.peerVer.Load().(string); ok {
 		d.PeerVer = v
