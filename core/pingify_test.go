@@ -9,20 +9,49 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
+// freePort asks the kernel for a port nothing is using.
+//
+// It has to close the listener before handing the number back - the test is
+// about to bind it itself - so there is always a gap, and in that gap anything
+// else on the machine can take it. That is the residual race and it cannot be
+// closed here without handing out listeners instead of numbers.
+//
+// What CAN be closed is the same port being handed out twice in one run. The
+// kernel is free to reuse an ephemeral port the moment it is released, and it
+// does under load: two tests then bind the same number and one of them loses.
+// That is the shape of a failure seen twice in this suite, both times while a
+// build or another suite was running beside it, and never once on its own.
 func freePort(t *testing.T) int {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	portMu.Lock()
+	defer portMu.Unlock()
+	for i := 0; i < 200; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		ln.Close()
+		if portsUsed[p] {
+			continue
+		}
+		portsUsed[p] = true
+		return p
 	}
-	defer ln.Close()
-	return ln.Addr().(*net.TCPAddr).Port
+	t.Fatal("no port the kernel offered was one this run had not already taken")
+	return 0
 }
+
+var (
+	portMu    sync.Mutex
+	portsUsed = map[int]bool{}
+)
 
 func testPSK(t *testing.T) string {
 	t.Helper()

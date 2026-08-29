@@ -2270,6 +2270,59 @@ encwz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
 check "the wizard has an encryption step"       "$(encwz | grep -c 'wiz "Encryption"')" "1"
 check "and says what it actually costs"       "$(encwz | grep -c 'tenth of one percent')" "1"
 
+# Asked on a private link and nowhere else: a forwarded port carries whatever
+# the service behind it speaks, and that is not the operator's to strip.
+check "and only for a private link" \
+      "$(encwz | grep -c 'T_KIND. != .tun')" "1"
+
+# ---------------------------------------------------------------------------
+note "a token printed before the setting still reads"
+# ---------------------------------------------------------------------------
+# The two servers are updated one at a time. A token printed five minutes ago,
+# by a version with no encryption field, has to keep working - and its absence
+# has to mean encrypted, because that is what that version did.
+COMPAT="$WORK/compat"; mkdir -p "$COMPAT"
+(
+    CFG_DIR="$COMPAT"
+    have() { case "$1" in ss | ip | tc) return 1 ;; *) command -v "$1" >/dev/null 2>&1 ;; esac; }
+    cfg_reset
+    T_ROLE="server"; T_TRANSPORT="icmp"; T_KIND="tun"; T_ACCEPTS="server"; cfg_mode
+    T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+    T_TOKEN="$TOKEN"; T_FORWARDS='"8009"'
+    T_TUNLOCAL="10.10.10.1/24"; T_TUNPEER="10.10.10.2/24"
+    T_ENCRYPT="true"; T_NAME="t"; T_STATUS="127.0.0.1:9700"
+    new="$(cfg_setup_token)"
+
+    # forge exactly what the older version printed: no encrypt field, and a
+    # checksum computed over the shorter body
+    raw="$(printf '%s' "$new" | base64 -d)"
+    body="${raw%|*}"
+    old_body="${body%|*}"
+    old_sum="$(printf '%s' "$old_body" | sha256sum | awk '{print $1}')"
+    old="$(printf '%s|%s' "$old_body" "$old_sum" | base64 | tr -d '\n')"
+
+    echo "new_fields=$(printf '%s' "$raw" | awk -F'|' '{print NF}')"
+    echo "old_fields=$(printf '%s|%s' "$old_body" "$old_sum" | awk -F'|' '{print NF}')"
+    cfg_reset
+    if setup_token_read "$new" > /dev/null 2>&1; then echo "new_reads=$T_ENCRYPT"; else echo "new_reads=FAILED"; fi
+    cfg_reset
+    if setup_token_read "$old" > /dev/null 2>&1; then echo "old_reads=$T_ENCRYPT"; else echo "old_reads=FAILED"; fi
+    # and one that is short for any other reason is still refused
+    cfg_reset
+    short_body="${old_body%|*}"
+    short_sum="$(printf '%s' "$short_body" | sha256sum | awk '{print $1}')"
+    short="$(printf '%s|%s' "$short_body" "$short_sum" | base64 | tr -d '\n')"
+    if setup_token_read "$short" > /dev/null 2>&1; then echo "short_reads=ACCEPTED"; else echo "short_reads=refused"; fi
+) > "$WORK/compat.out" 2>&1
+cz() { grep -m1 "^$1=" "$WORK/compat.out" | cut -d= -f2-; }
+
+check "this version writes 31 fields"      "$(cz new_fields)"   "31"
+check "the older one wrote 30"             "$(cz old_fields)"   "30"
+check "and both are read"                  "$(cz new_reads)"    "true"
+check "an older token means encrypted"     "$(cz old_reads)"    "true"
+check "anything shorter is still refused"  "$(cz short_reads)"  "refused"
+
+
 check "KHAREJ dials the domain"       "$(eg plain_connect)" "tunnel.example.com:8443"
 check "and says it only once"         "$(eg plain_host)"    ""
 check "no extra keys at all"          "$(eg plain_keys)"    "0"
