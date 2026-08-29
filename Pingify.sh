@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="1.1.0"
+PINGIFY_VERSION="1.1.1"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -8255,7 +8255,15 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	if peer == nil {
 		return errICMPNoPeer
 	}
-	pkt := make([]byte, icmpHdrLen+icmpTagLen+len(b))
+	bp := tunBufs.Get().(*[]byte)
+	need := icmpHdrLen + icmpTagLen + len(b)
+	if cap(*bp) < need {
+		*bp = make([]byte, 0, need)
+	}
+	pkt := (*bp)[:need]
+	for i := range pkt[:icmpHdrLen] {
+		pkt[i] = 0
+	}
 	pkt[0] = icmpEchoReply
 	binary.BigEndian.PutUint16(pkt[4:6], t.id)
 	binary.BigEndian.PutUint16(pkt[6:8], uint16(atomic.AddUint32(&t.pktSeq, 1)))
@@ -8264,6 +8272,8 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	copy(tagged[icmpTagLen:], b)
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
 	_, err := t.pc.WriteTo(pkt, peer)
+	*bp = pkt[:0]
+	tunBufs.Put(bp)
 	return err
 }
 
@@ -9947,7 +9957,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.1.0"
+const version = "1.1.1"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.
@@ -13972,8 +13982,18 @@ func (c *icmpCarrier) Dial(idx int) (net.Conn, error) {
 }
 
 func (c *icmpCarrier) Accept() (net.Conn, error) { return c.t.Accept() }
-func (c *icmpCarrier) Close() error              { return c.t.Close() }
-func (c *icmpCarrier) Name() string              { return "echo" }
+
+// The private link's packets go straight to the transport underneath. Without
+// these two the wrapper hid them: the pool holds this, not the transport, so
+// the check for "can this carry a bare packet" looked at the wrapper, found
+// nothing, and the direct path silently never turned on. Every test had
+// exercised the transport directly and so every test passed.
+func (c *icmpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *icmpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
+	c.t.SetPacketHandler(h, peer)
+}
+func (c *icmpCarrier) Close() error { return c.t.Close() }
+func (c *icmpCarrier) Name() string { return "echo" }
 
 // ---------------------------------------------------------------------------
 // choosing one
@@ -14122,7 +14142,16 @@ const (
 	// that reorders by more than this is reordering by more than any protocol
 	// inside is prepared for.
 	tunReplayWindow = 4096
+	tunReplayWords  = tunReplayWindow / 64
 )
+
+// Scratch space for one packet on its way out. Every packet on this path is
+// built and sent and finished with inside one call, so the same buffers go
+// round rather than being made and collected thousands of times a second.
+var tunBufs = sync.Pool{New: func() any {
+	b := make([]byte, 0, 2048)
+	return &b
+}}
 
 // tunFast seals and opens one packet at a time.
 //
@@ -14139,13 +14168,14 @@ type tunFast struct {
 	mu      sync.Mutex
 	counter uint64
 
+	// The replay window, one bit per counter in a ring. See fresh.
 	rmu    sync.Mutex
-	seen   map[uint64]bool
+	bits   [tunReplayWords]uint64
 	newest uint64
 }
 
 func newTunFast(tx, rx cipher.AEAD, send func([]byte) error, recv func([]byte)) *tunFast {
-	return &tunFast{tx: tx, rx: rx, send: send, recv: recv, seen: make(map[uint64]bool)}
+	return &tunFast{tx: tx, rx: rx, send: send, recv: recv}
 }
 
 // Send puts one IP packet on the wire. The buffer is not retained.
@@ -14158,14 +14188,22 @@ func (f *tunFast) Send(pkt []byte) error {
 	var nonce [12]byte
 	binary.BigEndian.PutUint64(nonce[4:], n)
 
-	out := make([]byte, tunNonceLen, tunNonceLen+len(pkt)+16)
+	bp := tunBufs.Get().(*[]byte)
+	need := tunNonceLen + len(pkt) + 16
+	if cap(*bp) < need {
+		*bp = make([]byte, 0, need)
+	}
+	out := (*bp)[:tunNonceLen]
 	binary.BigEndian.PutUint64(out[:tunNonceLen], n)
 	if f.tx == nil {
 		out = append(out, pkt...)
 	} else {
 		out = f.tx.Seal(out, nonce[:], pkt, nil)
 	}
-	return f.send(out)
+	err := f.send(out)
+	*bp = out[:0]
+	tunBufs.Put(bp)
+	return err
 }
 
 // Deliver opens one datagram and hands the packet up. A datagram that does not
@@ -14186,8 +14224,12 @@ func (f *tunFast) Deliver(buf []byte) {
 	} else {
 		var nonce [12]byte
 		binary.BigEndian.PutUint64(nonce[4:], n)
+		// Opened over the top of the sealed bytes, which Open allows when the
+		// destination is the ciphertext's own start. The buffer belongs to the
+		// reader and the packet is written to the device before it returns.
+		body := buf[tunNonceLen:]
 		var err error
-		pkt, err = f.rx.Open(nil, nonce[:], buf[tunNonceLen:], nil)
+		pkt, err = f.rx.Open(body[:0], nonce[:], body, nil)
 		if err != nil {
 			return
 		}
@@ -14200,35 +14242,45 @@ func (f *tunFast) Deliver(buf []byte) {
 // fresh is the replay check: a counter is accepted once, and only if it is
 // within the window of what has already been seen.
 //
+// One bit per counter, in a ring that the newest packet drags forward. A
+// packet in order touches one bit and clears one, so the cost does not depend
+// on the size of the window - which matters more than it sounds. Keeping the
+// seen counters in a map instead, and sweeping it for expired ones, cost a
+// pass over four thousand entries under this lock for every packet in either
+// direction, and held the private link to a third of its throughput with the
+// processor nearly idle. It was not working, it was queueing behind itself.
+//
 // Without encryption there is nothing to replay-protect - anything on the path
 // could write a packet anyway - so the check is only about not delivering the
 // same packet twice.
 func (f *tunFast) fresh(n uint64) bool {
+	if n == 0 {
+		return false // counters start at one
+	}
 	f.rmu.Lock()
 	defer f.rmu.Unlock()
 
-	if n > f.newest {
-		// Everything now too old to matter goes, so the map cannot grow.
-		if n-f.newest > tunReplayWindow {
-			f.seen = make(map[uint64]bool, tunReplayWindow)
+	switch {
+	case n > f.newest:
+		// Drag the window forward, clearing what the front passes over so a
+		// bit left from an earlier lap cannot be read as this one.
+		if n-f.newest >= tunReplayWindow {
+			f.bits = [tunReplayWords]uint64{}
 		} else {
-			for old := range f.seen {
-				if n-old > tunReplayWindow {
-					delete(f.seen, old)
-				}
+			for i := f.newest + 1; i <= n; i++ {
+				f.bits[(i/64)%tunReplayWords] &^= 1 << (i % 64)
 			}
 		}
 		f.newest = n
-		f.seen[n] = true
-		return true
-	}
-	if f.newest-n >= tunReplayWindow {
+	case f.newest-n >= tunReplayWindow:
 		return false // too far behind to tell whether it has been seen
 	}
-	if f.seen[n] {
+
+	word, bit := (n/64)%tunReplayWords, uint64(1)<<(n%64)
+	if f.bits[word]&bit != 0 {
 		return false
 	}
-	f.seen[n] = true
+	f.bits[word] |= bit
 	return true
 }
 PINGIFY_SRC_EOF
@@ -14419,10 +14471,17 @@ func (t *udpTransport) SendPacket(b []byte) error {
 	if peer == nil {
 		return errUDPNoPeer
 	}
-	body := make([]byte, udpTagLen+len(b))
+	bp := tunBufs.Get().(*[]byte)
+	need := udpTagLen + len(b)
+	if cap(*bp) < need {
+		*bp = make([]byte, 0, need)
+	}
+	body := (*bp)[:need]
 	t.putTagFor(udpTagDirect, body[:udpTagLen], b[:min(len(b), arqOver)])
 	copy(body[udpTagLen:], b)
 	_, err := t.pc.WriteTo(body, peer)
+	*bp = body[:0]
+	tunBufs.Put(bp)
 	return err
 }
 
@@ -14648,8 +14707,15 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 
 func (c *udpCarrier) Dial(idx int) (net.Conn, error) { return c.t.Dial(c.cfg.Connect, idx) }
 func (c *udpCarrier) Accept() (net.Conn, error)      { return c.t.Accept() }
-func (c *udpCarrier) Close() error                   { return c.t.Close() }
-func (c *udpCarrier) Name() string                   { return "udp" }
+
+// Forwarded for the same reason as the ICMP one: the pool holds this wrapper,
+// so anything asked of "the transport" has to be answerable here too.
+func (c *udpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *udpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
+	c.t.SetPacketHandler(h, peer)
+}
+func (c *udpCarrier) Close() error { return c.t.Close() }
+func (c *udpCarrier) Name() string { return "udp" }
 PINGIFY_SRC_EOF
     cat > "$d/ws.go" <<'PINGIFY_SRC_EOF'
 package main
