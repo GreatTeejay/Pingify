@@ -706,7 +706,12 @@ check "hand-set KCP FEC is custom" \
 
 T_TRANSPORT="icmp"
 apply_preset balanced >/dev/null 2>&1
-check "icmp balanced uses four sessions" "$T_CARRIERS" "4"
+# Enough sessions that a small request is not pinned behind a download. With
+# four heavy streams running, two sessions measured 80.7 ms of added latency
+# and eight measured 2.7, with throughput flat across all of them - so the
+# floor here is about the tail, not the ceiling.
+check "icmp balanced carries enough sessions" "$T_CARRIERS" "16"
+check "and even gaming has room to spare"       "$( T_TRANSPORT=icmp; apply_preset gaming >/dev/null 2>&1; echo "$T_CARRIERS" )" "8"
 check "icmp balanced has burst room" "$T_SNDBUF/$T_RCVBUF" "16384/16384"
 T_TRANSPORT="tcp"
 

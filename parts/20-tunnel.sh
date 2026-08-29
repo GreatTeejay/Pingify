@@ -371,16 +371,27 @@ apply_preset() {
             esac
             ;;
         icmp | udp)
-            # These transports use one shared socket and userspace ARQ. They
-            # do not need TCP's 16-24 congestion windows; too many sessions
-            # only multiply ACKs, timers and reordering. A small pool gives
-            # loss isolation while a wide window fills a 100+ Mbit path.
+            # These used to run two to eight sessions on the reasoning that a
+            # shared socket and a userspace ARQ do not need TCP's sixteen, and
+            # that more sessions only multiply ACKs and timers. Measured, that
+            # is backwards, and badly: a stream is pinned to one session for
+            # its life, so a small request sharing a session with a download
+            # waits behind it. With four heavy streams running,
+            #
+            #     2 sessions   80.7 ms      6 sessions   3.3 ms
+            #     4 sessions   77.6 ms      8 sessions   2.7 ms
+            #
+            # and throughput was flat across all of them. The two presets named
+            # for low latency were the two worst at it. What matters is that
+            # there are more sessions than there are heavy streams; past that
+            # nothing is gained and, measured up to thirty-two, nothing is lost
+            # - even at a single stream the count made no difference at all.
             case "$1" in
-                gaming)     T_CARRIERS=2; T_WINDOW=256;  T_SNDBUF=4096;  T_RCVBUF=4096 ;;
-                latency)    T_CARRIERS=3; T_WINDOW=512;  T_SNDBUF=8192;  T_RCVBUF=8192 ;;
-                balanced)   T_CARRIERS=4; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=16384 ;;
-                throughput) T_CARRIERS=6; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=32768 ;;
-                extreme)    T_CARRIERS=8; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=65536 ;;
+                gaming)     T_CARRIERS=8;  T_WINDOW=256;  T_SNDBUF=4096;  T_RCVBUF=4096 ;;
+                latency)    T_CARRIERS=12; T_WINDOW=512;  T_SNDBUF=8192;  T_RCVBUF=8192 ;;
+                balanced)   T_CARRIERS=16; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=16384 ;;
+                throughput) T_CARRIERS=20; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=32768 ;;
+                extreme)    T_CARRIERS=24; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=65536 ;;
                 *)          return 1 ;;
             esac
             ;;
@@ -487,11 +498,11 @@ preset_menu() {
             choice 5 "Extreme" "8 KCP, 4096 KB - maximum packet-path throughput"
             ;;
         icmp | udp)
-            choice 1 "Gaming" "2 sessions, 256 KB - smallest batch and lowest queueing"
-            choice 2 "Latency" "3 sessions, 512 KB - quick ACKs for browsing and calls"
-            choice 3 "Balanced" "4 sessions, 1024 KB - smooth video around 100 Mbit/s"
-            choice 4 "Download" "6 sessions, 2048 KB - larger receive batches and buffers"
-            choice 5 "Extreme" "8 sessions, 4096 KB - maximum raw packet throughput"
+            choice 1 "Gaming" "8 sessions, 256 KB - lowest ping, nothing queued"
+            choice 2 "Latency" "12 sessions, 512 KB - browsing, calls, chat"
+            choice 3 "Balanced" "16 sessions, 1024 KB - smooth video around 100 Mbit/s"
+            choice 4 "Download" "20 sessions, 2048 KB - larger receive batches and buffers"
+            choice 5 "Extreme" "24 sessions, 4096 KB - maximum raw packet throughput"
             ;;
         *)
             choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"

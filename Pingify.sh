@@ -8,7 +8,7 @@
 #  Edit parts/*.sh and core/*.go, then run build.sh - never edit Pingify.sh.
 # =============================================================================
 
-PINGIFY_VERSION="1.0.6"
+PINGIFY_VERSION="1.0.7"
 PINGIFY_REPO="GreatTeejay/Pingify"
 
 # Everything Pingify owns lives in one directory, so it is obvious what is
@@ -1288,16 +1288,27 @@ apply_preset() {
             esac
             ;;
         icmp | udp)
-            # These transports use one shared socket and userspace ARQ. They
-            # do not need TCP's 16-24 congestion windows; too many sessions
-            # only multiply ACKs, timers and reordering. A small pool gives
-            # loss isolation while a wide window fills a 100+ Mbit path.
+            # These used to run two to eight sessions on the reasoning that a
+            # shared socket and a userspace ARQ do not need TCP's sixteen, and
+            # that more sessions only multiply ACKs and timers. Measured, that
+            # is backwards, and badly: a stream is pinned to one session for
+            # its life, so a small request sharing a session with a download
+            # waits behind it. With four heavy streams running,
+            #
+            #     2 sessions   80.7 ms      6 sessions   3.3 ms
+            #     4 sessions   77.6 ms      8 sessions   2.7 ms
+            #
+            # and throughput was flat across all of them. The two presets named
+            # for low latency were the two worst at it. What matters is that
+            # there are more sessions than there are heavy streams; past that
+            # nothing is gained and, measured up to thirty-two, nothing is lost
+            # - even at a single stream the count made no difference at all.
             case "$1" in
-                gaming)     T_CARRIERS=2; T_WINDOW=256;  T_SNDBUF=4096;  T_RCVBUF=4096 ;;
-                latency)    T_CARRIERS=3; T_WINDOW=512;  T_SNDBUF=8192;  T_RCVBUF=8192 ;;
-                balanced)   T_CARRIERS=4; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=16384 ;;
-                throughput) T_CARRIERS=6; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=32768 ;;
-                extreme)    T_CARRIERS=8; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=65536 ;;
+                gaming)     T_CARRIERS=8;  T_WINDOW=256;  T_SNDBUF=4096;  T_RCVBUF=4096 ;;
+                latency)    T_CARRIERS=12; T_WINDOW=512;  T_SNDBUF=8192;  T_RCVBUF=8192 ;;
+                balanced)   T_CARRIERS=16; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=16384 ;;
+                throughput) T_CARRIERS=20; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=32768 ;;
+                extreme)    T_CARRIERS=24; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=65536 ;;
                 *)          return 1 ;;
             esac
             ;;
@@ -1404,11 +1415,11 @@ preset_menu() {
             choice 5 "Extreme" "8 KCP, 4096 KB - maximum packet-path throughput"
             ;;
         icmp | udp)
-            choice 1 "Gaming" "2 sessions, 256 KB - smallest batch and lowest queueing"
-            choice 2 "Latency" "3 sessions, 512 KB - quick ACKs for browsing and calls"
-            choice 3 "Balanced" "4 sessions, 1024 KB - smooth video around 100 Mbit/s"
-            choice 4 "Download" "6 sessions, 2048 KB - larger receive batches and buffers"
-            choice 5 "Extreme" "8 sessions, 4096 KB - maximum raw packet throughput"
+            choice 1 "Gaming" "8 sessions, 256 KB - lowest ping, nothing queued"
+            choice 2 "Latency" "12 sessions, 512 KB - browsing, calls, chat"
+            choice 3 "Balanced" "16 sessions, 1024 KB - smooth video around 100 Mbit/s"
+            choice 4 "Download" "20 sessions, 2048 KB - larger receive batches and buffers"
+            choice 5 "Extreme" "24 sessions, 4096 KB - maximum raw packet throughput"
             ;;
         *)
             choice 1 "Gaming" "8 carriers, 256 KB - lowest ping, nothing queued"
@@ -6758,6 +6769,11 @@ const (
 	// gone - so the ARQ, which knows more, is the one that decides.
 	arqMaxRTO = 5 * time.Second
 
+	// How long the best round trip is trusted before it is measured again.
+	// Long enough to ride out a burst, short enough to follow a path that has
+	// really changed.
+	minRTTWindow = 10 * time.Second
+
 	// How long a packet-transport session may hear nothing before it is
 	// let go of. Longer than the ARQ's own forty-seven seconds of retries
 	// and far longer than a ten-second keepalive, so nothing live is ever
@@ -6862,6 +6878,21 @@ type arqConn struct {
 
 	// round-trip estimate, Jacobson/Karels
 	srtt, rttvar, rto time.Duration
+
+	// The best round trip seen lately, and when that measurement started.
+	//
+	// A window only helps up to the bandwidth-delay product: enough segments
+	// in flight to keep the path full for one round trip. Past that the extra
+	// ones are not in flight at all, they are in a queue - and a queue is
+	// latency for everything behind it, including the small interactive
+	// packets that share the carrier.
+	//
+	// The round trip is what tells the two apart. While it stays near the
+	// best we have seen, the path is carrying what we send. When it climbs
+	// well above it, we are filling a buffer, and sending more will not make
+	// anything arrive sooner.
+	minRTT      time.Duration
+	minRTTSince time.Time
 
 	lastAck  uint32
 	dupAcks  int
@@ -7182,10 +7213,28 @@ func (c *arqConn) onDatagram(buf []byte) {
 // grow widens the window by one segment for each newly acknowledged segment,
 // up to what the tunnel was configured for. That is slow start on clean RTTs;
 // loss still halves it so a saturated path sheds its queue quickly.
+// grow widens the window by one segment for each newly acknowledged segment -
+// but only while the path is still carrying what it is given.
+//
+// Growing on acknowledgement alone fills the window to whatever ceiling the
+// config named and then keeps it there, which is why a bigger window_kb used
+// to buy latency and nothing else: measured over a real tunnel, going from
+// 128 KiB to 4 MiB left throughput where it was and took the round trip from
+// 3 ms to 8. The extra segments were never in flight. They were queued.
+//
+// So the round trip decides. While it sits near the best seen, there is room
+// and the window opens. Once it has climbed a quarter above that, the path is
+// buffering rather than carrying, and the window stays where it is until it
+// drains. That is what keeps a small packet quick while a large transfer is
+// running - the thing a tunnel is actually judged on.
 func (c *arqConn) grow() {
-	if c.window < c.maxWindow {
-		c.window++
+	if c.window >= c.maxWindow {
+		return
 	}
+	if c.minRTT > 0 && c.srtt > c.minRTT+c.minRTT/4 {
+		return
+	}
+	c.window++
 }
 
 // shrink halves the window when a segment had to be sent twice, which is the
@@ -7308,6 +7357,12 @@ func (c *arqConn) sampleRTT(m time.Duration) {
 		}
 		c.rttvar = (3*c.rttvar + d) / 4
 		c.srtt = (7*c.srtt + m) / 8
+	}
+	// Re-learn the floor now and then, so a path that genuinely got slower is
+	// not measured for ever against a number it can no longer reach.
+	if c.minRTT == 0 || m < c.minRTT || time.Since(c.minRTTSince) > minRTTWindow {
+		c.minRTT = m
+		c.minRTTSince = time.Now()
 	}
 	c.rto = c.srtt + 4*c.rttvar
 	if c.rto < 200*time.Millisecond {
@@ -9769,7 +9824,7 @@ import (
 // 1. configuration and entry point
 // ==========================================================================
 
-const version = "1.0.6"
+const version = "1.0.7"
 
 // Config is the on-disk tunnel description. One file per tunnel; the same file
 // shape is used on both servers, only a few fields differ.

@@ -67,6 +67,11 @@ const (
 	// gone - so the ARQ, which knows more, is the one that decides.
 	arqMaxRTO = 5 * time.Second
 
+	// How long the best round trip is trusted before it is measured again.
+	// Long enough to ride out a burst, short enough to follow a path that has
+	// really changed.
+	minRTTWindow = 10 * time.Second
+
 	// How long a packet-transport session may hear nothing before it is
 	// let go of. Longer than the ARQ's own forty-seven seconds of retries
 	// and far longer than a ten-second keepalive, so nothing live is ever
@@ -171,6 +176,21 @@ type arqConn struct {
 
 	// round-trip estimate, Jacobson/Karels
 	srtt, rttvar, rto time.Duration
+
+	// The best round trip seen lately, and when that measurement started.
+	//
+	// A window only helps up to the bandwidth-delay product: enough segments
+	// in flight to keep the path full for one round trip. Past that the extra
+	// ones are not in flight at all, they are in a queue - and a queue is
+	// latency for everything behind it, including the small interactive
+	// packets that share the carrier.
+	//
+	// The round trip is what tells the two apart. While it stays near the
+	// best we have seen, the path is carrying what we send. When it climbs
+	// well above it, we are filling a buffer, and sending more will not make
+	// anything arrive sooner.
+	minRTT      time.Duration
+	minRTTSince time.Time
 
 	lastAck  uint32
 	dupAcks  int
@@ -491,10 +511,28 @@ func (c *arqConn) onDatagram(buf []byte) {
 // grow widens the window by one segment for each newly acknowledged segment,
 // up to what the tunnel was configured for. That is slow start on clean RTTs;
 // loss still halves it so a saturated path sheds its queue quickly.
+// grow widens the window by one segment for each newly acknowledged segment -
+// but only while the path is still carrying what it is given.
+//
+// Growing on acknowledgement alone fills the window to whatever ceiling the
+// config named and then keeps it there, which is why a bigger window_kb used
+// to buy latency and nothing else: measured over a real tunnel, going from
+// 128 KiB to 4 MiB left throughput where it was and took the round trip from
+// 3 ms to 8. The extra segments were never in flight. They were queued.
+//
+// So the round trip decides. While it sits near the best seen, there is room
+// and the window opens. Once it has climbed a quarter above that, the path is
+// buffering rather than carrying, and the window stays where it is until it
+// drains. That is what keeps a small packet quick while a large transfer is
+// running - the thing a tunnel is actually judged on.
 func (c *arqConn) grow() {
-	if c.window < c.maxWindow {
-		c.window++
+	if c.window >= c.maxWindow {
+		return
 	}
+	if c.minRTT > 0 && c.srtt > c.minRTT+c.minRTT/4 {
+		return
+	}
+	c.window++
 }
 
 // shrink halves the window when a segment had to be sent twice, which is the
@@ -617,6 +655,12 @@ func (c *arqConn) sampleRTT(m time.Duration) {
 		}
 		c.rttvar = (3*c.rttvar + d) / 4
 		c.srtt = (7*c.srtt + m) / 8
+	}
+	// Re-learn the floor now and then, so a path that genuinely got slower is
+	// not measured for ever against a number it can no longer reach.
+	if c.minRTT == 0 || m < c.minRTT || time.Since(c.minRTTSince) > minRTTWindow {
+		c.minRTT = m
+		c.minRTTSince = time.Now()
 	}
 	c.rto = c.srtt + 4*c.rttvar
 	if c.rto < 200*time.Millisecond {
