@@ -125,8 +125,18 @@ func (c *icmpCarrier) Dial(idx int) (net.Conn, error) {
 }
 
 func (c *icmpCarrier) Accept() (net.Conn, error) { return c.t.Accept() }
-func (c *icmpCarrier) Close() error              { return c.t.Close() }
-func (c *icmpCarrier) Name() string              { return "echo" }
+
+// The private link's packets go straight to the transport underneath. Without
+// these two the wrapper hid them: the pool holds this, not the transport, so
+// the check for "can this carry a bare packet" looked at the wrapper, found
+// nothing, and the direct path silently never turned on. Every test had
+// exercised the transport directly and so every test passed.
+func (c *icmpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *icmpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
+	c.t.SetPacketHandler(h, peer)
+}
+func (c *icmpCarrier) Close() error { return c.t.Close() }
+func (c *icmpCarrier) Name() string { return "echo" }
 
 // ---------------------------------------------------------------------------
 // choosing one

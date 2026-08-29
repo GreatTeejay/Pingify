@@ -339,7 +339,15 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	if peer == nil {
 		return errICMPNoPeer
 	}
-	pkt := make([]byte, icmpHdrLen+icmpTagLen+len(b))
+	bp := tunBufs.Get().(*[]byte)
+	need := icmpHdrLen + icmpTagLen + len(b)
+	if cap(*bp) < need {
+		*bp = make([]byte, 0, need)
+	}
+	pkt := (*bp)[:need]
+	for i := range pkt[:icmpHdrLen] {
+		pkt[i] = 0
+	}
 	pkt[0] = icmpEchoReply
 	binary.BigEndian.PutUint16(pkt[4:6], t.id)
 	binary.BigEndian.PutUint16(pkt[6:8], uint16(atomic.AddUint32(&t.pktSeq, 1)))
@@ -348,6 +356,8 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	copy(tagged[icmpTagLen:], b)
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
 	_, err := t.pc.WriteTo(pkt, peer)
+	*bp = pkt[:0]
+	tunBufs.Put(bp)
 	return err
 }
 

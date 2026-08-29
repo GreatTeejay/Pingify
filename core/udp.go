@@ -184,10 +184,17 @@ func (t *udpTransport) SendPacket(b []byte) error {
 	if peer == nil {
 		return errUDPNoPeer
 	}
-	body := make([]byte, udpTagLen+len(b))
+	bp := tunBufs.Get().(*[]byte)
+	need := udpTagLen + len(b)
+	if cap(*bp) < need {
+		*bp = make([]byte, 0, need)
+	}
+	body := (*bp)[:need]
 	t.putTagFor(udpTagDirect, body[:udpTagLen], b[:min(len(b), arqOver)])
 	copy(body[udpTagLen:], b)
 	_, err := t.pc.WriteTo(body, peer)
+	*bp = body[:0]
+	tunBufs.Put(bp)
 	return err
 }
 
@@ -413,5 +420,12 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 
 func (c *udpCarrier) Dial(idx int) (net.Conn, error) { return c.t.Dial(c.cfg.Connect, idx) }
 func (c *udpCarrier) Accept() (net.Conn, error)      { return c.t.Accept() }
-func (c *udpCarrier) Close() error                   { return c.t.Close() }
-func (c *udpCarrier) Name() string                   { return "udp" }
+
+// Forwarded for the same reason as the ICMP one: the pool holds this wrapper,
+// so anything asked of "the transport" has to be answerable here too.
+func (c *udpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *udpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
+	c.t.SetPacketHandler(h, peer)
+}
+func (c *udpCarrier) Close() error { return c.t.Close() }
+func (c *udpCarrier) Name() string { return "udp" }

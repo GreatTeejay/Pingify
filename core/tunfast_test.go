@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 )
 
 func fastPair(t *testing.T, encrypted bool) (*tunFast, *tunFast, *[][]byte, *[][]byte) {
@@ -148,10 +149,56 @@ func TestTheReplayWindowDoesNotGrowForever(t *testing.T) {
 	if len(*got) != n {
 		t.Fatalf("delivered %d of %d", len(*got), n)
 	}
-	b.rmu.Lock()
-	held := len(b.seen)
-	b.rmu.Unlock()
-	if held > tunReplayWindow+16 {
-		t.Fatalf("the replay set holds %d entries after %d packets", held, n)
+}
+
+// What the window has to get right at its edges.
+func TestTheReplayWindowAtItsEdges(t *testing.T) {
+	f := &tunFast{}
+	for _, c := range []struct {
+		n    uint64
+		want bool
+		why  string
+	}{
+		{0, false, "zero is not a counter - they start at one"},
+		{1, true, "the first packet"},
+		{2, true, "in order"},
+		{2, false, "the same packet twice"},
+		{1, false, "an older packet already seen"},
+		{9, true, "a jump forward, having lost some"},
+		{5, true, "one of the lost ones, arriving late"},
+		{5, false, "and again"},
+		{9, false, "the one we jumped to, replayed"},
+		{9 + tunReplayWindow, true, "far enough ahead to clear the window"},
+		{9, false, "now too far behind to judge"},
+		{9 + tunReplayWindow, false, "the far one, replayed"},
+	} {
+		if got := f.fresh(c.n); got != c.want {
+			t.Errorf("fresh(%d) = %v, want %v - %s", c.n, got, c.want, c.why)
+		}
+	}
+}
+
+// The cost of the check must not depend on how much the window holds.
+//
+// This is here because it did: sweeping a map of seen counters cost a pass
+// over the whole window for every packet, and the private link ran at a third
+// of its throughput with the processor idle. A full window has to cost what an
+// empty one costs.
+func TestTheReplayCheckCostsTheSameWhenTheWindowIsFull(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing")
+	}
+	f := &tunFast{}
+	const n = 200000
+	for i := uint64(1); i <= tunReplayWindow; i++ {
+		f.fresh(i) // fill it
+	}
+	start := time.Now()
+	for i := uint64(tunReplayWindow + 1); i <= tunReplayWindow+n; i++ {
+		f.fresh(i)
+	}
+	per := time.Since(start) / n
+	if per > 3*time.Microsecond {
+		t.Fatalf("%v per packet with a full window - the check is scanning it", per)
 	}
 }

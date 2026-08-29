@@ -48,7 +48,16 @@ const (
 	// that reorders by more than this is reordering by more than any protocol
 	// inside is prepared for.
 	tunReplayWindow = 4096
+	tunReplayWords  = tunReplayWindow / 64
 )
+
+// Scratch space for one packet on its way out. Every packet on this path is
+// built and sent and finished with inside one call, so the same buffers go
+// round rather than being made and collected thousands of times a second.
+var tunBufs = sync.Pool{New: func() any {
+	b := make([]byte, 0, 2048)
+	return &b
+}}
 
 // tunFast seals and opens one packet at a time.
 //
@@ -65,13 +74,14 @@ type tunFast struct {
 	mu      sync.Mutex
 	counter uint64
 
+	// The replay window, one bit per counter in a ring. See fresh.
 	rmu    sync.Mutex
-	seen   map[uint64]bool
+	bits   [tunReplayWords]uint64
 	newest uint64
 }
 
 func newTunFast(tx, rx cipher.AEAD, send func([]byte) error, recv func([]byte)) *tunFast {
-	return &tunFast{tx: tx, rx: rx, send: send, recv: recv, seen: make(map[uint64]bool)}
+	return &tunFast{tx: tx, rx: rx, send: send, recv: recv}
 }
 
 // Send puts one IP packet on the wire. The buffer is not retained.
@@ -84,14 +94,22 @@ func (f *tunFast) Send(pkt []byte) error {
 	var nonce [12]byte
 	binary.BigEndian.PutUint64(nonce[4:], n)
 
-	out := make([]byte, tunNonceLen, tunNonceLen+len(pkt)+16)
+	bp := tunBufs.Get().(*[]byte)
+	need := tunNonceLen + len(pkt) + 16
+	if cap(*bp) < need {
+		*bp = make([]byte, 0, need)
+	}
+	out := (*bp)[:tunNonceLen]
 	binary.BigEndian.PutUint64(out[:tunNonceLen], n)
 	if f.tx == nil {
 		out = append(out, pkt...)
 	} else {
 		out = f.tx.Seal(out, nonce[:], pkt, nil)
 	}
-	return f.send(out)
+	err := f.send(out)
+	*bp = out[:0]
+	tunBufs.Put(bp)
+	return err
 }
 
 // Deliver opens one datagram and hands the packet up. A datagram that does not
@@ -112,8 +130,12 @@ func (f *tunFast) Deliver(buf []byte) {
 	} else {
 		var nonce [12]byte
 		binary.BigEndian.PutUint64(nonce[4:], n)
+		// Opened over the top of the sealed bytes, which Open allows when the
+		// destination is the ciphertext's own start. The buffer belongs to the
+		// reader and the packet is written to the device before it returns.
+		body := buf[tunNonceLen:]
 		var err error
-		pkt, err = f.rx.Open(nil, nonce[:], buf[tunNonceLen:], nil)
+		pkt, err = f.rx.Open(body[:0], nonce[:], body, nil)
 		if err != nil {
 			return
 		}
@@ -126,34 +148,44 @@ func (f *tunFast) Deliver(buf []byte) {
 // fresh is the replay check: a counter is accepted once, and only if it is
 // within the window of what has already been seen.
 //
+// One bit per counter, in a ring that the newest packet drags forward. A
+// packet in order touches one bit and clears one, so the cost does not depend
+// on the size of the window - which matters more than it sounds. Keeping the
+// seen counters in a map instead, and sweeping it for expired ones, cost a
+// pass over four thousand entries under this lock for every packet in either
+// direction, and held the private link to a third of its throughput with the
+// processor nearly idle. It was not working, it was queueing behind itself.
+//
 // Without encryption there is nothing to replay-protect - anything on the path
 // could write a packet anyway - so the check is only about not delivering the
 // same packet twice.
 func (f *tunFast) fresh(n uint64) bool {
+	if n == 0 {
+		return false // counters start at one
+	}
 	f.rmu.Lock()
 	defer f.rmu.Unlock()
 
-	if n > f.newest {
-		// Everything now too old to matter goes, so the map cannot grow.
-		if n-f.newest > tunReplayWindow {
-			f.seen = make(map[uint64]bool, tunReplayWindow)
+	switch {
+	case n > f.newest:
+		// Drag the window forward, clearing what the front passes over so a
+		// bit left from an earlier lap cannot be read as this one.
+		if n-f.newest >= tunReplayWindow {
+			f.bits = [tunReplayWords]uint64{}
 		} else {
-			for old := range f.seen {
-				if n-old > tunReplayWindow {
-					delete(f.seen, old)
-				}
+			for i := f.newest + 1; i <= n; i++ {
+				f.bits[(i/64)%tunReplayWords] &^= 1 << (i % 64)
 			}
 		}
 		f.newest = n
-		f.seen[n] = true
-		return true
-	}
-	if f.newest-n >= tunReplayWindow {
+	case f.newest-n >= tunReplayWindow:
 		return false // too far behind to tell whether it has been seen
 	}
-	if f.seen[n] {
+
+	word, bit := (n/64)%tunReplayWords, uint64(1)<<(n%64)
+	if f.bits[word]&bit != 0 {
 		return false
 	}
-	f.seen[n] = true
+	f.bits[word] |= bit
 	return true
 }
