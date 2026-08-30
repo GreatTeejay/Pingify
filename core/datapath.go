@@ -66,7 +66,7 @@ const (
 	// and a queue in front of it only adds delay to packets that are already
 	// late. Dropping is what a router does and it is the signal the sender
 	// inside is waiting for.
-	deviceQueueDepth = 8
+	deviceQueueDepth = 2
 )
 
 // pktBuf is one packet on its way to the device. The path owns it from the
