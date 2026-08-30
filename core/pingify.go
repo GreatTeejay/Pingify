@@ -3488,12 +3488,24 @@ func tuneSocket(c net.Conn, cfg *Config) {
 	// The one that matters on this route: bound how long the kernel will
 	// retransmit into a blackhole before admitting the socket is gone.
 	setUserTimeout(c)
-	if cfg.SndBufKB > 0 {
-		tc.SetWriteBuffer(cfg.SndBufKB * 1024)
-	}
-	if cfg.RcvBufKB > 0 {
-		tc.SetReadBuffer(cfg.RcvBufKB * 1024)
-	}
+	// The socket buffers are deliberately not set here.
+	//
+	// SetReadBuffer and SetWriteBuffer ask for SO_RCVBUF and SO_SNDBUF, and on
+	// a TCP socket that does two things, both of them bad. The kernel clamps
+	// the value to net.core.rmem_max - 212992 bytes on an ordinary server -
+	// and asking at all switches off the receive-buffer autotuning that would
+	// otherwise have grown the socket to net.ipv4.tcp_rmem's ceiling, six
+	// megabytes on the same machine.
+	//
+	// So a carrier that was given "sixteen megabytes" in the config ran with
+	// two hundred and eight kilobytes and no ability to grow. Over a 68 ms
+	// path that is twenty-four megabits a carrier, and eight of them measured
+	// 113 Mbit/s where the pair could carry far more.
+	//
+	// Autotuning is better than any number that could be written here: it
+	// grows to what the path turns out to need and gives the memory back when
+	// it does not. The packet transports still set theirs explicitly, because
+	// a raw socket has no autotuning to leave alone - see sockbuf_linux.go.
 }
 
 // ---------------------------------------------------------------------------
