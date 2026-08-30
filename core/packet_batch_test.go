@@ -78,6 +78,7 @@ func TestPacketReadersDeliverEveryDatagramWithAUsableAddress(t *testing.T) {
 			default:
 			}
 		},
+		nil,
 		func(err error) { t.Logf("reader: %v", err) })
 
 	send, err := net.Dial("udp", pc.LocalAddr().String())

@@ -256,11 +256,23 @@ func (c *Config) applyDefaults() {
 	if c.DialTimeout == 0 {
 		c.DialTimeout = 10
 	}
+	// Sixteen megabytes, and it is now a number that means something.
+	//
+	// Until the socket buffers were asked for without the clamp, whatever was
+	// written here was cut to net.core.rmem_max - 208 KiB on an ordinary
+	// server - and nothing said so. A raw socket that small drops packets in
+	// bursts and the tunnel never sees it happen: the kernel throws them away
+	// before any of this code is reached, and the TCP inside reads it as
+	// congestion and halves its window.
+	//
+	// Measured with the clamp lifted, one stream over a 68 ms path: 4 MiB
+	// carried 318 Mbit/s across four streams, 16 MiB carried 379, and 64 MiB
+	// carried 379 as well. Sixteen is where it stops buying anything.
 	if c.SndBufKB == 0 {
-		c.SndBufKB = 4096
+		c.SndBufKB = 16384
 	}
 	if c.RcvBufKB == 0 {
-		c.RcvBufKB = 4096
+		c.RcvBufKB = 16384
 	}
 	c.Profile = strings.ToLower(strings.TrimSpace(c.Profile))
 	if c.Profile == "" {
@@ -3112,8 +3124,9 @@ type tunnel struct {
 	closed chan struct{}
 	once   sync.Once
 
-	// One channel per device writer, chosen by the packet's flow. See toDevice.
-	writers []chan *[]byte
+	// Where a received packet goes: placed by flow, handed over in batches.
+	// See datapath.go.
+	fan *deviceFan
 
 	// When the transport can carry a whole packet with no session under it,
 	// this is how the private link travels: one packet, one datagram, no
@@ -3155,11 +3168,8 @@ func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 	// One writer per device queue: the queues are what make parallel writes
 	// worth anything, and a writer with no queue of its own would only queue
 	// behind another.
-	for i := 0; i < len(t.queues); i++ {
-		ch := make(chan *[]byte, 128)
-		t.writers = append(t.writers, ch)
-		go t.deviceWriteLoop(ch)
-	}
+	t.fan = newDeviceFan(t.queues, t.closed)
+	go t.fan.watchShedding(t.closed)
 	t.startFast()
 	for i := range t.queues {
 		go t.readQueue(t.queues[i])
@@ -3293,6 +3303,16 @@ func (t *tunnel) startFast() {
 	t.fast = newTunFast(tx, rx, pc.SendPacket, t.toDevice)
 	pc.SetPacketHandler(t.fast.Deliver, peer)
 
+	// Hand the whole socket batch onward in one go. Without this the fan
+	// would hold packets until it happened to fill, which on a quiet link is
+	// never - so a transport that cannot say when a read is finished does not
+	// get a fan at all.
+	if be, ok := t.p.tr.(interface{ SetBatchEnd(func()) }); ok && t.fan != nil {
+		be.SetBatchEnd(t.fan.flush)
+	} else {
+		t.fan = nil
+	}
+
 	how := "encrypted"
 	if !t.cfg.encrypted() {
 		how = "in the clear"
@@ -3302,61 +3322,15 @@ func (t *tunnel) startFast() {
 }
 
 // toDevice writes one IP packet to the interface, whichever path brought it.
-// toDevice hands one packet to the device.
-//
-// The write does not happen here. One reader drains the socket, so that the
-// packets of a flow keep the order they arrived in, and if that reader also
-// did the writing then every write into the kernel would be serialised behind
-// the one before it - which is what capped this path at a third of what the
-// pair could carry.
-//
-// So the packet goes to a writer chosen by its flow. Every packet of a flow
-// goes to the same writer and is written in order; different flows are written
-// at the same time by different threads. Order is a property of a flow, not of
-// the device, and that is the only place it has to be paid for.
+// toDevice hands one packet to the device. The bytes belong to the socket's
+// receive batch and are copied on the way in; see deviceFan.
 func (t *tunnel) toDevice(pkt []byte) {
-	if len(t.writers) > 0 {
-		w := t.writers[flowHash(pkt)%uint32(len(t.writers))]
-		// Sized to a packet, not to a record. The record pool hands out 32 KiB
-		// buffers, and pulling one of those through a channel for every 1320
-		// bytes on the wire is a cache line's worth of work done twenty times
-		// over.
-		bp := devBufs.Get().(*[]byte)
-		b := (*bp)[:copy((*bp)[:cap(*bp)], pkt)]
-		*bp = b
-		select {
-		case w <- bp:
-		default:
-			// This flow's writer is behind. Dropping is what a router does,
-			// and it is the signal the sender inside is waiting for.
-			*bp = b[:0]
-			devBufs.Put(bp)
-		}
+	if t.fan != nil {
+		t.fan.add(pkt)
 		return
 	}
 	t.writeDevice(pkt)
 }
-
-// deviceWriteLoop is one writer: everything it is given belongs to flows that
-// hash to it, so writing them in the order they arrive is enough.
-func (t *tunnel) deviceWriteLoop(in <-chan *[]byte) {
-	for {
-		select {
-		case <-t.closed:
-			return
-		case bp := <-in:
-			t.writeDevice(*bp)
-			*bp = (*bp)[:0]
-			devBufs.Put(bp)
-		}
-	}
-}
-
-// One packet's worth, which is all a device write ever needs.
-var devBufs = sync.Pool{New: func() interface{} {
-	b := make([]byte, 0, 2048)
-	return &b
-}}
 
 func (t *tunnel) writeDevice(pkt []byte) {
 	if len(t.queues) == 0 {

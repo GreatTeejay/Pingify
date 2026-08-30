@@ -139,6 +139,14 @@ type icmpTransport struct {
 	// See icmpsend_linux.go for why that is worth a queue.
 	outQ chan *[]byte
 
+	// Packets the sender could not take because it was behind.
+	sendDropped uint64
+
+	// Called once after every socket read, so the layer above can hand a
+	// whole batch onward in one go. Installed after the readers are already
+	// running, which is why it is atomic.
+	batchEnd atomic.Value // func()
+
 	// What this end puts on the wire. What it accepts is either type - see
 	// the note at the top of this file.
 	sendType byte
@@ -203,8 +211,10 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
 	}
 	go t.sendPacketLoop()
+	go t.watchSendDrops()
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
-		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
+		t.handlePacket, t.runBatchEnd,
+		func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
 		workers, batch, icmpMaxPayload)
 	return t, nil
@@ -361,6 +371,16 @@ func (t *icmpTransport) rememberPeer(ip *net.IPAddr) {
 	t.pktMu.Unlock()
 }
 
+// SetBatchEnd installs what to run when a socket read is finished with. See
+// startPacketReaders.
+func (t *icmpTransport) SetBatchEnd(f func()) { t.batchEnd.Store(f) }
+
+func (t *icmpTransport) runBatchEnd() {
+	if f, ok := t.batchEnd.Load().(func()); ok && f != nil {
+		f()
+	}
+}
+
 // SetPacketHandler installs where a bare packet goes, and names the peer to
 // send to when this end is the one that dials.
 func (t *icmpTransport) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
@@ -405,10 +425,35 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 		// The sender is behind, which on a link carrying IP means the wire is
 		// behind. Dropping here is what a router does, and it is the signal
 		// the sender inside needs; queueing it deeper would only add delay to
-		// a packet that is already late.
+		// a packet that is already late. Counted, because a drop here looks
+		// exactly like a drop on the path to everything above.
 		*bp = pkt[:0]
 		tunBufs.Put(bp)
+		atomic.AddUint64(&t.sendDropped, 1)
 		return nil
+	}
+}
+
+// watchSendDrops says so when the sender cannot keep up, because a packet
+// dropped here is indistinguishable from one lost on the path to everything
+// above, and only this end knows which it was.
+func (t *icmpTransport) watchSendDrops() {
+	tk := time.NewTicker(15 * time.Second)
+	defer tk.Stop()
+	var last uint64
+	for {
+		select {
+		case <-t.done:
+			return
+		case <-tk.C:
+			n := atomic.LoadUint64(&t.sendDropped)
+			if n == last {
+				continue
+			}
+			logWarn("the private link dropped %d packets on the way out in the "+
+				"last 15s (%d in all) - the sender is behind", n-last, n)
+			last = n
+		}
 	}
 }
 

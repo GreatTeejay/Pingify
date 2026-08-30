@@ -70,24 +70,32 @@ func packetReadTuning(profile string) (workers, batch int) {
 // stream delivered 6.3 Mbit/s. A reference tunnel on the same path, the same
 // minute, with one reader, reported no reordering at all and delivered 122.
 // One reader is not a compromise here: it is four times faster.
+//
+// endBatch, when it is not nil, is called once after every socket read,
+// whatever the read brought back. That is what lets the layer above hand a
+// whole batch onward in one go rather than a packet at a time - the thing the
+// profile said was costing more than the work itself. It is called from this
+// goroutine and from nowhere else, so what it touches needs no lock as long as
+// there is one reader, which ordered guarantees.
 func startPacketReaders(pc net.PacketConn, done <-chan struct{}, profile string,
-	ordered bool, maxPacket int, handle func([]byte, net.Addr), onError func(error)) (int, int) {
+	ordered bool, maxPacket int, handle func([]byte, net.Addr), endBatch func(),
+	onError func(error)) (int, int) {
 	workers, batch := packetReadTuning(profile)
 	if ordered {
 		workers = 1
 	}
 	for i := 0; i < workers; i++ {
 		if batch > 1 {
-			go packetBatchReadLoop(pc, done, batch, maxPacket, handle, onError)
+			go packetBatchReadLoop(pc, done, batch, maxPacket, handle, endBatch, onError)
 		} else {
-			go packetSingleReadLoop(pc, done, maxPacket, handle, onError)
+			go packetSingleReadLoop(pc, done, maxPacket, handle, endBatch, onError)
 		}
 	}
 	return workers, batch
 }
 
 func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPacket int,
-	handle func([]byte, net.Addr), onError func(error)) {
+	handle func([]byte, net.Addr), endBatch func(), onError func(error)) {
 	p := ipv4.NewPacketConn(pc)
 	msgs := make([]ipv4.Message, batch)
 	bufs := make([][]byte, batch)
@@ -111,6 +119,9 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 				handle(bufs[i][:msgs[i].N], msgs[i].Addr)
 			}
 		}
+		if endBatch != nil {
+			endBatch()
+		}
 		if err == nil {
 			fails = 0
 			continue
@@ -125,7 +136,7 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 			if fails >= 3 {
 				logWarn("batched receive is not working on this socket (%v) - "+
 					"falling back to the plain reader", err)
-				packetSingleReadLoop(pc, done, maxPacket, handle, onError)
+				packetSingleReadLoop(pc, done, maxPacket, handle, endBatch, onError)
 				return
 			}
 		}
@@ -134,12 +145,15 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 }
 
 func packetSingleReadLoop(pc net.PacketConn, done <-chan struct{}, maxPacket int,
-	handle func([]byte, net.Addr), onError func(error)) {
+	handle func([]byte, net.Addr), endBatch func(), onError func(error)) {
 	buf := make([]byte, maxPacket)
 	for {
 		n, addr, err := pc.ReadFrom(buf)
 		if err == nil {
 			handle(buf[:n], addr)
+			if endBatch != nil {
+				endBatch()
+			}
 			continue
 		}
 		select {
@@ -160,5 +174,20 @@ func tunePacketSocket(pc net.PacketConn, cfg *Config) {
 	}
 	if c, ok := pc.(interface{ SetWriteBuffer(int) error }); ok && cfg.SndBufKB > 0 {
 		_ = c.SetWriteBuffer(cfg.SndBufKB * 1024)
+	}
+
+	// And again without the clamp, because the calls above are quietly cut to
+	// net.core.rmem_max and nothing says so. See sockbuf_linux.go: a socket
+	// that asked for sixteen megabytes and got four hundred kilobytes had
+	// thrown away nine hundred packets before anything above it noticed.
+	gotR, gotS := forceSocketBuffer(pc, cfg.RcvBufKB*1024, cfg.SndBufKB*1024)
+	if gotR > 0 || gotS > 0 {
+		logInfo("packet socket buffers: asked %d/%d KiB, got %d/%d KiB",
+			cfg.RcvBufKB, cfg.SndBufKB, gotR/1024, gotS/1024)
+		if cfg.RcvBufKB > 0 && gotR < cfg.RcvBufKB*1024/2 {
+			logWarn("the kernel cut the receive buffer to %d KiB - raise "+
+				"net.core.rmem_max, or packets will be dropped before this "+
+				"tunnel ever sees them", gotR/1024)
+		}
 	}
 }

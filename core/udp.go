@@ -59,6 +59,9 @@ type udpTransport struct {
 	tagHash  sync.Pool
 	window   int
 
+	// Called once after every socket read - see startPacketReaders.
+	batchEnd atomic.Value // func()
+
 	// Whether this end dials. The end that dials never accepts, so an
 	// unknown session arriving there cannot be a carrier - see dispatch.
 	dials bool
@@ -105,7 +108,7 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
 	tunePacketSocket(pc, cfg)
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), udpMaxPacket,
-		t.handlePacket, func(error) {
+		t.handlePacket, t.runBatchEnd, func(error) {
 			// A UDP socket can report a transient ICMP port-unreachable. Reading
 			// on is the correct response and per-packet logging is only noise.
 		})
@@ -151,6 +154,15 @@ func (t *udpTransport) validTagFor(label string, want, hdr []byte) bool {
 
 func (t *udpTransport) validTag(want, hdr []byte) bool {
 	return t.validTagFor(udpTagARQ, want, hdr)
+}
+
+// SetBatchEnd installs what to run when a socket read is finished with.
+func (t *udpTransport) SetBatchEnd(f func()) { t.batchEnd.Store(f) }
+
+func (t *udpTransport) runBatchEnd() {
+	if f, ok := t.batchEnd.Load().(func()); ok && f != nil {
+		f()
+	}
 }
 
 // SetPacketHandler installs where a bare packet goes, and names the peer to
