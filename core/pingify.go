@@ -3040,7 +3040,6 @@ type tunnel struct {
 	cfg    *Config
 	p      *pool
 	queues []*os.File
-	wrIdx  uint32
 	closed chan struct{}
 	once   sync.Once
 
@@ -3225,7 +3224,20 @@ func (t *tunnel) toDevice(pkt []byte) {
 	if len(t.queues) == 0 {
 		return
 	}
-	q := t.queues[int(atomic.AddUint32(&t.wrIdx, 1))%len(t.queues)]
+	// The queue is chosen by the flow, never round-robin.
+	//
+	// Round-robin here quietly destroyed the thing the send side had been
+	// careful to preserve. A flow is pinned to one carrier so its packets stay
+	// in order on the wire, and then every packet that arrived was handed to
+	// the next device queue in turn. Several queues drain at once, so one
+	// flow's packets reached the kernel in whatever order the queues happened
+	// to run, and the TCP inside saw its own segments shuffled.
+	//
+	// Measured on a real 37 ms path: the inner connection reported 1071
+	// reordering events, retransmitted 400 KB it had never lost, and its round
+	// trip rose from 37 ms to 187 ms. Hashing the flow to a queue costs one
+	// pass over the header and keeps every flow on one queue, in order.
+	q := t.queues[flowHash(pkt)%uint32(len(t.queues))]
 	if _, err := q.Write(pkt); err != nil {
 		logDebug("tun write: %v", err)
 	}
@@ -3308,6 +3320,16 @@ func flowHash(pkt []byte) uint32 {
 			mix(pkt[40:44])
 		}
 	}
+	// FNV leaves its weakest bits at the bottom, and a modulus takes exactly
+	// those. It happens to spread runs of ephemeral source ports well enough,
+	// but only by luck of the multiplier - the guarantee is worth having when
+	// the cost is four instructions once per flow, and it is what keeps the
+	// carrier and the device queue from ever agreeing to cluster.
+	h ^= h >> 16
+	h *= 0x85ebca6b
+	h ^= h >> 13
+	h *= 0xc2b2ae35
+	h ^= h >> 16
 	return h
 }
 
