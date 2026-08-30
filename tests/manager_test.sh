@@ -2268,7 +2268,8 @@ note "encryption is a question, not an assumption"
 # end, so a second cipher over the top buys nothing the first did not. What it
 # buys is the shape - with it off, our framing is on the wire for anything that
 # looks - and the proof that a frame arrived unaltered. Worth asking about, and
-# worth defaulting to on.
+# and worth defaulting to off: what crosses one of these is nearly always
+# carrying its own TLS already, and the cipher is not free.
 ENC="$WORK/enc"; mkdir -p "$ENC"
 (
     CFG_DIR="$ENC"
@@ -2295,7 +2296,7 @@ ENC="$WORK/enc"; mkdir -p "$ENC"
 ) > "$WORK/enc.out" 2>&1
 ez() { grep -m1 "^$1=" "$WORK/enc.out" | cut -d= -f2-; }
 
-check "a new tunnel is encrypted"  "$(ez default)"    "true"
+check "a new tunnel is in the clear" "$(ez default)"   "false"
 check "and the config says so"     "$(ez cfg_true)"   "true"
 check "off is recorded too"        "$(ez cfg_false)"  "false"
 # Both ends read it from the same token, because a tunnel where one seals and
@@ -2305,12 +2306,18 @@ check "and carries no"             "$(ez read_false)" "false"
 
 encwz() { awk '/^new_tunnel\(\) \{/{f=1} f&&/^\}/{exit} f' Pingify.sh; }
 check "the wizard has an encryption step"       "$(encwz | grep -c 'wiz "Encryption"')" "1"
-check "and says what it actually costs"       "$(encwz | grep -c 'tenth of one percent')" "1"
+# It used to tell the operator the cipher costs "a tenth of one percent of a
+# core", which is not what it costs. Profiled on a server abroad without the
+# PCLMULQDQ instruction, a third of the processor was inside GCM's
+# authenticator. The step quotes the measurement now, and this guards
+# against the comfortable number coming back.
+check "it does not repeat the old claim" "$(encwz | grep -c 'tenth of one percent')" "0"
+check "and quotes what was measured"     "$(encwz | grep -c 'third of the')" "1"
 
-# Asked on a private link and nowhere else: a forwarded port carries whatever
-# the service behind it speaks, and that is not the operator's to strip.
-check "and only for a private link" \
-      "$(encwz | grep -c 'T_KIND. != .tun')" "1"
+# Asked on every tunnel now, not only a private link: what crosses one of
+# these nearly always carries its own TLS already, so a second cipher over
+# the top is a cost with nothing to show for it. The operator decides.
+check "and asked whatever the tunnel carries" "$(encwz | grep -c 'T_KIND. != .tun')" "0"
 
 # ---------------------------------------------------------------------------
 note "a token printed before the setting still reads"
