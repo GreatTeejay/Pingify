@@ -710,7 +710,20 @@ tuning_write() {
     f="$(cfg_file "$name")"
     [ -n "$snd" ] || snd="$win"
     [ -n "$rcv" ] || rcv="$win"
-    case "$T_TRANSPORT" in ws | wss) car=1 ;; esac
+    # A WebSocket tunnel is held to a few connections, not to one. Clamping
+    # it to one here meant the first time anyone touched any tuning value on a
+    # WSS tunnel - a window, a keepalive, a buffer - the carriers silently
+    # dropped to a single connection, which is the single point of failure the
+    # core was given a second carrier to avoid. It was written on one side
+    # only, so the two ends then disagreed and carried on.
+    case "$T_TRANSPORT" in
+        ws | wss)
+            case "$car" in
+                "" | *[!0-9]*) car=2 ;;
+                *) [ "$car" -ge 1 ] && [ "$car" -le 4 ] || car=2 ;;
+            esac
+            ;;
+    esac
     for n in "$car" "$win" "$ka" "$snd" "$rcv"; do
         case "$n" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
     done

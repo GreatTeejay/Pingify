@@ -4634,7 +4634,20 @@ tuning_write() {
     f="$(cfg_file "$name")"
     [ -n "$snd" ] || snd="$win"
     [ -n "$rcv" ] || rcv="$win"
-    case "$T_TRANSPORT" in ws | wss) car=1 ;; esac
+    # A WebSocket tunnel is held to a few connections, not to one. Clamping
+    # it to one here meant the first time anyone touched any tuning value on a
+    # WSS tunnel - a window, a keepalive, a buffer - the carriers silently
+    # dropped to a single connection, which is the single point of failure the
+    # core was given a second carrier to avoid. It was written on one side
+    # only, so the two ends then disagreed and carried on.
+    case "$T_TRANSPORT" in
+        ws | wss)
+            case "$car" in
+                "" | *[!0-9]*) car=2 ;;
+                *) [ "$car" -ge 1 ] && [ "$car" -le 4 ] || car=2 ;;
+            esac
+            ;;
+    esac
     for n in "$car" "$win" "$ka" "$snd" "$rcv"; do
         case "$n" in "" | *[!0-9]*) fail "numbers only"; pause; return ;; esac
     done
@@ -11542,6 +11555,11 @@ type recBuf struct {
 	a   []byte
 	n   int
 	big bool
+
+	// When this was put on a carrier's queue, for records that are worth less
+	// the longer they wait. Zero means it waits however long it takes: a
+	// handshake, a window credit or a forwarded byte has to arrive.
+	enq int64
 }
 
 func (r *recBuf) body() []byte  { return r.a[recHdr:] }
@@ -11574,6 +11592,7 @@ func getCtrl(payload int) *recBuf {
 }
 
 func putRec(r *recBuf) {
+	r.enq = 0
 	if r.big {
 		bigPool.Put(r)
 	} else {
@@ -11958,6 +11977,42 @@ func (l *link) died(format string, a ...interface{}) {
 	l.close()
 }
 
+// How long a private-link packet may wait before dropping it beats sending it.
+//
+// The queue is 128 records deep per carrier - at a carrier's share of a
+// hundred megabits, about seventy milliseconds of packets. Idle, the link
+// measures 40 ms. With sixteen streams pushing through it and no shedding at
+// all, the same ping averaged 270 ms and peaked at 896, with 244 ms of
+// jitter. The bytes were not lost, they were queued, and no sender inside
+// could tell: a queue that deep hides the congestion signal that would have
+// made them slow down.
+//
+// CoDel was tried here, properly - target 5 ms, interval 100 ms, drop rate
+// rising with the square root of a persisting queue - and it lost on both
+// counts: 191 ms under the same load against this rule's 63 ms, and 173
+// Mbit/s against 202. Its interval is the reason. CoDel waits a hundred
+// milliseconds to be sure a queue is standing rather than bursting, and on
+// this path the queue is built and hurting long before that.
+//
+// So the rule is the plain one: a packet that has waited longer than this is
+// one the TCP inside has already counted as lost and resent, and sending it
+// now adds delay for a copy nobody wants. Dropping is not damage on a link
+// that carries IP - it is the signal, and it is the signal that a deep queue
+// was preventing. Shedding is also what makes it FASTER under load, because
+// the retransmit storms that bufferbloat causes cost more than the drops do.
+const tunMaxSojourn = 6 * time.Millisecond
+
+// staleTUN reports a private-link packet the queue should shed, and returns
+// its buffer. Records with no timestamp - handshakes, window credits,
+// forwarded bytes - are never shed: those have to arrive.
+func (l *link) staleTUN(r *recBuf) bool {
+	if r.enq == 0 || time.Now().UnixNano()-r.enq <= int64(tunMaxSojourn) {
+		return false
+	}
+	putRec(r)
+	return true
+}
+
 // jumpsQueue is true for the records that carry no position in any stream, so
 // nothing is reordered by letting them go first.
 func jumpsQueue(cmd byte) bool {
@@ -12023,6 +12078,9 @@ func (l *link) writeLoop() {
 				return
 			}
 		}
+		if l.staleTUN(r) {
+			continue
+		}
 		frame = append(frame[:0], r.bytes()...)
 		putRec(r)
 	drain:
@@ -12036,6 +12094,9 @@ func (l *link) writeLoop() {
 				default:
 					break drain
 				}
+			}
+			if l.staleTUN(r2) {
+				continue
 			}
 			frame = append(frame, r2.bytes()...)
 			putRec(r2)
@@ -12956,7 +13017,6 @@ type tunnel struct {
 	cfg    *Config
 	p      *pool
 	queues []*os.File
-	wrIdx  uint32
 	closed chan struct{}
 	once   sync.Once
 
@@ -13060,6 +13120,7 @@ func (t *tunnel) readQueue(f *os.File) {
 				putRec(r)
 			} else {
 				r.seal(cmdTUN, 0, n)
+				r.enq = time.Now().UnixNano()
 				l := t.p.pickHash(flowHash(r.body()[:n]))
 				if l == nil {
 					putRec(r)
@@ -13141,7 +13202,20 @@ func (t *tunnel) toDevice(pkt []byte) {
 	if len(t.queues) == 0 {
 		return
 	}
-	q := t.queues[int(atomic.AddUint32(&t.wrIdx, 1))%len(t.queues)]
+	// The queue is chosen by the flow, never round-robin.
+	//
+	// Round-robin here quietly destroyed the thing the send side had been
+	// careful to preserve. A flow is pinned to one carrier so its packets stay
+	// in order on the wire, and then every packet that arrived was handed to
+	// the next device queue in turn. Several queues drain at once, so one
+	// flow's packets reached the kernel in whatever order the queues happened
+	// to run, and the TCP inside saw its own segments shuffled.
+	//
+	// Measured on a real 37 ms path: the inner connection reported 1071
+	// reordering events, retransmitted 400 KB it had never lost, and its round
+	// trip rose from 37 ms to 187 ms. Hashing the flow to a queue costs one
+	// pass over the header and keeps every flow on one queue, in order.
+	q := t.queues[flowHash(pkt)%uint32(len(t.queues))]
 	if _, err := q.Write(pkt); err != nil {
 		logDebug("tun write: %v", err)
 	}
@@ -13224,6 +13298,16 @@ func flowHash(pkt []byte) uint32 {
 			mix(pkt[40:44])
 		}
 	}
+	// FNV leaves its weakest bits at the bottom, and a modulus takes exactly
+	// those. It happens to spread runs of ephemeral source ports well enough,
+	// but only by luck of the multiplier - the guarantee is worth having when
+	// the cost is four instructions once per flow, and it is what keeps the
+	// carrier and the device queue from ever agreeing to cluster.
+	h ^= h >> 16
+	h *= 0x85ebca6b
+	h ^= h >> 13
+	h *= 0xc2b2ae35
+	h ^= h >> 16
 	return h
 }
 
@@ -13267,6 +13351,9 @@ func tuneSocket(c net.Conn, cfg *Config) {
 	tc.SetNoDelay(true)
 	tc.SetKeepAlive(true)
 	tc.SetKeepAlivePeriod(30e9)
+	// The one that matters on this route: bound how long the kernel will
+	// retransmit into a blackhole before admitting the socket is gone.
+	setUserTimeout(c)
 	if cfg.SndBufKB > 0 {
 		tc.SetWriteBuffer(cfg.SndBufKB * 1024)
 	}
@@ -13871,6 +13958,72 @@ func carrierRestarted(before, after *statusDoc) bool {
 	}
 	return false
 }
+PINGIFY_SRC_EOF
+    cat > "$d/socket_linux.go" <<'PINGIFY_SRC_EOF'
+//go:build linux
+
+package main
+
+import (
+	"net"
+	"time"
+
+	"golang.org/x/sys/unix"
+)
+
+// ---------------------------------------------------------------------------
+// telling the kernel how long to keep trying
+//
+// The measured failure on this path is not a reset and not an error. A
+// connection into Iran completes, carries a few exchanges, and is then
+// blackholed: nothing comes back and nothing says so. TCP does what TCP does -
+// it retransmits, backs off, and keeps the socket open. Captured on the wire,
+// one carrier retransmitted the same 37 bytes at 0.25s, 0.5s, 1s, 2s, 4s, 8s
+// and was still trying when we stopped watching, while the far end had long
+// since stopped answering.
+//
+// Everything above it believed the carrier was fine, because from its side
+// nothing had failed. Streams pinned there hung, new ones kept being handed to
+// it, and the tunnel went on reporting every carrier up.
+//
+// TCP_USER_TIMEOUT is the kernel's own answer: it bounds how long data may go
+// unacknowledged before the socket gives up and returns ETIMEDOUT. It needs no
+// protocol change, no cooperation from the peer, and no keepalive to notice -
+// the kernel already knows, and this is how it is asked to say so.
+// ---------------------------------------------------------------------------
+
+// How long unacknowledged data may sit before the kernel gives up on the
+// socket. Comfortably above any real round trip on this route - Germany is
+// 80 ms - and far below the minute the silence check needs.
+const userTimeout = 4 * time.Second
+
+func setUserTimeout(c net.Conn) {
+	tc := baseTCP(c)
+	if tc == nil {
+		return
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	// Best effort: an old kernel that does not know the option is not a
+	// reason to refuse the carrier, it just keeps the old behaviour.
+	_ = raw.Control(func(fd uintptr) {
+		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP,
+			unix.TCP_USER_TIMEOUT, int(userTimeout/time.Millisecond))
+	})
+}
+PINGIFY_SRC_EOF
+    cat > "$d/socket_other.go" <<'PINGIFY_SRC_EOF'
+//go:build !linux
+
+package main
+
+import "net"
+
+// Only Linux has TCP_USER_TIMEOUT. Elsewhere the carrier keeps the kernel's
+// default behaviour, which is what the tests on a development machine see.
+func setUserTimeout(net.Conn) {}
 PINGIFY_SRC_EOF
     cat > "$d/transport.go" <<'PINGIFY_SRC_EOF'
 package main
