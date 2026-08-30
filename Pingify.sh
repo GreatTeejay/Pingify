@@ -8156,7 +8156,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	if err := attachICMPFilter(pc, t.id); err != nil {
 		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
 	}
-	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, icmpMaxPacket,
+	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
 		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
 		workers, batch, icmpMaxPayload)
@@ -9349,9 +9349,26 @@ func packetReadTuning(profile string) (workers, batch int) {
 // ARQ and KCP are built to accept exactly that, and each ARQ session serialises
 // its own state. What we gain is that one busy CPU no longer caps every ICMP
 // carrier on the server.
+//
+// ordered says that assumption does not hold here. The private link's direct
+// path has no reordering layer under it by design - a packet is sealed on its
+// own and written to the device the moment it arrives - so two readers taking
+// consecutive recvmmsg batches and finishing in either order is not a detail
+// the layer above absorbs. It is delivered to the device that way, and the TCP
+// inside the tunnel counts it as loss.
+//
+// It was measured doing exactly that. With two readers on a real Iran-Germany
+// ICMP tunnel the inner connection reported 487 and then 7346 reordering
+// events, its congestion window collapsed from 1165 segments to 48, and one
+// stream delivered 6.3 Mbit/s. A reference tunnel on the same path, the same
+// minute, with one reader, reported no reordering at all and delivered 122.
+// One reader is not a compromise here: it is four times faster.
 func startPacketReaders(pc net.PacketConn, done <-chan struct{}, profile string,
-	maxPacket int, handle func([]byte, net.Addr), onError func(error)) (int, int) {
+	ordered bool, maxPacket int, handle func([]byte, net.Addr), onError func(error)) (int, int) {
 	workers, batch := packetReadTuning(profile)
+	if ordered {
+		workers = 1
+	}
 	for i := 0; i < workers; i++ {
 		if batch > 1 {
 			go packetBatchReadLoop(pc, done, batch, maxPacket, handle, onError)
@@ -10849,6 +10866,12 @@ func (c *Config) obfuscated() bool { return c.Obfuscate != nil && *c.Obfuscate }
 
 // encrypted is true unless the config says otherwise, so every tunnel that
 // predates the setting keeps its cipher.
+// carriesPackets says this tunnel puts whole IP packets on the wire with
+// nothing underneath them to put the order back. See startPacketReaders.
+func (c *Config) carriesPackets() bool {
+	return c.Mode == "tun" || c.Mode == "both"
+}
+
 func (c *Config) encrypted() bool { return c.Encrypt == nil || *c.Encrypt }
 
 func (c *Config) key() []byte {
@@ -15080,7 +15103,7 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 	}
 	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
 	tunePacketSocket(pc, cfg)
-	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, udpMaxPacket,
+	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), udpMaxPacket,
 		t.handlePacket, func(error) {
 			// A UDP socket can report a transient ICMP port-unreachable. Reading
 			// on is the correct response and per-packet logging is only noise.
