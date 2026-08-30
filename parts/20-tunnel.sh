@@ -55,7 +55,7 @@ cfg_reset() {
     T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1200; T_KCP_INTERVAL=10
     T_PCK_FLAGS="PA"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
-    T_ENCRYPT="true"     # AES-256-GCM on every frame; see the Encryption step
+    T_ENCRYPT="false"   # off unless asked for; see Config.encrypted in the core
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
     # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
@@ -922,7 +922,7 @@ TOKEN
     T_PCK_FLAGS="${pckflags:-PA}"; T_OBFUSCATE="$obfuscate"
     # An older token has no such field, and a tunnel that predates the
     # setting was encrypted - so empty has to mean yes, not no.
-    case "$encrypt" in false) T_ENCRYPT="false" ;; *) T_ENCRYPT="true" ;; esac
+    case "$encrypt" in true) T_ENCRYPT="true" ;; *) T_ENCRYPT="false" ;; esac
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
     T_GRE_TTL="${ttl:-255}"; T_AWG_PORT="${awgport:-51820}"
     T_AWG_PRIV="$awgpriv"; T_AWG_PUB="$awgpub"; T_AWG_OBF="$awgobf"
@@ -1419,28 +1419,31 @@ new_tunnel() {
     # operator did not choose what crosses it. A private link is different.
     # It carries raw IP between two machines the same person runs, they know
     # what is on it, and it is the one that is judged on speed.
-    if [ "$T_KIND" != "tun" ] && [ "$T_MODE" != "tun" ] && [ "$T_MODE" != "both" ]; then
-        T_ENCRYPT="true"
-    else
     wiz "Encryption"
-    choice 1 "Encrypted" "AES-256-GCM on every frame  (recommended)"
-    choice 2 "In the clear" "faster on paper, and the shape is visible"
+    choice 1 "In the clear" "what nearly every tunnel should pick  (recommended)"
+    choice 2 "Encrypted" "ChaCha or AES on every frame, and it is not free"
     say ""
-    dim "The cipher costs about a tenth of one percent of a core at 100 Mbit/s,"
-    dim "so this is not the setting that makes a tunnel fast. What it changes is"
-    dim "whether the traffic looks like anything, and whether a frame can be"
-    dim "altered on the way. Turn it off only when what you carry - Xray, a VPN,"
-    dim "anything with its own TLS - is already encrypted."
+    dim "This used to say the cipher costs a tenth of a percent of a core. That"
+    dim "was wrong, and measuring it said so: on a server abroad without the"
+    dim "PCLMULQDQ instruction - which is what a cheap VPS is - a third of the"
+    dim "processor went into the authenticator alone. Turning it off raised what"
+    dim "the pair carried by half and dropped the delay under load from 380 ms"
+    dim "to 82."
+    say ""
+    dim "The handshake is authenticated either way and the token still has to"
+    dim "match, so nobody without it can build a tunnel here. What changes is"
+    dim "whether what crosses afterwards can be read. Almost everything sent"
+    dim "through one of these - Xray, a VPN, a browser - carries its own TLS"
+    dim "already, and a second cipher over the top of it buys nothing."
     say ""
     local enc=""
     pick enc "select" 1 2 || { wiz_end; return 0; }
     if [ "$enc" = "2" ]; then
-        T_ENCRYPT="false"
-        say ""
-        warn "frames will not be encrypted, and both servers must agree"
-    else
         T_ENCRYPT="true"
-    fi
+        say ""
+        info "both servers must agree, and the far end is told in the token"
+    else
+        T_ENCRYPT="false"
     fi
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""

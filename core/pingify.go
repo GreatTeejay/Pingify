@@ -410,7 +410,22 @@ func (c *Config) carriesPackets() bool {
 	return c.Mode == "tun" || c.Mode == "both"
 }
 
-func (c *Config) encrypted() bool { return c.Encrypt == nil || *c.Encrypt }
+// encrypted says whether every frame and every private-link packet is sealed.
+//
+// It is off unless the config asks for it. The handshake is authenticated
+// either way and the token still has to match, so nobody without it can build
+// a tunnel here - but what crosses the wire afterwards is readable by anything
+// on the path, and more distinguishable for it.
+//
+// That is a deliberate trade and it was asked for. On a server abroad without
+// the PCLMULQDQ instruction - which is what a cheap VPS is - a third of the
+// processor went into GCM's authenticator, and turning it off raised what the
+// pair carried by half and dropped the tail under load from 380 ms to 82.
+// Where the traffic inside is already TLS, which is nearly all of it, this
+// seals nothing that was not already sealed.
+//
+// Set encrypt = true on both servers to have it back.
+func (c *Config) encrypted() bool { return c.Encrypt != nil && *c.Encrypt }
 
 func (c *Config) key() []byte {
 	if c.Token != "" {
@@ -3097,6 +3112,9 @@ type tunnel struct {
 	closed chan struct{}
 	once   sync.Once
 
+	// One channel per device writer, chosen by the packet's flow. See toDevice.
+	writers []chan *[]byte
+
 	// When the transport can carry a whole packet with no session under it,
 	// this is how the private link travels: one packet, one datagram, no
 	// reliability layer. See tunfast.go for why that is the right shape for
@@ -3133,6 +3151,15 @@ func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 		return nil, err
 	}
 	p.setHandler(t)
+
+	// One writer per device queue: the queues are what make parallel writes
+	// worth anything, and a writer with no queue of its own would only queue
+	// behind another.
+	for i := 0; i < len(t.queues); i++ {
+		ch := make(chan *[]byte, 128)
+		t.writers = append(t.writers, ch)
+		go t.deviceWriteLoop(ch)
+	}
 	t.startFast()
 	for i := range t.queues {
 		go t.readQueue(t.queues[i])
@@ -3275,7 +3302,63 @@ func (t *tunnel) startFast() {
 }
 
 // toDevice writes one IP packet to the interface, whichever path brought it.
+// toDevice hands one packet to the device.
+//
+// The write does not happen here. One reader drains the socket, so that the
+// packets of a flow keep the order they arrived in, and if that reader also
+// did the writing then every write into the kernel would be serialised behind
+// the one before it - which is what capped this path at a third of what the
+// pair could carry.
+//
+// So the packet goes to a writer chosen by its flow. Every packet of a flow
+// goes to the same writer and is written in order; different flows are written
+// at the same time by different threads. Order is a property of a flow, not of
+// the device, and that is the only place it has to be paid for.
 func (t *tunnel) toDevice(pkt []byte) {
+	if len(t.writers) > 0 {
+		w := t.writers[flowHash(pkt)%uint32(len(t.writers))]
+		// Sized to a packet, not to a record. The record pool hands out 32 KiB
+		// buffers, and pulling one of those through a channel for every 1320
+		// bytes on the wire is a cache line's worth of work done twenty times
+		// over.
+		bp := devBufs.Get().(*[]byte)
+		b := (*bp)[:copy((*bp)[:cap(*bp)], pkt)]
+		*bp = b
+		select {
+		case w <- bp:
+		default:
+			// This flow's writer is behind. Dropping is what a router does,
+			// and it is the signal the sender inside is waiting for.
+			*bp = b[:0]
+			devBufs.Put(bp)
+		}
+		return
+	}
+	t.writeDevice(pkt)
+}
+
+// deviceWriteLoop is one writer: everything it is given belongs to flows that
+// hash to it, so writing them in the order they arrive is enough.
+func (t *tunnel) deviceWriteLoop(in <-chan *[]byte) {
+	for {
+		select {
+		case <-t.closed:
+			return
+		case bp := <-in:
+			t.writeDevice(*bp)
+			*bp = (*bp)[:0]
+			devBufs.Put(bp)
+		}
+	}
+}
+
+// One packet's worth, which is all a device write ever needs.
+var devBufs = sync.Pool{New: func() interface{} {
+	b := make([]byte, 0, 2048)
+	return &b
+}}
+
+func (t *tunnel) writeDevice(pkt []byte) {
 	if len(t.queues) == 0 {
 		return
 	}

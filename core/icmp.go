@@ -72,6 +72,10 @@ const (
 
 	// what this transport's header mask key is derived from
 	icmpARQLabel = "pingify/v3 icmp"
+
+	// How many packets one crossing into the kernel may carry, where the
+	// kernel offers that. See icmpsend_linux.go.
+	icmpSendBatch = 64
 )
 
 var errICMPClosed = errors.New("icmp: transport closed")
@@ -129,6 +133,12 @@ type icmpTransport struct {
 	// and drop every other echo this host sees before it is ever queued.
 	id uint16
 
+	// Packets from the private link on their way out. A device reader hands
+	// one over and goes straight back to the device; one sender takes
+	// whatever has arrived and puts it on the wire in a single crossing.
+	// See icmpsend_linux.go for why that is worth a queue.
+	outQ chan *[]byte
+
 	// What this end puts on the wire. What it accepts is either type - see
 	// the note at the top of this file.
 	sendType byte
@@ -178,6 +188,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		id:       icmpIDFor(cfg.key()),
 		dials:    cfg.Connect != "",
 		sendType: icmpEchoRequest,
+		outQ:     make(chan *[]byte, 512),
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
@@ -191,6 +202,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	if err := attachICMPFilter(pc, t.id); err != nil {
 		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
 	}
+	go t.sendPacketLoop()
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
 		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
@@ -384,10 +396,72 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	t.putTagFor(icmpTagDirect, tagged[:icmpTagLen], b[:min(len(b), arqOver)])
 	copy(tagged[icmpTagLen:], b)
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
-	_, err := t.pc.WriteTo(pkt, peer)
-	*bp = pkt[:0]
-	tunBufs.Put(bp)
-	return err
+	*bp = pkt
+
+	select {
+	case t.outQ <- bp:
+		return nil
+	default:
+		// The sender is behind, which on a link carrying IP means the wire is
+		// behind. Dropping here is what a router does, and it is the signal
+		// the sender inside needs; queueing it deeper would only add delay to
+		// a packet that is already late.
+		*bp = pkt[:0]
+		tunBufs.Put(bp)
+		return nil
+	}
+}
+
+// sendPacketLoop puts the private link's packets on the wire, as many per
+// crossing into the kernel as have arrived by the time it looks.
+func (t *icmpTransport) sendPacketLoop() {
+	w := newICMPBatchWriter(t.pc)
+	held := make([]*[]byte, 0, icmpSendBatch)
+	bufs := make([][]byte, 0, icmpSendBatch)
+
+	release := func() {
+		for _, bp := range held {
+			*bp = (*bp)[:0]
+			tunBufs.Put(bp)
+		}
+		held = held[:0]
+		bufs = bufs[:0]
+	}
+
+	for {
+		var first *[]byte
+		select {
+		case first = <-t.outQ:
+		case <-t.done:
+			return
+		}
+		held = append(held, first)
+		// Whatever else is already waiting comes along for the same crossing.
+		// Nothing is waited for: a link with one packet on it sends one.
+	drain:
+		for len(held) < icmpSendBatch {
+			select {
+			case bp := <-t.outQ:
+				held = append(held, bp)
+			default:
+				break drain
+			}
+		}
+		t.pktMu.Lock()
+		peer := t.pktTo
+		t.pktMu.Unlock()
+		if peer == nil {
+			release()
+			continue
+		}
+		for _, bp := range held {
+			bufs = append(bufs, *bp)
+		}
+		if _, err := w.write(bufs, peer); err != nil {
+			logDebug("icmp send batch: %v", err)
+		}
+		release()
+	}
 }
 
 // dispatch hands the datagram to its connection, creating one if this is a

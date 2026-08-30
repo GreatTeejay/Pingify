@@ -8,14 +8,14 @@ import (
 
 // Leaving the setting out has to mean the cipher stays on, or every tunnel
 // written before it existed would quietly stop encrypting on upgrade.
-func TestEncryptionIsOnUnlessTurnedOff(t *testing.T) {
+func TestEncryptionIsOffUnlessAskedFor(t *testing.T) {
 	yes, no := true, false
 	for _, c := range []struct {
 		name string
 		cfg  Config
 		want bool
 	}{
-		{"a config that predates the setting", Config{}, true},
+		{"a config that does not say", Config{}, false},
 		{"asked for explicitly", Config{Encrypt: &yes}, true},
 		{"turned off explicitly", Config{Encrypt: &no}, false},
 	} {
@@ -49,7 +49,7 @@ listen = "0.0.0.0:9443"
 		add  string
 		want bool
 	}{
-		{"absent means encrypted", "", true},
+		{"absent means in the clear", "", false},
 		{"off", "encrypt = false\n", false},
 		{"on", "encrypt = true\n", true},
 	} {

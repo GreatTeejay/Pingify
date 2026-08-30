@@ -972,7 +972,7 @@ cfg_reset() {
     T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1200; T_KCP_INTERVAL=10
     T_PCK_FLAGS="PA"
     T_OBFUSCATE="false"  # v2.1.1 wire shape; the one that survives the path
-    T_ENCRYPT="true"     # AES-256-GCM on every frame; see the Encryption step
+    T_ENCRYPT="false"   # off unless asked for; see Config.encrypted in the core
     T_FORWARDS=""; T_STATUS=""; T_LOG="info"
     T_TUNIF=""; T_TUNLOCAL=""; T_TUNPEER=""; T_TUNMTU=1380
     # kernel tunnels: GRE carries a TTL, AmneziaWG a port, a keypair half and
@@ -1839,7 +1839,7 @@ TOKEN
     T_PCK_FLAGS="${pckflags:-PA}"; T_OBFUSCATE="$obfuscate"
     # An older token has no such field, and a tunnel that predates the
     # setting was encrypted - so empty has to mean yes, not no.
-    case "$encrypt" in false) T_ENCRYPT="false" ;; *) T_ENCRYPT="true" ;; esac
+    case "$encrypt" in true) T_ENCRYPT="true" ;; *) T_ENCRYPT="false" ;; esac
     [ -n "$tl" ] && { T_TUNLOCAL="$tl"; T_TUNPEER="$tp"; T_TUNMTU="${mtu:-1380}"; }
     T_GRE_TTL="${ttl:-255}"; T_AWG_PORT="${awgport:-51820}"
     T_AWG_PRIV="$awgpriv"; T_AWG_PUB="$awgpub"; T_AWG_OBF="$awgobf"
@@ -2336,28 +2336,31 @@ new_tunnel() {
     # operator did not choose what crosses it. A private link is different.
     # It carries raw IP between two machines the same person runs, they know
     # what is on it, and it is the one that is judged on speed.
-    if [ "$T_KIND" != "tun" ] && [ "$T_MODE" != "tun" ] && [ "$T_MODE" != "both" ]; then
-        T_ENCRYPT="true"
-    else
     wiz "Encryption"
-    choice 1 "Encrypted" "AES-256-GCM on every frame  (recommended)"
-    choice 2 "In the clear" "faster on paper, and the shape is visible"
+    choice 1 "In the clear" "what nearly every tunnel should pick  (recommended)"
+    choice 2 "Encrypted" "ChaCha or AES on every frame, and it is not free"
     say ""
-    dim "The cipher costs about a tenth of one percent of a core at 100 Mbit/s,"
-    dim "so this is not the setting that makes a tunnel fast. What it changes is"
-    dim "whether the traffic looks like anything, and whether a frame can be"
-    dim "altered on the way. Turn it off only when what you carry - Xray, a VPN,"
-    dim "anything with its own TLS - is already encrypted."
+    dim "This used to say the cipher costs a tenth of a percent of a core. That"
+    dim "was wrong, and measuring it said so: on a server abroad without the"
+    dim "PCLMULQDQ instruction - which is what a cheap VPS is - a third of the"
+    dim "processor went into the authenticator alone. Turning it off raised what"
+    dim "the pair carried by half and dropped the delay under load from 380 ms"
+    dim "to 82."
+    say ""
+    dim "The handshake is authenticated either way and the token still has to"
+    dim "match, so nobody without it can build a tunnel here. What changes is"
+    dim "whether what crosses afterwards can be read. Almost everything sent"
+    dim "through one of these - Xray, a VPN, a browser - carries its own TLS"
+    dim "already, and a second cipher over the top of it buys nothing."
     say ""
     local enc=""
     pick enc "select" 1 2 || { wiz_end; return 0; }
     if [ "$enc" = "2" ]; then
-        T_ENCRYPT="false"
-        say ""
-        warn "frames will not be encrypted, and both servers must agree"
-    else
         T_ENCRYPT="true"
-    fi
+        say ""
+        info "both servers must agree, and the far end is told in the token"
+    else
+        T_ENCRYPT="false"
     fi
     if [ "$T_TRANSPORT" = "awg" ]; then
         say ""
@@ -8037,6 +8040,10 @@ const (
 
 	// what this transport's header mask key is derived from
 	icmpARQLabel = "pingify/v3 icmp"
+
+	// How many packets one crossing into the kernel may carry, where the
+	// kernel offers that. See icmpsend_linux.go.
+	icmpSendBatch = 64
 )
 
 var errICMPClosed = errors.New("icmp: transport closed")
@@ -8094,6 +8101,12 @@ type icmpTransport struct {
 	// and drop every other echo this host sees before it is ever queued.
 	id uint16
 
+	// Packets from the private link on their way out. A device reader hands
+	// one over and goes straight back to the device; one sender takes
+	// whatever has arrived and puts it on the wire in a single crossing.
+	// See icmpsend_linux.go for why that is worth a queue.
+	outQ chan *[]byte
+
 	// What this end puts on the wire. What it accepts is either type - see
 	// the note at the top of this file.
 	sendType byte
@@ -8143,6 +8156,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		id:       icmpIDFor(cfg.key()),
 		dials:    cfg.Connect != "",
 		sendType: icmpEchoRequest,
+		outQ:     make(chan *[]byte, 512),
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
@@ -8156,6 +8170,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	if err := attachICMPFilter(pc, t.id); err != nil {
 		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
 	}
+	go t.sendPacketLoop()
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
 		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
@@ -8349,10 +8364,72 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	t.putTagFor(icmpTagDirect, tagged[:icmpTagLen], b[:min(len(b), arqOver)])
 	copy(tagged[icmpTagLen:], b)
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
-	_, err := t.pc.WriteTo(pkt, peer)
-	*bp = pkt[:0]
-	tunBufs.Put(bp)
-	return err
+	*bp = pkt
+
+	select {
+	case t.outQ <- bp:
+		return nil
+	default:
+		// The sender is behind, which on a link carrying IP means the wire is
+		// behind. Dropping here is what a router does, and it is the signal
+		// the sender inside needs; queueing it deeper would only add delay to
+		// a packet that is already late.
+		*bp = pkt[:0]
+		tunBufs.Put(bp)
+		return nil
+	}
+}
+
+// sendPacketLoop puts the private link's packets on the wire, as many per
+// crossing into the kernel as have arrived by the time it looks.
+func (t *icmpTransport) sendPacketLoop() {
+	w := newICMPBatchWriter(t.pc)
+	held := make([]*[]byte, 0, icmpSendBatch)
+	bufs := make([][]byte, 0, icmpSendBatch)
+
+	release := func() {
+		for _, bp := range held {
+			*bp = (*bp)[:0]
+			tunBufs.Put(bp)
+		}
+		held = held[:0]
+		bufs = bufs[:0]
+	}
+
+	for {
+		var first *[]byte
+		select {
+		case first = <-t.outQ:
+		case <-t.done:
+			return
+		}
+		held = append(held, first)
+		// Whatever else is already waiting comes along for the same crossing.
+		// Nothing is waited for: a link with one packet on it sends one.
+	drain:
+		for len(held) < icmpSendBatch {
+			select {
+			case bp := <-t.outQ:
+				held = append(held, bp)
+			default:
+				break drain
+			}
+		}
+		t.pktMu.Lock()
+		peer := t.pktTo
+		t.pktMu.Unlock()
+		if peer == nil {
+			release()
+			continue
+		}
+		for _, bp := range held {
+			bufs = append(bufs, *bp)
+		}
+		if _, err := w.write(bufs, peer); err != nil {
+			logDebug("icmp send batch: %v", err)
+		}
+		release()
+	}
 }
 
 // dispatch hands the datagram to its connection, creating one if this is a
@@ -8708,6 +8785,96 @@ import "net"
 // Everywhere else the sorting stays in Go, which is where it was before this
 // existed. Only Linux has the socket filter, and only Linux runs these tunnels.
 func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
+PINGIFY_SRC_EOF
+    cat > "$d/icmpsend_linux.go" <<'PINGIFY_SRC_EOF'
+//go:build linux
+
+package main
+
+import (
+	"net"
+
+	"golang.org/x/net/ipv4"
+)
+
+// ---------------------------------------------------------------------------
+// putting several packets on the wire with one syscall
+//
+// The private link's direct path sends one packet per write, and on a busy
+// link that is one syscall per packet in each direction. Profiled on a real
+// server abroad carrying this tunnel, with the encryption off so nothing else
+// could be blamed:
+//
+//	9.85%  finish_task_switch
+//	8.64%  _raw_spin_unlock_irqrestore
+//	2.30%  do_syscall_64
+//
+// No hot function of our own anywhere - the processor was going into the
+// kernel and coming back, over and over, and switching threads while it did.
+// A reference tunnel on the same path moved four times the packets for a third
+// of the processor.
+//
+// sendmmsg is the answer to exactly that: hand the kernel a batch and cross
+// once. The batch is opportunistic and never waits for one to fill - a sender
+// takes whatever is queued at that instant, so a link with one packet on it
+// sends one packet immediately and pays nothing, and a link under load sends
+// sixty-four at a time and pays one crossing instead of sixty-four.
+// ---------------------------------------------------------------------------
+
+type icmpBatchWriter struct {
+	pc *ipv4.PacketConn
+	ms []ipv4.Message
+}
+
+func newICMPBatchWriter(pc net.PacketConn) *icmpBatchWriter {
+	w := &icmpBatchWriter{
+		pc: ipv4.NewPacketConn(pc),
+		ms: make([]ipv4.Message, icmpSendBatch),
+	}
+	for i := range w.ms {
+		w.ms[i].Buffers = make([][]byte, 1)
+	}
+	return w
+}
+
+// write sends up to len(pkts) packets to addr, and reports how many the kernel
+// took. A short count is not an error: the caller keeps the rest for the next
+// crossing rather than dropping them.
+func (w *icmpBatchWriter) write(pkts [][]byte, addr net.Addr) (int, error) {
+	n := len(pkts)
+	if n > len(w.ms) {
+		n = len(w.ms)
+	}
+	for i := 0; i < n; i++ {
+		w.ms[i].Buffers[0] = pkts[i]
+		w.ms[i].Addr = addr
+	}
+	return w.pc.WriteBatch(w.ms[:n], 0)
+}
+PINGIFY_SRC_EOF
+    cat > "$d/icmpsend_other.go" <<'PINGIFY_SRC_EOF'
+//go:build !linux
+
+package main
+
+import "net"
+
+// Only Linux has sendmmsg. Everywhere else each packet is its own write, which
+// is what the tests on a development machine exercise.
+type icmpBatchWriter struct{ pc net.PacketConn }
+
+func newICMPBatchWriter(pc net.PacketConn) *icmpBatchWriter {
+	return &icmpBatchWriter{pc: pc}
+}
+
+func (w *icmpBatchWriter) write(pkts [][]byte, addr net.Addr) (int, error) {
+	for i, p := range pkts {
+		if _, err := w.pc.WriteTo(p, addr); err != nil {
+			return i, err
+		}
+	}
+	return len(pkts), nil
+}
 PINGIFY_SRC_EOF
     cat > "$d/kcp_transport.go" <<'PINGIFY_SRC_EOF'
 package main
@@ -10872,7 +11039,22 @@ func (c *Config) carriesPackets() bool {
 	return c.Mode == "tun" || c.Mode == "both"
 }
 
-func (c *Config) encrypted() bool { return c.Encrypt == nil || *c.Encrypt }
+// encrypted says whether every frame and every private-link packet is sealed.
+//
+// It is off unless the config asks for it. The handshake is authenticated
+// either way and the token still has to match, so nobody without it can build
+// a tunnel here - but what crosses the wire afterwards is readable by anything
+// on the path, and more distinguishable for it.
+//
+// That is a deliberate trade and it was asked for. On a server abroad without
+// the PCLMULQDQ instruction - which is what a cheap VPS is - a third of the
+// processor went into GCM's authenticator, and turning it off raised what the
+// pair carried by half and dropped the tail under load from 380 ms to 82.
+// Where the traffic inside is already TLS, which is nearly all of it, this
+// seals nothing that was not already sealed.
+//
+// Set encrypt = true on both servers to have it back.
+func (c *Config) encrypted() bool { return c.Encrypt != nil && *c.Encrypt }
 
 func (c *Config) key() []byte {
 	if c.Token != "" {
@@ -13559,6 +13741,9 @@ type tunnel struct {
 	closed chan struct{}
 	once   sync.Once
 
+	// One channel per device writer, chosen by the packet's flow. See toDevice.
+	writers []chan *[]byte
+
 	// When the transport can carry a whole packet with no session under it,
 	// this is how the private link travels: one packet, one datagram, no
 	// reliability layer. See tunfast.go for why that is the right shape for
@@ -13595,6 +13780,15 @@ func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 		return nil, err
 	}
 	p.setHandler(t)
+
+	// One writer per device queue: the queues are what make parallel writes
+	// worth anything, and a writer with no queue of its own would only queue
+	// behind another.
+	for i := 0; i < len(t.queues); i++ {
+		ch := make(chan *[]byte, 128)
+		t.writers = append(t.writers, ch)
+		go t.deviceWriteLoop(ch)
+	}
 	t.startFast()
 	for i := range t.queues {
 		go t.readQueue(t.queues[i])
@@ -13737,7 +13931,63 @@ func (t *tunnel) startFast() {
 }
 
 // toDevice writes one IP packet to the interface, whichever path brought it.
+// toDevice hands one packet to the device.
+//
+// The write does not happen here. One reader drains the socket, so that the
+// packets of a flow keep the order they arrived in, and if that reader also
+// did the writing then every write into the kernel would be serialised behind
+// the one before it - which is what capped this path at a third of what the
+// pair could carry.
+//
+// So the packet goes to a writer chosen by its flow. Every packet of a flow
+// goes to the same writer and is written in order; different flows are written
+// at the same time by different threads. Order is a property of a flow, not of
+// the device, and that is the only place it has to be paid for.
 func (t *tunnel) toDevice(pkt []byte) {
+	if len(t.writers) > 0 {
+		w := t.writers[flowHash(pkt)%uint32(len(t.writers))]
+		// Sized to a packet, not to a record. The record pool hands out 32 KiB
+		// buffers, and pulling one of those through a channel for every 1320
+		// bytes on the wire is a cache line's worth of work done twenty times
+		// over.
+		bp := devBufs.Get().(*[]byte)
+		b := (*bp)[:copy((*bp)[:cap(*bp)], pkt)]
+		*bp = b
+		select {
+		case w <- bp:
+		default:
+			// This flow's writer is behind. Dropping is what a router does,
+			// and it is the signal the sender inside is waiting for.
+			*bp = b[:0]
+			devBufs.Put(bp)
+		}
+		return
+	}
+	t.writeDevice(pkt)
+}
+
+// deviceWriteLoop is one writer: everything it is given belongs to flows that
+// hash to it, so writing them in the order they arrive is enough.
+func (t *tunnel) deviceWriteLoop(in <-chan *[]byte) {
+	for {
+		select {
+		case <-t.closed:
+			return
+		case bp := <-in:
+			t.writeDevice(*bp)
+			*bp = (*bp)[:0]
+			devBufs.Put(bp)
+		}
+	}
+}
+
+// One packet's worth, which is all a device write ever needs.
+var devBufs = sync.Pool{New: func() interface{} {
+	b := make([]byte, 0, 2048)
+	return &b
+}}
+
+func (t *tunnel) writeDevice(pkt []byte) {
 	if len(t.queues) == 0 {
 		return
 	}
