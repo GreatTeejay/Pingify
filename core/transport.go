@@ -160,6 +160,8 @@ func newTransport(cfg *Config) (carrierTransport, error) {
 		return newWSTransport(cfg)
 	case "wss":
 		return newWSSTransport(cfg)
+	case "mirage":
+		return newMirageTransport(cfg)
 	case "tcp", "":
 		return newTCPTransport(cfg)
 	}

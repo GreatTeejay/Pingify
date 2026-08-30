@@ -312,7 +312,7 @@ func (c *Config) validate() error {
 		return fmt.Errorf("mode must be \"forward\", \"tun\" or \"both\", got %q", c.Mode)
 	}
 	switch c.Transport {
-	case "tcp", "icmp", "udp", "kcp", "pck", "ws", "wss":
+	case "tcp", "icmp", "udp", "kcp", "pck", "ws", "wss", "mirage":
 	default:
 		return fmt.Errorf("transport %q is not available in this build", c.Transport)
 	}

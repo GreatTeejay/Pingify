@@ -67,6 +67,10 @@ const (
 	// gone - so the ARQ, which knows more, is the one that decides.
 	arqMaxRTO = 5 * time.Second
 
+	// Below this a retransmission is likely to be answering jitter rather
+	// than loss, whatever the path measures.
+	arqMinRTO = 40 * time.Millisecond
+
 	// How long the best round trip is trusted before it is measured again.
 	// Long enough to ride out a burst, short enough to follow a path that has
 	// really changed.
@@ -663,11 +667,25 @@ func (c *arqConn) sampleRTT(m time.Duration) {
 		c.minRTTSince = time.Now()
 	}
 	c.rto = c.srtt + 4*c.rttvar
-	if c.rto < 200*time.Millisecond {
-		c.rto = 200 * time.Millisecond
+	// The floor is what a lost packet costs, and a flat 200 ms is a floor set
+	// for a dial-up path. Measured on a real 74 ms route that loses about one
+	// packet in six: the median exchange took 74 ms and the ninetieth
+	// percentile took 278 ms, which is 74 plus the floor almost exactly. That
+	// tail is what a user calls lag.
+	//
+	// So the floor follows the path instead of ignoring it: half a round trip
+	// on top of the round trip, which is enough that ordinary jitter does not
+	// fire it, and nothing like a fifth of a second on a link this quick. The
+	// absolute floor stays only for a path so fast that the measurement noise
+	// is bigger than the trip.
+	if floor := c.srtt + c.srtt/2; c.rto < floor {
+		c.rto = floor
 	}
-	if c.rto > 5*time.Second {
-		c.rto = 5 * time.Second
+	if c.rto < arqMinRTO {
+		c.rto = arqMinRTO
+	}
+	if c.rto > arqMaxRTO {
+		c.rto = arqMaxRTO
 	}
 }
 

@@ -23,10 +23,34 @@ import (
 // not merely an emergency fallback. Its packet path is batch-read and its ARQ
 // window is shared across several lightweight sessions to fill a fast link.
 //
-// Data travels in Echo *Reply* packets (type 0) in both directions rather
-// than requests. Two reasons: the kernel answers an echo request by itself,
-// which would double every packet we send, and a reply needs no matching
-// request to exist on our side. Raw sockets receive both regardless.
+// Both ends send echo *requests* (type 8), and both accept either type.
+//
+// This used to send replies in both directions, on the reasoning that the
+// kernel answers a request by itself and would double every packet we send.
+// The reasoning is sound and the arrangement still could not carry a tunnel,
+// because it never asked what the path would carry. Measured between a real
+// Iranian server and two abroad, 50 packets at each of six sizes up to 1400:
+//
+//	                    echo reply (0)    echo request (8)
+//	Iran -> Germany     nothing           300 of 300
+//	Germany -> Iran     nothing           50,50,44,41,39,42
+//	Iran -> Turkey      300 of 300        300 of 300
+//
+// An unsolicited echo reply is not part of any conversation and that route
+// drops it in both directions. A request is the start of one, and passes. So
+// the type that always works is the request, and that is what both ends send.
+//
+// Being strict about what we send and liberal about what we accept costs
+// nothing here and means a peer configured either way still connects.
+//
+// The doubling problem is real and is handled where it belongs, in the kernel:
+// net.ipv4.icmp_echo_ignore_all stops it answering pings nobody asked it
+// about. The manager sets it on both servers, and without it every packet this
+// transport receives is answered a second time by the machine underneath it.
+//
+// One thing this cannot fix: whether the route carries ICMP at all. Turkey to
+// Iran allowed six packets and then nothing, on the same day the Germany route
+// carried everything. That is the path, not the packet.
 //
 //	ICMP data = [4] tag  [24] arq datagram ...
 //
@@ -105,6 +129,10 @@ type icmpTransport struct {
 	// and drop every other echo this host sees before it is ever queued.
 	id uint16
 
+	// What this end puts on the wire. What it accepts is either type - see
+	// the note at the top of this file.
+	sendType byte
+
 	// Whether this end dials. The end that dials never accepts, so an
 	// unknown session arriving there cannot be a carrier - see dispatch.
 	dials bool
@@ -149,6 +177,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		window:   arqWindowFor(cfg.WindowKB, icmpMaxPayload),
 		id:       icmpIDFor(cfg.key()),
 		dials:    cfg.Connect != "",
+		sendType: icmpEchoRequest,
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
@@ -220,7 +249,7 @@ func (t *icmpTransport) sender(peer *net.IPAddr) func([]byte) error {
 		// tagged body and then copy it into a second allocation in buildEcho for
 		// every packet on the path.
 		pkt := make([]byte, icmpHdrLen+icmpTagLen+len(datagram))
-		pkt[0] = icmpEchoReply
+		pkt[0] = t.sendType
 		binary.BigEndian.PutUint16(pkt[4:6], t.id)
 		s := uint16(atomic.AddUint32(&seq, 1))
 		binary.BigEndian.PutUint16(pkt[6:8], s)
@@ -348,7 +377,7 @@ func (t *icmpTransport) SendPacket(b []byte) error {
 	for i := range pkt[:icmpHdrLen] {
 		pkt[i] = 0
 	}
-	pkt[0] = icmpEchoReply
+	pkt[0] = t.sendType
 	binary.BigEndian.PutUint16(pkt[4:6], t.id)
 	binary.BigEndian.PutUint16(pkt[6:8], uint16(atomic.AddUint32(&t.pktSeq, 1)))
 	tagged := pkt[icmpHdrLen:]
