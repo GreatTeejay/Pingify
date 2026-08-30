@@ -191,7 +191,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	if err := attachICMPFilter(pc, t.id); err != nil {
 		logDebug("icmp: no kernel filter (%v) - every echo this host sees will be sorted in Go", err)
 	}
-	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, icmpMaxPacket,
+	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
 		t.handlePacket, func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
 		workers, batch, icmpMaxPayload)

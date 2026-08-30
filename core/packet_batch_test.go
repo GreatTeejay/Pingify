@@ -68,7 +68,7 @@ func TestPacketReadersDeliverEveryDatagramWithAUsableAddress(t *testing.T) {
 	seen := map[string]net.Addr{}
 	arrived := make(chan struct{}, 64)
 
-	startPacketReaders(pc, done, "extreme", 2048,
+	startPacketReaders(pc, done, "extreme", false, 2048,
 		func(b []byte, a net.Addr) {
 			mu.Lock()
 			seen[string(b)] = a

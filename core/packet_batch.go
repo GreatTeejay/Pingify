@@ -56,9 +56,26 @@ func packetReadTuning(profile string) (workers, batch int) {
 // ARQ and KCP are built to accept exactly that, and each ARQ session serialises
 // its own state. What we gain is that one busy CPU no longer caps every ICMP
 // carrier on the server.
+//
+// ordered says that assumption does not hold here. The private link's direct
+// path has no reordering layer under it by design - a packet is sealed on its
+// own and written to the device the moment it arrives - so two readers taking
+// consecutive recvmmsg batches and finishing in either order is not a detail
+// the layer above absorbs. It is delivered to the device that way, and the TCP
+// inside the tunnel counts it as loss.
+//
+// It was measured doing exactly that. With two readers on a real Iran-Germany
+// ICMP tunnel the inner connection reported 487 and then 7346 reordering
+// events, its congestion window collapsed from 1165 segments to 48, and one
+// stream delivered 6.3 Mbit/s. A reference tunnel on the same path, the same
+// minute, with one reader, reported no reordering at all and delivered 122.
+// One reader is not a compromise here: it is four times faster.
 func startPacketReaders(pc net.PacketConn, done <-chan struct{}, profile string,
-	maxPacket int, handle func([]byte, net.Addr), onError func(error)) (int, int) {
+	ordered bool, maxPacket int, handle func([]byte, net.Addr), onError func(error)) (int, int) {
 	workers, batch := packetReadTuning(profile)
+	if ordered {
+		workers = 1
+	}
 	for i := 0; i < workers; i++ {
 		if batch > 1 {
 			go packetBatchReadLoop(pc, done, batch, maxPacket, handle, onError)

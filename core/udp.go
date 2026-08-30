@@ -104,7 +104,7 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 	}
 	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
 	tunePacketSocket(pc, cfg)
-	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, udpMaxPacket,
+	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), udpMaxPacket,
 		t.handlePacket, func(error) {
 			// A UDP socket can report a transient ICMP port-unreachable. Reading
 			// on is the correct response and per-packet logging is only noise.

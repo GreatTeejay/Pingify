@@ -404,6 +404,12 @@ func (c *Config) obfuscated() bool { return c.Obfuscate != nil && *c.Obfuscate }
 
 // encrypted is true unless the config says otherwise, so every tunnel that
 // predates the setting keeps its cipher.
+// carriesPackets says this tunnel puts whole IP packets on the wire with
+// nothing underneath them to put the order back. See startPacketReaders.
+func (c *Config) carriesPackets() bool {
+	return c.Mode == "tun" || c.Mode == "both"
+}
+
 func (c *Config) encrypted() bool { return c.Encrypt == nil || *c.Encrypt }
 
 func (c *Config) key() []byte {
