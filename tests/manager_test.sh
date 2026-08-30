@@ -1047,6 +1047,44 @@ cfg_load tw >/dev/null 2>&1
 check "the buffers are read back" "$T_SNDBUF" "3072"
 check "and the receive one"       "$T_RCVBUF" "3072"
 
+# --- a websocket tunnel keeps its second carrier ---------------------------
+# Touching any tuning value on a WSS tunnel used to rewrite carriers to 1,
+# which is the single point of failure the core keeps a second carrier to
+# avoid - and it was written on one side only, so the two ends then disagreed.
+cfg_reset
+T_NAME="tww"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="wss"; T_MODE="forward"
+T_FORWARDER="pingify"
+T_TOKEN="$TOKEN"; T_PORT=443; T_PEER_IP="198.51.100.4"; T_FORWARDS='"443"'
+T_CARRIERS=2; T_WINDOW=1024; T_SNDBUF=1024; T_RCVBUF=1024
+T_STATUS="127.0.0.1:9703"
+twwf="$(cfg_save)"
+(
+    pause() { :; }
+    systemctl() { :; }
+    CORE_BIN=/bin/true
+    tuning_write tww 2 2048 10 3072 3072
+) > /dev/null 2>&1
+check "wss keeps two carriers"  "$(toml_get "$twwf" transport carriers)" "2"
+check "and stays a real preset" "$(toml_get "$twwf" tuning profile)"     "custom"
+
+# out of range for a websocket falls back to two, it does not clamp to one
+(
+    pause() { :; }
+    systemctl() { :; }
+    CORE_BIN=/bin/true
+    tuning_write tww 9 2048 10 3072 3072
+) > /dev/null 2>&1
+check "nine carriers becomes two" "$(toml_get "$twwf" transport carriers)" "2"
+
+# but a value the core will honour is kept
+(
+    pause() { :; }
+    systemctl() { :; }
+    CORE_BIN=/bin/true
+    tuning_write tww 4 2048 10 3072 3072
+) > /dev/null 2>&1
+check "four is allowed"          "$(toml_get "$twwf" transport carriers)" "4"
+
 # --- what it refuses -------------------------------------------------------
 (
     pause() { :; }
