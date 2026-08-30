@@ -25,7 +25,24 @@ cfg_reset() {
     T_KIND="tcp"; T_TRANSPORT="tcp"; T_MODE="forward"; T_FORWARDER="pingify"
     T_TOKEN=""
     T_PORT=9443          # the tunnel's own port, TCP only
-    T_ACCEPTS="server"   # reverse: IRAN accepts, KHAREJ comes to it
+    # Which side takes the connection. KHAREJ does, and IRAN dials out to it.
+    #
+    # It used to be the other way round, and on a real Iranian line that does
+    # not work. Measured between a real Iran server and two abroad servers: a
+    # connection dialled INTO Iran carries about six exchanges and is then
+    # blackholed - no reset, no error, the packets simply stop arriving, and
+    # the tunnel sits there believing every carrier is up. A connection dialled
+    # OUT of Iran over the same path, the same second, the same payload, ran
+    # 120 of 120 exchanges without a loss.
+    #
+    #   dialled into Iran     1 of 40 round trips,   24 Mbit/s
+    #   dialled out of Iran  40 of 40 round trips,  254 Mbit/s, +0.7 ms
+    #
+    # It holds for every transport and both abroad servers, and it is why UDP
+    # and ICMP cannot carry a tunnel there at all: their return traffic is
+    # inbound too. IRAN still owns the forwarded ports and is still the server
+    # role - only who opens the socket changed.
+    T_ACCEPTS="client"
     T_PUBLIC_IP=""; T_PEER_IP=""
     # wss only, and optional: an address to dial instead of the peer, for
     # a connection that must not be seen going to the peer at all.
@@ -1271,34 +1288,35 @@ new_tunnel() {
     # -- which way the link is opened, TCP only ----------------------------
     #
     # Ports live on IRAN either way and clients always arrive there. This is
-    # only about which end makes the TCP connection, and it matters because
-    # the two are not equally reachable: one Iranian server here takes an
-    # inbound connection and runs at 100 Mbit/s with no retransmits, another
-    # accepts it and then loses the flow a few kilobytes in. If one direction
-    # will not stay up, the other usually will.
+    # only about which end makes the connection, and the two are not equally
+    # reachable: a connection dialled into an Iranian server is commonly
+    # allowed to complete, carry a few exchanges, and then be blackholed with
+    # no reset and no error - which looks exactly like a tunnel that is up and
+    # carrying nothing. Dialled the other way the same path is clean.
     #
-    # Reverse is what a Pingify tunnel is. IRAN accepts and KHAREJ comes to
-    # it, which is the arrangement ICMP has always used and the one every
-    # other transport starts from.
+    # IRAN dialling out is the default because it is the one that survives.
+    # See cfg_reset for the measurements: dialled into Iran a connection gets
+    # about six exchanges before the path blackholes it silently; dialled out
+    # of Iran the same path ran 120 of 120. The other way is kept because a
+    # KHAREJ server behind NAT cannot take a connection either, and then this
+    # is the only thing that helps.
     #
-    # TCP is asked because there it can fail: an Iranian server that will not
-    # hold an inbound connection has no way to be reached, and turning the
-    # link around is the only thing that helps. ICMP is not asked - it has no
-    # port to be reachable on, so there is nothing to choose.
-    T_ACCEPTS="server"
-    if [ "$T_TRANSPORT" = "tcp" ]; then
+    # Only transports that bind a port have a choice. ICMP has no port to be
+    # reachable on, and a kernel tunnel names both addresses itself.
+    T_ACCEPTS="client"
+    if [ "$T_TRANSPORT" != "icmp" ] && ! kernel_transport; then
         wiz "Link direction"
         CHOICE_DEF="1"
-        choice 1 "Reverse" "KHAREJ opens the connection to IRAN - the usual one"
-        choice 2 "Direct" "IRAN opens it to KHAREJ - when inbound to IRAN will not hold"
+        choice 1 "IRAN dials out" "IRAN opens the connection to KHAREJ - what works through the filtering"
+        choice 2 "KHAREJ dials in" "only if KHAREJ cannot take a connection, behind NAT or with no open port"
         CHOICE_DEF=""
         say ""
         local dir=""
         ask dir "select" "1" || { wiz_end; return 0; }
         if [ "$dir" = "2" ]; then
-            T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
-        else
             T_ACCEPTS="server"      # IRAN accepts; KHAREJ dials in
+        else
+            T_ACCEPTS="client"      # KHAREJ accepts; IRAN dials out
         fi
     fi
 

@@ -60,8 +60,8 @@ check "role"                  "$(toml_get "$iran" tunnel role)"       "server"
 check "no private link"       "$(toml_get "$iran" tunnel mode)"       "forward"
 check "and no [tun] section"  "$(grep -c '^\[tun\]' "$iran")"         "0"
 check "protocol"              "$(toml_get "$iran" transport type)"    "tcp"
-check "IRAN accepts the link" "$(toml_get "$iran" transport listen)"  "0.0.0.0:9443"
-check "and does not dial"     "$(toml_get "$iran" transport connect)" ""
+check "IRAN dials KHAREJ"     "$(toml_get "$iran" transport connect)" "198.51.100.4:9443"
+check "and does not listen"   "$(toml_get "$iran" transport listen)"  ""
 check "token, not a key"      "$(toml_get "$iran" security token)"    "$TOKEN"
 check "no psk is written"     "$(grep -c '^psk' "$iran")"             "0"
 check "forwarded by the core" "$(toml_get "$iran" forward forwarder)" "pingify"
@@ -75,7 +75,7 @@ check "cfg_load token"     "$T_TOKEN"     "$TOKEN"
 check "cfg_load forwarder" "$T_FORWARDER" "pingify"
 check "cfg_load ports"     "$T_FORWARDS"  '"443","udp:500"'
 check "cfg_load port"      "$T_PORT"      "9443"
-check "cfg_load accepts"   "$T_ACCEPTS"   "server"
+check "cfg_load accepts"   "$T_ACCEPTS"   "client"
 
 # ---------------------------------------------------------------------------
 note "a TUN tunnel - the private link"
@@ -90,10 +90,8 @@ tun="$(cfg_save)"
 
 check "mode is tun"           "$(toml_get "$tun" tunnel mode)"        "tun"
 check "carried over ICMP"     "$(toml_get "$tun" transport type)"     "icmp"
-# ICMP has no port, so listen carries the address to answer from. On a
-# server with several addresses the kernel would otherwise pick one, and a
-# reply from an address the far end is not expecting is thrown away.
-check "listens on its own address" "$(toml_get "$tun" transport listen)"  "203.0.113.9"
+# ICMP has no port, so connect carries the address to send to.
+check "dials the peer address" "$(toml_get "$tun" transport connect)" "198.51.100.4"
 check "private address"       "$(toml_get "$tun" tun local_addr)"     "10.10.10.1/24"
 check "peer private address"  "$(toml_get "$tun" tun remote_addr)"    "10.10.10.2/24"
 check "forwarded by iptables" "$(toml_get "$tun" forward forwarder)"  "iptables"
@@ -111,30 +109,31 @@ T_PORT=9443; T_PEER_IP="203.0.113.9"; T_PUBLIC_IP="198.51.100.4"; T_TOKEN="$TOKE
 T_STATUS="127.0.0.1:9701"
 kharej="$(cfg_save)"
 
-check "KHAREJ dials IRAN"   "$(toml_get "$kharej" transport connect)" "203.0.113.9:9443"
-check "and does not listen" "$(toml_get "$kharej" transport listen)"  ""
+check "KHAREJ takes the link" "$(toml_get "$kharej" transport listen)"  "0.0.0.0:9443"
+check "and does not dial"     "$(toml_get "$kharej" transport connect)" ""
 check "same token"          "$(toml_get "$kharej" security token)"    "$TOKEN"
 check "no ports on KHAREJ"  "$(grep -c '^ports' "$kharej")"           "0"
 
 cfg_load kh
-check "cfg_load accepts" "$T_ACCEPTS" "server"
+check "cfg_load accepts" "$T_ACCEPTS" "client"
 
 # ---------------------------------------------------------------------------
 note "ICMP needs no port"
 # ---------------------------------------------------------------------------
 cfg_reset
 T_NAME="ic"; T_ROLE="server"; T_TRANSPORT="icmp"; T_TOKEN="$TOKEN"
-T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"; T_PUBLIC_IP="203.0.113.9"
+T_TUNLOCAL="10.20.10.1/24"; T_TUNPEER="10.20.10.2/24"
+T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
 T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9702"
 cfg_endpoints
-check "IRAN answers from its own address" "$CFG_LISTEN" "203.0.113.9"
+check "IRAN sends without a port" "$CFG_CONNECT" "198.51.100.4"
+check "and nothing is appended"   "$CFG_LISTEN"  ""
 
 cfg_reset
 T_NAME="ic2"; T_ROLE="client"; T_TRANSPORT="icmp"; T_TOKEN="$TOKEN"
-T_PEER_IP="203.0.113.9"
+T_PUBLIC_IP="198.51.100.4"; T_PEER_IP="203.0.113.9"
 cfg_endpoints
-check "KHAREJ sends without a port" "$CFG_CONNECT" "203.0.113.9"
-check "and nothing is appended"     "$CFG_LISTEN"  ""
+check "KHAREJ answers from its own address" "$CFG_LISTEN" "198.51.100.4"
 
 # ---------------------------------------------------------------------------
 note "an incomplete tunnel names what is missing"
@@ -971,9 +970,8 @@ ic="$(awg_conf_path "$T_TUNIF")"
 check "IRAN keeps its own key"     "$(grep -c 'PrivateKey = PRIV1' "$ic")"    "1"
 check "and lists the other's"      "$(grep -c 'PublicKey = PUBofPRIV2' "$ic")" "1"
 check "the obfuscation is written" "$(grep -c "H1 = $h1" "$ic")"              "1"
-# The end that waits has no endpoint to dial - it learns the address from the
-# first handshake, which is what lets it sit behind whatever the path does.
-check "the waiting end has no endpoint" "$(grep -c 'Endpoint' "$ic")"         "0"
+# IRAN is the end that dials now, so it is the end that carries an endpoint.
+check "IRAN dials KHAREJ" "$(grep -c 'Endpoint = 198.51.100.4:51820' "$ic")" "1"
 
 decode "$(cfg_setup_token)"
 check "the port travels"       "$TOK_AWGPORT" "51820"
@@ -989,15 +987,16 @@ T_TRANSPORT="$TOK_TR"; T_MODE="$TOK_MODE"; T_KIND="$TOK_KIND"
 T_TUNLOCAL="$TOK_TL"; T_TUNPEER="$TOK_TP"; T_TUNMTU="$TOK_MTU"
 T_AWG_PORT="$TOK_AWGPORT"; T_AWG_PRIV="$TOK_AWGPRIV"; T_AWG_PUB="$TOK_AWGPUB"
 T_AWG_OBF="$TOK_AWGOBF"; T_PEER_IP="$TOK_HOST"
-T_ROLE="client"; T_ACCEPTS="server"
+T_ROLE="client"; T_ACCEPTS="client"
 T_NAME="kharej-tun-awg"; T_TUNIF="$(link_iface "$T_NAME")"
 awg_write_conf "$T_NAME" "$T_TUNIF" "$(awg_conf_path "$T_TUNIF")"
 kc="$(awg_conf_path "$T_TUNIF")"
 check "KHAREJ gets the other key"  "$(grep -c 'PrivateKey = PRIV2' "$kc")"     "1"
 check "and lists IRAN's"           "$(grep -c 'PublicKey = PUBofPRIV1' "$kc")" "1"
 check "the two agree on H1"        "$(grep -c "H1 = $h1" "$kc")"               "1"
-# reverse, like every other Pingify tunnel: KHAREJ is the end that dials
-check "KHAREJ dials IRAN"          "$(grep -c 'Endpoint = 203.0.113.9:51820' "$kc")" "1"
+# KHAREJ waits, so it has no endpoint - it learns the address from the first
+# handshake, which is what lets IRAN reach it from behind the filtering.
+check "the waiting end has no endpoint" "$(grep -c 'Endpoint' "$kc")" "0"
 check "at its end of the link"     "$(grep -c 'Address = 10.20.10.2/24' "$kc")"      "1"
 unset -f awg
 
@@ -1652,18 +1651,18 @@ check "the ping block is named as the reason a path goes silent" \
 # ---------------------------------------------------------------------------
 note "the end that accepts still knows who it is talking to"
 # ---------------------------------------------------------------------------
-# IRAN does not dial, so there is no connect line in its config and no address
-# to read - which is why Find the MTU on the IRAN side said it had no peer to
-# measure to. Something did arrive, though, and the core knows what: that is
-# the only place on that machine where the far address exists at all.
+# The end that accepts does not dial, so there is no connect line in its config
+# and no address to read - which is why Find the MTU on that side said it had
+# no peer to measure to. Something did arrive, though, and the core knows what:
+# that is the only place on that machine where the far address exists at all.
 SP="$WORK/speer"; mkdir -p "$SP"
 (
     CFG_DIR="$SP"; CORE_BIN="$SP/c"
     cfg_reset
-    T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
+    T_ROLE="client"; T_KIND="tun"; T_TRANSPORT="icmp"; cfg_mode
     T_NAME="sp"; T_TOKEN="$TOKEN"; T_PUBLIC_IP="185.31.8.93"
-    T_TUNLOCAL="10.11.10.1/24"; T_TUNPEER="10.11.10.2/24"; T_TUNIF="icmp-iran-11"
-    T_FORWARDS='"443"'; T_STATUS="127.0.0.1:9700"
+    T_TUNLOCAL="10.11.10.2/24"; T_TUNPEER="10.11.10.1/24"; T_TUNIF="icmp-kharej-11"
+    T_STATUS="127.0.0.1:9700"
     cfg_save >/dev/null
 
     cfg_load sp >/dev/null 2>&1
