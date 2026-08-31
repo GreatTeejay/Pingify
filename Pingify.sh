@@ -8363,30 +8363,36 @@ func (t *icmpTransport) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
 }
 
 // SendPacket puts one whole packet on the wire, with no session under it.
-func (t *icmpTransport) SendPacket(b []byte) error {
+// Headroom is the ICMP header and the tag that follows it.
+func (t *icmpTransport) Headroom() int { return icmpHdrLen + icmpTagLen }
+
+// SendPacket puts one packet from the private link on the wire. The first
+// Headroom() bytes are ours to fill; the rest is already built, and is not
+// copied anywhere. The buffer comes with the packet and goes back to the pool
+// when the wire is done with it.
+func (t *icmpTransport) SendPacket(bp *[]byte) error {
 	t.pktMu.Lock()
 	peer := t.pktTo
 	t.pktMu.Unlock()
 	if peer == nil {
+		tunBufs.Put(bp)
 		return errICMPNoPeer
 	}
-	bp := tunBufs.Get().(*[]byte)
-	need := icmpHdrLen + icmpTagLen + len(b)
-	if cap(*bp) < need {
-		*bp = make([]byte, 0, need)
+	pkt := *bp
+	if len(pkt) < icmpHdrLen+icmpTagLen {
+		tunBufs.Put(bp)
+		return nil
 	}
-	pkt := (*bp)[:need]
 	for i := range pkt[:icmpHdrLen] {
 		pkt[i] = 0
 	}
 	pkt[0] = t.sendType
 	binary.BigEndian.PutUint16(pkt[4:6], t.id)
 	binary.BigEndian.PutUint16(pkt[6:8], uint16(atomic.AddUint32(&t.pktSeq, 1)))
-	tagged := pkt[icmpHdrLen:]
-	t.putTagFor(icmpTagDirect, tagged[:icmpTagLen], b[:min(len(b), arqOver)])
-	copy(tagged[icmpTagLen:], b)
+	body := pkt[icmpHdrLen+icmpTagLen:]
+	t.putTagFor(icmpTagDirect, pkt[icmpHdrLen:icmpHdrLen+icmpTagLen],
+		body[:min(len(body), arqOver)])
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
-	*bp = pkt
 
 	select {
 	case t.outQ <- bp:
@@ -13827,7 +13833,19 @@ type tunnel struct {
 // packetCarrier is a transport that can put one whole packet on the wire
 // without a session underneath it.
 type packetCarrier interface {
-	SendPacket([]byte) error
+	// Headroom is how many bytes the transport needs in front of the payload
+	// for its own header. The private link leaves that much room when it
+	// builds a packet, so the transport fills it in place instead of taking a
+	// second buffer and copying the payload into it - which is what it used
+	// to do, once per packet, for every packet.
+	Headroom() int
+
+	// SendPacket puts one packet on the wire. (*buf)[:Headroom()] belongs to
+	// the transport to fill; the rest is the payload, already built and not
+	// copied anywhere. The buffer goes with it: the wire may be written from
+	// another thread, so the transport is what returns it to the pool.
+	SendPacket(buf *[]byte) error
+
 	SetPacketHandler(func([]byte), *net.IPAddr)
 }
 
@@ -14014,7 +14032,7 @@ func (t *tunnel) startFast() {
 		}
 	}
 
-	t.fast = newTunFast(tx, rx, pc.SendPacket, t.toDevice)
+	t.fast = newTunFast(tx, rx, pc.Headroom(), pc.SendPacket, t.toDevice)
 	pc.SetPacketHandler(t.fast.Deliver, peer)
 
 	how := "encrypted"
@@ -15106,7 +15124,8 @@ func (c *icmpCarrier) Accept() (net.Conn, error) { return c.t.Accept() }
 // the check for "can this carry a bare packet" looked at the wrapper, found
 // nothing, and the direct path silently never turned on. Every test had
 // exercised the transport directly and so every test passed.
-func (c *icmpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *icmpCarrier) Headroom() int               { return c.t.Headroom() }
+func (c *icmpCarrier) SendPacket(bp *[]byte) error { return c.t.SendPacket(bp) }
 func (c *icmpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
 	c.t.SetPacketHandler(h, peer)
 }
@@ -15218,6 +15237,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 )
 
 // ---------------------------------------------------------------------------
@@ -15282,11 +15302,15 @@ type tunFast struct {
 	tx cipher.AEAD // nil when the tunnel is not encrypted
 	rx cipher.AEAD
 
-	send func([]byte) error
+	// send takes the buffer with it: the wire is written from another
+	// thread, so whoever finishes with it is the one that returns it.
+	send func(*[]byte) error
 	recv func([]byte)
 
-	mu      sync.Mutex
-	counter uint64
+	// How much room the transport needs in front of what we build.
+	headroom int
+
+	counter uint64 // atomic: one packet, one number, and no lock to take
 
 	// The replay window, one bit per counter in a ring. See fresh.
 	rmu    sync.Mutex
@@ -15294,36 +15318,35 @@ type tunFast struct {
 	newest uint64
 }
 
-func newTunFast(tx, rx cipher.AEAD, send func([]byte) error, recv func([]byte)) *tunFast {
-	return &tunFast{tx: tx, rx: rx, send: send, recv: recv}
+func newTunFast(tx, rx cipher.AEAD, headroom int, send func(*[]byte) error, recv func([]byte)) *tunFast {
+	return &tunFast{tx: tx, rx: rx, headroom: headroom, send: send, recv: recv}
 }
 
 // Send puts one IP packet on the wire. The buffer is not retained.
 func (f *tunFast) Send(pkt []byte) error {
-	f.mu.Lock()
-	f.counter++
-	n := f.counter
-	f.mu.Unlock()
+	n := atomic.AddUint64(&f.counter, 1)
 
 	var nonce [12]byte
 	binary.BigEndian.PutUint64(nonce[4:], n)
 
+	// One buffer, with the transport's header room left empty at the front.
+	// It used to be two: this one, and another inside the transport that the
+	// payload was copied into. At a thousand packets a millisecond that copy
+	// is real, and there was never a reason for it.
 	bp := tunBufs.Get().(*[]byte)
-	need := tunNonceLen + len(pkt) + 16
+	need := f.headroom + tunNonceLen + len(pkt) + 16
 	if cap(*bp) < need {
 		*bp = make([]byte, 0, need)
 	}
-	out := (*bp)[:tunNonceLen]
-	binary.BigEndian.PutUint64(out[:tunNonceLen], n)
+	out := (*bp)[:f.headroom+tunNonceLen]
+	binary.BigEndian.PutUint64(out[f.headroom:], n)
 	if f.tx == nil {
 		out = append(out, pkt...)
 	} else {
 		out = f.tx.Seal(out, nonce[:], pkt, nil)
 	}
-	err := f.send(out)
-	*bp = out[:0]
-	tunBufs.Put(bp)
-	return err
+	*bp = out
+	return f.send(bp)
 }
 
 // Deliver opens one datagram and hands the packet up. A datagram that does not
@@ -15584,21 +15607,22 @@ func (t *udpTransport) rememberPeer(a net.Addr) {
 }
 
 // SendPacket puts one whole packet on the wire, with no session under it.
-func (t *udpTransport) SendPacket(b []byte) error {
+// Headroom is the tag that goes in front of a private-link packet.
+func (t *udpTransport) Headroom() int { return udpTagLen }
+
+// SendPacket puts one whole packet on the wire, with no session under it.
+// The first Headroom() bytes are ours to fill and the rest is already built.
+func (t *udpTransport) SendPacket(bp *[]byte) error {
 	t.pktMu.Lock()
 	peer := t.pktTo
 	t.pktMu.Unlock()
-	if peer == nil {
+	body := *bp
+	if peer == nil || len(body) < udpTagLen {
+		tunBufs.Put(bp)
 		return errUDPNoPeer
 	}
-	bp := tunBufs.Get().(*[]byte)
-	need := udpTagLen + len(b)
-	if cap(*bp) < need {
-		*bp = make([]byte, 0, need)
-	}
-	body := (*bp)[:need]
-	t.putTagFor(udpTagDirect, body[:udpTagLen], b[:min(len(b), arqOver)])
-	copy(body[udpTagLen:], b)
+	payload := body[udpTagLen:]
+	t.putTagFor(udpTagDirect, body[:udpTagLen], payload[:min(len(payload), arqOver)])
 	_, err := t.pc.WriteTo(body, peer)
 	*bp = body[:0]
 	tunBufs.Put(bp)
@@ -15830,7 +15854,8 @@ func (c *udpCarrier) Accept() (net.Conn, error)      { return c.t.Accept() }
 
 // Forwarded for the same reason as the ICMP one: the pool holds this wrapper,
 // so anything asked of "the transport" has to be answerable here too.
-func (c *udpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *udpCarrier) Headroom() int               { return c.t.Headroom() }
+func (c *udpCarrier) SendPacket(bp *[]byte) error { return c.t.SendPacket(bp) }
 func (c *udpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
 	c.t.SetPacketHandler(h, peer)
 }
