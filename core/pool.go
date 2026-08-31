@@ -50,6 +50,14 @@ type replayWindow struct {
 	top   uint32 // the highest counter seen
 	bits  [replayWords]uint64
 	empty bool
+
+	// What the far end sent that we did not get, and what arrived behind
+	// something newer. The counter is consecutive at the sender, so a number
+	// that is skipped is a packet the path lost - and that is not visible
+	// anywhere else: not in a device counter, not in a qdisc, not in the
+	// socket. It was found once by capturing at the far end and counting by
+	// hand, and once was enough.
+	skipped, late, gaps uint64
 }
 
 func newReplayWindow() *replayWindow { return &replayWindow{empty: true} }
@@ -69,11 +77,16 @@ func (w *replayWindow) fresh(seq uint32) bool {
 	case int32(seq-w.top) > 0:
 		// Newer than anything seen. Drag the window forward, clearing the
 		// bits that just fell off the bottom.
+		if d := seq - w.top; d > 1 {
+			w.skipped += uint64(d - 1)
+			w.gaps++
+		}
 		w.shift(seq - w.top)
 		w.top = seq
 		w.set(0)
 		return true
 	default:
+		w.late++
 		back := w.top - seq
 		if back >= replayDepth {
 			return false // older than the window remembers; treat as replay

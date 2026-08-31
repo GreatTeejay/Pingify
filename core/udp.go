@@ -181,6 +181,8 @@ func (c *udpCarrier) Close() error {
 	return c.pc.Close()
 }
 
+func (c *udpCarrier) lost() (missing, late, gaps uint64) { return c.fr.lost() }
+
 func (c *udpCarrier) counters() (rx, tx, bad, replay, errs uint64) {
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
 		c.fr.badTag, c.fr.replayed, atomic.LoadUint64(&c.sendErrs)

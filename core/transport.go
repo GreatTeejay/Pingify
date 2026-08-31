@@ -19,6 +19,10 @@ type carrier interface {
 	run()
 	keepalive(time.Duration)
 	counters() (rx, tx, bad, replay, errs uint64)
+
+	// lost is what the far end sent that never arrived, counted from the gaps
+	// in its sequence numbers. Nothing else on either machine can see this.
+	lost() (missing, late, gaps uint64)
 }
 
 func openCarrier(cfg *Config) (carrier, error) {

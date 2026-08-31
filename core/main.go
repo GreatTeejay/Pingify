@@ -107,10 +107,18 @@ func main() {
 // doing something. A line every thirty seconds saying nothing happened fills
 // a log with the absence of news, and the one line that matters is then in the
 // middle of a thousand that do not.
+func max64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 func reportEvery(every time.Duration, c carrier, l *link) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	var lastRx, lastTx uint64
+	var lastMissing, lastLate, lastGaps uint64
 	for range tk.C {
 		rx, tx, bad, replay, errs := c.counters()
 		if rx == lastRx && tx == lastTx {
@@ -121,6 +129,15 @@ func reportEvery(every time.Duration, c carrier, l *link) {
 			float64(rx-lastRx)*8/secs/1e6, float64(tx-lastTx)*8/secs/1e6)
 		if bad > 0 || replay > 0 {
 			logDebug("carrier: %d not ours, %d already seen", bad, replay)
+		}
+		// How much was lost matters less than how it was lost. Losses spread
+		// one at a time are noise a congestion window shrugs off; the same
+		// number arriving in runs is a window halved once per run.
+		if missing, late, gaps := c.lost(); missing != lastMissing || late != lastLate {
+			run := float64(missing-lastMissing) / float64(max64(gaps-lastGaps, 1))
+			logInfo("the path lost %d and reordered %d in the last %s (%d gaps, %.0f packets each)",
+				missing-lastMissing, late-lastLate, every, gaps-lastGaps, run)
+			lastMissing, lastLate, lastGaps = missing, late, gaps
 		}
 		if errs > 0 {
 			logDebug("carrier: %d sends failed", errs)

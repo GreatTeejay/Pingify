@@ -47,6 +47,14 @@ type framer struct {
 	badTag, replayed uint64
 }
 
+// lost reports what the far end sent that never arrived, and what arrived out
+// of order. Both are counted from the sequence number, which is consecutive at
+// the sender - so a gap in it is the one measure of the path that no counter
+// on either machine will show.
+func (f *framer) lost() (missing, late, gaps uint64) {
+	return f.seen.skipped, f.seen.late, f.seen.gaps
+}
+
 // newFramer derives this carrier's key from the token the user typed.
 //
 // Each carrier passes its own label, so a datagram built for one can never be
