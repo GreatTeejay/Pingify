@@ -43,7 +43,12 @@ import (
 // A rate cap on top helps further but has to suit the path - 400 Mbit/s gave
 // 253.8 here where 200 throttled us to 181 - so it is offered and not assumed.
 // fq on its own needs no number and cannot be set too low.
-const soMaxPacingRate = 47
+const (
+	soMaxPacingRate = 47
+
+	// See the table above smoothTheWire for how this was chosen.
+	flowLimit = "2000"
+)
 
 // egressInterface is the one the default route leaves by, read from the
 // kernel rather than guessed at from a name.
@@ -64,17 +69,20 @@ func egressInterface() string {
 	return ""
 }
 
-// rootQdisc says what is currently spacing this interface's packets.
+// rootQdisc is the whole line describing what currently spaces this
+// interface's packets - the kind and everything it was set with.
+//
+// The whole line, not just the kind. Checking only for "fq" and stopping
+// there left an interface someone had set to fq with a flow_limit of two
+// hundred exactly as it was, and two hundred packets is not enough queue to
+// carry anything: sixteen streams fell from 450 Mbit/s to 183 and one stream
+// to 75, while the tunnel logged that the queue was already what it wanted.
 func rootQdisc(dev string) string {
 	out, err := exec.Command("tc", "qdisc", "show", "dev", dev, "root").Output()
 	if err != nil {
 		return ""
 	}
-	fields := strings.Fields(string(out))
-	if len(fields) > 1 {
-		return fields[1]
-	}
-	return ""
+	return strings.TrimSpace(string(out))
 }
 
 // smoothTheWire puts fq on the way out, unless it is already there or the
@@ -93,11 +101,13 @@ func smoothTheWire(cfg *config.Config) {
 		logging.Debug("could not tell which interface leaves this machine; not touching the queue")
 		return
 	}
-	if q := rootQdisc(dev); q == "fq" {
-		logging.Info("%s already spaces packets with fq", dev)
-		return
-	} else if q == "" {
+	was := rootQdisc(dev)
+	if was == "" {
 		logging.Debug("could not read the queue on %s", dev)
+		return
+	}
+	if strings.Contains(was, "qdisc fq ") && strings.Contains(was, "flow_limit "+flowLimit+"p") {
+		logging.Info("%s already spaces packets the way this wants", dev)
 		return
 	}
 
@@ -121,7 +131,7 @@ func smoothTheWire(cfg *config.Config) {
 	// starts refusing work the link could have carried, and six hundred gives
 	// up a quarter of the throughput to save fourteen milliseconds - a trade
 	// worth offering and not worth assuming.
-	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", "2000"}
+	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", flowLimit}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 		logging.Warn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
 			" and the path will drop runs of them", dev, err, strings.TrimSpace(string(out)))
