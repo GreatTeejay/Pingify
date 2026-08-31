@@ -1296,11 +1296,11 @@ apply_preset() {
             # FEC. A small pool buys fairness and failover without multiplying
             # parity traffic sixteen times as the TCP presets would.
             case "$1" in
-                gaming)     T_CARRIERS=1; T_WINDOW=256;  T_SNDBUF=4096;  T_RCVBUF=4096;  T_FEC_DATA=10; T_FEC_PARITY=2; T_PACKET_MTU=1280; T_KCP_INTERVAL=5 ;;
-                latency)    T_CARRIERS=2; T_WINDOW=512;  T_SNDBUF=8192;  T_RCVBUF=8192;  T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1280; T_KCP_INTERVAL=5 ;;
-                balanced)   T_CARRIERS=4; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=16384; T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1280; T_KCP_INTERVAL=10 ;;
-                throughput) T_CARRIERS=6; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=32768; T_FEC_DATA=20; T_FEC_PARITY=4; T_PACKET_MTU=1280; T_KCP_INTERVAL=10 ;;
-                extreme)    T_CARRIERS=8; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=65536; T_FEC_DATA=20; T_FEC_PARITY=5; T_PACKET_MTU=1280; T_KCP_INTERVAL=10 ;;
+                gaming)     T_CARRIERS=1; T_WINDOW=256;  T_SNDBUF=16384; T_RCVBUF=1024;  T_FEC_DATA=10; T_FEC_PARITY=2; T_PACKET_MTU=1280; T_KCP_INTERVAL=5 ;;
+                latency)    T_CARRIERS=2; T_WINDOW=512;  T_SNDBUF=16384; T_RCVBUF=2048;  T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1280; T_KCP_INTERVAL=5 ;;
+                balanced)   T_CARRIERS=4; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=3072;  T_FEC_DATA=10; T_FEC_PARITY=3; T_PACKET_MTU=1280; T_KCP_INTERVAL=10 ;;
+                throughput) T_CARRIERS=6; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=6144;  T_FEC_DATA=20; T_FEC_PARITY=4; T_PACKET_MTU=1280; T_KCP_INTERVAL=10 ;;
+                extreme)    T_CARRIERS=8; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=16384; T_FEC_DATA=20; T_FEC_PARITY=5; T_PACKET_MTU=1280; T_KCP_INTERVAL=10 ;;
                 *)          return 1 ;;
             esac
             ;;
@@ -1320,12 +1320,37 @@ apply_preset() {
             # there are more sessions than there are heavy streams; past that
             # nothing is gained and, measured up to thirty-two, nothing is lost
             # - even at a single stream the count made no difference at all.
+            # The receive buffer is what these presets actually choose
+            # between, and it used to be set as though bigger were always
+            # better. It is not: on a packet transport it is the one number
+            # that trades delay for bytes, and every preset here was far past
+            # the point where it stops buying anything.
+            #
+            # Swept on a real Iran-Germany link with sixteen streams pushing,
+            # measuring the round trip across the tunnel while they ran:
+            #
+            #     1 MiB   p50  75 ms   p90  84 ms   323 Mbit/s
+            #     2 MiB   p50  77 ms   p90  90 ms   350 Mbit/s
+            #     3 MiB   p50  82 ms   p90  96 ms   415 Mbit/s
+            #     4 MiB   p50 110 ms   p90 123 ms   424 Mbit/s
+            #     6 MiB   p50 132 ms   p90 176 ms   432 Mbit/s
+            #    16 MiB   p50 133 ms   p90 165 ms   474 Mbit/s
+            #
+            # So gaming, which asked for four megabytes, was choosing 110 ms
+            # when 75 was available - the preset named for latency was one of
+            # the worst at it. Three is the knee and belongs to balanced:
+            # below it a burst has nowhere to go and throughput falls away,
+            # above it every megabyte costs tens of milliseconds.
+            #
+            # The send buffer is not this knob. Swept over the same range it
+            # changed neither figure - nothing waits behind it on this machine
+            # - so it stays large enough for any burst.
             case "$1" in
-                gaming)     T_CARRIERS=8;  T_WINDOW=256;  T_SNDBUF=4096;  T_RCVBUF=4096 ;;
-                latency)    T_CARRIERS=12; T_WINDOW=512;  T_SNDBUF=8192;  T_RCVBUF=8192 ;;
-                balanced)   T_CARRIERS=16; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=16384 ;;
-                throughput) T_CARRIERS=20; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=32768 ;;
-                extreme)    T_CARRIERS=24; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=65536 ;;
+                gaming)     T_CARRIERS=8;  T_WINDOW=256;  T_SNDBUF=16384; T_RCVBUF=1024 ;;
+                latency)    T_CARRIERS=12; T_WINDOW=512;  T_SNDBUF=16384; T_RCVBUF=2048 ;;
+                balanced)   T_CARRIERS=16; T_WINDOW=1024; T_SNDBUF=16384; T_RCVBUF=3072 ;;
+                throughput) T_CARRIERS=20; T_WINDOW=2048; T_SNDBUF=32768; T_RCVBUF=6144 ;;
+                extreme)    T_CARRIERS=24; T_WINDOW=4096; T_SNDBUF=65536; T_RCVBUF=16384 ;;
                 *)          return 1 ;;
             esac
             ;;
