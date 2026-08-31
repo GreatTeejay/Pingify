@@ -425,6 +425,52 @@ show_taken_tunnel_ports() {
 # but a person changing one should be able to see what the others took.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# ICMP has no port, so two tunnels collide on the token instead
+# ---------------------------------------------------------------------------
+
+# icmp_token_owner TOKEN [EXCEPT] - the tunnel here already carrying ICMP with
+# this token, if there is one.
+#
+# An ICMP tunnel has no port to tell it apart from another. What it has is an
+# identifier on every echo, and that identifier is derived from the token -
+# which is what lets the kernel filter drop the ordinary pings a public server
+# sees all day without waking anything up.
+#
+# Two tunnels on one server with the same token therefore carry the same
+# identifier. Each one's filter accepts the other's packets, each hands them to
+# its own session table, finds a session it never opened, and turns it away.
+# What the operator sees is both tunnels flapping and a log line blaming the
+# security token - which is right, but not in the way it reads.
+#
+# One token per tunnel is the answer, and this is where to say so.
+icmp_token_owner() {
+    local want="$1" except="${2:-}" f name
+    [ -n "$want" ] || return 0
+    cfg_files | while read -r f; do
+        [ "$(toml_get "$f" transport type)" = "icmp" ] || continue
+        [ "$(toml_get "$f" security token)" = "$want" ] || continue
+        name="$(cfg_name "$f")"
+        [ -n "$except" ] && [ "$name" = "$except" ] && continue
+        printf '%s' "$name"
+        break
+    done
+    return 0
+}
+
+# show_taken_icmp_token TOKEN [EXCEPT] - warn if this token is already carrying
+# an ICMP tunnel here. Returns 1 when it clashes, so a caller can insist.
+show_taken_icmp_token() {
+    local owner
+    owner="$(icmp_token_owner "$1" "${2:-}")"
+    [ -n "$owner" ] || return 0
+    warn "the tunnel \"$owner\" already carries ICMP with this token"
+    dim "Both would put the same identifier on every packet, so each would"
+    dim "read the other's and answer it with a session it never opened. Both"
+    dim "flap, and the log blames the token. Give this one a different token."
+    return 1
+}
+
 health_owner() {
     local want="$1" except="${2:-}" f addr name
     case "$want" in '' | *[!0-9]*) return 0 ;; esac

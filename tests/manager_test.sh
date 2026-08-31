@@ -1134,6 +1134,13 @@ COL="$WORK/collide"; mkdir -p "$COL"
     # a tunnel is allowed to keep its own network when its settings are edited
     echo "own-net=$(net_owner 10.10.10 tun-a)"
 
+    # --- an icmp tunnel has no port, so the token is what clashes ---------
+    # Both of these carry ICMP with the same token, which means both would put
+    # the same identifier on every packet and read each other's.
+    echo "icmp-tok=$(icmp_token_owner "$TOKEN")"
+    echo "icmp-tok-not-a=$(icmp_token_owner "$TOKEN" tun-a)"
+    echo "icmp-tok-other=$(icmp_token_owner "a different token entirely")"
+
     # --- ports -------------------------------------------------------------
     echo "port443=$(port_owner 443)"
     echo "port9002=$(port_owner 9002)"
@@ -1187,6 +1194,13 @@ check "the link question lists what is taken" "$(wz | grep -c 'show_taken_nets')
 check "and refuses a repeat"                  "$(wz | grep -c 'net_owner')"        "1"
 check "and a network the host already has"    "$(wz | grep -c 'host_has_net')"     "1"
 check "the ports question lists them too"     "$(wz | grep -c 'show_taken_ports')" "1"
+# An ICMP tunnel has no port to clash on; what clashes is the token, because
+# the identifier on every packet is derived from it and two tunnels sharing
+# one read each other's traffic and turn each other away.
+check "a shared icmp token is found"   "$(col icmp-tok)"       "tun-a"
+check "and the other one is named"     "$(col icmp-tok-not-a)" "tun-b"
+check "a different token is free"      "$(col icmp-tok-other)" ""
+check "and the token question says so"       "$(wz | grep -c 'show_taken_icmp_token "')" "1"
 check "and refuses a clash"                   "$(wz | grep -c 'forwards_clash')"   "1"
 ef() { awk '/^edit_forwards\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh; }
 check "changing ports later checks too"       "$(ef | grep -c 'forwards_clash')"   "1"
