@@ -64,6 +64,11 @@ type Config struct {
 
 	Token string
 
+	Tuning struct {
+		RcvBufKB int
+		SndBufKB int
+	}
+
 	TUN struct {
 		Name   string
 		Iran   string
@@ -166,6 +171,11 @@ func assign(c *Config, table, key, raw string) error {
 	case "security.token":
 		c.Token, err = str()
 
+	case "tuning.rcvbuf_kb":
+		c.Tuning.RcvBufKB, err = num()
+	case "tuning.sndbuf_kb":
+		c.Tuning.SndBufKB, err = num()
+
 	case "tun.name":
 		c.TUN.Name, err = str()
 	case "tun.iran":
@@ -227,10 +237,12 @@ func (c *Config) check() error {
 	if c.Transport.Type == "" {
 		c.Transport.Type = "udp"
 	}
-	if c.Transport.Type != "udp" {
-		return fmt.Errorf("transport.type %q: only \"udp\" is built so far", c.Transport.Type)
+	if c.Transport.Type != "udp" && c.Transport.Type != "icmp" {
+		return fmt.Errorf("transport.type %q: udp and icmp are what exist so far", c.Transport.Type)
 	}
-	if c.Transport.Port <= 0 || c.Transport.Port > 65535 {
+	// ICMP has no ports. There is nothing to listen on and nothing to
+	// misconfigure, which is half of why it is the transport that survives.
+	if c.Transport.Type != "icmp" && (c.Transport.Port <= 0 || c.Transport.Port > 65535) {
 		return fmt.Errorf("transport.port %d is not a port", c.Transport.Port)
 	}
 	if c.dials() && c.Transport.Kharej == "" {
@@ -256,6 +268,16 @@ func (c *Config) check() error {
 	}
 	if c.Name == "" {
 		c.Name = "pingify"
+	}
+	// Measured on the real path, sweeping the receive buffer against latency
+	// and throughput: below about two megabytes the kernel drops packets the
+	// process never sees, and above about six the queue is deep enough to be
+	// felt as lag. Three is where both were good.
+	if c.Tuning.RcvBufKB == 0 {
+		c.Tuning.RcvBufKB = 3072
+	}
+	if c.Tuning.SndBufKB == 0 {
+		c.Tuning.SndBufKB = 16384
 	}
 	return nil
 }

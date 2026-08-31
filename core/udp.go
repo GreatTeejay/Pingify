@@ -1,40 +1,15 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// UDP, the first carrier, and the shape every other packet carrier follows.
-//
-// On the wire a datagram is:
-//
-//	0                 8                12
-//	+-----------------+----------------+-----------------------------+
-//	|  tag (8)        |  seq (4)       |  the IP packet              |
-//	+-----------------+----------------+-----------------------------+
-//
-// The tag is what says a datagram is ours. Anyone can send to an open UDP
-// port, and without it the first thing a scanner sends would be handed
-// straight to the kernel as an IP packet.
-//
-// It is one hash over the sequence number and the first bytes of the packet -
-// not the whole packet, which at four hundred megabits would mean hashing
-// fifty megabytes a second to learn what the first thirty-two bytes already
-// say. One hash per packet, not two: the old core built a second tag it then
-// checked in a different order, and that was pure cost.
-//
-// There is no encryption here and none is wanted. What travels through this
-// tunnel is already TLS, and what is asked of the tunnel is speed, ping and
-// stability.
+// UDP: a framed datagram in a UDP datagram, and nothing else.
 //
 // What happened when this was first run between Tehran and Frankfurt: the
 // tunnel came up, carried exactly one round trip at 81.0 ms, and went silent.
@@ -52,50 +27,36 @@ import (
 // Iran.
 //
 // So UDP is not a slow transport on this path. It is an unusable one, and no
-// amount of tuning here changes that - which is the whole reason ICMP is the
-// transport worth making good rather than the fallback.
+// amount of tuning here changes that - which is why ICMP is the transport
+// worth making good rather than the fallback.
 //
-// This carrier stays anyway. It is the same code an ICMP carrier needs minus
-// the raw socket, so it is the cheapest place to get the shape right, and this
-// is one path on one ISP on one day. Somebody else's will carry UDP happily.
-const (
-	udpTagLen   = 8
-	udpSeqLen   = 4
-	udpHeadroom = udpTagLen + udpSeqLen
-	udpTagOver  = 32 // how many bytes of the payload the tag covers
-	udpMaxDgram = 1500
-)
+// This carrier stays anyway. It is what proved the shape the framer and the
+// private link now share, it is the one place to test a carrier without a raw
+// socket, and this is one path on one ISP on one day. Somebody else's will
+// carry UDP happily.
+const udpMaxDgram = 1500
 
 var errNoPeer = errors.New("no peer yet")
 
 type udpCarrier struct {
-	pc  *net.UDPConn
-	key []byte
-	hp  sync.Pool // hash.Hash, kept rather than made per packet
+	pc *net.UDPConn
+	fr *framer
 
-	seq  uint32
-	peer atomic.Pointer[net.UDPAddr]
-
+	peer     atomic.Pointer[net.UDPAddr]
 	onPacket atomic.Pointer[func([]byte)]
 
 	done chan struct{}
 	once sync.Once
 
-	rxBytes, txBytes   uint64
-	rxPackets          uint64
-	badTag, replayed   uint64
-	sendErrs, noPeerTx uint64
-
-	seen *replayWindow
+	rxBytes, txBytes uint64
+	sendErrs         uint64
 }
 
 func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 	c := &udpCarrier{
-		key:  carrierKey(cfg.Token, "pingify udp v1"),
+		fr:   newFramer(cfg.Token, "pingify udp v1"),
 		done: make(chan struct{}),
-		seen: newReplayWindow(),
 	}
-	c.hp.New = func() any { return hmac.New(sha256.New, c.key) }
 
 	if cfg.dials() {
 		// Iran dials out. The socket stays unconnected and the peer is
@@ -112,6 +73,7 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 		}
 		c.pc = pc
 		c.peer.Store(raddr)
+		tuneSocket(pc, cfg)
 		logInfo("carrier: dialling %s over udp", raddr)
 		return c, nil
 	}
@@ -121,49 +83,41 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 		return nil, fmt.Errorf("listen on udp/%d: %v", cfg.Transport.Port, err)
 	}
 	c.pc = pc
+	tuneSocket(pc, cfg)
 	logInfo("carrier: waiting on udp/%d", cfg.Transport.Port)
 	return c, nil
 }
 
-func (c *udpCarrier) Headroom() int   { return udpHeadroom }
-func (c *udpCarrier) MaxPayload() int { return udpMaxDgram - udpHeadroom }
+func (c *udpCarrier) Headroom() int   { return c.fr.headroom() }
+func (c *udpCarrier) MaxPayload() int { return udpMaxDgram - c.fr.headroom() }
 func (c *udpCarrier) Up() bool        { return c.peer.Load() != nil }
 
 func (c *udpCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
 
-// tag writes the eight bytes that say a datagram is ours.
-func (c *udpCarrier) tag(dst, seqAndBody []byte) {
-	m := c.hp.Get().(hash.Hash)
-	m.Reset()
-	m.Write(seqAndBody)
-	var sum [sha256.Size]byte
-	copy(dst, m.Sum(sum[:0])[:udpTagLen])
-	c.hp.Put(m)
-}
+// udpSender sends a batch one packet at a time. There is no sendmmsg here
+// because there is no point: this carrier is for paths where UDP works, and
+// those are not the paths where the last ten percent is being fought over.
+type udpSender struct{ c *udpCarrier }
 
-// covered is how much of a datagram the tag is computed over.
-func covered(b []byte) []byte {
-	if len(b) > udpHeadroom+udpTagOver {
-		return b[udpTagLen : udpHeadroom+udpTagOver]
+func (c *udpCarrier) NewSender() packetSender { return &udpSender{c: c} }
+
+func (s *udpSender) send(bps []*[]byte) {
+	for _, bp := range bps {
+		_ = s.c.Send(bp)
 	}
-	return b[udpTagLen:]
 }
 
 func (c *udpCarrier) Send(bp *[]byte) error {
 	peer := c.peer.Load()
-	if peer == nil {
-		bufPool.Put(bp)
-		atomic.AddUint64(&c.noPeerTx, 1)
-		return errNoPeer
-	}
 	b := *bp
-	if len(b) < udpHeadroom {
+	if peer == nil || len(b) < c.fr.headroom() {
 		bufPool.Put(bp)
+		if peer == nil {
+			return errNoPeer
+		}
 		return nil
 	}
-	binary.BigEndian.PutUint32(b[udpTagLen:udpHeadroom], atomic.AddUint32(&c.seq, 1))
-	c.tag(b[:udpTagLen], covered(b))
-
+	c.fr.seal(b)
 	n, err := c.pc.WriteToUDP(b, peer)
 	bufPool.Put(bp)
 	if err != nil {
@@ -176,18 +130,12 @@ func (c *udpCarrier) Send(bp *[]byte) error {
 
 // run reads datagrams until the socket closes, handing each one that carries
 // the right tag to the layer above - on this goroutine, with nothing in
-// between.
-//
-// The reader that took the packet off the socket is the one that writes it to
-// the device. A layer of per-flow writers and batched handovers was tried
-// there, on the reasoning that one thread doing every write would serialise
-// them. It did, and it was still faster: p50 113 ms and 444 Mbit/s written
-// here, against 160 ms and 427 Mbit/s handed over.
+// between. See link.fromWire for why there is nothing in between.
 func (c *udpCarrier) run() {
 	buf := make([]byte, udpMaxDgram)
 	for {
 		n, from, err := c.pc.ReadFromUDP(buf)
-		if n >= udpHeadroom {
+		if n > 0 {
 			c.handle(buf[:n], from)
 		}
 		if err != nil {
@@ -202,16 +150,8 @@ func (c *udpCarrier) run() {
 }
 
 func (c *udpCarrier) handle(b []byte, from *net.UDPAddr) {
-	var want [udpTagLen]byte
-	c.tag(want[:], covered(b))
-	if !hmac.Equal(want[:], b[:udpTagLen]) {
-		atomic.AddUint64(&c.badTag, 1)
-		return
-	}
-
-	seq := binary.BigEndian.Uint32(b[udpTagLen:udpHeadroom])
-	if !c.seen.fresh(seq) {
-		atomic.AddUint64(&c.replayed, 1)
+	body, ok := c.fr.open(b)
+	if !ok {
 		return
 	}
 
@@ -224,9 +164,6 @@ func (c *udpCarrier) handle(b []byte, from *net.UDPAddr) {
 	}
 
 	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
-	atomic.AddUint64(&c.rxPackets, 1)
-
-	body := b[udpHeadroom:]
 	if len(body) == 0 {
 		return // a keepalive, which has done its whole job by arriving
 	}
@@ -235,23 +172,8 @@ func (c *udpCarrier) handle(b []byte, from *net.UDPAddr) {
 	}
 }
 
-// keepalive holds the path open, and on the side that waits it is the only
-// thing that says where the far end is. The side that dials sends it, because
-// before a datagram arrives the other side knows nothing to send to.
 func (c *udpCarrier) keepalive(every time.Duration) {
-	tk := time.NewTicker(every)
-	defer tk.Stop()
-	for {
-		select {
-		case <-c.done:
-			return
-		case <-tk.C:
-			bp := takeBuf(udpHeadroom, 0)
-			if err := c.Send(bp); err != nil && !errors.Is(err, errNoPeer) {
-				logDebug("keepalive: %v", err)
-			}
-		}
-	}
+	keepaliveLoop(c, c.done, every)
 }
 
 func (c *udpCarrier) Close() error {
@@ -259,12 +181,26 @@ func (c *udpCarrier) Close() error {
 	return c.pc.Close()
 }
 
-// carrierKey turns the token the user typed into the key a carrier tags with.
-// Each carrier has its own label, so a datagram built for one can never be
-// mistaken for a datagram built for another - which matters the moment two
-// tunnels between the same pair of servers share a token.
-func carrierKey(token, label string) []byte {
-	m := hmac.New(sha256.New, []byte(label))
-	m.Write([]byte(token))
-	return m.Sum(nil)
+func (c *udpCarrier) counters() (rx, tx, bad, replay, errs uint64) {
+	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
+		c.fr.badTag, c.fr.replayed, atomic.LoadUint64(&c.sendErrs)
+}
+
+// keepaliveLoop holds the path open, and on the side that waits it is the only
+// thing that says where the far end is. The side that dials sends it, because
+// before a datagram arrives the other side has nothing to send to.
+func keepaliveLoop(c packetCarrier, done <-chan struct{}, every time.Duration) {
+	tk := time.NewTicker(every)
+	defer tk.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-tk.C:
+			bp := takeBuf(c.Headroom(), 0)
+			if err := c.Send(bp); err != nil && !errors.Is(err, errNoPeer) {
+				logDebug("keepalive: %v", err)
+			}
+		}
+	}
 }

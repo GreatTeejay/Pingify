@@ -27,10 +27,27 @@ type packetCarrier interface {
 	// headroom has been subtracted.
 	MaxPayload() int
 
-	// Send puts one datagram on the wire. It takes ownership of the buffer:
-	// after Send returns, the caller must not look at it again, whatever the
-	// error says.
+	// Send puts one datagram on the wire, on its own. It takes ownership of
+	// the buffer: after Send returns the caller must not look at it again,
+	// whatever the error says. This is for keepalives and nothing else - the
+	// data path uses a sender.
 	Send(bp *[]byte) error
+
+	// NewSender returns somewhere to send batches from. One per goroutine
+	// that sends, because a sender holds the arrays the kernel is handed and
+	// two goroutines sharing them would hand it each other's packets.
+	//
+	// Batching used to live behind a channel here, with one goroutine draining
+	// it. That is the obvious design and it is wrong: one flow is read by one
+	// device queue, so every packet of it crossed the channel and waited to be
+	// scheduled on the other side. Sixteen streams did not care - there was
+	// always something to batch - but a single stream fell from 245 Mbit/s to
+	// 164, because a single stream is exactly the case where the queue is
+	// always empty and the handoff is pure cost.
+	//
+	// So the goroutine that read the packets sends them. Nothing is handed
+	// over and nothing is woken.
+	NewSender() packetSender
 
 	// OnPacket registers what to do with each datagram that arrives. It is
 	// called on the goroutine that read the datagram off the socket, and the
@@ -43,4 +60,12 @@ type packetCarrier interface {
 	Up() bool
 
 	Close() error
+}
+
+// A packetSender puts a batch of packets on the wire in one crossing into the
+// kernel. It belongs to one goroutine and is not safe for two.
+type packetSender interface {
+	// send takes ownership of every buffer in the batch, and returns them to
+	// the pool however it goes.
+	send(bps []*[]byte)
 }

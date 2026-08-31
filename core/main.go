@@ -37,7 +37,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "2.0.0-udp"
+const version = "2.0.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -73,7 +73,7 @@ func main() {
 	logInfo("pingify-core %s starting: %s, %s side, %s over %s",
 		version, cfg.Name, cfg.Side, cfg.Mode, cfg.Transport.Type)
 
-	car, err := newUDPCarrier(cfg)
+	car, err := openCarrier(cfg)
 	if err != nil {
 		die("carrier: %v", err)
 	}
@@ -107,21 +107,23 @@ func main() {
 // doing something. A line every thirty seconds saying nothing happened fills
 // a log with the absence of news, and the one line that matters is then in the
 // middle of a thousand that do not.
-func reportEvery(every time.Duration, c *udpCarrier, l *link) {
+func reportEvery(every time.Duration, c carrier, l *link) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	var lastRx, lastTx uint64
 	for range tk.C {
-		rx := atomic.LoadUint64(&c.rxBytes)
-		tx := atomic.LoadUint64(&c.txBytes)
+		rx, tx, bad, replay, errs := c.counters()
 		if rx == lastRx && tx == lastTx {
 			continue
 		}
 		secs := every.Seconds()
 		logInfo("carrier: %.1f Mbit/s in, %.1f Mbit/s out",
 			float64(rx-lastRx)*8/secs/1e6, float64(tx-lastTx)*8/secs/1e6)
-		if bad := atomic.LoadUint64(&c.badTag); bad > 0 {
-			logDebug("carrier: %d datagrams were not ours", bad)
+		if bad > 0 || replay > 0 {
+			logDebug("carrier: %d not ours, %d already seen", bad, replay)
+		}
+		if errs > 0 {
+			logDebug("carrier: %d sends failed", errs)
 		}
 		if d := atomic.LoadUint64(&l.dropped); d > 0 {
 			logWarn("private link: %d packets could not be put on the wire", d)

@@ -88,26 +88,56 @@ func (l *link) start() {
 
 // readQueue takes packets off one device queue and puts them on the wire.
 //
-// The packet is read straight into a buffer that already has the carrier's
+// It blocks for the first packet, then takes whatever else is already waiting
+// behind it - without waiting for it - and hands the lot to the carrier as one
+// batch. A link with one packet on it therefore sends one packet immediately,
+// and a link with a hundred sends them in one crossing into the kernel.
+//
+// The goroutine that read the packets is the one that sends them. Batching
+// behind a channel with a single draining goroutine was tried first, and it is
+// the obvious design: it cost a single stream 245 Mbit/s down to 164, because
+// one flow is read by one device queue, so every one of its packets crossed
+// the channel and waited to be scheduled on the far side. Sixteen streams
+// never noticed - there was always something to batch - which is exactly how a
+// design like that survives a benchmark.
+//
+// Each packet is read straight into a buffer that already has the carrier's
 // headroom in front of it, so nothing is copied and nothing is shifted along
 // afterwards to make room for a header that was known about before the read.
 func (l *link) readQueue(f *os.File, q int) {
-	head := l.car.Headroom()
-	max := l.car.MaxPayload()
+	head, max := l.car.Headroom(), l.car.MaxPayload()
+	sender := l.car.NewSender()
+	rc := rawOf(f)
+	held := make([]*[]byte, 0, sendBatch)
+
 	for {
 		bp := takeBuf(head, max)
-		b := *bp
-		n, err := f.Read(b[head:])
+		n, err := f.Read((*bp)[head:])
 		if n > 0 {
-			*bp = b[:head+n]
-			if e := l.car.Send(bp); e != nil {
-				atomic.AddUint64(&l.dropped, 1)
-			} else {
-				atomic.AddUint64(&l.toWire, 1)
-			}
+			*bp = (*bp)[:head+n]
+			held = append(held, bp)
 		} else {
 			bufPool.Put(bp)
 		}
+
+		// Whatever else is already there comes along for the same crossing.
+		for rc != nil && len(held) > 0 && len(held) < sendBatch {
+			nb := takeBuf(head, max)
+			m, ok := readNow(rc, (*nb)[head:])
+			if !ok {
+				bufPool.Put(nb)
+				break
+			}
+			*nb = (*nb)[:head+m]
+			held = append(held, nb)
+		}
+
+		if len(held) > 0 {
+			atomic.AddUint64(&l.toWire, uint64(len(held)))
+			sender.send(held)
+			held = held[:0]
+		}
+
 		if err != nil {
 			select {
 			case <-l.closing:
