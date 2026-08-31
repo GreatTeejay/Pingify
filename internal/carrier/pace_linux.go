@@ -47,7 +47,7 @@ const (
 	soMaxPacingRate = 47
 
 	// See the table above smoothTheWire for how this was chosen.
-	flowLimit = "2000"
+	flowLimit = "600"
 )
 
 // egressInterface is the one the default route leaves by, read from the
@@ -126,11 +126,17 @@ func smoothTheWire(cfg *config.Config) {
 	//	       200        82.1            232.1          75.8
 	//
 	// Measured once at twenty thousand, with the cap still catching up: p50
-	// 302 ms and a tail at 1174. Two thousand costs nothing against it and
-	// cannot hold more than about fifty milliseconds. Below that the queue
-	// starts refusing work the link could have carried, and six hundred gives
-	// up a quarter of the throughput to save fourteen milliseconds - a trade
-	// worth offering and not worth assuming.
+	// 302 ms and a tail at 1174.
+	//
+	// Six hundred is chosen, and it is a deliberate trade. What it gives up is
+	// the ceiling on sixteen streams at once - 337 Mbit/s rather than 450 -
+	// and what it buys is fifteen milliseconds off the round trip whenever the
+	// link is busy, which is the half a person actually feels. A single stream
+	// does not pay for it at all: 247.7 against 240.7.
+	//
+	// Two hundred is where it stops being a trade and starts being a mistake:
+	// the queue refuses work the link could have carried and one stream falls
+	// to 75 Mbit/s.
 	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", flowLimit}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 		logging.Warn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
