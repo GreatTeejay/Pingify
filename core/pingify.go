@@ -257,23 +257,39 @@ func (c *Config) applyDefaults() {
 	if c.DialTimeout == 0 {
 		c.DialTimeout = 10
 	}
-	// Sixteen megabytes, and it is now a number that means something.
+	// The receive buffer is where a packet transport's delay lives, and it is
+	// deliberately not large.
 	//
-	// Until the socket buffers were asked for without the clamp, whatever was
+	// Until these were asked for without the kernel's clamp, whatever was
 	// written here was cut to net.core.rmem_max - 208 KiB on an ordinary
-	// server - and nothing said so. A raw socket that small drops packets in
-	// bursts and the tunnel never sees it happen: the kernel throws them away
-	// before any of this code is reached, and the TCP inside reads it as
-	// congestion and halves its window.
+	// server - and nothing said so. That was costing packets: a raw socket
+	// that small overflows in bursts, the kernel throws them away before any
+	// of this code is reached, and the TCP inside reads it as congestion.
 	//
-	// Measured with the clamp lifted, one stream over a 68 ms path: 4 MiB
-	// carried 318 Mbit/s across four streams, 16 MiB carried 379, and 64 MiB
-	// carried 379 as well. Sixteen is where it stops buying anything.
+	// Lifting the clamp fixed that and then went too far the other way. A
+	// buffer that never overflows does not stop queueing - it queues instead
+	// of dropping, and delay does not show up in a drop counter. Swept on a
+	// real 68 ms path with sixteen streams pushing, measuring the round trip
+	// across the link while they ran:
+	//
+	//	 1 MiB    p50  75 ms   p90  84 ms   323 Mbit/s
+	//	 2 MiB    p50  89 ms   p90 107 ms   406 Mbit/s
+	//	 4 MiB    p50 118 ms   p90 136 ms   433 Mbit/s
+	//	16 MiB    p50 133 ms   p90 165 ms   474 Mbit/s
+	//
+	// Every megabyte past two buys bytes with delay. Two is where a burst
+	// still has somewhere to go and a standing queue does not: it is a
+	// twentieth of a second of packets at this rate, which is under the round
+	// trip, so the sender inside learns about congestion from a drop rather
+	// than from a queue it cannot see.
+	//
+	// The send side is not the same problem - nothing waits behind it on this
+	// machine - so it keeps room for a burst.
 	if c.SndBufKB == 0 {
 		c.SndBufKB = 16384
 	}
 	if c.RcvBufKB == 0 {
-		c.RcvBufKB = 16384
+		c.RcvBufKB = 2048
 	}
 	c.Profile = strings.ToLower(strings.TrimSpace(c.Profile))
 	if c.Profile == "" {

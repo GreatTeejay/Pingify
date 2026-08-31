@@ -137,7 +137,7 @@ type icmpTransport struct {
 	// one over and goes straight back to the device; one sender takes
 	// whatever has arrived and puts it on the wire in a single crossing.
 	// See icmpsend_linux.go for why that is worth a queue.
-	outQ chan *[]byte
+	outQ chan outPkt
 
 	// Packets the sender could not take because it was behind.
 	sendDropped uint64
@@ -191,7 +191,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 		id:       icmpIDFor(cfg.key()),
 		dials:    cfg.Connect != "",
 		sendType: icmpEchoRequest,
-		outQ:     make(chan *[]byte, 512),
+		outQ:     make(chan outPkt, 512),
 		sessions: make(map[sessionKey]*arqConn),
 		// Deep enough that a listening end with a busy acceptor does not drop
 		// a carrier it wanted; the reader never waits on it either way.
@@ -427,7 +427,7 @@ func (t *icmpTransport) SendPacket(bp *[]byte) error {
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
 
 	select {
-	case t.outQ <- bp:
+	case t.outQ <- outPkt{bp: bp, at: time.Now().UnixNano()}:
 		return nil
 	default:
 		// The sender is behind, which on a link carrying IP means the wire is
@@ -467,6 +467,25 @@ func (t *icmpTransport) watchSendDrops() {
 
 // sendPacketLoop puts the private link's packets on the wire, as many per
 // crossing into the kernel as have arrived by the time it looks.
+// outPkt is one packet waiting for the wire, and when it started waiting.
+type outPkt struct {
+	bp *[]byte
+	at int64
+}
+
+// sendPacketLoop puts the private link's packets on the wire, as many per
+// crossing into the kernel as have arrived by the time it looks.
+//
+// A packet that has waited longer than it is worth is dropped rather than
+// sent. On a link carrying IP that is not damage: the TCP inside has already
+// counted it lost and sent another, so putting this one on the wire adds
+// delay for a copy nobody wants, and the drop is the congestion signal that
+// tells the sender to slow down - the signal a queue hides.
+//
+// Without it the queue is bounded only by its length, and length is not what
+// a user feels. Five hundred packets is fourteen milliseconds at four hundred
+// megabits and two hundred at twenty, and the same number cannot be right for
+// both. Time is the same at any rate.
 func (t *icmpTransport) sendPacketLoop() {
 	w := newICMPBatchWriter(t.pc)
 	held := make([]*[]byte, 0, icmpSendBatch)
@@ -481,24 +500,40 @@ func (t *icmpTransport) sendPacketLoop() {
 		bufs = bufs[:0]
 	}
 
+	// A deadline was tried here: drop a packet that has waited longer than
+	// tunMaxSojourn rather than send it, on the reasoning that the TCP inside
+	// has already given up on it. The reasoning holds and the number does not.
+	// At six milliseconds it dropped so much that throughput fell from 440
+	// Mbit/s to 158, then to 294, and the third run did not carry anything at
+	// all - a sender that is mid-syscall is not a sender that is behind, and
+	// six milliseconds cannot tell them apart. The queue is bounded by its
+	// length, which is what a queue that empties in one crossing needs.
+	take := func(o outPkt, _ int64) {
+		held = append(held, o.bp)
+	}
+
 	for {
-		var first *[]byte
+		var first outPkt
 		select {
 		case first = <-t.outQ:
 		case <-t.done:
 			return
 		}
-		held = append(held, first)
+		now := time.Now().UnixNano()
+		take(first, now)
 		// Whatever else is already waiting comes along for the same crossing.
 		// Nothing is waited for: a link with one packet on it sends one.
 	drain:
 		for len(held) < icmpSendBatch {
 			select {
-			case bp := <-t.outQ:
-				held = append(held, bp)
+			case o := <-t.outQ:
+				take(o, now)
 			default:
 				break drain
 			}
+		}
+		if len(held) == 0 {
+			continue
 		}
 		t.pktMu.Lock()
 		peer := t.pktTo
