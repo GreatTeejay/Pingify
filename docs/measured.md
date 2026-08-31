@@ -140,6 +140,36 @@ Connections *into* the Iran server are blackholed after about six exchanges.
 The side that owns the ports is not the side that dials. Settled; do not
 revisit.
 
+## 15. UDP into Iran stops after six packets
+
+Measured with no tunnel involved at all: a python socket on the Iran server
+sending to a python socket in Germany that echoes whatever it gets.
+
+	  udp/8444    6 of 30 back   111111........................
+	  udp/8445    6 of 15 back   111111.........
+	  udp/8446    6 of 15 back   111111.........
+	  udp/443     0 of 30 back   ..............................
+	  udp/53      0 of 30 back   ..............................
+
+Six. Every time, and only ever six: a fresh destination port gets six, a fresh
+source port gets six, waiting a minute and starting again gets six, and firing
+forty packets back to back with no pause gets six. It is a count, not a rate
+and not a timeout.
+
+The direction matters and was checked separately, from a capture on both ends
+at once: Germany received every packet Iran sent and answered every one of
+them. Iran received six of the answers. **Outbound from Iran is fine. Inbound
+to Iran is what stops.**
+
+This is the same shape as (14) and is probably the same device doing it. It
+means UDP is not a slow transport on this path, it is an unusable one - and it
+is why ICMP is the transport worth making good, not the fallback.
+
+The UDP carrier is still worth having. It is the same code an ICMP carrier
+needs, minus a raw socket, so it is the cheapest place to get the shape right;
+and this is one path, on one ISP, at one time. Somebody else's will carry UDP
+happily.
+
 ## 15. No encryption unless it is asked for
 
 Off by default. What is wanted from this tunnel is speed, ping and stability,
