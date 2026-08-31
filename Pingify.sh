@@ -10976,6 +10976,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -14074,12 +14075,39 @@ type packetCarrier interface {
 
 func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 	t := &tunnel{cfg: cfg, p: p, closed: make(chan struct{})}
-	n := cfg.Carriers
-	if n < 1 {
-		n = 1
+	// How many device queues, and so how many threads read the device.
+	//
+	// This used to be the carrier count, which has nothing to do with it. A
+	// carrier is a path across the wire; a queue is a thread competing for
+	// this machine's processors, and eight of them on a server with one
+	// processor do not read the device eight times faster - they take turns,
+	// and everything else on that processor takes its turn behind them.
+	//
+	// Measured on a one-processor server abroad, a single stream through an
+	// ICMP tunnel:
+	//
+	//	one queue      213 Mbit/s
+	//	two queues     270 Mbit/s, and the sender dropped nothing
+	//	four queues    262 Mbit/s, sender dropped 227 packets
+	//	eight queues   216 Mbit/s
+	//
+	// At eight the threads reading the device starved the one putting packets
+	// on the wire, its queue filled, and it threw away three thousand packets
+	// - which the TCP inside read as congestion and answered by halving its
+	// window. The machine was not short of work to do. It was short of turns.
+	//
+	// So the count follows the processors, with two as a floor because one
+	// queue cannot overlap a read with anything, and eight as a ceiling
+	// because past that the descriptors cost more than the parallelism pays.
+	n := runtime.GOMAXPROCS(0)
+	if n < 2 {
+		n = 2
 	}
 	if n > 8 {
-		n = 8 // more queues than this stops helping and costs descriptors
+		n = 8
+	}
+	if cfg.Carriers > 0 && n > cfg.Carriers {
+		n = cfg.Carriers
 	}
 	for i := 0; i < n; i++ {
 		f, err := openTUN(cfg.TUN.Name, n > 1)
