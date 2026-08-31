@@ -101,10 +101,27 @@ func smoothTheWire(cfg *config.Config) {
 		return
 	}
 
-	// flow_limit is the number of packets one flow may have waiting, and the
-	// default is a hundred - which is the size of the burst this is meant to
-	// smooth, so the default would drop exactly what we came to space out.
-	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", "20000"}
+	// flow_limit is how many packets one flow may have waiting, and both ends
+	// of the range are wrong. The default of a hundred is the size of the
+	// burst this exists to smooth, so it would drop exactly what we came to
+	// space out. Twenty thousand - which is what this asked for first - is a
+	// quarter of a second of queue at four hundred megabits, and it behaves
+	// like one: when the rate cap sits briefly under what is being offered,
+	// the queue fills and every packet behind it waits.
+	//
+	//	  flow_limit   ping under load   16 streams    one stream
+	//	     20000       102.8 ms         456.4         246.9 Mbit/s
+	//	      2000       104.5            449.9         240.7
+	//	       600        88.9            337.4         247.7
+	//	       200        82.1            232.1          75.8
+	//
+	// Measured once at twenty thousand, with the cap still catching up: p50
+	// 302 ms and a tail at 1174. Two thousand costs nothing against it and
+	// cannot hold more than about fifty milliseconds. Below that the queue
+	// starts refusing work the link could have carried, and six hundred gives
+	// up a quarter of the throughput to save fourteen milliseconds - a trade
+	// worth offering and not worth assuming.
+	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", "2000"}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 		logging.Warn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
 			" and the path will drop runs of them", dev, err, strings.TrimSpace(string(out)))
