@@ -7835,233 +7835,6 @@ func assign(c *Config, section, key, val string) error {
 	return err
 }
 PINGIFY_SRC_EOF
-    cat > "$d/datapath.go" <<'PINGIFY_SRC_EOF'
-package main
-
-import (
-	"os"
-	"sync"
-	"sync/atomic"
-	"time"
-)
-
-// ---------------------------------------------------------------------------
-// the private link's datapath
-//
-// This is the part that decides what the tunnel feels like. Everything else -
-// the handshake, the token, the wizard - happens once. This runs for every
-// packet, tens of thousands of times a second, and what it costs per packet is
-// what the link costs.
-//
-// It was rebuilt around one measurement. Profiled on a real server abroad
-// carrying this tunnel with the cipher out of the way, so nothing else could
-// be blamed:
-//
-//	9.85%  finish_task_switch
-//	8.64%  _raw_spin_unlock_irqrestore
-//	2.30%  do_syscall_64
-//
-// Nothing of ours was hot. No cipher, no hash, no parsing - the processor was
-// going into the kernel and coming back, and switching threads while it did.
-// The work was not the problem. Getting to the work was.
-//
-// So the shape here follows one rule: cross a boundary once for many packets,
-// never once per packet. There are three boundaries and each one is crossed in
-// batches now.
-//
-//	the socket        recvmmsg already read a batch; the batch is kept whole
-//	                  through the whole path instead of being taken apart at
-//	                  the first hop
-//
-//	the writers       a batch is handed to a device writer in one send, not
-//	                  one send per packet. At a hundred and twenty-eight
-//	                  packets a batch that is one wakeup instead of a hundred
-//	                  and twenty-eight
-//
-//	the device        one write per packet, which is all a TUN device offers -
-//	                  but the writes for a batch happen back to back on one
-//	                  thread that is already running, not on a thread that had
-//	                  to be woken for each
-//
-// Ordering survives all of it, and that is not incidental. A packet is placed
-// by its flow: every packet of a flow goes to the same writer, and a writer
-// writes what it is given in the order it was given. Different flows are
-// written at the same time by different threads. Order is a property of a
-// flow, not of a device, and this is the only place it has to be paid for.
-//
-// The alternative - one reader doing all the writing - keeps order too, and
-// was measured: it held the link to a third of what the pair could carry,
-// because every write into the kernel queued behind the one before it.
-// ---------------------------------------------------------------------------
-
-const (
-	// How many packets a device writer takes in one handover. Sized to the
-	// receive batch so a full socket read becomes one wakeup per writer.
-	deviceBatch = 128
-
-	// How many batches may be waiting for a writer before the path sheds.
-	// Short on purpose: a writer that is behind means the device is behind,
-	// and a queue in front of it only adds delay to packets that are already
-	// late. Dropping is what a router does and it is the signal the sender
-	// inside is waiting for.
-	deviceQueueDepth = 2
-)
-
-// pktBuf is one packet on its way to the device. The path owns it from the
-// moment it is filled to the moment it has been written.
-type pktBuf struct {
-	b []byte
-}
-
-var pktBufPool = sync.Pool{New: func() interface{} {
-	return &pktBuf{b: make([]byte, 0, 2048)}
-}}
-
-func getPktBuf(src []byte) *pktBuf {
-	p := pktBufPool.Get().(*pktBuf)
-	if cap(p.b) < len(src) {
-		p.b = make([]byte, len(src))
-	}
-	p.b = p.b[:len(src)]
-	copy(p.b, src)
-	return p
-}
-
-func putPktBuf(p *pktBuf) {
-	p.b = p.b[:0]
-	pktBufPool.Put(p)
-}
-
-// deviceWriter owns one device queue and writes what it is handed, in order.
-type deviceWriter struct {
-	q    *os.File
-	in   chan []*pktBuf
-	done <-chan struct{}
-
-	dropped uint64 // batches shed because this writer was behind
-}
-
-func (w *deviceWriter) run() {
-	for {
-		select {
-		case <-w.done:
-			return
-		case batch := <-w.in:
-			for _, p := range batch {
-				if _, err := w.q.Write(p.b); err != nil {
-					logDebug("tun write: %v", err)
-				}
-				putPktBuf(p)
-			}
-			batchPool.Put(batch[:0])
-		}
-	}
-}
-
-var batchPool = sync.Pool{New: func() interface{} {
-	return make([]*pktBuf, 0, deviceBatch)
-}}
-
-// deviceFan places packets on writers by flow and hands them over in batches.
-//
-// One of these belongs to the goroutine draining the socket, and only that
-// goroutine touches it, so it needs no lock of its own.
-type deviceFan struct {
-	writers []*deviceWriter
-	pending [][]*pktBuf // one accumulating batch per writer
-}
-
-func newDeviceFan(queues []*os.File, done <-chan struct{}) *deviceFan {
-	f := &deviceFan{
-		writers: make([]*deviceWriter, len(queues)),
-		pending: make([][]*pktBuf, len(queues)),
-	}
-	for i, q := range queues {
-		w := &deviceWriter{
-			q:    q,
-			in:   make(chan []*pktBuf, deviceQueueDepth),
-			done: done,
-		}
-		f.writers[i] = w
-		f.pending[i] = batchPool.Get().([]*pktBuf)
-		go w.run()
-	}
-	return f
-}
-
-// add takes one packet. The bytes are copied: they belong to the socket's
-// receive batch and will be overwritten as soon as this returns.
-func (f *deviceFan) add(pkt []byte) {
-	if len(f.writers) == 0 || len(pkt) == 0 {
-		return
-	}
-	i := int(flowHash(pkt) % uint32(len(f.writers)))
-	f.pending[i] = append(f.pending[i], getPktBuf(pkt))
-	if len(f.pending[i]) >= deviceBatch {
-		f.flushOne(i)
-	}
-}
-
-// flush hands over everything accumulated. Called once at the end of a socket
-// batch, so a batch of any size costs one wakeup per writer that has work.
-func (f *deviceFan) flush() {
-	for i := range f.pending {
-		if len(f.pending[i]) > 0 {
-			f.flushOne(i)
-		}
-	}
-}
-
-func (f *deviceFan) flushOne(i int) {
-	batch := f.pending[i]
-	w := f.writers[i]
-	select {
-	case w.in <- batch:
-	default:
-		// The writer is behind, which means the device is behind. Shed it.
-		for _, p := range batch {
-			putPktBuf(p)
-		}
-		atomic.AddUint64(&w.dropped, uint64(len(batch)))
-		batchPool.Put(batch[:0])
-	}
-	f.pending[i] = batchPool.Get().([]*pktBuf)
-}
-
-// shed reports how many packets every writer has had to drop, which is the
-// only honest measure of whether this side is keeping up.
-func (f *deviceFan) shed() uint64 {
-	var n uint64
-	for _, w := range f.writers {
-		n += atomic.LoadUint64(&w.dropped)
-	}
-	return n
-}
-
-// watchShedding says so when this side starts dropping, because a drop here
-// is indistinguishable from a drop on the path to everything above - the TCP
-// inside halves its window either way - and only this end knows which it was.
-func (f *deviceFan) watchShedding(done <-chan struct{}) {
-	t := time.NewTicker(15 * time.Second)
-	defer t.Stop()
-	var last uint64
-	for {
-		select {
-		case <-done:
-			return
-		case <-t.C:
-			n := f.shed()
-			if n == last {
-				continue
-			}
-			logWarn("the private link dropped %d packets writing to the device "+
-				"in the last 15s (%d in all) - this end is not keeping up, and "+
-				"the sender inside will read it as congestion", n-last, n)
-			last = n
-		}
-	}
-}
-PINGIFY_SRC_EOF
     cat > "$d/handshake_v2.go" <<'PINGIFY_SRC_EOF'
 package main
 
@@ -8337,11 +8110,6 @@ type icmpTransport struct {
 	// Packets the sender could not take because it was behind.
 	sendDropped uint64
 
-	// Called once after every socket read, so the layer above can hand a
-	// whole batch onward in one go. Installed after the readers are already
-	// running, which is why it is atomic.
-	batchEnd atomic.Value // func()
-
 	// What this end puts on the wire. What it accepts is either type - see
 	// the note at the top of this file.
 	sendType byte
@@ -8408,7 +8176,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	go t.sendPacketLoop()
 	go t.watchSendDrops()
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
-		t.handlePacket, t.runBatchEnd,
+		t.handlePacket,
 		func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
 		workers, batch, icmpMaxPayload)
@@ -8522,10 +8290,27 @@ func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 	// can be used in place. Copying every received packet here only fed the GC.
 	head := datagram[:min(len(datagram), arqOver)]
 	direct := false
-	if !t.validTag(body[:icmpTagLen], head) {
-		// Not a session datagram. It may still be a packet from the private
-		// link, which is tagged with a different key and has no session.
-		if t.packetHandler() == nil || !t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
+
+	// Which tag to try first is worth getting right, because the one that
+	// fails costs exactly as much as the one that succeeds - each is an
+	// HMAC over the header - and on a tunnel carrying a private link almost
+	// every packet is a private-link packet.
+	//
+	// The session tag used to be tried first, so every one of those paid for
+	// two hashes: one that could never match and one that did. On the server
+	// abroad the reader could not drain the socket fast enough because of it,
+	// and the kernel's receive buffer stood at seven to eight megabytes -
+	// a hundred and fifty milliseconds of packets waiting their turn, which
+	// is what a user feels as lag while something downloads.
+	//
+	// So when there is a private link, its tag is tried first. A carrier's
+	// datagram then pays for two hashes instead, and there are a handful of
+	// those a second against tens of thousands of the other.
+	h := t.packetHandler()
+	if h != nil && t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
+		direct = true
+	} else if !t.validTag(body[:icmpTagLen], head) {
+		if h == nil || !t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
 			return
 		}
 		direct = true
@@ -8564,16 +8349,6 @@ func (t *icmpTransport) rememberPeer(ip *net.IPAddr) {
 		t.pktTo = ip
 	}
 	t.pktMu.Unlock()
-}
-
-// SetBatchEnd installs what to run when a socket read is finished with. See
-// startPacketReaders.
-func (t *icmpTransport) SetBatchEnd(f func()) { t.batchEnd.Store(f) }
-
-func (t *icmpTransport) runBatchEnd() {
-	if f, ok := t.batchEnd.Load().(func()); ok && f != nil {
-		f()
-	}
 }
 
 // SetPacketHandler installs where a bare packet goes, and names the peer to
@@ -9802,15 +9577,8 @@ func packetReadTuning(profile string) (workers, batch int) {
 // stream delivered 6.3 Mbit/s. A reference tunnel on the same path, the same
 // minute, with one reader, reported no reordering at all and delivered 122.
 // One reader is not a compromise here: it is four times faster.
-//
-// endBatch, when it is not nil, is called once after every socket read,
-// whatever the read brought back. That is what lets the layer above hand a
-// whole batch onward in one go rather than a packet at a time - the thing the
-// profile said was costing more than the work itself. It is called from this
-// goroutine and from nowhere else, so what it touches needs no lock as long as
-// there is one reader, which ordered guarantees.
 func startPacketReaders(pc net.PacketConn, done <-chan struct{}, profile string,
-	ordered bool, maxPacket int, handle func([]byte, net.Addr), endBatch func(),
+	ordered bool, maxPacket int, handle func([]byte, net.Addr),
 	onError func(error)) (int, int) {
 	workers, batch := packetReadTuning(profile)
 	if ordered {
@@ -9818,16 +9586,16 @@ func startPacketReaders(pc net.PacketConn, done <-chan struct{}, profile string,
 	}
 	for i := 0; i < workers; i++ {
 		if batch > 1 {
-			go packetBatchReadLoop(pc, done, batch, maxPacket, handle, endBatch, onError)
+			go packetBatchReadLoop(pc, done, batch, maxPacket, handle, onError)
 		} else {
-			go packetSingleReadLoop(pc, done, maxPacket, handle, endBatch, onError)
+			go packetSingleReadLoop(pc, done, maxPacket, handle, onError)
 		}
 	}
 	return workers, batch
 }
 
 func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPacket int,
-	handle func([]byte, net.Addr), endBatch func(), onError func(error)) {
+	handle func([]byte, net.Addr), onError func(error)) {
 	p := ipv4.NewPacketConn(pc)
 	msgs := make([]ipv4.Message, batch)
 	bufs := make([][]byte, batch)
@@ -9851,9 +9619,6 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 				handle(bufs[i][:msgs[i].N], msgs[i].Addr)
 			}
 		}
-		if endBatch != nil {
-			endBatch()
-		}
 		if err == nil {
 			fails = 0
 			continue
@@ -9868,7 +9633,7 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 			if fails >= 3 {
 				logWarn("batched receive is not working on this socket (%v) - "+
 					"falling back to the plain reader", err)
-				packetSingleReadLoop(pc, done, maxPacket, handle, endBatch, onError)
+				packetSingleReadLoop(pc, done, maxPacket, handle, onError)
 				return
 			}
 		}
@@ -9877,15 +9642,12 @@ func packetBatchReadLoop(pc net.PacketConn, done <-chan struct{}, batch, maxPack
 }
 
 func packetSingleReadLoop(pc net.PacketConn, done <-chan struct{}, maxPacket int,
-	handle func([]byte, net.Addr), endBatch func(), onError func(error)) {
+	handle func([]byte, net.Addr), onError func(error)) {
 	buf := make([]byte, maxPacket)
 	for {
 		n, addr, err := pc.ReadFrom(buf)
 		if err == nil {
 			handle(buf[:n], addr)
-			if endBatch != nil {
-				endBatch()
-			}
 			continue
 		}
 		select {
@@ -14055,10 +13817,6 @@ type tunnel struct {
 	closed chan struct{}
 	once   sync.Once
 
-	// Where a received packet goes: placed by flow, handed over in batches.
-	// See datapath.go.
-	fan *deviceFan
-
 	// When the transport can carry a whole packet with no session under it,
 	// this is how the private link travels: one packet, one datagram, no
 	// reliability layer. See tunfast.go for why that is the right shape for
@@ -14126,8 +13884,6 @@ func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 	// One writer per device queue: the queues are what make parallel writes
 	// worth anything, and a writer with no queue of its own would only queue
 	// behind another.
-	t.fan = newDeviceFan(t.queues, t.closed)
-	go t.fan.watchShedding(t.closed)
 	t.startFast()
 	for i := range t.queues {
 		go t.readQueue(t.queues[i])
@@ -14261,16 +14017,6 @@ func (t *tunnel) startFast() {
 	t.fast = newTunFast(tx, rx, pc.SendPacket, t.toDevice)
 	pc.SetPacketHandler(t.fast.Deliver, peer)
 
-	// Hand the whole socket batch onward in one go. Without this the fan
-	// would hold packets until it happened to fill, which on a quiet link is
-	// never - so a transport that cannot say when a read is finished does not
-	// get a fan at all.
-	if be, ok := t.p.tr.(interface{ SetBatchEnd(func()) }); ok && t.fan != nil {
-		be.SetBatchEnd(t.fan.flush)
-	} else {
-		t.fan = nil
-	}
-
 	how := "encrypted"
 	if !t.cfg.encrypted() {
 		how = "in the clear"
@@ -14280,17 +14026,26 @@ func (t *tunnel) startFast() {
 }
 
 // toDevice writes one IP packet to the interface, whichever path brought it.
-// toDevice hands one packet to the device. The bytes belong to the socket's
-// receive batch and are copied on the way in; see deviceFan.
+// toDevice writes one received packet to the device.
+//
+// The reader that took it off the socket writes it, here, with nothing in
+// between. That is worth saying because it was not always so: a layer of
+// per-flow writers and batched handovers sat here for a while, on the
+// reasoning that one thread doing every write would serialise them.
+//
+// It did, and it was still faster. Measured once the kernel's receive buffer
+// was no longer being silently clamped - which was the real reason the reader
+// could not keep up - with sixteen streams pushing through the link:
+//
+//	               p50      p90      p99    throughput
+//	batched      160 ms   179 ms   561 ms   427 Mbit/s
+//	written here 113 ms   133 ms   146 ms   444 Mbit/s
+//
+// Better on every one of them. The handovers cost more in wakeups than the
+// writes cost in waiting, and the queue in front of them was one more place
+// for delay to hide. What made the batching look necessary was a bug
+// somewhere else.
 func (t *tunnel) toDevice(pkt []byte) {
-	if t.fan != nil {
-		t.fan.add(pkt)
-		return
-	}
-	t.writeDevice(pkt)
-}
-
-func (t *tunnel) writeDevice(pkt []byte) {
 	if len(t.queues) == 0 {
 		return
 	}
@@ -15711,9 +15466,6 @@ type udpTransport struct {
 	tagHash  sync.Pool
 	window   int
 
-	// Called once after every socket read - see startPacketReaders.
-	batchEnd atomic.Value // func()
-
 	// Whether this end dials. The end that dials never accepts, so an
 	// unknown session arriving there cannot be a carrier - see dispatch.
 	dials bool
@@ -15760,7 +15512,7 @@ func newUDPTransport(cfg *Config) (*udpTransport, error) {
 	t.tagHash.New = func() interface{} { return hmac.New(sha256.New, t.psk) }
 	tunePacketSocket(pc, cfg)
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), udpMaxPacket,
-		t.handlePacket, t.runBatchEnd, func(error) {
+		t.handlePacket, func(error) {
 			// A UDP socket can report a transient ICMP port-unreachable. Reading
 			// on is the correct response and per-packet logging is only noise.
 		})
@@ -15806,15 +15558,6 @@ func (t *udpTransport) validTagFor(label string, want, hdr []byte) bool {
 
 func (t *udpTransport) validTag(want, hdr []byte) bool {
 	return t.validTagFor(udpTagARQ, want, hdr)
-}
-
-// SetBatchEnd installs what to run when a socket read is finished with.
-func (t *udpTransport) SetBatchEnd(f func()) { t.batchEnd.Store(f) }
-
-func (t *udpTransport) runBatchEnd() {
-	if f, ok := t.batchEnd.Load().(func()); ok && f != nil {
-		f()
-	}
 }
 
 // SetPacketHandler installs where a bare packet goes, and names the peer to
