@@ -177,21 +177,22 @@ func (t *udpTransport) rememberPeer(a net.Addr) {
 }
 
 // SendPacket puts one whole packet on the wire, with no session under it.
-func (t *udpTransport) SendPacket(b []byte) error {
+// Headroom is the tag that goes in front of a private-link packet.
+func (t *udpTransport) Headroom() int { return udpTagLen }
+
+// SendPacket puts one whole packet on the wire, with no session under it.
+// The first Headroom() bytes are ours to fill and the rest is already built.
+func (t *udpTransport) SendPacket(bp *[]byte) error {
 	t.pktMu.Lock()
 	peer := t.pktTo
 	t.pktMu.Unlock()
-	if peer == nil {
+	body := *bp
+	if peer == nil || len(body) < udpTagLen {
+		tunBufs.Put(bp)
 		return errUDPNoPeer
 	}
-	bp := tunBufs.Get().(*[]byte)
-	need := udpTagLen + len(b)
-	if cap(*bp) < need {
-		*bp = make([]byte, 0, need)
-	}
-	body := (*bp)[:need]
-	t.putTagFor(udpTagDirect, body[:udpTagLen], b[:min(len(b), arqOver)])
-	copy(body[udpTagLen:], b)
+	payload := body[udpTagLen:]
+	t.putTagFor(udpTagDirect, body[:udpTagLen], payload[:min(len(payload), arqOver)])
 	_, err := t.pc.WriteTo(body, peer)
 	*bp = body[:0]
 	tunBufs.Put(bp)
@@ -423,7 +424,8 @@ func (c *udpCarrier) Accept() (net.Conn, error)      { return c.t.Accept() }
 
 // Forwarded for the same reason as the ICMP one: the pool holds this wrapper,
 // so anything asked of "the transport" has to be answerable here too.
-func (c *udpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *udpCarrier) Headroom() int               { return c.t.Headroom() }
+func (c *udpCarrier) SendPacket(bp *[]byte) error { return c.t.SendPacket(bp) }
 func (c *udpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
 	c.t.SetPacketHandler(h, peer)
 }

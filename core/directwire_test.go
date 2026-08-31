@@ -61,8 +61,12 @@ func TestBarePacketsAndSessionDatagramsShareASocket(t *testing.T) {
 	client.pktTo = server.pc.LocalAddr()
 	client.pktMu.Unlock()
 
+	// The transport fills its own header in front of the payload, so the
+	// buffer handed to it has that much room at the start.
 	pkt := []byte("an IP packet from the private link")
-	if err := client.SendPacket(pkt); err != nil {
+	buf := make([]byte, client.Headroom()+len(pkt))
+	copy(buf[client.Headroom():], pkt)
+	if err := client.SendPacket(&buf); err != nil {
 		t.Fatal(err)
 	}
 	select {

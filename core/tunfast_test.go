@@ -26,11 +26,12 @@ func fastPair(t *testing.T, encrypted bool) (*tunFast, *tunFast, *[][]byte, *[][
 		if !encrypted {
 			ta, ra = nil, nil
 		}
-		return newTunFast(ta, ra,
-			func(p []byte) error {
+		return newTunFast(ta, ra, 0,
+			func(bp *[]byte) error {
 				mu.Lock()
-				*wire = append(*wire, append([]byte(nil), p...))
+				*wire = append(*wire, append([]byte(nil), (*bp)...))
 				mu.Unlock()
+				tunBufs.Put(bp)
 				return nil
 			},
 			func(p []byte) {

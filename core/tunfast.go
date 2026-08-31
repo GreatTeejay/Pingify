@@ -4,6 +4,7 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"sync"
+	"sync/atomic"
 )
 
 // ---------------------------------------------------------------------------
@@ -68,11 +69,15 @@ type tunFast struct {
 	tx cipher.AEAD // nil when the tunnel is not encrypted
 	rx cipher.AEAD
 
-	send func([]byte) error
+	// send takes the buffer with it: the wire is written from another
+	// thread, so whoever finishes with it is the one that returns it.
+	send func(*[]byte) error
 	recv func([]byte)
 
-	mu      sync.Mutex
-	counter uint64
+	// How much room the transport needs in front of what we build.
+	headroom int
+
+	counter uint64 // atomic: one packet, one number, and no lock to take
 
 	// The replay window, one bit per counter in a ring. See fresh.
 	rmu    sync.Mutex
@@ -80,36 +85,35 @@ type tunFast struct {
 	newest uint64
 }
 
-func newTunFast(tx, rx cipher.AEAD, send func([]byte) error, recv func([]byte)) *tunFast {
-	return &tunFast{tx: tx, rx: rx, send: send, recv: recv}
+func newTunFast(tx, rx cipher.AEAD, headroom int, send func(*[]byte) error, recv func([]byte)) *tunFast {
+	return &tunFast{tx: tx, rx: rx, headroom: headroom, send: send, recv: recv}
 }
 
 // Send puts one IP packet on the wire. The buffer is not retained.
 func (f *tunFast) Send(pkt []byte) error {
-	f.mu.Lock()
-	f.counter++
-	n := f.counter
-	f.mu.Unlock()
+	n := atomic.AddUint64(&f.counter, 1)
 
 	var nonce [12]byte
 	binary.BigEndian.PutUint64(nonce[4:], n)
 
+	// One buffer, with the transport's header room left empty at the front.
+	// It used to be two: this one, and another inside the transport that the
+	// payload was copied into. At a thousand packets a millisecond that copy
+	// is real, and there was never a reason for it.
 	bp := tunBufs.Get().(*[]byte)
-	need := tunNonceLen + len(pkt) + 16
+	need := f.headroom + tunNonceLen + len(pkt) + 16
 	if cap(*bp) < need {
 		*bp = make([]byte, 0, need)
 	}
-	out := (*bp)[:tunNonceLen]
-	binary.BigEndian.PutUint64(out[:tunNonceLen], n)
+	out := (*bp)[:f.headroom+tunNonceLen]
+	binary.BigEndian.PutUint64(out[f.headroom:], n)
 	if f.tx == nil {
 		out = append(out, pkt...)
 	} else {
 		out = f.tx.Seal(out, nonce[:], pkt, nil)
 	}
-	err := f.send(out)
-	*bp = out[:0]
-	tunBufs.Put(bp)
-	return err
+	*bp = out
+	return f.send(bp)
 }
 
 // Deliver opens one datagram and hands the packet up. A datagram that does not

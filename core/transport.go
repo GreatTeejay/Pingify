@@ -131,7 +131,8 @@ func (c *icmpCarrier) Accept() (net.Conn, error) { return c.t.Accept() }
 // the check for "can this carry a bare packet" looked at the wrapper, found
 // nothing, and the direct path silently never turned on. Every test had
 // exercised the transport directly and so every test passed.
-func (c *icmpCarrier) SendPacket(b []byte) error { return c.t.SendPacket(b) }
+func (c *icmpCarrier) Headroom() int               { return c.t.Headroom() }
+func (c *icmpCarrier) SendPacket(bp *[]byte) error { return c.t.SendPacket(bp) }
 func (c *icmpCarrier) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
 	c.t.SetPacketHandler(h, peer)
 }

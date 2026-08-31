@@ -395,30 +395,36 @@ func (t *icmpTransport) SetPacketHandler(h func([]byte), peer *net.IPAddr) {
 }
 
 // SendPacket puts one whole packet on the wire, with no session under it.
-func (t *icmpTransport) SendPacket(b []byte) error {
+// Headroom is the ICMP header and the tag that follows it.
+func (t *icmpTransport) Headroom() int { return icmpHdrLen + icmpTagLen }
+
+// SendPacket puts one packet from the private link on the wire. The first
+// Headroom() bytes are ours to fill; the rest is already built, and is not
+// copied anywhere. The buffer comes with the packet and goes back to the pool
+// when the wire is done with it.
+func (t *icmpTransport) SendPacket(bp *[]byte) error {
 	t.pktMu.Lock()
 	peer := t.pktTo
 	t.pktMu.Unlock()
 	if peer == nil {
+		tunBufs.Put(bp)
 		return errICMPNoPeer
 	}
-	bp := tunBufs.Get().(*[]byte)
-	need := icmpHdrLen + icmpTagLen + len(b)
-	if cap(*bp) < need {
-		*bp = make([]byte, 0, need)
+	pkt := *bp
+	if len(pkt) < icmpHdrLen+icmpTagLen {
+		tunBufs.Put(bp)
+		return nil
 	}
-	pkt := (*bp)[:need]
 	for i := range pkt[:icmpHdrLen] {
 		pkt[i] = 0
 	}
 	pkt[0] = t.sendType
 	binary.BigEndian.PutUint16(pkt[4:6], t.id)
 	binary.BigEndian.PutUint16(pkt[6:8], uint16(atomic.AddUint32(&t.pktSeq, 1)))
-	tagged := pkt[icmpHdrLen:]
-	t.putTagFor(icmpTagDirect, tagged[:icmpTagLen], b[:min(len(b), arqOver)])
-	copy(tagged[icmpTagLen:], b)
+	body := pkt[icmpHdrLen+icmpTagLen:]
+	t.putTagFor(icmpTagDirect, pkt[icmpHdrLen:icmpHdrLen+icmpTagLen],
+		body[:min(len(body), arqOver)])
 	binary.BigEndian.PutUint16(pkt[2:4], icmpChecksum(pkt))
-	*bp = pkt
 
 	select {
 	case t.outQ <- bp:

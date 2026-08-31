@@ -3135,7 +3135,19 @@ type tunnel struct {
 // packetCarrier is a transport that can put one whole packet on the wire
 // without a session underneath it.
 type packetCarrier interface {
-	SendPacket([]byte) error
+	// Headroom is how many bytes the transport needs in front of the payload
+	// for its own header. The private link leaves that much room when it
+	// builds a packet, so the transport fills it in place instead of taking a
+	// second buffer and copying the payload into it - which is what it used
+	// to do, once per packet, for every packet.
+	Headroom() int
+
+	// SendPacket puts one packet on the wire. (*buf)[:Headroom()] belongs to
+	// the transport to fill; the rest is the payload, already built and not
+	// copied anywhere. The buffer goes with it: the wire may be written from
+	// another thread, so the transport is what returns it to the pool.
+	SendPacket(buf *[]byte) error
+
 	SetPacketHandler(func([]byte), *net.IPAddr)
 }
 
@@ -3322,7 +3334,7 @@ func (t *tunnel) startFast() {
 		}
 	}
 
-	t.fast = newTunFast(tx, rx, pc.SendPacket, t.toDevice)
+	t.fast = newTunFast(tx, rx, pc.Headroom(), pc.SendPacket, t.toDevice)
 	pc.SetPacketHandler(t.fast.Deliver, peer)
 
 	how := "encrypted"
