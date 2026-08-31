@@ -711,7 +711,15 @@ apply_preset balanced >/dev/null 2>&1
 # floor here is about the tail, not the ceiling.
 check "icmp balanced carries enough sessions" "$T_CARRIERS" "16"
 check "and even gaming has room to spare"       "$( T_TRANSPORT=icmp; apply_preset gaming >/dev/null 2>&1; echo "$T_CARRIERS" )" "8"
-check "icmp balanced has burst room" "$T_SNDBUF/$T_RCVBUF" "16384/16384"
+# The receive buffer is what trades delay for bytes on a packet transport, and
+# more of it is not better. Measured on a real Iran-Germany link with sixteen
+# streams pushing: 2 MiB gave a median round trip of 77 ms and 350 Mbit/s,
+# 3 MiB gave 82 ms and 415, 4 MiB gave 110 ms, and 16 MiB gave 133 ms for 474.
+# Three is the knee and it belongs to balanced. The send buffer is not this
+# knob - swept over the same range it changed neither figure - so it stays big.
+check "icmp balanced sits at the knee"  "$T_SNDBUF/$T_RCVBUF" "16384/3072"
+check "and gaming asks for less delay"       "$( T_TRANSPORT=icmp; apply_preset gaming >/dev/null 2>&1; echo "$T_RCVBUF" )" "1024"
+check "while extreme asks for bytes"       "$( T_TRANSPORT=icmp; apply_preset extreme >/dev/null 2>&1; echo "$T_RCVBUF" )" "16384"
 T_TRANSPORT="tcp"
 
 # ---------------------------------------------------------------------------
