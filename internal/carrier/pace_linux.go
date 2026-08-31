@@ -44,12 +44,7 @@ import (
 // A rate cap on top helps further but has to suit the path - 400 Mbit/s gave
 // 253.8 here where 200 throttled us to 181 - so it is offered and not assumed.
 // fq on its own needs no number and cannot be set too low.
-const (
-	soMaxPacingRate = 47
-
-	// See the table above smoothTheWire for how this was chosen.
-	flowLimit = "900"
-)
+const soMaxPacingRate = 47
 
 // egressInterface is the one the default route leaves by, read from the
 // kernel rather than guessed at from a name.
@@ -108,9 +103,6 @@ func smoothTheWire(cfg *config.Config) {
 		return
 	}
 	limit := strconv.Itoa(cfg.Tuning.QueuePkts)
-	if cfg.Tuning.QueuePkts == 0 {
-		limit = flowLimit
-	}
 	if strings.Contains(was, "qdisc fq ") && strings.Contains(was, "flow_limit "+limit+"p") {
 		logging.Info("%s already spaces packets the way this wants", dev)
 		return
@@ -156,8 +148,9 @@ func smoothTheWire(cfg *config.Config) {
 			" and the path will drop runs of them", dev, err, strings.TrimSpace(string(out)))
 		return
 	}
-	logging.Info("%s now spaces packets with fq, %s deep, so a burst leaves as a"+
-		" stream (this changes the queue for everything on %s)", dev, limit, dev)
+	logging.Info("%s now spaces packets with fq, %s packets deep (%s), so a burst"+
+		" leaves as a stream (this changes the queue for everything on %s)",
+		dev, limit, cfg.Tuning.Profile, dev)
 }
 
 // Choosing the rate without being told it.

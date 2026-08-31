@@ -71,10 +71,11 @@ type Config struct {
 	Tuning struct {
 		RcvBufKB  int
 		SndBufKB  int
-		SendBatch int  // packets per crossing into the kernel; 0 means choose
-		Pace      bool // put fq on the way out, so bursts leave as a stream
-		PaceMbit  int  // and cap the rate; unset means the tunnel works it out
-		QueuePkts int  // how deep that queue may get; 0 for the default
+		SendBatch int    // packets per crossing into the kernel; 0 means choose
+		Pace      bool   // put fq on the way out, so bursts leave as a stream
+		PaceMbit  int    // and cap the rate; unset means the tunnel works it out
+		Profile   string // gaming | balanced | download
+		QueuePkts int    // how deep that queue may get; the profile sets it
 
 		// Whether the file said anything, so a default can tell itself apart
 		// from a deliberate zero.
@@ -197,6 +198,8 @@ func assign(c *Config, table, key, raw string) error {
 	case "tuning.pace_mbit":
 		c.Tuning.PaceMbit, err = num()
 		c.Tuning.PaceMbitSet = true
+	case "tuning.profile":
+		c.Tuning.Profile, err = str()
 	case "tuning.queue_packets":
 		c.Tuning.QueuePkts, err = num()
 
@@ -218,6 +221,69 @@ func assign(c *Config, table, key, raw string) error {
 		return fmt.Errorf("unknown setting %q", table+"."+key)
 	}
 	return err
+}
+
+// The profiles, and the one number they move.
+//
+// Everything else this tunnel tunes was measured to have one right answer
+// whatever it is carrying - the socket buffers, one packet per crossing into
+// the kernel, a pacing rate it works out for itself - so a profile that
+// changed those would be changing them for show.
+//
+// What genuinely trades is how deep a queue the kernel may hold for us. A deep
+// one absorbs bursts and carries more; a shallow one is emptier when a small
+// packet arrives, so that packet waits less. Measured on the real path,
+// restarted fresh at each depth:
+//
+//	profile     queue    16 streams   one stream   under load
+//	gaming        600     327 Mbit/s   193 Mbit/s   84.6 / 91.5 ms
+//	balanced      900     476          246          99.8 / 116.3
+//	download     1500     452          254         111.6 / 127.3
+//
+// Gaming gives up a third of the throughput for fifteen milliseconds, which is
+// the right trade when what is crossing the link is a game and the wrong one
+// when it is a film. Download buys eight megabits on a single stream for
+// twelve milliseconds. Balanced is not a compromise between the other two -
+// it carries more than either, and it is where the two stop fighting.
+const (
+	ProfileGaming   = "gaming"
+	ProfileBalanced = "balanced"
+	ProfileDownload = "download"
+)
+
+func (c *Config) profile() error {
+	depth := 0
+	switch strings.ToLower(strings.TrimSpace(c.Tuning.Profile)) {
+	case "":
+		c.Tuning.Profile = ProfileBalanced
+		depth = 900
+	case ProfileGaming:
+		depth = 600
+	case ProfileBalanced:
+		depth = 900
+	case ProfileDownload:
+		depth = 1500
+	default:
+		return fmt.Errorf("tuning.profile %q: it is %q, %q or %q",
+			c.Tuning.Profile, ProfileGaming, ProfileBalanced, ProfileDownload)
+	}
+
+	// An explicit depth wins. The profiles are three points on a line, and
+	// somebody measuring their own path may want a fourth.
+	if c.Tuning.QueuePkts == 0 {
+		c.Tuning.QueuePkts = depth
+		return nil
+	}
+	if c.Tuning.QueuePkts < 200 {
+		return fmt.Errorf("tuning.queue_packets %d: below two hundred the queue stops"+
+			" smoothing bursts and starts refusing work the link could have carried"+
+			" - one stream fell to 75 Mbit/s", c.Tuning.QueuePkts)
+	}
+	if c.Tuning.QueuePkts > 20000 {
+		return fmt.Errorf("tuning.queue_packets %d: that is a quarter of a second of"+
+			" queue and it behaves like one", c.Tuning.QueuePkts)
+	}
+	return nil
 }
 
 func boolean(raw string) (bool, error) {
@@ -323,9 +389,8 @@ func (c *Config) check() error {
 	if !c.Tuning.PaceSet {
 		c.Tuning.Pace = true
 	}
-	if c.Tuning.QueuePkts < 0 || (c.Tuning.QueuePkts > 0 && c.Tuning.QueuePkts < 200) {
-		return fmt.Errorf("tuning.queue_packets %d: below two hundred the queue"+
-			" refuses work the link could have carried", c.Tuning.QueuePkts)
+	if err := c.profile(); err != nil {
+		return err
 	}
 	if c.Tuning.PaceMbit < 0 {
 		return fmt.Errorf("tuning.pace_mbit %d is not a rate", c.Tuning.PaceMbit)
