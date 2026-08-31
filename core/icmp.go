@@ -115,6 +115,8 @@ func newICMPCarrier(cfg *Config) (*icmpCarrier, error) {
 
 	silenceKernelPings()
 	tuneSocket(pc, cfg)
+	smoothTheWire(cfg)
+	pace(pc, cfg, c.done, func() uint64 { return atomic.LoadUint64(&c.txBytes) })
 
 	// The kernel can sort our echoes from everybody else's for nothing, before
 	// a packet is queued or a goroutine woken. Without it, every monitoring

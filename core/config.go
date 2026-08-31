@@ -67,7 +67,12 @@ type Config struct {
 	Tuning struct {
 		RcvBufKB  int
 		SndBufKB  int
-		SendBatch int // packets per crossing into the kernel; 0 means choose
+		SendBatch int  // packets per crossing into the kernel; 0 means choose
+		Pace      bool // put fq on the way out, so bursts leave as a stream
+		PaceMbit  int  // and cap the rate; unset means half the link speed
+
+		paceSet     bool
+		paceMbitSet bool
 	}
 
 	TUN struct {
@@ -179,6 +184,12 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.SndBufKB, err = num()
 	case "tuning.send_batch":
 		c.Tuning.SendBatch, err = num()
+	case "tuning.pace":
+		c.Tuning.Pace, err = boolean(raw)
+		c.Tuning.paceSet = true
+	case "tuning.pace_mbit":
+		c.Tuning.PaceMbit, err = num()
+		c.Tuning.paceMbitSet = true
 
 	case "tun.name":
 		c.TUN.Name, err = str()
@@ -198,6 +209,16 @@ func assign(c *Config, table, key, raw string) error {
 		return fmt.Errorf("unknown setting %q", table+"."+key)
 	}
 	return err
+}
+
+func boolean(raw string) (bool, error) {
+	switch strings.ToLower(strings.Trim(raw, `"' `)) {
+	case "true", "yes", "on", "1":
+		return true, nil
+	case "false", "no", "off", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("%q is not true or false", raw)
 }
 
 func stripComment(s string) string {
@@ -290,6 +311,14 @@ func (c *Config) check() error {
 	}
 	if c.Tuning.SendBatch == 0 {
 		c.Tuning.SendBatch = defaultSendBatch
+	}
+	// On by default. It is a change to the whole interface, so it is logged
+	// where anyone can see it, and one line of config turns it off.
+	if !c.Tuning.paceSet {
+		c.Tuning.Pace = true
+	}
+	if c.Tuning.PaceMbit < 0 {
+		return fmt.Errorf("tuning.pace_mbit %d is not a rate", c.Tuning.PaceMbit)
 	}
 	if c.Tuning.SendBatch < 1 || c.Tuning.SendBatch > sendBatch {
 		return fmt.Errorf("tuning.send_batch %d is outside 1..%d", c.Tuning.SendBatch, sendBatch)

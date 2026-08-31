@@ -74,6 +74,8 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 		c.pc = pc
 		c.peer.Store(raddr)
 		tuneSocket(pc, cfg)
+		smoothTheWire(cfg)
+		pace(pc, cfg, c.done, func() uint64 { return atomic.LoadUint64(&c.txBytes) })
 		logInfo("carrier: dialling %s over udp", raddr)
 		return c, nil
 	}
@@ -84,6 +86,8 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 	}
 	c.pc = pc
 	tuneSocket(pc, cfg)
+	smoothTheWire(cfg)
+	pace(pc, cfg, c.done, func() uint64 { return atomic.LoadUint64(&c.txBytes) })
 	logInfo("carrier: waiting on udp/%d", cfg.Transport.Port)
 	return c, nil
 }
