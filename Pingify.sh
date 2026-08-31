@@ -501,12 +501,17 @@ trap 'ui_detect' WINCH
 # which meant a second administrator could not find it, backups that skip /root
 # skipped the tunnel, and the configs sat beside the operator's ssh keys.
 
-PINGIFY_BIN=/usr/local/bin/pingify
-CORE_BIN=/usr/local/bin/pingify-core
+# Every path takes its value from the environment if there is one. Not for
+# flexibility - nobody moves these - but so that a test can point the whole
+# script at a temporary directory and be certain it cannot touch the machine
+# it is running on. Two of the five already did, which meant a test could
+# redirect the configs and then have the real core binary invoked on them.
+PINGIFY_BIN=${PINGIFY_BIN:-/usr/local/bin/pingify}
+CORE_BIN=${PINGIFY_CORE_BIN:-/usr/local/bin/pingify-core}
 CFG_DIR=${PINGIFY_CFG_DIR:-/etc/pingify}
 STATE_DIR=${PINGIFY_STATE_DIR:-/var/lib/pingify}
 SRC_DIR=${PINGIFY_SRC_DIR:-/usr/local/src/pingify}
-UNIT_DIR=/etc/systemd/system
+UNIT_DIR=${PINGIFY_UNIT_DIR:-/etc/systemd/system}
 
 # The status endpoint listens on the loopback address. One port per tunnel,
 # from a base, so two tunnels on one server do not collide.
@@ -4602,20 +4607,26 @@ v_wiz_port() {
     # local listener on the same number there is not a conflict, and refusing
     # it would be a refusal with no action behind it.
     if [ "$T_SIDE" = kharej ] && wiz_port_bound "$1"; then
-        echo "something here already listens on udp/$1 - check with: ss -lnup | grep :$1"
+        echo "udp/$1 is in use here; see: ss -lnup | grep :$1"
         return 1
     fi
     return 0
 }
 
-# The token goes into a TOML basic string with no escaping, and the core's
-# parser toggles on every quote character, so a quote in the token truncates
-# the value silently. Nothing else in a token needs refusing: # and \ and
-# spaces all survive the round trip, and a test pins that.
+# Two characters are refused, and both were found by writing one and reading it
+# back. A double quote ends the TOML string early, because the core's parser
+# toggles on every quote it sees. A hash is worse, because it round trips
+# through the core perfectly and is truncated by toml_get, which strips from a
+# hash without caring whether it is inside a string - so the tunnel works and
+# the fingerprint on the review panel is a different token's. Backslashes,
+# pipes and spaces all survive both readers and are allowed.
 v_wiz_token() {
     v_token "$1" || return 1
     case $1 in
-    *'"'*) echo 'a double quote cannot go in the config file - pick another character'; return 1 ;;
+    *'"'* | *'#'*)
+        echo 'no " or # in a token - the config file cannot carry them intact'
+        return 1
+        ;;
     esac
     return 0
 }
@@ -4702,7 +4713,8 @@ q_port() {
     fi
     rule "4 - Port"
     blank
-    dim "KHAREJ waits on this port; IRAN dials it. The same number on both."
+    dim "KHAREJ waits on this port and IRAN dials it. The same"
+    dim "number goes on both servers."
     blank
     for n in $(cfg_list); do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
@@ -4724,7 +4736,7 @@ q_link() {
     local def n a dev addr
     rule "5 - The private link"
     blank
-    dim "Two addresses only this tunnel uses. Pick the middle number."
+    dim "Two addresses nothing else uses. Pick the middle number."
     blank
     for n in $(cfg_list); do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
@@ -4738,8 +4750,8 @@ q_link() {
 
     def=$(free_octet) || def=
     if [ -z "$def" ]; then
-        warn "every 10.x.10.0/24 is inside an address already on this host"
-        fix "ip -4 -o addr   shows what has them; free one and start again"
+        warn "every 10.x.10.0/24 is inside an address on this host"
+        fix "ip -4 -o addr   shows what has them"
     fi
     ask T_OCTET "range  10.x.10.0/24  -  x" "$def" v_wiz_octet || return 1
 
@@ -4768,8 +4780,8 @@ q_profile() {
     row "$G_CUR 2  Balanced" "448" "254" "93.3 / 106.5"
     row "  3  Download" "466" "253" "115.8 / 139.3"
     blank
-    dim "Balanced is not the middle: it carries a single stream faster"
-    dim "than either of the others. Idle ping is 81 ms whichever you pick."
+    dim "Balanced is not the middle of the three: it carries one"
+    dim "stream faster than either. Idle ping is 81 ms for all."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -4926,7 +4938,7 @@ tunnel_create() {
     [ -e "$f" ] && { bad "there is already a tunnel called $name here"; return 1; }
     if [ ! -x "$CORE_BIN" ]; then
         bad "the core is not installed at $CORE_BIN"
-        fix "install or update Pingify first; the wizard has changed nothing"
+        fix "install Pingify first - nothing has been changed"
         return 1
     fi
 
@@ -4945,12 +4957,14 @@ tunnel_create() {
     fi
 
     if ! out=$("$CORE_BIN" -c "$f" -check 2>&1); then
-        bad "the core will not accept that config, so nothing was created:"
+        bad "the core will not accept that config - nothing created"
         printf '%s\n' "$out" | sed 's/^/       /'
         rm -f "$f"
         return 1
     fi
-    ok "$f written, and the core accepts it"
+    # Cut to fit rather than run over the edge: a long tunnel name makes a long
+    # path, and this is the one line in the wizard that carries one.
+    ok "$(trunc_to "$f" $((UI_W - 30))) accepted by the core"
 
     # A repair, not a rewrite: the units are written once at install, and doing
     # it per tunnel is how the old script came to rewrite four units whenever
@@ -5068,20 +5082,20 @@ wizard_new() {
 wiz_handoff() {
     local name=$1 other=$2 line
     if ! line=$(token_encode "$(cfg_file "$name")"); then
-        bad "the config is written, but the token for $other could not be made"
-        fix "copy $(cfg_file "$name") across by hand and change side to the other one"
+        bad "the config is written, but the token could not be made"
+        fix "copy the file to $other by hand and change side there"
         return 1
     fi
     blank
     rule "Now the other server"
     blank
-    dim "Run Pingify on $other, choose \"Finish the pair\", and paste:"
+    dim "Run Pingify on $other, pick \"Finish the pair\", and paste:"
     blank
     # Printed flush left with nothing around it, so a double click or a triple
     # click selects the token and only the token.
     say "$line"
     blank
-    warn "treat that like a password - the security token is inside it"
+    warn "treat that like a password: the token is inside it"
     blank
     return 0
 }
@@ -5096,8 +5110,8 @@ wizard_paste() {
     blank
     rule "Finish the pair"
     blank
-    dim "Paste the line the first server printed. It carries the whole"
-    dim "config, so there is nothing left to answer."
+    dim "Paste the line the first server printed. It carries"
+    dim "the whole config, so there is nothing left to answer."
     blank
     ask line "paste the line from the other server" "" v_wiz_paste || return 1
 
@@ -5107,7 +5121,7 @@ wizard_paste() {
     if ! err=$(token_decode "$line" 2>&1 >"$f"); then
         blank
         bad "$err"
-        fix "copy the line again from the first server, all of it, in one go"
+        fix "copy the whole line again from the first server"
         rm -f "$f"
         return 1
     fi
@@ -5133,7 +5147,7 @@ wizard_paste() {
         ! v_octet "$T_OCTET" >/dev/null 2>&1 ||
         [ -z "$T_DEV" ] || [ -z "$T_TRANSPORT" ]; then
         bad "that token decoded, but it is not a Pingify config"
-        fix "paste the line from the Pingify screen on the other server"
+        fix "paste the line the other server printed"
         rm -f "$f"
         return 1
     fi
@@ -5153,27 +5167,27 @@ wizard_paste() {
     clash=0
     if [ -e "$(cfg_file "$T_NAME")" ]; then
         bad "there is already a tunnel called $T_NAME here"
-        fix "delete it first, or build the pair again with a different octet"
+        fix "delete that one first, or use a different octet"
         clash=1
     fi
     if own=$(wiz_link_owner "$T_OCTET"); then
         bad "10.$T_OCTET.10.0/24 is in use here by $own"
-        fix "change the range on the other server as well, and paste again"
+        fix "change the range on both servers, and paste again"
         clash=1
     fi
     if own=$(wiz_device_owner "$T_DEV"); then
         bad "the device $T_DEV is in use here by $own"
-        fix "the device name is in the shared file, so it has to change on both"
+        fix "the device is in the shared file - change both"
         clash=1
     fi
     if [ "$T_SIDE" = kharej ] && [ "$T_TRANSPORT" != icmp ]; then
         if own=$(wiz_port_owner "$T_PORT"); then
             bad "port $T_PORT already belongs to $own"
-            fix "change the port on the other server as well, and paste again"
+            fix "change the port on both servers, and paste again"
             clash=1
         elif wiz_port_bound "$T_PORT"; then
             bad "something here already listens on udp/$T_PORT"
-            fix "ss -lnup | grep :$T_PORT   shows what; free it, or change the port on both"
+            fix "ss -lnup | grep :$T_PORT   shows what has it"
             clash=1
         fi
     fi
@@ -5191,8 +5205,8 @@ wizard_paste() {
     port=$(wiz_free_status_port)
     for n in $(cfg_list); do
         [ "$(toml_get "$(cfg_file "$n")" status port)" = "$T_STATUS" ] || continue
-        warn "status port $T_STATUS is already used here by $n, so this file uses $port"
-        dim "the two files now differ in that line as well as in side"
+        warn "status port $T_STATUS is taken here by $n"
+        dim "this file uses $port, so the two differ there too"
         T_STATUS=
         break
     done
@@ -5211,7 +5225,7 @@ wizard_paste() {
     rm -f "$f"
     blank
     ok "both ends are configured now - nothing else to paste"
-    dim "give it a few seconds, then look at $T_NAME on the main screen"
+    dim "give it a few seconds and look at it on the home screen"
     blank
     return 0
 }
@@ -5231,8 +5245,8 @@ wizard_menu() {
     blank
     rule "New tunnel"
     blank
-    item2 "1" "Build a new tunnel" "six questions here"
-    item2 "2" "Finish the pair" "one paste from the other server"
+    item2 "1" "Build a new tunnel" "six questions"
+    item2 "2" "Finish the pair" "one paste"
     item "0" "Back"
     blank
     menu_key k || return 0
@@ -6203,10 +6217,9 @@ screen_ports_set() {
 # collecting a verdict
 # --------------------------------------------------------------------------
 #
-# health_check runs one pass and buffers the result rather than printing as it
-# goes, so the text screen and --json are the same pass rendered twice. Two
-# passes would eventually disagree with each other, and the one a script reads
-# is the one nobody looks at.
+# health_check buffers its result rather than printing as it goes, so the text
+# screen and --json are one pass rendered twice. Two passes would eventually
+# disagree, and the one a script reads is the one nobody looks at.
 
 CHK_STATE=() CHK_ID=() CHK_TEXT=() CHK_FIX=()
 CHK_NBAD=0 CHK_NWARN=0
@@ -6331,9 +6344,9 @@ chk_json() {
 # reading a tunnel's own idea of itself
 # --------------------------------------------------------------------------
 #
-# Eight values every screen in this part needs, read once into CK_* globals.
-# Reading them per screen meant eight awk passes over the same file and, in the
-# old script, two of the readers disagreed about which side we were on.
+# Eight values every screen here needs, read once into CK_* globals. Reading
+# them per screen meant eight awk passes over one file and, in the old script,
+# two of the readers disagreed about which side we were on.
 
 chk_load() {
     local name=$1
@@ -6399,12 +6412,10 @@ chk_forward_spec() {
 # --------------------------------------------------------------------------
 #
 # One pass, in the order things fail. A check whose evidence is missing says so
-# in grey and does not guess: if the core is not installed there is no verdict
-# to give about whether it accepts the config, and printing one anyway is how a
-# health report comes to be ignored.
-#
-# Exit 0 clean, 1 warnings, 2 problems - so `pingify --check NAME` is usable
-# from cron. The old one ended in `pause` and returned nothing.
+# in grey and does not guess: with no core installed there is no verdict to
+# give about whether it accepts the config, and giving one anyway is how a
+# health report comes to be ignored. Exit 0 clean, 1 warnings, 2 problems, so
+# `pingify --check NAME` is usable from cron; the old one ended in `pause`.
 
 health_check() {
     local name=$1 mode=${2:-}
@@ -6506,9 +6517,9 @@ health_check() {
         fi
     fi
 
-    # 5. has the far end ever been heard from. This is the field that matters
-    # most and the one nothing else stands in for: the link can be up, the
-    # config right and the service running with no packet ever having arrived.
+    # 5. has the far end ever been heard from. Nothing else stands in for it:
+    # the link can be up, the config right and the service running with no
+    # packet from over there having ever arrived.
     if tun_stats "$name"; then
         case $ST_UP in
         true | 1 | yes)
@@ -6543,10 +6554,9 @@ health_check() {
         fi
     fi
 
-    # 6. loss, expressed as a rate. There is no denominator in the report - the
-    # core counts what it missed, not what it should have had - so this is
-    # losses per minute since the tunnel started, and it is not called a
-    # percentage, because it is not one.
+    # 6. loss, as a rate. There is no denominator in the report - the core
+    # counts what it missed, not what it should have had - so this is losses
+    # per minute since it started, and it is not called a percentage.
     if [ "$ST_UP" = true ] && [ -n "$ST_UPTIME" ]; then
         lpm=$(awk -v l="${ST_LOST:-0}" -v s="$ST_UPTIME" \
             'BEGIN { if (s + 0 < 30) print "early"; else printf "%.1f", l * 60 / s }')
@@ -6623,9 +6633,8 @@ health_check() {
 }
 
 # chk_finish picks the renderer. One place, so an early return in health_check
-# cannot forget the --json case - which is exactly what an early return in the
-# old health check did, printing a screen at a caller that wanted a machine to
-# read it.
+# cannot forget the --json case and print a screen at a caller that wanted
+# something a machine could read.
 chk_finish() {
     if [ "$2" = --json ]; then
         chk_json "$1"
@@ -6707,9 +6716,9 @@ screen_live() {
         last_rx=$rxp last_tx=$txp
 
         # One ping per frame, bound to the tun. On an ICMP tunnel there is
-        # nothing to ping, so that row becomes the grey explanation instead and
-        # the block keeps its height. The ping and the status read together add
-        # about a tenth of a second, so a frame is about a second, not exactly.
+        # nothing to ping, so that row becomes the grey explanation and the
+        # block keeps its height. The ping and the status read add about a
+        # tenth of a second, so a frame is about a second, not exactly.
         rtt=
         if [ "$CK_TRANSPORT" != icmp ]; then
             rtt=$(link_rtt "$CK_DEV" "$CK_PEER") || rtt=
@@ -6745,10 +6754,9 @@ screen_live() {
     return 0
 }
 
-# live_frame prints the block once, from the CK_* that screen_live loaded. It
-# is a separate function so the non-interactive path and the loop draw exactly
-# the same thing, and so the height of the block is a property of one function
-# rather than of the loop that has to count it.
+# live_frame prints the block once, from the CK_* screen_live loaded. Separate,
+# so the non-interactive path and the loop draw the same thing and the height
+# of the block is a property of one function rather than of the loop.
 live_frame() {
     local name=$1 spark=$2 rtt=$3 din=${4:-} dout=${5:-} state=unknown
     local carrying losses packets
@@ -6760,7 +6768,8 @@ live_frame() {
     fi
 
     carrying="$(round1 "$ST_IN") Mbit/s in, $(round1 "$ST_OUT") out"
-    losses="${ST_LOST:-0} lost, ${ST_LATE:-0} late, ${ST_GAPS:-0} gaps"
+    losses="${ST_LOST:-0} lost, ${ST_LATE:-0} late, ${ST_GAPS:-0}"
+    losses="$losses gap$(plural_s "${ST_GAPS:-0}")"
     if [ -n "$din" ]; then
         packets="$din in, $dout out in the last second"
     else
@@ -6788,11 +6797,10 @@ live_frame() {
 #
 # A binary search for the largest packet that crosses the private link intact.
 # `ping -M do` sets don't-fragment, so a packet too big for the carrier path is
-# dropped rather than quietly cut in half, and the search finds the boundary.
-#
-# The search is bounded above by the device's own mtu: the kernel refuses to
-# send a don't-fragment packet larger than the interface. So what this measures
-# is whether the configured mtu is honest, and when it is not, what is.
+# dropped rather than quietly cut in half and the search finds the boundary.
+# The device's own mtu is the ceiling - the kernel will not send a bigger
+# don't-fragment packet - so this measures whether the configured mtu is
+# honest, and when it is not, what is.
 
 MTU_WANT=
 
@@ -6821,8 +6829,10 @@ measure_mtu() {
         dim "big, and the search sets the floor on no evidence."
         blank
         say "  Use a number instead of a measurement:"
-        field "1320" "the default; room for the outer headers on a 1500 path"
-        field "1280" "what survives PPPoE, mobile, and double tunnelling"
+        # Short enough to survive field's cut at UI_W-20 on a 60-column
+        # terminal: a truncated explanation explains nothing.
+        field "1320" "the default, and right on a 1500 path"
+        field "1280" "survives PPPoE, mobile, double tunnels"
         blank
         if [ "$CK_MTU" != 1280 ] && confirm "set the mtu to 1280?" n; then
             MTU_WANT=1280
