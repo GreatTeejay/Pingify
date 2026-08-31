@@ -202,9 +202,14 @@ func flowHash(p []byte) uint32 {
 // say. See the note on reordering in readQueue for why more is not better.
 func defaultQueues() int { return 1 }
 
-// Dropped is how many packets the link could not put on the wire. It is the
-// one number above that main has any business seeing.
+// Dropped is how many packets the link could not put on the wire, and Packets
+// is how many crossed it each way. The three of them are what a report is made
+// of; nothing else above needs to see inside.
 func (l *Link) Dropped() uint64 { return atomic.LoadUint64(&l.dropped) }
+
+func (l *Link) Packets() (toWire, toDevice uint64) {
+	return atomic.LoadUint64(&l.toWire), atomic.LoadUint64(&l.toDevice)
+}
 
 func (l *Link) closeDevices() {
 	for _, f := range l.dev {

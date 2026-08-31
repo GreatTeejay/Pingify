@@ -92,6 +92,10 @@ type Config struct {
 	}
 
 	Level string
+
+	// Where to answer questions about itself. Loopback only, and zero turns
+	// it off.
+	StatusPort int
 }
 
 // Dials reports whether this side is the one that opens the connection.
@@ -216,6 +220,9 @@ func assign(c *Config, table, key, raw string) error {
 
 	case "logging.level":
 		c.Level, err = str()
+
+	case "status.port":
+		c.StatusPort, err = num()
 
 	default:
 		return fmt.Errorf("unknown setting %q", table+"."+key)
@@ -379,6 +386,9 @@ func (c *Config) check() error {
 	}
 	if c.Name == "" {
 		c.Name = "pingify"
+	}
+	if c.StatusPort < 0 || c.StatusPort > 65535 {
+		return fmt.Errorf("status.port %d is not a port", c.StatusPort)
 	}
 	// Measured on the real path, sweeping the receive buffer against latency
 	// and throughput: below about two megabytes the kernel drops packets the

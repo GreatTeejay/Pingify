@@ -12,6 +12,7 @@ import (
 	"pingify/internal/config"
 	"pingify/internal/link"
 	"pingify/internal/logging"
+	"pingify/internal/status"
 )
 
 // Pingify, the core.
@@ -52,11 +53,28 @@ func main() {
 		cfgPath = flag.String("c", "", "path to the config file")
 		check   = flag.Bool("check", false, "read the config, say whether it is good, and stop")
 		showVer = flag.Bool("version", false, "print the version and stop")
+		ask     = flag.String("status", "", "ask a running tunnel how it is (host:port or just a port) and stop")
+		healthz = flag.String("healthz", "", "exit 0 only if the tunnel at this address is up")
 	)
 	flag.Parse()
 
 	if *showVer {
 		fmt.Println("pingify-core " + version)
+		return
+	}
+	if *healthz != "" {
+		r, err := status.Fetch(*healthz)
+		if err != nil || !r.Up {
+			os.Exit(1)
+		}
+		return
+	}
+	if *ask != "" {
+		r, err := status.Fetch(*ask)
+		if err != nil {
+			logging.Die("could not ask the tunnel at %s: %v", *ask, err)
+		}
+		status.Print(r)
 		return
 	}
 	if *cfgPath == "" {
@@ -94,6 +112,7 @@ func main() {
 		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
 	}
 	go reportEvery(30*time.Second, car, l)
+	go status.New(cfg, version, car, l).Serve(cfg.StatusPort)
 
 	logging.Info("running")
 
