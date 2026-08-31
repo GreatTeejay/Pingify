@@ -231,7 +231,7 @@ v_wiz_port() {
     # local listener on the same number there is not a conflict, and refusing
     # it would be a refusal with no action behind it.
     if [ "$T_SIDE" = kharej ] && wiz_port_bound "$1"; then
-        echo "something here already listens on udp/$1 - check with: ss -lnup | grep :$1"
+        echo "udp/$1 is in use here; see: ss -lnup | grep :$1"
         return 1
     fi
     return 0
@@ -337,7 +337,8 @@ q_port() {
     fi
     rule "4 - Port"
     blank
-    dim "KHAREJ waits on this port; IRAN dials it. The same number on both."
+    dim "KHAREJ waits on this port and IRAN dials it. The same"
+    dim "number goes on both servers."
     blank
     for n in $(cfg_list); do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
@@ -359,7 +360,7 @@ q_link() {
     local def n a dev addr
     rule "5 - The private link"
     blank
-    dim "Two addresses only this tunnel uses. Pick the middle number."
+    dim "Two addresses nothing else uses. Pick the middle number."
     blank
     for n in $(cfg_list); do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
@@ -373,8 +374,8 @@ q_link() {
 
     def=$(free_octet) || def=
     if [ -z "$def" ]; then
-        warn "every 10.x.10.0/24 is inside an address already on this host"
-        fix "ip -4 -o addr   shows what has them; free one and start again"
+        warn "every 10.x.10.0/24 is inside an address on this host"
+        fix "ip -4 -o addr   shows what has them"
     fi
     ask T_OCTET "range  10.x.10.0/24  -  x" "$def" v_wiz_octet || return 1
 
@@ -403,8 +404,8 @@ q_profile() {
     row "$G_CUR 2  Balanced" "448" "254" "93.3 / 106.5"
     row "  3  Download" "466" "253" "115.8 / 139.3"
     blank
-    dim "Balanced is not the middle: it carries a single stream faster"
-    dim "than either of the others. Idle ping is 81 ms whichever you pick."
+    dim "Balanced is not the middle of the three: it carries one"
+    dim "stream faster than either. Idle ping is 81 ms for all."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -561,7 +562,7 @@ tunnel_create() {
     [ -e "$f" ] && { bad "there is already a tunnel called $name here"; return 1; }
     if [ ! -x "$CORE_BIN" ]; then
         bad "the core is not installed at $CORE_BIN"
-        fix "install or update Pingify first; the wizard has changed nothing"
+        fix "install Pingify first - nothing has been changed"
         return 1
     fi
 
@@ -580,12 +581,14 @@ tunnel_create() {
     fi
 
     if ! out=$("$CORE_BIN" -c "$f" -check 2>&1); then
-        bad "the core will not accept that config, so nothing was created:"
+        bad "the core will not accept that config - nothing created"
         printf '%s\n' "$out" | sed 's/^/       /'
         rm -f "$f"
         return 1
     fi
-    ok "$f written, and the core accepts it"
+    # Cut to fit rather than run over the edge: a long tunnel name makes a long
+    # path, and this is the one line in the wizard that carries one.
+    ok "$(trunc_to "$f" $((UI_W - 30))) accepted by the core"
 
     # A repair, not a rewrite: the units are written once at install, and doing
     # it per tunnel is how the old script came to rewrite four units whenever
@@ -703,20 +706,20 @@ wizard_new() {
 wiz_handoff() {
     local name=$1 other=$2 line
     if ! line=$(token_encode "$(cfg_file "$name")"); then
-        bad "the config is written, but the token for $other could not be made"
-        fix "copy $(cfg_file "$name") across by hand and change side to the other one"
+        bad "the config is written, but the token could not be made"
+        fix "copy the file to $other by hand and change side there"
         return 1
     fi
     blank
     rule "Now the other server"
     blank
-    dim "Run Pingify on $other, choose \"Finish the pair\", and paste:"
+    dim "Run Pingify on $other, pick \"Finish the pair\", and paste:"
     blank
     # Printed flush left with nothing around it, so a double click or a triple
     # click selects the token and only the token.
     say "$line"
     blank
-    warn "treat that like a password - the security token is inside it"
+    warn "treat that like a password: the token is inside it"
     blank
     return 0
 }
@@ -731,8 +734,8 @@ wizard_paste() {
     blank
     rule "Finish the pair"
     blank
-    dim "Paste the line the first server printed. It carries the whole"
-    dim "config, so there is nothing left to answer."
+    dim "Paste the line the first server printed. It carries"
+    dim "the whole config, so there is nothing left to answer."
     blank
     ask line "paste the line from the other server" "" v_wiz_paste || return 1
 
@@ -742,7 +745,7 @@ wizard_paste() {
     if ! err=$(token_decode "$line" 2>&1 >"$f"); then
         blank
         bad "$err"
-        fix "copy the line again from the first server, all of it, in one go"
+        fix "copy the whole line again from the first server"
         rm -f "$f"
         return 1
     fi
@@ -768,7 +771,7 @@ wizard_paste() {
         ! v_octet "$T_OCTET" >/dev/null 2>&1 ||
         [ -z "$T_DEV" ] || [ -z "$T_TRANSPORT" ]; then
         bad "that token decoded, but it is not a Pingify config"
-        fix "paste the line from the Pingify screen on the other server"
+        fix "paste the line the other server printed"
         rm -f "$f"
         return 1
     fi
@@ -788,27 +791,27 @@ wizard_paste() {
     clash=0
     if [ -e "$(cfg_file "$T_NAME")" ]; then
         bad "there is already a tunnel called $T_NAME here"
-        fix "delete it first, or build the pair again with a different octet"
+        fix "delete that one first, or use a different octet"
         clash=1
     fi
     if own=$(wiz_link_owner "$T_OCTET"); then
         bad "10.$T_OCTET.10.0/24 is in use here by $own"
-        fix "change the range on the other server as well, and paste again"
+        fix "change the range on both servers, and paste again"
         clash=1
     fi
     if own=$(wiz_device_owner "$T_DEV"); then
         bad "the device $T_DEV is in use here by $own"
-        fix "the device name is in the shared file, so it has to change on both"
+        fix "the device is in the shared file - change both"
         clash=1
     fi
     if [ "$T_SIDE" = kharej ] && [ "$T_TRANSPORT" != icmp ]; then
         if own=$(wiz_port_owner "$T_PORT"); then
             bad "port $T_PORT already belongs to $own"
-            fix "change the port on the other server as well, and paste again"
+            fix "change the port on both servers, and paste again"
             clash=1
         elif wiz_port_bound "$T_PORT"; then
             bad "something here already listens on udp/$T_PORT"
-            fix "ss -lnup | grep :$T_PORT   shows what; free it, or change the port on both"
+            fix "ss -lnup | grep :$T_PORT   shows what has it"
             clash=1
         fi
     fi
@@ -826,8 +829,8 @@ wizard_paste() {
     port=$(wiz_free_status_port)
     for n in $(cfg_list); do
         [ "$(toml_get "$(cfg_file "$n")" status port)" = "$T_STATUS" ] || continue
-        warn "status port $T_STATUS is already used here by $n, so this file uses $port"
-        dim "the two files now differ in that line as well as in side"
+        warn "status port $T_STATUS is taken here by $n"
+        dim "this file uses $port, so the two differ there too"
         T_STATUS=
         break
     done
@@ -846,7 +849,7 @@ wizard_paste() {
     rm -f "$f"
     blank
     ok "both ends are configured now - nothing else to paste"
-    dim "give it a few seconds, then look at $T_NAME on the main screen"
+    dim "give it a few seconds and look at it on the home screen"
     blank
     return 0
 }
@@ -866,8 +869,8 @@ wizard_menu() {
     blank
     rule "New tunnel"
     blank
-    item2 "1" "Build a new tunnel" "six questions here"
-    item2 "2" "Finish the pair" "one paste from the other server"
+    item2 "1" "Build a new tunnel" "six questions"
+    item2 "2" "Finish the pair" "one paste"
     item "0" "Back"
     blank
     menu_key k || return 0

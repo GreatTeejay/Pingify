@@ -29,10 +29,9 @@
 # collecting a verdict
 # --------------------------------------------------------------------------
 #
-# health_check runs one pass and buffers the result rather than printing as it
-# goes, so the text screen and --json are the same pass rendered twice. Two
-# passes would eventually disagree with each other, and the one a script reads
-# is the one nobody looks at.
+# health_check buffers its result rather than printing as it goes, so the text
+# screen and --json are one pass rendered twice. Two passes would eventually
+# disagree, and the one a script reads is the one nobody looks at.
 
 CHK_STATE=() CHK_ID=() CHK_TEXT=() CHK_FIX=()
 CHK_NBAD=0 CHK_NWARN=0
@@ -157,9 +156,9 @@ chk_json() {
 # reading a tunnel's own idea of itself
 # --------------------------------------------------------------------------
 #
-# Eight values every screen in this part needs, read once into CK_* globals.
-# Reading them per screen meant eight awk passes over the same file and, in the
-# old script, two of the readers disagreed about which side we were on.
+# Eight values every screen here needs, read once into CK_* globals. Reading
+# them per screen meant eight awk passes over one file and, in the old script,
+# two of the readers disagreed about which side we were on.
 
 chk_load() {
     local name=$1
@@ -225,12 +224,10 @@ chk_forward_spec() {
 # --------------------------------------------------------------------------
 #
 # One pass, in the order things fail. A check whose evidence is missing says so
-# in grey and does not guess: if the core is not installed there is no verdict
-# to give about whether it accepts the config, and printing one anyway is how a
-# health report comes to be ignored.
-#
-# Exit 0 clean, 1 warnings, 2 problems - so `pingify --check NAME` is usable
-# from cron. The old one ended in `pause` and returned nothing.
+# in grey and does not guess: with no core installed there is no verdict to
+# give about whether it accepts the config, and giving one anyway is how a
+# health report comes to be ignored. Exit 0 clean, 1 warnings, 2 problems, so
+# `pingify --check NAME` is usable from cron; the old one ended in `pause`.
 
 health_check() {
     local name=$1 mode=${2:-}
@@ -332,9 +329,9 @@ health_check() {
         fi
     fi
 
-    # 5. has the far end ever been heard from. This is the field that matters
-    # most and the one nothing else stands in for: the link can be up, the
-    # config right and the service running with no packet ever having arrived.
+    # 5. has the far end ever been heard from. Nothing else stands in for it:
+    # the link can be up, the config right and the service running with no
+    # packet from over there having ever arrived.
     if tun_stats "$name"; then
         case $ST_UP in
         true | 1 | yes)
@@ -369,10 +366,9 @@ health_check() {
         fi
     fi
 
-    # 6. loss, expressed as a rate. There is no denominator in the report - the
-    # core counts what it missed, not what it should have had - so this is
-    # losses per minute since the tunnel started, and it is not called a
-    # percentage, because it is not one.
+    # 6. loss, as a rate. There is no denominator in the report - the core
+    # counts what it missed, not what it should have had - so this is losses
+    # per minute since it started, and it is not called a percentage.
     if [ "$ST_UP" = true ] && [ -n "$ST_UPTIME" ]; then
         lpm=$(awk -v l="${ST_LOST:-0}" -v s="$ST_UPTIME" \
             'BEGIN { if (s + 0 < 30) print "early"; else printf "%.1f", l * 60 / s }')
@@ -449,9 +445,8 @@ health_check() {
 }
 
 # chk_finish picks the renderer. One place, so an early return in health_check
-# cannot forget the --json case - which is exactly what an early return in the
-# old health check did, printing a screen at a caller that wanted a machine to
-# read it.
+# cannot forget the --json case and print a screen at a caller that wanted
+# something a machine could read.
 chk_finish() {
     if [ "$2" = --json ]; then
         chk_json "$1"
@@ -533,9 +528,9 @@ screen_live() {
         last_rx=$rxp last_tx=$txp
 
         # One ping per frame, bound to the tun. On an ICMP tunnel there is
-        # nothing to ping, so that row becomes the grey explanation instead and
-        # the block keeps its height. The ping and the status read together add
-        # about a tenth of a second, so a frame is about a second, not exactly.
+        # nothing to ping, so that row becomes the grey explanation and the
+        # block keeps its height. The ping and the status read add about a
+        # tenth of a second, so a frame is about a second, not exactly.
         rtt=
         if [ "$CK_TRANSPORT" != icmp ]; then
             rtt=$(link_rtt "$CK_DEV" "$CK_PEER") || rtt=
@@ -571,10 +566,9 @@ screen_live() {
     return 0
 }
 
-# live_frame prints the block once, from the CK_* that screen_live loaded. It
-# is a separate function so the non-interactive path and the loop draw exactly
-# the same thing, and so the height of the block is a property of one function
-# rather than of the loop that has to count it.
+# live_frame prints the block once, from the CK_* screen_live loaded. Separate,
+# so the non-interactive path and the loop draw the same thing and the height
+# of the block is a property of one function rather than of the loop.
 live_frame() {
     local name=$1 spark=$2 rtt=$3 din=${4:-} dout=${5:-} state=unknown
     local carrying losses packets
@@ -586,7 +580,8 @@ live_frame() {
     fi
 
     carrying="$(round1 "$ST_IN") Mbit/s in, $(round1 "$ST_OUT") out"
-    losses="${ST_LOST:-0} lost, ${ST_LATE:-0} late, ${ST_GAPS:-0} gaps"
+    losses="${ST_LOST:-0} lost, ${ST_LATE:-0} late, ${ST_GAPS:-0}"
+    losses="$losses gap$(plural_s "${ST_GAPS:-0}")"
     if [ -n "$din" ]; then
         packets="$din in, $dout out in the last second"
     else
@@ -614,11 +609,10 @@ live_frame() {
 #
 # A binary search for the largest packet that crosses the private link intact.
 # `ping -M do` sets don't-fragment, so a packet too big for the carrier path is
-# dropped rather than quietly cut in half, and the search finds the boundary.
-#
-# The search is bounded above by the device's own mtu: the kernel refuses to
-# send a don't-fragment packet larger than the interface. So what this measures
-# is whether the configured mtu is honest, and when it is not, what is.
+# dropped rather than quietly cut in half and the search finds the boundary.
+# The device's own mtu is the ceiling - the kernel will not send a bigger
+# don't-fragment packet - so this measures whether the configured mtu is
+# honest, and when it is not, what is.
 
 MTU_WANT=
 
@@ -647,8 +641,10 @@ measure_mtu() {
         dim "big, and the search sets the floor on no evidence."
         blank
         say "  Use a number instead of a measurement:"
-        field "1320" "the default; room for the outer headers on a 1500 path"
-        field "1280" "what survives PPPoE, mobile, and double tunnelling"
+        # Short enough to survive field's cut at UI_W-20 on a 60-column
+        # terminal: a truncated explanation explains nothing.
+        field "1320" "the default, and right on a 1500 path"
+        field "1280" "survives PPPoE, mobile, double tunnels"
         blank
         if [ "$CK_MTU" != 1280 ] && confirm "set the mtu to 1280?" n; then
             MTU_WANT=1280

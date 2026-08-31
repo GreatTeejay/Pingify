@@ -8,12 +8,17 @@
 # which meant a second administrator could not find it, backups that skip /root
 # skipped the tunnel, and the configs sat beside the operator's ssh keys.
 
-PINGIFY_BIN=/usr/local/bin/pingify
-CORE_BIN=/usr/local/bin/pingify-core
+# Every path takes its value from the environment if there is one. Not for
+# flexibility - nobody moves these - but so that a test can point the whole
+# script at a temporary directory and be certain it cannot touch the machine
+# it is running on. Two of the five already did, which meant a test could
+# redirect the configs and then have the real core binary invoked on them.
+PINGIFY_BIN=${PINGIFY_BIN:-/usr/local/bin/pingify}
+CORE_BIN=${PINGIFY_CORE_BIN:-/usr/local/bin/pingify-core}
 CFG_DIR=${PINGIFY_CFG_DIR:-/etc/pingify}
 STATE_DIR=${PINGIFY_STATE_DIR:-/var/lib/pingify}
 SRC_DIR=${PINGIFY_SRC_DIR:-/usr/local/src/pingify}
-UNIT_DIR=/etc/systemd/system
+UNIT_DIR=${PINGIFY_UNIT_DIR:-/etc/systemd/system}
 
 # The status endpoint listens on the loopback address. One port per tunnel,
 # from a base, so two tunnels on one server do not collide.
