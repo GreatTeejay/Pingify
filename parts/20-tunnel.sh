@@ -1599,6 +1599,14 @@ new_tunnel() {
     say ""
     ok "fingerprint  ${C_YEL}$(token_print "$T_TOKEN")${C_OFF}"
 
+    # An ICMP tunnel has no port to tell it apart from another one here - what
+    # it has is an identifier taken from the token. Two of them sharing a token
+    # read each other's packets. See show_taken_icmp_token.
+    if [ "$T_TRANSPORT" = "icmp" ]; then
+        say ""
+        show_taken_icmp_token "$T_TOKEN" "$T_NAME" || :
+    fi
+
     # -- ports: the IRAN side owns them ------------------------------------
     if [ "$T_ROLE" = "server" ]; then
         wiz "Ports" "The ports your clients will connect to, here on IRAN."
