@@ -1,10 +1,15 @@
-package main
+package link
 
 import (
 	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
+
+	"pingify/internal/buf"
+	"pingify/internal/carrier"
+	"pingify/internal/config"
+	"pingify/internal/logging"
 )
 
 // The private link: a layer-3 interface on each server, and one datagram on
@@ -21,9 +26,9 @@ import (
 // The old core got this backwards: the link was built on a stream multiplexer
 // with per-stream credit windows, and the direct path had to be added beside
 // it later. Here the direct path is the only path.
-type link struct {
-	cfg *Config
-	car packetCarrier
+type Link struct {
+	cfg *config.Config
+	car carrier.Carrier
 
 	dev  []*os.File
 	name string
@@ -39,9 +44,9 @@ type link struct {
 	burst int // how many packets may go on the wire in one crossing
 }
 
-func newLink(cfg *Config, car packetCarrier) (*link, error) {
-	l := &link{cfg: cfg, car: car, name: cfg.TUN.Name, closing: make(chan struct{}),
-		burst: cfg.Tuning.SendBatch}
+func New(cfg *config.Config, car carrier.Carrier) (*Link, error) {
+	l := &Link{cfg: cfg, car: car, name: cfg.TUN.Name, closing: make(chan struct{}),
+		burst: car.Burst()}
 
 	n := cfg.TUN.Queues
 	if n == 0 {
@@ -57,18 +62,18 @@ func newLink(cfg *Config, car packetCarrier) (*link, error) {
 		l.dev = append(l.dev, f)
 	}
 
-	mine, _ := cfg.mine()
+	mine, _ := cfg.Mine()
 	if err := configureDevice(l.name, mine, cfg.TUN.MTU); err != nil {
 		l.closeDevices()
 		return nil, err
 	}
-	logInfo("private link %s up: %s, mtu %d, %d queues", l.name, mine, cfg.TUN.MTU, n)
+	logging.Info("private link %s up: %s, mtu %d, %d queues", l.name, mine, cfg.TUN.MTU, n)
 	return l, nil
 }
 
 // start puts the link to work: one reader per queue taking packets to the
 // wire, and the carrier bringing them back the other way.
-func (l *link) start() {
+func (l *Link) Start() {
 	l.car.OnPacket(l.fromWire)
 	for i := range l.dev {
 		l.wg.Add(1)
@@ -97,28 +102,28 @@ func (l *link) start() {
 // Each packet is read straight into a buffer that already has the carrier's
 // headroom in front of it, so nothing is copied and nothing is shifted along
 // afterwards to make room for a header that was known about before the read.
-func (l *link) readQueue(f *os.File, q int) {
+func (l *Link) readQueue(f *os.File, q int) {
 	head, max := l.car.Headroom(), l.car.MaxPayload()
 	sender := l.car.NewSender()
 	rc := rawOf(f)
-	held := make([]*[]byte, 0, sendBatch)
+	held := make([]*[]byte, 0, l.burst)
 
 	for {
-		bp := takeBuf(head, max)
+		bp := buf.Take(head, max)
 		n, err := f.Read((*bp)[head:])
 		if n > 0 {
 			*bp = (*bp)[:head+n]
 			held = append(held, bp)
 		} else {
-			bufPool.Put(bp)
+			buf.Put(bp)
 		}
 
 		// Whatever else is already there comes along for the same crossing.
 		for rc != nil && len(held) > 0 && len(held) < l.burst {
-			nb := takeBuf(head, max)
+			nb := buf.Take(head, max)
 			m, ok := readNow(rc, (*nb)[head:])
 			if !ok {
-				bufPool.Put(nb)
+				buf.Put(nb)
 				break
 			}
 			*nb = (*nb)[:head+m]
@@ -127,7 +132,7 @@ func (l *link) readQueue(f *os.File, q int) {
 
 		if len(held) > 0 {
 			atomic.AddUint64(&l.toWire, uint64(len(held)))
-			sender.send(held)
+			sender.Send(held)
 			held = held[:0]
 		}
 
@@ -135,7 +140,7 @@ func (l *link) readQueue(f *os.File, q int) {
 			select {
 			case <-l.closing:
 			default:
-				logWarn("device queue %d: %v", q, err)
+				logging.Warn("device queue %d: %v", q, err)
 			}
 			return
 		}
@@ -146,7 +151,7 @@ func (l *link) readQueue(f *os.File, q int) {
 //
 // It runs on the goroutine that read the datagram off the socket, and writes
 // from there. See udpCarrier.run for why there is nothing in between.
-func (l *link) fromWire(b []byte) {
+func (l *Link) fromWire(b []byte) {
 	if len(b) < 20 {
 		atomic.AddUint64(&l.short, 1)
 		return
@@ -156,7 +161,7 @@ func (l *link) fromWire(b []byte) {
 		select {
 		case <-l.closing:
 		default:
-			logDebug("device write: %v", err)
+			logging.Debug("device write: %v", err)
 		}
 		return
 	}
@@ -197,13 +202,17 @@ func flowHash(p []byte) uint32 {
 // say. See the note on reordering in readQueue for why more is not better.
 func defaultQueues() int { return 1 }
 
-func (l *link) closeDevices() {
+// Dropped is how many packets the link could not put on the wire. It is the
+// one number above that main has any business seeing.
+func (l *Link) Dropped() uint64 { return atomic.LoadUint64(&l.dropped) }
+
+func (l *Link) closeDevices() {
 	for _, f := range l.dev {
 		f.Close()
 	}
 }
 
-func (l *link) Close() error {
+func (l *Link) Close() error {
 	l.once.Do(func() {
 		close(l.closing)
 		l.closeDevices()
@@ -211,7 +220,7 @@ func (l *link) Close() error {
 	return nil
 }
 
-func (l *link) String() string {
+func (l *Link) String() string {
 	return fmt.Sprintf("%s: %d packets to the wire, %d to the device, %d dropped",
 		l.name, atomic.LoadUint64(&l.toWire), atomic.LoadUint64(&l.toDevice),
 		atomic.LoadUint64(&l.dropped))

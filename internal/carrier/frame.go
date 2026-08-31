@@ -1,4 +1,4 @@
-package main
+package carrier
 
 import (
 	"crypto/hmac"
@@ -7,6 +7,8 @@ import (
 	"hash"
 	"sync"
 	"sync/atomic"
+
+	"pingify/internal/buf"
 )
 
 // What every packet carrier puts in front of a packet, and the only thing they
@@ -42,7 +44,7 @@ type framer struct {
 	key  []byte
 	hp   sync.Pool // hash.Hash, kept rather than made per packet
 	seq  uint32
-	seen *replayWindow
+	seen *buf.ReplayWindow
 
 	badTag, replayed uint64
 }
@@ -52,7 +54,7 @@ type framer struct {
 // the sender - so a gap in it is the one measure of the path that no counter
 // on either machine will show.
 func (f *framer) lost() (missing, late, gaps uint64) {
-	return f.seen.skipped, f.seen.late, f.seen.gaps
+	return f.seen.Lost()
 }
 
 // newFramer derives this carrier's key from the token the user typed.
@@ -63,7 +65,7 @@ func (f *framer) lost() (missing, late, gaps uint64) {
 func newFramer(token, label string) *framer {
 	m := hmac.New(sha256.New, []byte(label))
 	m.Write([]byte(token))
-	f := &framer{key: m.Sum(nil), seen: newReplayWindow()}
+	f := &framer{key: m.Sum(nil), seen: buf.NewReplayWindow()}
 	f.hp.New = func() any { return hmac.New(sha256.New, f.key) }
 	return f
 }
@@ -110,7 +112,7 @@ func (f *framer) open(b []byte) ([]byte, bool) {
 		f.badTag++
 		return nil, false
 	}
-	if !f.seen.fresh(binary.BigEndian.Uint32(b[tagLen:frameLen])) {
+	if !f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen])) {
 		f.replayed++
 		return nil, false
 	}

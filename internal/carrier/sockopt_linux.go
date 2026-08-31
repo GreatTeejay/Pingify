@@ -1,10 +1,13 @@
 //go:build linux
 
-package main
+package carrier
 
 import (
 	"net"
 	"syscall"
+
+	"pingify/internal/config"
+	"pingify/internal/logging"
 )
 
 // Asking for a socket buffer the kernel will actually give.
@@ -43,7 +46,7 @@ const (
 // Never call this on a TCP socket. Setting SO_RCVBUF at all switches off
 // tcp_rmem autotuning for that socket and pins the window wherever it was put,
 // which is worse than any number you might choose.
-func tuneSocket(pc net.PacketConn, cfg *Config) {
+func tuneSocket(pc net.PacketConn, cfg *config.Config) {
 	sc, ok := pc.(syscall.Conn)
 	if !ok {
 		return
@@ -80,9 +83,9 @@ func tuneSocket(pc net.PacketConn, cfg *Config) {
 		}
 	})
 
-	logInfo("socket buffers: %d KB in, %d KB out", gotRcv/1024, gotSnd/1024)
+	logging.Info("socket buffers: %d KB in, %d KB out", gotRcv/1024, gotSnd/1024)
 	if rcv > 0 && gotRcv < rcv*9/10 {
-		logWarn("asked the kernel for %d KB of receive buffer and got %d KB -"+
+		logging.Warn("asked the kernel for %d KB of receive buffer and got %d KB -"+
 			" raise net.core.rmem_max, or packets will be dropped before we see them",
 			rcv/1024, gotRcv/1024)
 	}

@@ -5,9 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"sync/atomic"
 	"syscall"
 	"time"
+
+	"pingify/internal/carrier"
+	"pingify/internal/config"
+	"pingify/internal/link"
+	"pingify/internal/logging"
 )
 
 // Pingify, the core.
@@ -56,51 +60,51 @@ func main() {
 		return
 	}
 	if *cfgPath == "" {
-		die("no config: pass -c /path/to/config.toml")
+		logging.Die("no config: pass -c /path/to/config.toml")
 	}
 
-	cfg, err := loadConfig(*cfgPath)
+	cfg, err := config.Load(*cfgPath)
 	if err != nil {
-		die("%s: %v", *cfgPath, err)
+		logging.Die("%s: %v", *cfgPath, err)
 	}
 	if *check {
 		fmt.Printf("%s: good - %s side, %s mode, %s transport\n",
 			*cfgPath, cfg.Side, cfg.Mode, cfg.Transport.Type)
 		return
 	}
-	setLogLevel(cfg.Level)
+	logging.SetLevel(cfg.Level)
 
-	logInfo("pingify-core %s starting: %s, %s side, %s over %s",
+	logging.Info("pingify-core %s starting: %s, %s side, %s over %s",
 		version, cfg.Name, cfg.Side, cfg.Mode, cfg.Transport.Type)
 
-	car, err := openCarrier(cfg)
+	car, err := carrier.Open(cfg)
 	if err != nil {
-		die("carrier: %v", err)
+		logging.Die("carrier: %v", err)
 	}
 
-	l, err := newLink(cfg, car)
+	l, err := link.New(cfg, car)
 	if err != nil {
 		car.Close()
-		die("private link: %v", err)
+		logging.Die("private link: %v", err)
 	}
 
-	l.start()
-	go car.run()
-	if cfg.dials() {
-		go car.keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
+	l.Start()
+	go car.Run()
+	if cfg.Dials() {
+		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
 	}
 	go reportEvery(30*time.Second, car, l)
 
-	logInfo("running")
+	logging.Info("running")
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
 
-	logInfo("stopping")
+	logging.Info("stopping")
 	l.Close()
 	car.Close()
-	logInfo("%s", l)
+	logging.Info("%s", l)
 }
 
 // reportEvery says what the tunnel has been doing, but only when it has been
@@ -114,36 +118,36 @@ func max64(a, b uint64) uint64 {
 	return b
 }
 
-func reportEvery(every time.Duration, c carrier, l *link) {
+func reportEvery(every time.Duration, c carrier.Full, l *link.Link) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	var lastRx, lastTx uint64
 	var lastMissing, lastLate, lastGaps uint64
 	for range tk.C {
-		rx, tx, bad, replay, errs := c.counters()
+		rx, tx, bad, replay, errs := c.Counters()
 		if rx == lastRx && tx == lastTx {
 			continue
 		}
 		secs := every.Seconds()
-		logInfo("carrier: %.1f Mbit/s in, %.1f Mbit/s out",
+		logging.Info("carrier: %.1f Mbit/s in, %.1f Mbit/s out",
 			float64(rx-lastRx)*8/secs/1e6, float64(tx-lastTx)*8/secs/1e6)
 		if bad > 0 || replay > 0 {
-			logDebug("carrier: %d not ours, %d already seen", bad, replay)
+			logging.Debug("carrier: %d not ours, %d already seen", bad, replay)
 		}
 		// How much was lost matters less than how it was lost. Losses spread
 		// one at a time are noise a congestion window shrugs off; the same
 		// number arriving in runs is a window halved once per run.
-		if missing, late, gaps := c.lost(); missing != lastMissing || late != lastLate {
+		if missing, late, gaps := c.Lost(); missing != lastMissing || late != lastLate {
 			run := float64(missing-lastMissing) / float64(max64(gaps-lastGaps, 1))
-			logInfo("the path lost %d and reordered %d in the last %s (%d gaps, %.0f packets each)",
+			logging.Info("the path lost %d and reordered %d in the last %s (%d gaps, %.0f packets each)",
 				missing-lastMissing, late-lastLate, every, gaps-lastGaps, run)
 			lastMissing, lastLate, lastGaps = missing, late, gaps
 		}
 		if errs > 0 {
-			logDebug("carrier: %d sends failed", errs)
+			logging.Debug("carrier: %d sends failed", errs)
 		}
-		if d := atomic.LoadUint64(&l.dropped); d > 0 {
-			logWarn("private link: %d packets could not be put on the wire", d)
+		if d := l.Dropped(); d > 0 {
+			logging.Warn("private link: %d packets could not be put on the wire", d)
 		}
 		lastRx, lastTx = rx, tx
 	}

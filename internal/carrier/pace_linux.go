@@ -1,6 +1,6 @@
 //go:build linux
 
-package main
+package carrier
 
 import (
 	"bufio"
@@ -10,6 +10,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"pingify/internal/config"
+	"pingify/internal/logging"
 )
 
 // Smoothing what we put on the wire.
@@ -81,20 +84,20 @@ func rootQdisc(dev string) string {
 // reason. fq is a reasonable queue for anything - it is the default on a lot
 // of systems already - and it does not cap anything by itself, so the rest of
 // what the server does is unaffected.
-func smoothTheWire(cfg *Config) {
+func smoothTheWire(cfg *config.Config) {
 	if !cfg.Tuning.Pace {
 		return
 	}
 	dev := egressInterface()
 	if dev == "" {
-		logDebug("could not tell which interface leaves this machine; not touching the queue")
+		logging.Debug("could not tell which interface leaves this machine; not touching the queue")
 		return
 	}
 	if q := rootQdisc(dev); q == "fq" {
-		logInfo("%s already spaces packets with fq", dev)
+		logging.Info("%s already spaces packets with fq", dev)
 		return
 	} else if q == "" {
-		logDebug("could not read the queue on %s", dev)
+		logging.Debug("could not read the queue on %s", dev)
 		return
 	}
 
@@ -103,11 +106,11 @@ func smoothTheWire(cfg *Config) {
 	// smooth, so the default would drop exactly what we came to space out.
 	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", "20000"}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
-		logWarn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
+		logging.Warn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
 			" and the path will drop runs of them", dev, err, strings.TrimSpace(string(out)))
 		return
 	}
-	logInfo("%s now spaces packets with fq, so a burst leaves as a stream"+
+	logging.Info("%s now spaces packets with fq, so a burst leaves as a stream"+
 		" (this changes the queue for everything on %s)", dev, dev)
 }
 
@@ -192,10 +195,10 @@ func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64)
 				return // the kernel will not have it; stop asking
 			}
 			if applied == 0 {
-				logInfo("pacing follows the path: %d Mbit/s, from the %d it carried",
+				logging.Info("pacing follows the path: %d Mbit/s, from the %d it carried",
 					want*8/1e6, peak*8/1e6)
 			} else {
-				logDebug("pacing raised to %d Mbit/s", want*8/1e6)
+				logging.Debug("pacing raised to %d Mbit/s", want*8/1e6)
 			}
 			applied = want
 		}
@@ -217,7 +220,7 @@ func setPacingRate(pc net.PacketConn, bytesPerSecond int) bool {
 	_ = raw.Control(func(fd uintptr) {
 		if e := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET,
 			soMaxPacingRate, bytesPerSecond); e != nil {
-			logDebug("could not set a pacing rate: %v", e)
+			logging.Debug("could not set a pacing rate: %v", e)
 			return
 		}
 		ok = true
@@ -229,13 +232,13 @@ func setPacingRate(pc net.PacketConn, bytesPerSecond int) bool {
 // is used and nothing changes it; without one, it follows the path. Either way
 // it does nothing at all unless the interface uses fq, which is why
 // smoothTheWire runs first.
-func pace(pc net.PacketConn, cfg *Config, done <-chan struct{}, sent func() uint64) {
+func pace(pc net.PacketConn, cfg *config.Config, done <-chan struct{}, sent func() uint64) {
 	if !cfg.Tuning.Pace {
 		return
 	}
-	if cfg.Tuning.paceMbitSet {
+	if cfg.Tuning.PaceMbitSet {
 		if cfg.Tuning.PaceMbit > 0 && setPacingRate(pc, cfg.Tuning.PaceMbit*1000*1000/8) {
-			logInfo("packets are paced at %d Mbit/s, as the config asks", cfg.Tuning.PaceMbit)
+			logging.Info("packets are paced at %d Mbit/s, as the config asks", cfg.Tuning.PaceMbit)
 		}
 		return
 	}

@@ -1,4 +1,4 @@
-package main
+package config
 
 import (
 	"bufio"
@@ -46,8 +46,12 @@ import (
 //	level = "info"
 
 const (
-	sideIran   = "iran"
-	sideKharej = "kharej"
+	// MaxSendBatch is the largest burst any carrier will be asked for. The
+	// value that is actually used comes from the carrier - see Carrier.Burst.
+	MaxSendBatch = 64
+
+	SideIran   = "iran"
+	SideKharej = "kharej"
 )
 
 type Config struct {
@@ -71,8 +75,10 @@ type Config struct {
 		Pace      bool // put fq on the way out, so bursts leave as a stream
 		PaceMbit  int  // and cap the rate; unset means half the link speed
 
-		paceSet     bool
-		paceMbitSet bool
+		// Whether the file said anything, so a default can tell itself apart
+		// from a deliberate zero.
+		PaceSet     bool
+		PaceMbitSet bool
 	}
 
 	TUN struct {
@@ -86,23 +92,23 @@ type Config struct {
 	Level string
 }
 
-// dials reports whether this side is the one that opens the connection.
+// Dials reports whether this side is the one that opens the connection.
 //
-// Iran dials out, always. Connections into the Iran server are blackholed
+// Iran Dials out, always. Connections into the Iran server are blackholed
 // after about six exchanges - measured, repeatedly - so the side that owns the
 // ports users connect to is not the side that waits for the tunnel. This is
 // settled and nothing above needs to ask again.
-func (c *Config) dials() bool { return c.Side == sideIran }
+func (c *Config) Dials() bool { return c.Side == SideIran }
 
-// mine returns this side's tun address, and theirs.
-func (c *Config) mine() (string, string) {
-	if c.Side == sideIran {
+// Mine returns this side's tun address, and theirs.
+func (c *Config) Mine() (string, string) {
+	if c.Side == SideIran {
 		return c.TUN.Iran, c.TUN.Kharej
 	}
 	return c.TUN.Kharej, c.TUN.Iran
 }
 
-func loadConfig(path string) (*Config, error) {
+func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -186,10 +192,10 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.SendBatch, err = num()
 	case "tuning.pace":
 		c.Tuning.Pace, err = boolean(raw)
-		c.Tuning.paceSet = true
+		c.Tuning.PaceSet = true
 	case "tuning.pace_mbit":
 		c.Tuning.PaceMbit, err = num()
-		c.Tuning.paceMbitSet = true
+		c.Tuning.PaceMbitSet = true
 
 	case "tun.name":
 		c.TUN.Name, err = str()
@@ -252,8 +258,8 @@ func unquote(s string) (string, error) {
 // runs before anything opens a socket, so a bad config fails at the moment
 // the user can still read the message.
 func (c *Config) check() error {
-	if c.Side != sideIran && c.Side != sideKharej {
-		return fmt.Errorf("tunnel.side must be %q or %q, not %q", sideIran, sideKharej, c.Side)
+	if c.Side != SideIran && c.Side != SideKharej {
+		return fmt.Errorf("tunnel.side must be %q or %q, not %q", SideIran, SideKharej, c.Side)
 	}
 	if c.Mode == "" {
 		c.Mode = "tun"
@@ -272,8 +278,8 @@ func (c *Config) check() error {
 	if c.Transport.Type != "icmp" && (c.Transport.Port <= 0 || c.Transport.Port > 65535) {
 		return fmt.Errorf("transport.port %d is not a port", c.Transport.Port)
 	}
-	if c.dials() && c.Transport.Kharej == "" {
-		return fmt.Errorf("transport.kharej: the Iran side needs the address it dials")
+	if c.Dials() && c.Transport.Kharej == "" {
+		return fmt.Errorf("transport.kharej: the Iran side needs the address it Dials")
 	}
 	if c.Transport.Keepalive <= 0 {
 		c.Transport.Keepalive = 10
@@ -309,19 +315,19 @@ func (c *Config) check() error {
 	if c.Tuning.SndBufKB == 0 {
 		c.Tuning.SndBufKB = 16384
 	}
-	if c.Tuning.SendBatch == 0 {
-		c.Tuning.SendBatch = defaultSendBatch
-	}
 	// On by default. It is a change to the whole interface, so it is logged
 	// where anyone can see it, and one line of config turns it off.
-	if !c.Tuning.paceSet {
+	if !c.Tuning.PaceSet {
 		c.Tuning.Pace = true
 	}
 	if c.Tuning.PaceMbit < 0 {
 		return fmt.Errorf("tuning.pace_mbit %d is not a rate", c.Tuning.PaceMbit)
 	}
-	if c.Tuning.SendBatch < 1 || c.Tuning.SendBatch > sendBatch {
-		return fmt.Errorf("tuning.send_batch %d is outside 1..%d", c.Tuning.SendBatch, sendBatch)
+	// Zero means "let the carrier choose", which is what happens: how many
+	// packets fit in one crossing into the kernel is the carrier's business
+	// and differs by platform, so the number is not decided here.
+	if c.Tuning.SendBatch < 0 || c.Tuning.SendBatch > MaxSendBatch {
+		return fmt.Errorf("tuning.send_batch %d is outside 0..%d", c.Tuning.SendBatch, MaxSendBatch)
 	}
 	return nil
 }

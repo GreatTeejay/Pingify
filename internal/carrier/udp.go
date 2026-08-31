@@ -1,4 +1,4 @@
-package main
+package carrier
 
 import (
 	"errors"
@@ -7,6 +7,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"pingify/internal/buf"
+	"pingify/internal/config"
+	"pingify/internal/logging"
 )
 
 // UDP: a framed datagram in a UDP datagram, and nothing else.
@@ -36,7 +40,7 @@ import (
 // carry UDP happily.
 const udpMaxDgram = 1500
 
-var errNoPeer = errors.New("no peer yet")
+var ErrNoPeer = errors.New("no peer yet")
 
 type udpCarrier struct {
 	pc *net.UDPConn
@@ -52,13 +56,13 @@ type udpCarrier struct {
 	sendErrs         uint64
 }
 
-func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
+func newUDPCarrier(cfg *config.Config) (*udpCarrier, error) {
 	c := &udpCarrier{
 		fr:   newFramer(cfg.Token, "pingify udp v1"),
 		done: make(chan struct{}),
 	}
 
-	if cfg.dials() {
+	if cfg.Dials() {
 		// Iran dials out. The socket stays unconnected and the peer is
 		// remembered instead, because the abroad side may answer from a
 		// different source port when anything on the way rewrites addresses.
@@ -76,7 +80,7 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 		tuneSocket(pc, cfg)
 		smoothTheWire(cfg)
 		pace(pc, cfg, c.done, func() uint64 { return atomic.LoadUint64(&c.txBytes) })
-		logInfo("carrier: dialling %s over udp", raddr)
+		logging.Info("carrier: dialling %s over udp", raddr)
 		return c, nil
 	}
 
@@ -88,10 +92,13 @@ func newUDPCarrier(cfg *Config) (*udpCarrier, error) {
 	tuneSocket(pc, cfg)
 	smoothTheWire(cfg)
 	pace(pc, cfg, c.done, func() uint64 { return atomic.LoadUint64(&c.txBytes) })
-	logInfo("carrier: waiting on udp/%d", cfg.Transport.Port)
+	logging.Info("carrier: waiting on udp/%d", cfg.Transport.Port)
 	return c, nil
 }
 
+// Burst is one: this carrier sends a packet per call, so there is nothing to
+// be gained by collecting them first.
+func (c *udpCarrier) Burst() int      { return 1 }
 func (c *udpCarrier) Headroom() int   { return c.fr.headroom() }
 func (c *udpCarrier) MaxPayload() int { return udpMaxDgram - c.fr.headroom() }
 func (c *udpCarrier) Up() bool        { return c.peer.Load() != nil }
@@ -103,9 +110,9 @@ func (c *udpCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
 // those are not the paths where the last ten percent is being fought over.
 type udpSender struct{ c *udpCarrier }
 
-func (c *udpCarrier) NewSender() packetSender { return &udpSender{c: c} }
+func (c *udpCarrier) NewSender() Sender { return &udpSender{c: c} }
 
-func (s *udpSender) send(bps []*[]byte) {
+func (s *udpSender) Send(bps []*[]byte) {
 	for _, bp := range bps {
 		_ = s.c.Send(bp)
 	}
@@ -115,15 +122,15 @@ func (c *udpCarrier) Send(bp *[]byte) error {
 	peer := c.peer.Load()
 	b := *bp
 	if peer == nil || len(b) < c.fr.headroom() {
-		bufPool.Put(bp)
+		buf.Put(bp)
 		if peer == nil {
-			return errNoPeer
+			return ErrNoPeer
 		}
 		return nil
 	}
 	c.fr.seal(b)
 	n, err := c.pc.WriteToUDP(b, peer)
-	bufPool.Put(bp)
+	buf.Put(bp)
 	if err != nil {
 		atomic.AddUint64(&c.sendErrs, 1)
 		return err
@@ -135,7 +142,7 @@ func (c *udpCarrier) Send(bp *[]byte) error {
 // run reads datagrams until the socket closes, handing each one that carries
 // the right tag to the layer above - on this goroutine, with nothing in
 // between. See link.fromWire for why there is nothing in between.
-func (c *udpCarrier) run() {
+func (c *udpCarrier) Run() {
 	buf := make([]byte, udpMaxDgram)
 	for {
 		n, from, err := c.pc.ReadFromUDP(buf)
@@ -146,7 +153,7 @@ func (c *udpCarrier) run() {
 			select {
 			case <-c.done:
 			default:
-				logWarn("udp read: %v", err)
+				logging.Warn("udp read: %v", err)
 			}
 			return
 		}
@@ -164,7 +171,7 @@ func (c *udpCarrier) handle(b []byte, from *net.UDPAddr) {
 	if p := c.peer.Load(); p == nil || p.Port != from.Port || !p.IP.Equal(from.IP) {
 		cp := *from
 		c.peer.Store(&cp)
-		logInfo("carrier: the far end is at %s", from)
+		logging.Info("carrier: the far end is at %s", from)
 	}
 
 	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
@@ -176,7 +183,7 @@ func (c *udpCarrier) handle(b []byte, from *net.UDPAddr) {
 	}
 }
 
-func (c *udpCarrier) keepalive(every time.Duration) {
+func (c *udpCarrier) Keepalive(every time.Duration) {
 	keepaliveLoop(c, c.done, every)
 }
 
@@ -185,9 +192,9 @@ func (c *udpCarrier) Close() error {
 	return c.pc.Close()
 }
 
-func (c *udpCarrier) lost() (missing, late, gaps uint64) { return c.fr.lost() }
+func (c *udpCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
 
-func (c *udpCarrier) counters() (rx, tx, bad, replay, errs uint64) {
+func (c *udpCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
 		c.fr.badTag, c.fr.replayed, atomic.LoadUint64(&c.sendErrs)
 }
@@ -195,7 +202,7 @@ func (c *udpCarrier) counters() (rx, tx, bad, replay, errs uint64) {
 // keepaliveLoop holds the path open, and on the side that waits it is the only
 // thing that says where the far end is. The side that dials sends it, because
 // before a datagram arrives the other side has nothing to send to.
-func keepaliveLoop(c packetCarrier, done <-chan struct{}, every time.Duration) {
+func keepaliveLoop(c Carrier, done <-chan struct{}, every time.Duration) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	for {
@@ -203,9 +210,9 @@ func keepaliveLoop(c packetCarrier, done <-chan struct{}, every time.Duration) {
 		case <-done:
 			return
 		case <-tk.C:
-			bp := takeBuf(c.Headroom(), 0)
-			if err := c.Send(bp); err != nil && !errors.Is(err, errNoPeer) {
-				logDebug("keepalive: %v", err)
+			bp := buf.Take(c.Headroom(), 0)
+			if err := c.Send(bp); err != nil && !errors.Is(err, ErrNoPeer) {
+				logging.Debug("keepalive: %v", err)
 			}
 		}
 	}

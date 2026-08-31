@@ -1,4 +1,4 @@
-package main
+package carrier
 
 import (
 	"crypto/hmac"
@@ -12,6 +12,10 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"pingify/internal/buf"
+	"pingify/internal/config"
+	"pingify/internal/logging"
 )
 
 // ICMP: the transport that works on the path this tunnel was built for.
@@ -74,6 +78,7 @@ type icmpCarrier struct {
 	onPacket atomic.Pointer[func([]byte)]
 
 	batched bool
+	burst   int
 
 	// Whether the kernel handed us the IP header. It does on a raw socket, and
 	// Go takes it off again in ReadFromIP but not in recvmmsg - so it is looked
@@ -88,11 +93,15 @@ type icmpCarrier struct {
 	notEcho, dropped  uint64
 }
 
-func newICMPCarrier(cfg *Config) (*icmpCarrier, error) {
+func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 	c := &icmpCarrier{
-		fr:   newFramer(cfg.Token, "pingify icmp v1"),
-		id:   icmpIDFrom(cfg.Token),
-		done: make(chan struct{}),
+		fr:    newFramer(cfg.Token, "pingify icmp v1"),
+		id:    icmpIDFrom(cfg.Token),
+		done:  make(chan struct{}),
+		burst: cfg.Tuning.SendBatch,
+	}
+	if c.burst <= 0 {
+		c.burst = defaultSendBatch
 	}
 
 	pc, err := net.ListenIP("ip4:icmp", &net.IPAddr{IP: net.IPv4zero})
@@ -101,16 +110,16 @@ func newICMPCarrier(cfg *Config) (*icmpCarrier, error) {
 	}
 	c.pc = pc
 
-	if cfg.dials() {
+	if cfg.Dials() {
 		addr, err := net.ResolveIPAddr("ip4", cfg.Transport.Kharej)
 		if err != nil {
 			pc.Close()
 			return nil, fmt.Errorf("resolve %s: %v", cfg.Transport.Kharej, err)
 		}
 		c.setPeer(addr.IP)
-		logInfo("carrier: echoing to %s, id %d", addr.IP, c.id)
+		logging.Info("carrier: echoing to %s, id %d", addr.IP, c.id)
 	} else {
-		logInfo("carrier: listening for echoes, id %d", c.id)
+		logging.Info("carrier: listening for echoes, id %d", c.id)
 	}
 
 	silenceKernelPings()
@@ -124,21 +133,21 @@ func newICMPCarrier(cfg *Config) (*icmpCarrier, error) {
 	// out in Go, one hash at a time - which on a busy address is most of the
 	// work the transport does.
 	if err := attachICMPFilter(pc, c.id); err != nil {
-		logDebug("no socket filter (%v); every echo the host sees is sorted here instead", err)
+		logging.Debug("no socket filter (%v); every echo the host sees is sorted here instead", err)
 	} else {
-		logInfo("the kernel is filtering echoes for us: only id %d arrives", c.id)
+		logging.Info("the kernel is filtering echoes for us: only id %d arrives", c.id)
 	}
 
 	if canBatch {
 		if rc, err := pc.SyscallConn(); err == nil {
 			c.rc, c.batched = rc, true
-			logInfo("packet i/o: up to %d in and %d out per crossing into the kernel",
+			logging.Info("packet i/o: up to %d in and %d out per crossing into the kernel",
 				recvBatch, sendBatch)
 		} else {
-			logWarn("no raw access to the socket (%v): one call per packet", err)
+			logging.Warn("no raw access to the socket (%v): one call per packet", err)
 		}
 	} else {
-		logInfo("packet i/o: one call per packet on this platform")
+		logging.Info("packet i/o: one call per packet on this platform")
 	}
 	return c, nil
 }
@@ -152,6 +161,7 @@ func (c *icmpCarrier) setPeer(ip net.IP) {
 	c.peer4.Store(uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3]))
 }
 
+func (c *icmpCarrier) Burst() int      { return c.burst }
 func (c *icmpCarrier) Headroom() int   { return icmpHdrLen + c.fr.headroom() }
 func (c *icmpCarrier) MaxPayload() int { return icmpMaxPayload - c.fr.headroom() }
 func (c *icmpCarrier) Up() bool        { return c.peer.Load() != nil }
@@ -176,15 +186,15 @@ func (c *icmpCarrier) Send(bp *[]byte) error {
 	peer := c.peer.Load()
 	b := *bp
 	if peer == nil || len(b) < c.Headroom() {
-		bufPool.Put(bp)
+		buf.Put(bp)
 		if peer == nil {
-			return errNoPeer
+			return ErrNoPeer
 		}
 		return nil
 	}
 	c.stamp(b)
 	n, err := c.pc.WriteToIP(b, peer)
-	bufPool.Put(bp)
+	buf.Put(bp)
 	if err != nil {
 		atomic.AddUint64(&c.sendErrs, 1)
 		return err
@@ -201,19 +211,19 @@ type icmpSender struct {
 	bufs [][]byte
 }
 
-func (c *icmpCarrier) NewSender() packetSender {
+func (c *icmpCarrier) NewSender() Sender {
 	if !c.batched {
 		return &plainSender{c: c}
 	}
 	return &icmpSender{c: c, w: newBatchWriter(), bufs: make([][]byte, 0, sendBatch)}
 }
 
-func (s *icmpSender) send(bps []*[]byte) {
+func (s *icmpSender) Send(bps []*[]byte) {
 	c := s.c
 	peer := c.peer.Load()
 	if peer == nil {
 		for _, bp := range bps {
-			bufPool.Put(bp)
+			buf.Put(bp)
 		}
 		return
 	}
@@ -233,7 +243,7 @@ func (s *icmpSender) send(bps []*[]byte) {
 		n, err := s.w.write(c.rc, out, to)
 		if err != nil {
 			atomic.AddUint64(&c.sendErrs, 1)
-			logDebug("icmp send batch: %v", err)
+			logging.Debug("icmp send batch: %v", err)
 			break
 		}
 		if n <= 0 {
@@ -245,7 +255,7 @@ func (s *icmpSender) send(bps []*[]byte) {
 		out = out[n:]
 	}
 	for _, bp := range bps {
-		bufPool.Put(bp)
+		buf.Put(bp)
 	}
 }
 
@@ -253,13 +263,13 @@ func (s *icmpSender) send(bps []*[]byte) {
 // one call, which is what every carrier did before.
 type plainSender struct{ c *icmpCarrier }
 
-func (s *plainSender) send(bps []*[]byte) {
+func (s *plainSender) Send(bps []*[]byte) {
 	for _, bp := range bps {
 		_ = s.c.Send(bp)
 	}
 }
 
-func (c *icmpCarrier) run() {
+func (c *icmpCarrier) Run() {
 	if c.batched {
 		c.runBatched()
 		return
@@ -279,7 +289,7 @@ func (c *icmpCarrier) runBatched() {
 			select {
 			case <-c.done:
 			default:
-				logWarn("icmp read: %v", err)
+				logging.Warn("icmp read: %v", err)
 			}
 			return
 		}
@@ -301,7 +311,7 @@ func (c *icmpCarrier) runPlain() {
 			select {
 			case <-c.done:
 			default:
-				logWarn("icmp read: %v", err)
+				logging.Warn("icmp read: %v", err)
 			}
 			return
 		}
@@ -322,7 +332,7 @@ func (c *icmpCarrier) handle(b []byte, from [4]byte) {
 		}
 		b = b[ihl:]
 		c.sawIPHeader.Do(func() {
-			logDebug("the ip header arrives with each echo; stepping over it")
+			logging.Debug("the ip header arrives with each echo; stepping over it")
 		})
 	}
 	if len(b) < icmpHdrLen+frameLen {
@@ -347,7 +357,7 @@ func (c *icmpCarrier) handle(b []byte, from [4]byte) {
 	v := uint32(from[0])<<24 | uint32(from[1])<<16 | uint32(from[2])<<8 | uint32(from[3])
 	if v != 0 && c.peer4.Load() != v {
 		c.setPeer(net.IPv4(from[0], from[1], from[2], from[3]))
-		logInfo("carrier: the far end is at %d.%d.%d.%d", from[0], from[1], from[2], from[3])
+		logging.Info("carrier: the far end is at %d.%d.%d.%d", from[0], from[1], from[2], from[3])
 	}
 
 	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
@@ -359,7 +369,7 @@ func (c *icmpCarrier) handle(b []byte, from [4]byte) {
 	}
 }
 
-func (c *icmpCarrier) keepalive(every time.Duration) {
+func (c *icmpCarrier) Keepalive(every time.Duration) {
 	keepaliveLoop(c, c.done, every)
 }
 
@@ -368,9 +378,9 @@ func (c *icmpCarrier) Close() error {
 	return c.pc.Close()
 }
 
-func (c *icmpCarrier) lost() (missing, late, gaps uint64) { return c.fr.lost() }
+func (c *icmpCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
 
-func (c *icmpCarrier) counters() (rx, tx, bad, replay, errs uint64) {
+func (c *icmpCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
 		c.fr.badTag, c.fr.replayed,
 		atomic.LoadUint64(&c.sendErrs) + atomic.LoadUint64(&c.dropped)
@@ -429,10 +439,10 @@ func silenceKernelPings() {
 		return
 	}
 	if err := os.WriteFile(path, []byte("1\n"), 0o644); err != nil {
-		logWarn("could not stop the kernel answering pings (%v) - it will answer"+
+		logging.Warn("could not stop the kernel answering pings (%v) - it will answer"+
 			" every echo this tunnel sends, and double the traffic", err)
 		return
 	}
-	logInfo("the kernel will stop answering pings while this runs" +
+	logging.Info("the kernel will stop answering pings while this runs" +
 		" (icmp_echo_ignore_all), because both ends of this tunnel send requests")
 }

@@ -1,4 +1,4 @@
-package main
+package buf
 
 import "sync"
 
@@ -12,17 +12,21 @@ import "sync"
 // along to make room for a header that was known about all along.
 const bufSize = 2048
 
-var bufPool = sync.Pool{
+// Put hands a buffer back. It is a function rather than the pool itself so
+// that nothing outside can reach past it.
+func Put(bp *[]byte) { pool.Put(bp) }
+
+var pool = sync.Pool{
 	New: func() any {
 		b := make([]byte, bufSize)
 		return &b
 	},
 }
 
-// takeBuf returns a buffer with room for a packet of n bytes behind head bytes
+// Take returns a buffer with room for a packet of n bytes behind head bytes
 // of headroom, already sliced to the full length.
-func takeBuf(head, n int) *[]byte {
-	bp := bufPool.Get().(*[]byte)
+func Take(head, n int) *[]byte {
+	bp := pool.Get().(*[]byte)
 	b := (*bp)[:cap(*bp)]
 	if len(b) < head+n {
 		b = make([]byte, head+n)
@@ -42,11 +46,11 @@ func takeBuf(head, n int) *[]byte {
 // that had fallen out of the window, which is O(window) per packet to learn
 // something a shift already knows.
 const (
-	replayDepth = 4096
-	replayWords = replayDepth / 64
+	ReplayDepth = 4096
+	replayWords = ReplayDepth / 64
 )
 
-type replayWindow struct {
+type ReplayWindow struct {
 	top   uint32 // the highest counter seen
 	bits  [replayWords]uint64
 	empty bool
@@ -60,11 +64,21 @@ type replayWindow struct {
 	skipped, late, gaps uint64
 }
 
-func newReplayWindow() *replayWindow { return &replayWindow{empty: true} }
+func NewReplayWindow() *ReplayWindow { return &ReplayWindow{empty: true} }
 
-// fresh reports whether this counter is one we have not already delivered,
+// Lost is what the far end sent that never arrived, what arrived behind
+// something newer, and how many separate runs the missing packets came in.
+//
+// The last of those is the one that matters. Losses spread one at a time are
+// noise a congestion window shrugs off; the same number arriving in runs is a
+// window halved once per run.
+func (w *ReplayWindow) Lost() (missing, late, gaps uint64) {
+	return w.skipped, w.late, w.gaps
+}
+
+// Fresh reports whether this counter is one we have not already delivered,
 // and records it. It is called from one goroutine only.
-func (w *replayWindow) fresh(seq uint32) bool {
+func (w *ReplayWindow) Fresh(seq uint32) bool {
 	if w.empty {
 		w.empty = false
 		w.top = seq
@@ -88,7 +102,7 @@ func (w *replayWindow) fresh(seq uint32) bool {
 	default:
 		w.late++
 		back := w.top - seq
-		if back >= replayDepth {
+		if back >= ReplayDepth {
 			return false // older than the window remembers; treat as replay
 		}
 		if w.get(back) {
@@ -99,18 +113,18 @@ func (w *replayWindow) fresh(seq uint32) bool {
 	}
 }
 
-func (w *replayWindow) get(back uint32) bool {
+func (w *ReplayWindow) get(back uint32) bool {
 	return w.bits[back/64]&(1<<(back%64)) != 0
 }
 
-func (w *replayWindow) set(back uint32) {
+func (w *ReplayWindow) set(back uint32) {
 	w.bits[back/64] |= 1 << (back % 64)
 }
 
 // shift moves every bit up by n places, which is what "the newest packet is
 // now this one" means when the newest is the top of the window.
-func (w *replayWindow) shift(n uint32) {
-	if n >= replayDepth {
+func (w *ReplayWindow) shift(n uint32) {
+	if n >= ReplayDepth {
 		w.bits = [replayWords]uint64{}
 		return
 	}

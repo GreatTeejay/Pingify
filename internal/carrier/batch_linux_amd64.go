@@ -1,6 +1,6 @@
 //go:build linux && amd64
 
-package main
+package carrier
 
 // The two calls this core makes by number, because Go's syscall package
 // exports SYS_RECVMMSG on some architectures and SYS_SENDMMSG on none of them.

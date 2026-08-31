@@ -1,4 +1,4 @@
-package main
+package carrier
 
 // A carrier moves whole messages between the two servers.
 //
@@ -17,15 +17,20 @@ package main
 // one datagram; if it is lost, the TCP inside it will notice long before we
 // could, and if it arrives out of order, that is what IP has always been
 // allowed to do.
-type packetCarrier interface {
+type Carrier interface {
 	// Headroom is how many bytes at the front of a buffer belong to the
-	// carrier. The layer above builds its packet after them, so that a packet
+	//  The layer above builds its packet after them, so that a packet
 	// is written once and never shifted along to make room for a header.
 	Headroom() int
 
 	// MaxPayload is the largest packet this carrier will take, after the
 	// headroom has been subtracted.
 	MaxPayload() int
+
+	// Burst is how many packets this carrier wants handed to it at once.
+	// One means the reader sends each packet as it reads it, which is what
+	// keeps the pacing the TCP inside applied - see the note in the link.
+	Burst() int
 
 	// Send puts one datagram on the wire, on its own. It takes ownership of
 	// the buffer: after Send returns the caller must not look at it again,
@@ -47,7 +52,7 @@ type packetCarrier interface {
 	//
 	// So the goroutine that read the packets sends them. Nothing is handed
 	// over and nothing is woken.
-	NewSender() packetSender
+	NewSender() Sender
 
 	// OnPacket registers what to do with each datagram that arrives. It is
 	// called on the goroutine that read the datagram off the socket, and the
@@ -62,10 +67,10 @@ type packetCarrier interface {
 	Close() error
 }
 
-// A packetSender puts a batch of packets on the wire in one crossing into the
+// A Sender puts a batch of packets on the wire in one crossing into the
 // kernel. It belongs to one goroutine and is not safe for two.
-type packetSender interface {
+type Sender interface {
 	// send takes ownership of every buffer in the batch, and returns them to
 	// the pool however it goes.
-	send(bps []*[]byte)
+	Send(bps []*[]byte)
 }
