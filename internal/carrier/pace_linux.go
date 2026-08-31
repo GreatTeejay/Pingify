@@ -181,14 +181,29 @@ func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64)
 				continue // idle, and an idle second says nothing about the path
 			}
 			busy++
+
+			// The peak follows what the tunnel is doing now, not the best it
+			// ever did. Sixteen streams push it far above what one stream can
+			// use, and a cap set from that is no cap at all: measured, after a
+			// sixteen-stream run the cap sat at 793 Mbit/s and a single stream
+			// fell back to 228 from the 255 it manages when the cap suits it.
+			//
+			// So a busy second that is slower than the peak lets the peak down
+			// by a sixty-fourth, which halves it in about forty seconds, and it
+			// can never fall below the rate actually being carried. An idle
+			// second does nothing at all - it is not evidence about the path.
 			if rate > peak {
+				peak = rate
+			} else if peak -= peak / 64; rate > peak {
 				peak = rate
 			}
 			if busy < paceLearnFor {
 				continue
 			}
 			want := peak * paceHeadroom / 2
-			if want <= applied {
+			// A little hysteresis, so the cap is not rewritten every second
+			// for a percent either way.
+			if applied > 0 && want < applied+applied/16 && want > applied-applied/16 {
 				continue
 			}
 			if !setPacingRate(pc, int(want)) {
@@ -198,7 +213,7 @@ func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64)
 				logging.Info("pacing follows the path: %d Mbit/s, from the %d it carried",
 					want*8/1e6, peak*8/1e6)
 			} else {
-				logging.Debug("pacing raised to %d Mbit/s", want*8/1e6)
+				logging.Debug("pacing now %d Mbit/s", want*8/1e6)
 			}
 			applied = want
 		}
