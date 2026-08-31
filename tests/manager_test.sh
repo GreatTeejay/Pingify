@@ -1027,10 +1027,16 @@ check "and no window either"         "$(stream_ceiling '' 90)"     "-"
 # They were derived from the window and capped, with no way to reach them.
 # Too small and the window above is a fiction; too large and a busy server
 # spends real memory on carriers that are idle.
+# The buffers are carried by a packet transport, which is the only kind that
+# reads them: a TCP carrier's are sized by the kernel, and a number written
+# for one would be clamped to a fraction of it and switch off the autotuning
+# that would have done better - so those are not written at all.
 cfg_reset
-T_NAME="tw"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="server"
+T_NAME="tw"; T_ROLE="server"; T_KIND="tun"; T_TRANSPORT="icmp"; T_ACCEPTS="client"
 cfg_mode
-T_TOKEN="$TOKEN"; T_PORT=9443; T_PUBLIC_IP="203.0.113.9"; T_FORWARDS='"443"'
+T_TOKEN="$TOKEN"; T_PUBLIC_IP="203.0.113.9"; T_PEER_IP="198.51.100.4"
+T_TUNLOCAL="10.44.10.1/24"; T_TUNPEER="10.44.10.2/24"
+T_FORWARDS='"443"'
 T_CARRIERS=14; T_WINDOW=1024; T_SNDBUF=1024; T_RCVBUF=1024
 T_STATUS="127.0.0.1:9700"
 twf="$(cfg_save)"
@@ -1048,6 +1054,17 @@ check "receive as well"        "$(toml_get "$twf" tuning rcvbuf_kb)"    "3072"
 # A preset is the whole set of numbers, not only carrier/window. Hand-edited
 # buffers must say custom instead of claiming they are still Download.
 check "the profile follows"    "$(toml_get "$twf" tuning profile)"      "custom"
+
+# And a TCP tunnel is written without them, because it would ignore them.
+cfg_reset
+T_NAME="twtcp"; T_ROLE="server"; T_KIND="tcp"; T_TRANSPORT="tcp"; T_ACCEPTS="client"
+cfg_mode
+T_TOKEN="$TOKEN"; T_PORT=9443; T_PEER_IP="198.51.100.4"; T_FORWARDS='"443"'
+T_STATUS="127.0.0.1:9704"
+twtcpf="$(cfg_save)"
+check "a tcp tunnel has a window"      "$(toml_get "$twtcpf" tuning window_kb)" "1024"
+check "and no buffer it would ignore"  "$(grep -c 'buf_kb' "$twtcpf")"          "0"
+check "nor is it asked for one"        "$(awk '/^edit_buffers\(\) \{/{f=1} f&&/^}/{exit} f' Pingify.sh | grep -c 'kernel sizes their')" "1"
 
 # and cfg_load has to read them back, or the screen shows a default that is
 # not what is in the file

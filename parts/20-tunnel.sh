@@ -689,8 +689,21 @@ cfg_render() {
         printf '\n[tuning]\n'
         printf 'profile          = "%s"\n' "$T_PRESET"
         printf 'window_kb        = %s\n' "$T_WINDOW"
-        printf 'sndbuf_kb        = %s\n' "$T_SNDBUF"
-        printf 'rcvbuf_kb        = %s\n' "$T_RCVBUF"
+        # The socket buffers are written only where they are read.
+        #
+        # A TCP carrier - tcp, ws, wss - does not take them any more. Asking
+        # for SO_RCVBUF on one is clamped by the kernel to net.core.rmem_max,
+        # about two hundred kilobytes, and asking at all switches off the
+        # autotuning that would otherwise have grown the socket to several
+        # megabytes. So the core stopped asking, and a number written here for
+        # one of those would be a number that does nothing - which is the worst
+        # kind to leave in a file that says it is safe to edit by hand.
+        case "$(port_family "$T_TRANSPORT")" in
+            udp | none)
+            printf 'sndbuf_kb        = %s\n' "$T_SNDBUF"
+            printf 'rcvbuf_kb        = %s\n' "$T_RCVBUF"
+                ;;
+        esac
         printf '\n[status]\n'
         printf 'addr             = "%s"\n' "$status"
         printf '\n[logging]\n'
