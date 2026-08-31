@@ -1606,8 +1606,21 @@ cfg_render() {
         printf '\n[tuning]\n'
         printf 'profile          = "%s"\n' "$T_PRESET"
         printf 'window_kb        = %s\n' "$T_WINDOW"
-        printf 'sndbuf_kb        = %s\n' "$T_SNDBUF"
-        printf 'rcvbuf_kb        = %s\n' "$T_RCVBUF"
+        # The socket buffers are written only where they are read.
+        #
+        # A TCP carrier - tcp, ws, wss - does not take them any more. Asking
+        # for SO_RCVBUF on one is clamped by the kernel to net.core.rmem_max,
+        # about two hundred kilobytes, and asking at all switches off the
+        # autotuning that would otherwise have grown the socket to several
+        # megabytes. So the core stopped asking, and a number written here for
+        # one of those would be a number that does nothing - which is the worst
+        # kind to leave in a file that says it is safe to edit by hand.
+        case "$(port_family "$T_TRANSPORT")" in
+            udp | none)
+            printf 'sndbuf_kb        = %s\n' "$T_SNDBUF"
+            printf 'rcvbuf_kb        = %s\n' "$T_RCVBUF"
+                ;;
+        esac
         printf '\n[status]\n'
         printf 'addr             = "%s"\n' "$status"
         printf '\n[logging]\n'
@@ -4686,20 +4699,26 @@ edit_buffers() {
     banner
     head2 "Buffers: $name"
     say ""
-    case "$T_TRANSPORT" in
-        ws | wss | icmp | udp | pck)
-            dim "This transport uses one shared socket for its send and receive buffers."
-            ;;
-        *)
-            dim "Each carrier gets a send and a receive buffer of this size, so a"
-            dim "$T_CARRIERS-carrier tunnel holds ${T_CARRIERS} of each."
+    # A TCP carrier does not take these any more, so there is nothing here to
+    # ask about. Setting SO_RCVBUF on one is clamped by the kernel to
+    # net.core.rmem_max - about two hundred kilobytes - and asking at all
+    # switches off the autotuning that would have grown it to several
+    # megabytes, so the core stopped asking and lets the kernel decide.
+    case "$(port_family "$T_TRANSPORT")" in
+        tcp)
+            dim "This transport's carriers are TCP, and the kernel sizes their"
+            dim "buffers itself - it grows them to what the path turns out to"
+            dim "need and gives the memory back when it does not. A number set"
+            dim "here would be clamped to a fraction of it and would switch that"
+            dim "off, so there is nothing to set."
+            say ""
+            pause
+            return 0
             ;;
     esac
+    dim "This transport uses one shared socket for its send and receive buffers."
     say ""
-    case "$T_TRANSPORT" in
-        ws | wss | icmp | udp | pck) total_buf="$(( (T_SNDBUF + T_RCVBUF) / 1024 )) MB" ;;
-        *)        total_buf="$(( (T_SNDBUF + T_RCVBUF) * T_CARRIERS / 1024 )) MB" ;;
-    esac
+    total_buf="$(( (T_SNDBUF + T_RCVBUF) / 1024 )) MB"
     field "Now" "${T_SNDBUF} / ${T_RCVBUF} KB" "In total" "$total_buf"
     say ""
     dim "They should be at least the window (${T_WINDOW} KB), or the window"
