@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -47,7 +48,7 @@ const (
 	soMaxPacingRate = 47
 
 	// See the table above smoothTheWire for how this was chosen.
-	flowLimit = "600"
+	flowLimit = "900"
 )
 
 // egressInterface is the one the default route leaves by, read from the
@@ -106,7 +107,11 @@ func smoothTheWire(cfg *config.Config) {
 		logging.Debug("could not read the queue on %s", dev)
 		return
 	}
-	if strings.Contains(was, "qdisc fq ") && strings.Contains(was, "flow_limit "+flowLimit+"p") {
+	limit := strconv.Itoa(cfg.Tuning.QueuePkts)
+	if cfg.Tuning.QueuePkts == 0 {
+		limit = flowLimit
+	}
+	if strings.Contains(was, "qdisc fq ") && strings.Contains(was, "flow_limit "+limit+"p") {
 		logging.Info("%s already spaces packets the way this wants", dev)
 		return
 	}
@@ -128,23 +133,31 @@ func smoothTheWire(cfg *config.Config) {
 	// Measured once at twenty thousand, with the cap still catching up: p50
 	// 302 ms and a tail at 1174.
 	//
-	// Six hundred is chosen, and it is a deliberate trade. What it gives up is
-	// the ceiling on sixteen streams at once - 337 Mbit/s rather than 450 -
-	// and what it buys is fifteen milliseconds off the round trip whenever the
-	// link is busy, which is the half a person actually feels. A single stream
-	// does not pay for it at all: 247.7 against 240.7.
+	// Between the floor and that, it is one straight trade and there is no
+	// setting on it that is free. Restarted fresh at each depth:
 	//
-	// Two hundred is where it stops being a trade and starts being a mistake:
-	// the queue refuses work the link could have carried and one stream falls
-	// to 75 Mbit/s.
-	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", flowLimit}
+	//	  queue    16 streams   one stream   under load
+	//	   600      327.1        193.1        84.6 / 91.5 ms
+	//	   900      476.5        245.6        99.8 / 116.3
+	//	  1200      461.6        251.0       104.2 / 127.7
+	//	  1500      451.5        254.3       111.6 / 127.3
+	//
+	// Nine hundred is where the two stop fighting. It carries more than any
+	// other depth measured - more than flagtun on the same path - keeps a
+	// single stream within a few percent of the best it ever manages, and
+	// still answers under load faster than flagtun does. Six hundred buys
+	// fifteen milliseconds more and pays a third of the throughput for them,
+	// which is the wrong side of the trade for a link people watch video over.
+	//
+	// tuning.queue_packets moves it, and the table says what that costs.
+	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", limit}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 		logging.Warn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
 			" and the path will drop runs of them", dev, err, strings.TrimSpace(string(out)))
 		return
 	}
-	logging.Info("%s now spaces packets with fq, so a burst leaves as a stream"+
-		" (this changes the queue for everything on %s)", dev, dev)
+	logging.Info("%s now spaces packets with fq, %s deep, so a burst leaves as a"+
+		" stream (this changes the queue for everything on %s)", dev, limit, dev)
 }
 
 // Choosing the rate without being told it.

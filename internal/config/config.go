@@ -73,7 +73,8 @@ type Config struct {
 		SndBufKB  int
 		SendBatch int  // packets per crossing into the kernel; 0 means choose
 		Pace      bool // put fq on the way out, so bursts leave as a stream
-		PaceMbit  int  // and cap the rate; unset means half the link speed
+		PaceMbit  int  // and cap the rate; unset means the tunnel works it out
+		QueuePkts int  // how deep that queue may get; 0 for the default
 
 		// Whether the file said anything, so a default can tell itself apart
 		// from a deliberate zero.
@@ -196,6 +197,8 @@ func assign(c *Config, table, key, raw string) error {
 	case "tuning.pace_mbit":
 		c.Tuning.PaceMbit, err = num()
 		c.Tuning.PaceMbitSet = true
+	case "tuning.queue_packets":
+		c.Tuning.QueuePkts, err = num()
 
 	case "tun.name":
 		c.TUN.Name, err = str()
@@ -319,6 +322,10 @@ func (c *Config) check() error {
 	// where anyone can see it, and one line of config turns it off.
 	if !c.Tuning.PaceSet {
 		c.Tuning.Pace = true
+	}
+	if c.Tuning.QueuePkts < 0 || (c.Tuning.QueuePkts > 0 && c.Tuning.QueuePkts < 200) {
+		return fmt.Errorf("tuning.queue_packets %d: below two hundred the queue"+
+			" refuses work the link could have carried", c.Tuning.QueuePkts)
 	}
 	if c.Tuning.PaceMbit < 0 {
 		return fmt.Errorf("tuning.pace_mbit %d is not a rate", c.Tuning.PaceMbit)
