@@ -65,8 +65,9 @@ type Config struct {
 	Token string
 
 	Tuning struct {
-		RcvBufKB int
-		SndBufKB int
+		RcvBufKB  int
+		SndBufKB  int
+		SendBatch int // packets per crossing into the kernel; 0 means choose
 	}
 
 	TUN struct {
@@ -74,6 +75,7 @@ type Config struct {
 		Iran   string
 		Kharej string
 		MTU    int
+		Queues int // 0 means choose one
 	}
 
 	Level string
@@ -175,6 +177,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.RcvBufKB, err = num()
 	case "tuning.sndbuf_kb":
 		c.Tuning.SndBufKB, err = num()
+	case "tuning.send_batch":
+		c.Tuning.SendBatch, err = num()
 
 	case "tun.name":
 		c.TUN.Name, err = str()
@@ -184,6 +188,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.TUN.Kharej, err = str()
 	case "tun.mtu":
 		c.TUN.MTU, err = num()
+	case "tun.queues":
+		c.TUN.Queues, err = num()
 
 	case "logging.level":
 		c.Level, err = str()
@@ -266,6 +272,9 @@ func (c *Config) check() error {
 	if c.TUN.MTU < 576 || c.TUN.MTU > 9000 {
 		return fmt.Errorf("tun.mtu %d is outside anything that works", c.TUN.MTU)
 	}
+	if c.TUN.Queues < 0 || c.TUN.Queues > 16 {
+		return fmt.Errorf("tun.queues %d is not a number of queues", c.TUN.Queues)
+	}
 	if c.Name == "" {
 		c.Name = "pingify"
 	}
@@ -278,6 +287,12 @@ func (c *Config) check() error {
 	}
 	if c.Tuning.SndBufKB == 0 {
 		c.Tuning.SndBufKB = 16384
+	}
+	if c.Tuning.SendBatch == 0 {
+		c.Tuning.SendBatch = defaultSendBatch
+	}
+	if c.Tuning.SendBatch < 1 || c.Tuning.SendBatch > sendBatch {
+		return fmt.Errorf("tuning.send_batch %d is outside 1..%d", c.Tuning.SendBatch, sendBatch)
 	}
 	return nil
 }

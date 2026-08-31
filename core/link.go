@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"runtime"
 	"sync"
 	"sync/atomic"
 )
@@ -36,23 +35,17 @@ type link struct {
 	toWire, toDevice uint64
 	dropped          uint64
 	short            uint64
+
+	burst int // how many packets may go on the wire in one crossing
 }
 
 func newLink(cfg *Config, car packetCarrier) (*link, error) {
-	l := &link{cfg: cfg, car: car, name: cfg.TUN.Name, closing: make(chan struct{})}
+	l := &link{cfg: cfg, car: car, name: cfg.TUN.Name, closing: make(chan struct{}),
+		burst: cfg.Tuning.SendBatch}
 
-	// The queue count follows the processors, with two as a floor because one
-	// queue cannot overlap a read with anything, and eight as a ceiling
-	// because past that the readers starve the sender: at eight the sender's
-	// queue filled and it threw away three thousand packets, which the TCP
-	// inside read as congestion and answered by halving its window. The
-	// machine was not short of work to do. It was short of turns.
-	n := runtime.GOMAXPROCS(0)
-	if n < deviceQueuesMin {
-		n = deviceQueuesMin
-	}
-	if n > deviceQueuesMax {
-		n = deviceQueuesMax
+	n := cfg.TUN.Queues
+	if n == 0 {
+		n = defaultQueues()
 	}
 
 	for i := 0; i < n; i++ {
@@ -121,7 +114,7 @@ func (l *link) readQueue(f *os.File, q int) {
 		}
 
 		// Whatever else is already there comes along for the same crossing.
-		for rc != nil && len(held) > 0 && len(held) < sendBatch {
+		for rc != nil && len(held) > 0 && len(held) < l.burst {
 			nb := takeBuf(head, max)
 			m, ok := readNow(rc, (*nb)[head:])
 			if !ok {
@@ -199,6 +192,10 @@ func flowHash(p []byte) uint32 {
 	h ^= h >> 13
 	return h
 }
+
+// defaultQueues is how many device queues to open when the config does not
+// say. See the note on reordering in readQueue for why more is not better.
+func defaultQueues() int { return 1 }
 
 func (l *link) closeDevices() {
 	for _, f := range l.dev {

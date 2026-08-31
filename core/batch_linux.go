@@ -31,7 +31,33 @@ import (
 // build tag says.
 const (
 	recvBatch = 128 // what a busy link can have waiting when we look
-	sendBatch = 64
+	sendBatch = 64  // the most a sender will ever be asked for
+
+	// How many packets go on the wire in one crossing unless the config says
+	// otherwise. One - which is to say, none.
+	//
+	// This is not a throughput knob. It is a burst knob, and the path cares
+	// about bursts far more than it cares about syscalls. Measured at Germany
+	// by counting gaps in our own sequence numbers, one stream pushing:
+	//
+	//	  send_batch    packets the path lost    one stream
+	//	      64             2.870%               129.8 Mbit/s
+	//	      16             0.728%               144.1
+	//	       4             1.145%               157.0
+	//	       1             0.000%               170.6
+	//
+	// flagtun on the same path in the same minute lost nothing at all, which
+	// is what said the loss was ours and not the route's. Draining the device
+	// and firing sixty-four packets into the wire at line rate undoes the
+	// pacing the TCP inside had carefully applied, and something on the way
+	// polices the burst by dropping a run of it - a hundred and seventy-three
+	// packets in a row, twice in fifteen seconds.
+	//
+	// Batching cost nothing to give up. Sixteen streams carried 442.7 Mbit/s
+	// at a batch of one against 443.2 at sixty-four, because with sixteen
+	// streams the packets are already there when we look; it is the single
+	// stream, the one that arrives paced, that a batch can only damage.
+	defaultSendBatch = 1
 )
 
 // mmsghdr is the kernel's struct mmsghdr: a msghdr and the length that call

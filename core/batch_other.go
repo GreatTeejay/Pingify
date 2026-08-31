@@ -12,9 +12,10 @@ import (
 // slower, and says so in the log rather than pretending.
 
 const (
-	canBatch  = false
-	recvBatch = 1
-	sendBatch = 1
+	canBatch         = false
+	recvBatch        = 1
+	sendBatch        = 1
+	defaultSendBatch = 1
 )
 
 var errNoBatch = errors.New("recvmmsg and sendmmsg are not available here")
