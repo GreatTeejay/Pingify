@@ -272,16 +272,17 @@ func (c *Config) applyDefaults() {
 	// real 68 ms path with sixteen streams pushing, measuring the round trip
 	// across the link while they ran:
 	//
-	//	 1 MiB    p50  75 ms   p90  84 ms   323 Mbit/s
-	//	 2 MiB    p50  89 ms   p90 107 ms   406 Mbit/s
-	//	 4 MiB    p50 118 ms   p90 136 ms   433 Mbit/s
-	//	16 MiB    p50 133 ms   p90 165 ms   474 Mbit/s
+	//	2 MiB    p50  77 ms   p90  90 ms   350 Mbit/s
+	//	3 MiB    p50  82 ms   p90  96 ms   415 Mbit/s
+	//	4 MiB    p50 110 ms   p90 123 ms   424 Mbit/s
+	//	6 MiB    p50 132 ms   p90 176 ms   432 Mbit/s
 	//
-	// Every megabyte past two buys bytes with delay. Two is where a burst
-	// still has somewhere to go and a standing queue does not: it is a
-	// twentieth of a second of packets at this rate, which is under the round
-	// trip, so the sender inside learns about congestion from a drop rather
-	// than from a queue it cannot see.
+	// Three is where the curve turns. Below it the buffer is too small to
+	// absorb a burst and throughput falls away; above it every megabyte buys
+	// a few more bits per second with tens of milliseconds of delay. At three
+	// a burst still has somewhere to go and a standing queue does not - it is
+	// well under a round trip of packets, so the sender inside learns about
+	// congestion from a drop rather than from a queue it cannot see.
 	//
 	// The send side is not the same problem - nothing waits behind it on this
 	// machine - so it keeps room for a burst.
@@ -289,7 +290,7 @@ func (c *Config) applyDefaults() {
 		c.SndBufKB = 16384
 	}
 	if c.RcvBufKB == 0 {
-		c.RcvBufKB = 2048
+		c.RcvBufKB = 3072
 	}
 	c.Profile = strings.ToLower(strings.TrimSpace(c.Profile))
 	if c.Profile == "" {

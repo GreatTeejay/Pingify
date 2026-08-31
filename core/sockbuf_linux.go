@@ -61,6 +61,11 @@ func forceSocketBuffer(pc net.PacketConn, rcv, snd int) (gotRcv, gotSnd int) {
 				_ = unix.SetsockoptInt(f, unix.SOL_SOCKET, unix.SO_SNDBUF, snd)
 			}
 		}
+		// Ahead of ordinary traffic in the qdisc, behind anything the kernel
+		// considers control. What this carries is somebody's call or game, and
+		// on a server that is also doing other things it should not wait
+		// behind a backup.
+		_ = unix.SetsockoptInt(f, unix.SOL_SOCKET, unix.SO_PRIORITY, 6)
 		// What the kernel reports back is doubled: it counts its own
 		// bookkeeping in the figure. Halving it gives the usable bytes, which
 		// is what was asked for and what belongs in the log.
