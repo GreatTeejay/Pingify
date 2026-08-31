@@ -3125,10 +3125,6 @@ type tunnel struct {
 	closed chan struct{}
 	once   sync.Once
 
-	// Where a received packet goes: placed by flow, handed over in batches.
-	// See datapath.go.
-	fan *deviceFan
-
 	// When the transport can carry a whole packet with no session under it,
 	// this is how the private link travels: one packet, one datagram, no
 	// reliability layer. See tunfast.go for why that is the right shape for
@@ -3196,8 +3192,6 @@ func startTUN(cfg *Config, p *pool) (*tunnel, error) {
 	// One writer per device queue: the queues are what make parallel writes
 	// worth anything, and a writer with no queue of its own would only queue
 	// behind another.
-	t.fan = newDeviceFan(t.queues, t.closed)
-	go t.fan.watchShedding(t.closed)
 	t.startFast()
 	for i := range t.queues {
 		go t.readQueue(t.queues[i])
@@ -3331,16 +3325,6 @@ func (t *tunnel) startFast() {
 	t.fast = newTunFast(tx, rx, pc.SendPacket, t.toDevice)
 	pc.SetPacketHandler(t.fast.Deliver, peer)
 
-	// Hand the whole socket batch onward in one go. Without this the fan
-	// would hold packets until it happened to fill, which on a quiet link is
-	// never - so a transport that cannot say when a read is finished does not
-	// get a fan at all.
-	if be, ok := t.p.tr.(interface{ SetBatchEnd(func()) }); ok && t.fan != nil {
-		be.SetBatchEnd(t.fan.flush)
-	} else {
-		t.fan = nil
-	}
-
 	how := "encrypted"
 	if !t.cfg.encrypted() {
 		how = "in the clear"
@@ -3350,17 +3334,26 @@ func (t *tunnel) startFast() {
 }
 
 // toDevice writes one IP packet to the interface, whichever path brought it.
-// toDevice hands one packet to the device. The bytes belong to the socket's
-// receive batch and are copied on the way in; see deviceFan.
+// toDevice writes one received packet to the device.
+//
+// The reader that took it off the socket writes it, here, with nothing in
+// between. That is worth saying because it was not always so: a layer of
+// per-flow writers and batched handovers sat here for a while, on the
+// reasoning that one thread doing every write would serialise them.
+//
+// It did, and it was still faster. Measured once the kernel's receive buffer
+// was no longer being silently clamped - which was the real reason the reader
+// could not keep up - with sixteen streams pushing through the link:
+//
+//	               p50      p90      p99    throughput
+//	batched      160 ms   179 ms   561 ms   427 Mbit/s
+//	written here 113 ms   133 ms   146 ms   444 Mbit/s
+//
+// Better on every one of them. The handovers cost more in wakeups than the
+// writes cost in waiting, and the queue in front of them was one more place
+// for delay to hide. What made the batching look necessary was a bug
+// somewhere else.
 func (t *tunnel) toDevice(pkt []byte) {
-	if t.fan != nil {
-		t.fan.add(pkt)
-		return
-	}
-	t.writeDevice(pkt)
-}
-
-func (t *tunnel) writeDevice(pkt []byte) {
 	if len(t.queues) == 0 {
 		return
 	}

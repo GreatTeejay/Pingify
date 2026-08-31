@@ -142,11 +142,6 @@ type icmpTransport struct {
 	// Packets the sender could not take because it was behind.
 	sendDropped uint64
 
-	// Called once after every socket read, so the layer above can hand a
-	// whole batch onward in one go. Installed after the readers are already
-	// running, which is why it is atomic.
-	batchEnd atomic.Value // func()
-
 	// What this end puts on the wire. What it accepts is either type - see
 	// the note at the top of this file.
 	sendType byte
@@ -213,7 +208,7 @@ func newICMPTransport(cfg *Config) (*icmpTransport, error) {
 	go t.sendPacketLoop()
 	go t.watchSendDrops()
 	workers, batch := startPacketReaders(pc, t.done, cfg.Profile, cfg.carriesPackets(), icmpMaxPacket,
-		t.handlePacket, t.runBatchEnd,
+		t.handlePacket,
 		func(err error) { logDebug("icmp read: %v", err) })
 	logInfo("ICMP packet I/O: %d receive workers, batches up to %d packets, %d-byte payload",
 		workers, batch, icmpMaxPayload)
@@ -327,10 +322,27 @@ func (t *icmpTransport) handlePacket(pkt []byte, addr net.Addr) {
 	// can be used in place. Copying every received packet here only fed the GC.
 	head := datagram[:min(len(datagram), arqOver)]
 	direct := false
-	if !t.validTag(body[:icmpTagLen], head) {
-		// Not a session datagram. It may still be a packet from the private
-		// link, which is tagged with a different key and has no session.
-		if t.packetHandler() == nil || !t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
+
+	// Which tag to try first is worth getting right, because the one that
+	// fails costs exactly as much as the one that succeeds - each is an
+	// HMAC over the header - and on a tunnel carrying a private link almost
+	// every packet is a private-link packet.
+	//
+	// The session tag used to be tried first, so every one of those paid for
+	// two hashes: one that could never match and one that did. On the server
+	// abroad the reader could not drain the socket fast enough because of it,
+	// and the kernel's receive buffer stood at seven to eight megabytes -
+	// a hundred and fifty milliseconds of packets waiting their turn, which
+	// is what a user feels as lag while something downloads.
+	//
+	// So when there is a private link, its tag is tried first. A carrier's
+	// datagram then pays for two hashes instead, and there are a handful of
+	// those a second against tens of thousands of the other.
+	h := t.packetHandler()
+	if h != nil && t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
+		direct = true
+	} else if !t.validTag(body[:icmpTagLen], head) {
+		if h == nil || !t.validTagFor(icmpTagDirect, body[:icmpTagLen], head) {
 			return
 		}
 		direct = true
@@ -369,16 +381,6 @@ func (t *icmpTransport) rememberPeer(ip *net.IPAddr) {
 		t.pktTo = ip
 	}
 	t.pktMu.Unlock()
-}
-
-// SetBatchEnd installs what to run when a socket read is finished with. See
-// startPacketReaders.
-func (t *icmpTransport) SetBatchEnd(f func()) { t.batchEnd.Store(f) }
-
-func (t *icmpTransport) runBatchEnd() {
-	if f, ok := t.batchEnd.Load().(func()); ok && f != nil {
-		f()
-	}
 }
 
 // SetPacketHandler installs where a bare packet goes, and names the peer to
