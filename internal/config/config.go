@@ -236,15 +236,21 @@ func assign(c *Config, table, key, raw string) error {
 // restarted fresh at each depth:
 //
 //	profile     queue    16 streams   one stream   under load
-//	gaming        600     327 Mbit/s   193 Mbit/s   84.6 / 91.5 ms
-//	balanced      900     476          246          99.8 / 116.3
-//	download     1500     452          254         111.6 / 127.3
+//	gaming        600     397 Mbit/s   167 Mbit/s   84.5 / 92.5 ms
+//	balanced      900     448          254          93.3 / 106.5
+//	download     1500     466          253         115.8 / 139.3
 //
-// Gaming gives up a third of the throughput for fifteen milliseconds, which is
-// the right trade when what is crossing the link is a game and the wrong one
-// when it is a film. Download buys eight megabits on a single stream for
-// twelve milliseconds. Balanced is not a compromise between the other two -
-// it carries more than either, and it is where the two stop fighting.
+// Gaming gives up a third of a single stream for nine milliseconds at the
+// median and fourteen at the ninetieth, which is the right trade when what
+// crosses the link is a game and the wrong one when it is a film. Download
+// buys eighteen megabits of aggregate for twenty-three milliseconds. Balanced
+// is not the average of the other two: it carries a single stream faster than
+// either and answers under load faster than flagtun does.
+//
+// The quiet round trip does not move at all - 81.0, 81.1, 81.2 - because an
+// empty queue is an empty queue however deep it was allowed to get. What a
+// profile changes is what happens when the link is busy, which is the only
+// time any of it is felt.
 const (
 	ProfileGaming   = "gaming"
 	ProfileBalanced = "balanced"
