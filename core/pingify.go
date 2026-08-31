@@ -1956,7 +1956,10 @@ func (s *stream) pumpIn(local net.Conn) {
 		n, err := s.rb.Read(buf)
 		if n > 0 {
 			if _, werr := local.Write(buf[:n]); werr != nil {
-				s.reset()
+				// The client is gone. The far end is still reading the real
+				// service for it and must be told, or it waits for credit
+				// that is never coming.
+				s.resetPeer()
 				return
 			}
 			atomic.AddUint64(&s.l.rxBytes, uint64(n))
@@ -1972,13 +1975,20 @@ func (s *stream) pumpIn(local net.Conn) {
 			if cw, ok := local.(interface{ CloseWrite() error }); ok {
 				cw.CloseWrite()
 			} else {
-				s.reset()
+				s.resetPeer()
 			}
 			return
 		}
 	}
 }
 
+// reset tears the stream down at this end and says nothing.
+//
+// It is the ordinary end of a stream as well as an unhappy one - halfDone
+// calls it when both directions have finished - so it must not tell the peer
+// anything. A record sent from here would arrive after the data still in
+// flight and cut it off. Where this end has genuinely failed and the peer
+// needs to know, resetPeer is the one to call.
 func (s *stream) reset() {
 	s.once.Do(func() {
 		close(s.done)
@@ -1992,6 +2002,28 @@ func (s *stream) reset() {
 		}
 		s.l.removeStream(s.id)
 	})
+}
+
+// resetPeer tears the stream down and tells the other end, for the cases where
+// this end failed rather than finished.
+//
+// Saying so is not politeness. Without it, a client that vanishes at the edge
+// leaves the far end reading from the real service and sending data for a
+// stream id that no longer exists. Those records are dropped on arrival with
+// no reply, so no window credit ever comes back, and after one window the far
+// end's writer blocks for good - holding a goroutine, a connection to the real
+// service, and a window's worth of memory, until the carrier itself dies. One
+// browser closed the wrong way was enough.
+//
+// trySend, never send: this is reachable from the read loop, which is the one
+// goroutine draining the peer's socket, and send() waits for room. On a
+// carrier whose queue is full - which is exactly when this matters - waiting
+// there would stop the reads that make room.
+func (s *stream) resetPeer() {
+	if s.l.alive() {
+		s.l.trySend(ctrlRec(cmdRST, s.id, nil))
+	}
+	s.reset()
 }
 
 // ---------------------------------------------------------------------------
@@ -2813,21 +2845,35 @@ func (f *forwarder) serveTCP(ln net.Listener, r fwdRule) {
 	}
 }
 
+// openStream carries one user connection across the braid.
+//
+// If the carrier it picked cannot take the opening record, another is tried.
+// It used to give up there and close the user's connection, which is the one
+// thing a braid exists to avoid: a carrier can die between being chosen and
+// being written to, and one dead carrier out of eight was taking a share of
+// everybody's connections down with it rather than being routed around.
 func (f *forwarder) openStream(c net.Conn, r fwdRule) {
 	tuneSocket(c, f.cfg)
-	l := f.p.pick()
-	if l == nil {
-		f.noteNoCarrier(r.lport)
-		c.Close()
-		return
+	// As many attempts as there are carriers, so a connection is only given up
+	// on when the braid as a whole has nothing to offer.
+	for try := 0; try < maxCarriers; try++ {
+		l := f.p.pick()
+		if l == nil {
+			break
+		}
+		s := l.newStream(c)
+		if l.send(ctrlRec(cmdSYN, s.id, []byte(r.target))) {
+			go s.pumpIn(c)
+			s.pumpOut(c)
+			return
+		}
+		// That carrier is gone. Take the stream off it and ask the pool for
+		// another - reset() would close the user's connection, which is the
+		// thing being rescued.
+		l.removeStream(s.id)
 	}
-	s := l.newStream(c)
-	if !l.send(ctrlRec(cmdSYN, s.id, []byte(r.target))) {
-		s.reset()
-		return
-	}
-	go s.pumpIn(c)
-	s.pumpOut(c)
+	f.noteNoCarrier(r.lport)
+	c.Close()
 }
 
 // ---------------------------------------------------------------------------
