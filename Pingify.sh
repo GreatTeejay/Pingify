@@ -2375,8 +2375,13 @@ new_tunnel() {
     # It carries raw IP between two machines the same person runs, they know
     # what is on it, and it is the one that is judged on speed.
     wiz "Encryption"
+    # The recommended one is the default, so enter takes it. A step that
+    # labels an option "recommended" and then refuses an empty answer is
+    # asking the operator to read its mind.
+    CHOICE_DEF="1"
     choice 1 "In the clear" "what nearly every tunnel should pick  (recommended)"
-    choice 2 "Encrypted" "ChaCha or AES on every frame, and it is not free"
+    choice 2 "Encrypted" "AES on every frame, and it is not free"
+    CHOICE_DEF=""
     say ""
     dim "This used to say the cipher costs a tenth of a percent of a core. That"
     dim "was wrong, and measuring it said so: on a server abroad without the"
@@ -2392,7 +2397,8 @@ new_tunnel() {
     dim "already, and a second cipher over the top of it buys nothing."
     say ""
     local enc=""
-    pick enc "select" 1 2 || { wiz_end; return 0; }
+    ask enc "select" "1" || { wiz_end; return 0; }
+    case "$enc" in 1 | 2) ;; *) enc=1 ;; esac
     if [ "$enc" = "2" ]; then
         T_ENCRYPT="true"
         say ""
