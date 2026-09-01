@@ -342,9 +342,14 @@ ExecStart=$CORE_BIN -c $CFG_DIR/%i.toml
 Restart=always
 RestartSec=2
 
-# A raw ICMP socket and a tun device need these two, and nothing needs more.
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# A raw ICMP socket and a tun device need the first two. The third is for a
+# transport that waits on a port below 1024, which is not a luxury: behind a
+# CDN the edge comes to the origin on the port the client asked for, and a
+# WebSocket carrier fronted by one is listening on 80 or 443 or it is not
+# listening at all. Found by a tunnel that died with "bind: permission denied"
+# while the far end read back Cloudflare's 521.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 
 # The tunnel is a long-lived process that holds a lot of sockets open.

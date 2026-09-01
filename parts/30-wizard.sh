@@ -412,10 +412,20 @@ addr_text() { printf '%s%s%s' "$C_ADDR" "$1" "$C_OFF"; }
 # are listed and picked from - taking the first and saying nothing is how the
 # wrong one ends up in the file, and nothing says so until the other end has
 # been dialling it for a quarter of an hour.
-q_here() {
-    local def= n i=0
+# Both addresses, in one step. They were two, and two steps to type two lines
+# is a wizard that counts its own questions rather than the reader's work.
+#
+# This server's is read off its own interfaces and offered as the default: if
+# it is right, enter. When a server answers on more than one they are listed
+# and picked from - taking the first and saying nothing is how the wrong one
+# ends up in the file, and nothing says so until the other end has been
+# dialling it for a quarter of an hour.
+q_addresses() {
+    local def= n i=0 other=KHAREJ
     local -a addrs=()
-    wiz_ask "This server's address"
+    [ "$T_SIDE" = kharej ] && other=IRAN
+
+    wiz_ask "The two servers"
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
@@ -426,33 +436,18 @@ q_here() {
             item "$((i + 1))" "$(addr_text "${addrs[i]}")"
             i=$((i + 1))
         done
-        item "$((i + 1))" "Something else" "a hostname, or an address not listed"
+        item "$((i + 1))" "Something else" "a hostname, or one not listed"
         blank
         pick n "select" 1 $((i + 1)) || return 1
         if [ "$n" -le "${#addrs[@]}" ]; then
             T_HERE=${addrs[n - 1]}
-            return 0
         fi
         blank
     else
         def=${addrs[0]:-}
-        [ -n "$def" ] && dim "this is what the server says its address is - enter takes it"
-        [ -n "$def" ] && blank
     fi
-
-    ask T_HERE "address of this server" "$def" v_host || return 1
-    return 0
-}
-
-q_there() {
-    local other=KHAREJ
-    [ "$T_SIDE" = kharej ] && other=IRAN
-    wiz_ask "The other server's address"
-    blank
-    dim "The $other server, which you are not sitting on. Both files carry"
-    dim "both addresses, so this answer is the same on each of them."
-    blank
-    ask T_THERE "address of the $other server" "" v_host || return 1
+    [ -n "$T_HERE" ] || ask T_HERE "this server (${T_SIDE^^})" "$def" v_host || return 1
+    ask T_THERE "the other one ($other)" "" v_host || return 1
     return 0
 }
 
@@ -460,25 +455,26 @@ q_transport() {
     local n
     wiz_ask "How it crosses"
     blank
-    item "1" "UDP" "one open port on KHAREJ - the fastest"
-    item "2" "TCP" "one open port, on a path that carries only TCP"
-    item "3" "ICMP" "inside ping packets - no open port at all"
+    item "1" "UDP" "a packet in, a packet out, nothing in the way"
+    item "2" "TCP" "one open port, where a network carries only TCP"
+    item "3" "WS" "an ordinary WebSocket - goes where HTTP goes"
+    item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
+    item "5" "ICMP" "inside ping packets - no open port at all"
     blank
-    dim "UDP first: it is a packet in, a packet out, and nothing in the way."
+    dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
+    dim "  WS 427   WSS 405   ICMP 371   TCP 342   UDP unusable there"
     blank
-    dim "TCP where a network carries nothing else - and it is a stream, so a"
-    dim "packet the path drops is repaired underneath the connections running"
-    dim "through it, which costs some of the speed UDP would have had."
+    dim "WS and WSS can go behind a CDN, which is what makes them the ones to"
+    dim "try when a port is blocked rather than slow. While an ICMP tunnel runs"
+    dim "neither server answers a ping."
     blank
-    dim "ICMP where no port can be opened at all. While one runs neither server"
-    dim "answers an ordinary ping; that is deliberate and no screen here reads"
-    dim "it as a fault."
-    blank
-    pick n "select" 1 3 || return 1
+    pick n "select" 1 5 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
-    3) T_TRANSPORT=icmp ;;
+    3) T_TRANSPORT=ws ;;
+    4) T_TRANSPORT=wss ;;
+    5) T_TRANSPORT=icmp ;;
     esac
     return 0
 }
@@ -493,8 +489,7 @@ q_port() {
     fi
     wiz_ask "Port"
     blank
-    dim "KHAREJ listens on this port and IRAN dials it. The same number goes"
-    dim "on both servers, and it is the only port the tunnel itself needs open."
+    dim "The same number on both servers, and the only port the tunnel needs."
     blank
     while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
@@ -516,13 +511,95 @@ q_port() {
 # One question, not three. The old wizard asked for the octet and then re-asked
 # both addresses it had just derived from it, so a hand edit at the second
 # prompt walked straight past the checks that guarded the first.
+# The one extra step a WebSocket transport needs, and it is skipped entirely
+# by the three that do not.
+#
+# A domain is what makes these worth having: a name in front of a server can
+# be a CDN, and a CDN answers on its own addresses, terminates the TLS itself
+# and comes to the origin from its own network. That is also why it changes
+# which side dials - an edge connects *inward* to the origin, so a name in
+# front of the IRAN server can only be reached by KHAREJ dialling it.
+q_web() {
+    local n def_listen
+    case $T_TRANSPORT in ws | wss) ;; *) return 0 ;; esac
+
+    wiz_ask "The web address"
+    blank
+    if [ "$T_TRANSPORT" = wss ]; then
+        dim "TLS is checked against this name, and a CDN answers only for names"
+        dim "it has been given."
+        blank
+        ask T_DOMAIN "domain" "" v_host || return 1
+    else
+        dim "With a domain this goes through whatever answers for it; without"
+        dim "one it dials the address directly."
+        blank
+        ask T_DOMAIN "domain, or - for none" "-" v_domain_or_none || return 1
+        [ "$T_DOMAIN" = "-" ] && T_DOMAIN=
+    fi
+
+    # Generated rather than asked. Any path works and none is better than
+    # another, so this is one more question with no wrong answer - and a
+    # random one is not a path anybody scans for.
+    T_PATH=$(wiz_path)
+    field "path" "$T_PATH"
+
+    [ -z "$T_DOMAIN" ] && { T_DIALS=; T_LISTEN=; return 0; }
+
+    blank
+    item "1" "the name points at KHAREJ" "the usual - IRAN dials it"
+    item "2" "a CDN in front of IRAN" "KHAREJ dials it, and this side waits"
+    blank
+    pick n "select" 1 2 || return 1
+    if [ "$n" = 1 ]; then
+        T_DIALS= T_LISTEN=
+        return 0
+    fi
+
+    T_DIALS=kharej
+    # A CDN takes the connection on the port that was asked for and comes to
+    # the origin on a port of its own. Cloudflare's flexible mode terminates
+    # the TLS at the edge and arrives here in plain HTTP on 80, which is why
+    # that is the default when the port dialled is 443.
+    def_listen=$T_PORT
+    [ "$T_PORT" = 443 ] && def_listen=80
+    blank
+    ask T_LISTEN "port the edge will reach this server on" "$def_listen" v_listen_port || return 1
+    return 0
+}
+
+# A path nobody scans for: six hex characters, from the kernel's own random
+# device where there is one and from the shell's when there is not.
+wiz_path() {
+    local h
+    h=$(head -c 3 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [ -n "$h" ] || h=$(printf '%06x' $((RANDOM * RANDOM % 16777216)))
+    printf '/%s' "$h"
+}
+
+v_domain_or_none() {
+    [ "$1" = "-" ] && return 0
+    v_host "$1"
+}
+
+# The port this server will bind when it is the one that waits. Unlike the
+# port a tunnel is dialled on, this one is opened here and now, so something
+# else already holding it is a refusal rather than a note.
+v_listen_port() {
+    v_port "$1" || return 1
+    if wiz_port_bound "$1" tcp; then
+        echo "something here already listens on tcp/$1; see: ss -lntp | grep :$1"
+        return 1
+    fi
+    return 0
+}
+
 q_link() {
     local def n a dev addr
     wiz_ask "The private link"
     blank
-    dim "The two servers talk to each other on a pair of private addresses"
-    dim "that nothing else on either machine uses. Pick the middle number and"
-    dim "both are worked out from it."
+    dim "A pair of addresses nothing else on either machine uses. Pick the"
+    dim "middle number; both are worked out from it."
     blank
     while IFS= read -r n; do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
@@ -564,11 +641,8 @@ q_profile() {
     item "2" "Balanced" "900 packets - the one to pick if unsure"
     item "3" "Download" "1500 packets - most on a long transfer"
     blank
-    dim "A profile sets one number: how many packets may wait in the tunnel's"
-    dim "queue. A deeper queue carries more at once and holds a packet longer;"
-    dim "a shallower one answers sooner and gives up some throughput for it."
-    blank
-    dim "It can be changed later, on either server, without rebuilding anything."
+    dim "How many packets may wait in the tunnel's queue. Changeable later, on"
+    dim "either server, without rebuilding anything."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -626,6 +700,9 @@ wiz_review() {
     local trans prof
     trans=${T_TRANSPORT^^}
     [ -n "$T_PORT" ] && trans="$trans  port $T_PORT"
+    case $T_TRANSPORT in
+    tcp | ws | wss) trans="$trans  ${T_CONNS:-8} connections" ;;
+    esac
     prof=${T_PROFILE:-balanced}
     blank
     panel_open "$T_NAME"
@@ -636,6 +713,20 @@ wiz_review() {
         panel_field "IRAN" "$(addr_text "$T_IRAN")"
     fi
     panel_field "Transport" "$trans"
+    if [ -n "$T_DOMAIN" ]; then
+        panel_field "Address" "$(addr_text "$T_DOMAIN")$T_PATH"
+        # Written from where it is being read. The same file is shown on both
+        # servers and this line said "this server waits on 80" on the one
+        # doing the dialling.
+        local dialer=${T_DIALS:-iran}
+        if [ "$T_SIDE" = "$dialer" ]; then
+            panel_field "Direction" "this server dials the name"
+        else
+            panel_field "Direction" "${dialer^^} dials it; this server waits on ${T_LISTEN:-$T_PORT}"
+        fi
+    elif [ -n "$T_PATH" ]; then
+        panel_field "Path" "$T_PATH"
+    fi
     # "Link", not "Private link": it is the widest key any panel in the script
     # has, and one key a column wider than the rest puts one value out of line
     # with every other value in the box. The tunnel screen already calls it
@@ -705,7 +796,15 @@ wiz_render() {
     # Only a stream carrier opens more than one. On this path a single TCP
     # connection is shaped to nothing and eight together are not shaped at
     # all, which is the whole reason the number is here.
-    [ "$T_TRANSPORT" = tcp ] && printf 'connections = %s\n' "${T_CONNS:-8}"
+    case $T_TRANSPORT in
+    tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
+    esac
+    [ -n "$T_DOMAIN" ] && printf 'domain = "%s"\n' "$T_DOMAIN"
+    [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
+    # Which side opens the connection, written only when it is not the usual
+    # one - a line saying "iran" would be a setting nobody chose.
+    [ -n "$T_DIALS" ] && printf 'dials = "%s"\n' "$T_DIALS"
+    [ -n "$T_LISTEN" ] && printf 'listen_port = %s\n' "$T_LISTEN"
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -847,6 +946,7 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
+    T_DOMAIN= T_PATH= T_DIALS= T_LISTEN=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -864,9 +964,7 @@ wizard_new() {
         return $?
     fi
     blank
-    q_here || return 1
-    blank
-    q_there || return 1
+    q_addresses || return 1
 
     # Which of the two answers is which key. The file names both ends, and it
     # names them the same way on both servers, so the mapping happens once
@@ -883,6 +981,8 @@ wizard_new() {
     q_transport || return 1
     blank
     q_port || return 1
+    blank
+    q_web || return 1
     blank
     q_link || return 1
     blank
@@ -985,6 +1085,10 @@ wizard_paste() {
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
+    T_DOMAIN=$(toml_get "$f" transport domain)
+    T_PATH=$(toml_get "$f" transport path)
+    T_DIALS=$(toml_get "$f" transport dials)
+    T_LISTEN=$(toml_get "$f" transport listen_port)
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
     T_DEV=$(toml_get "$f" tun name)
