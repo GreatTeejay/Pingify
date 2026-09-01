@@ -652,7 +652,7 @@ screen_ports() {
     local name=$1 f side peer cur tuples proto lo hi dsth dstp key
     f=$(cfg_file "$name")
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
-    wipe
+    screen_top
 
     while :; do
         side=$(toml_get "$f" tunnel side)

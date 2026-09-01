@@ -30,20 +30,20 @@ systemctl() { printf '%s\n' "systemctl $*" >>"$SANDBOX/systemctl.log"; return 0;
 svc_do() { printf '%s\n' "svc_do $*" >>"$SANDBOX/systemctl.log"; return 0; }
 nat_apply() { return 0; }
 
-# Six answers: iran, the address abroad, udp, the port, the octet, balanced,
-# then y to create.
+# Seven answers: iran, this server's address, the one abroad, udp, the port,
+# the octet, balanced, then y to create.
 answers() { printf '%s\n' "$@"; }
 
-section "six questions on the first server"
+section "seven questions on the first server"
 
 if [ -z "$CORE" ]; then
     skip "the wizard end to end" "no core could be built"
 else
-    out=$(answers 1 46.247.109.83 1 8443 99 2 y | wizard_new 2>&1)
+    out=$(answers 1 185.31.8.129 46.247.109.83 1 8443 99 2 y | wizard_new 2>&1)
     rc=$?
     check "the wizard finished" "$rc" "0"
 
-    f=$CFG_DIR/udp-99.toml
+    f=$CFG_DIR/iran-udp-8443.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
         printf '    \033[31mx\033[0m no config was written\n'
@@ -51,6 +51,9 @@ else
     else
         check "the side that was chosen" "$(toml_get "$f" tunnel side)" "iran"
         check "the address abroad" "$(toml_get "$f" transport kharej)" "46.247.109.83"
+        # Recorded rather than dialled, and the wizard asks for it because a
+        # server with several addresses had the first one taken silently.
+        check "this server's own address" "$(toml_get "$f" transport iran)" "185.31.8.129"
         check "the transport" "$(toml_get "$f" transport type)" "udp"
         check "the port" "$(toml_get "$f" transport port)" "8443"
         check "the profile" "$(toml_get "$f" tuning profile)" "balanced"
@@ -85,17 +88,24 @@ else
     fi
 fi
 
-section "the name says nothing about which side it is"
+section "the name says which side it is"
 
-# The name lives in the shared file, so a name with iran in it would be wrong
-# on the other server the moment it was pasted there. The old naming scheme
-# was iran-9443 and walked straight into this.
-if [ -f "$CFG_DIR/udp-99.toml" ]; then
-    n=$(toml_get "$CFG_DIR/udp-99.toml" tunnel name)
-    check_missing "no iran in the name" "$n" "iran"
-    check_missing "no kharej in the name" "$n" "kharej"
-    d=$(toml_get "$CFG_DIR/udp-99.toml" tun name)
-    check_missing "nor in the device name" "$d" "iran"
+# The first thing anybody needs to know about a tunnel is which end of the
+# border it is, and `ls /root/pingify` should answer that without opening
+# anything. It is why the two files differ in two lines rather than one: the
+# paste rewrites the name along with the side.
+if [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
+    n=$(toml_get "$CFG_DIR/iran-udp-8443.toml" tunnel name)
+    check "the name is side, transport and port" "$n" "iran-udp-8443"
+    check "flipping it gives the other server's name" \
+        "$(name_for_side "$n" kharej)" "kharej-udp-8443"
+    check "a name nobody built from a side is left alone" \
+        "$(name_for_side "something-else" kharej)" "something-else"
+
+    # The device name is not the tunnel's name and must not become it: linux
+    # takes fifteen characters and kharej-icmp-100 is already fifteen.
+    d=$(toml_get "$CFG_DIR/iran-udp-8443.toml" tun name)
+    check_missing "the device is not named after a side" "$d" "iran"
     if [ "${#d}" -le 15 ]; then PASS=$((PASS + 1)); else
         FAIL=$((FAIL + 1))
         printf '    \033[31mx\033[0m the device name is %s characters; linux allows 15\n' "${#d}"
@@ -104,8 +114,8 @@ fi
 
 section "the token carries the whole file"
 
-if [ -f "$CFG_DIR/udp-99.toml" ]; then
-    f=$CFG_DIR/udp-99.toml
+if [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
+    f=$CFG_DIR/iran-udp-8443.toml
     line=$(token_encode "$f")
     check_contains "it is marked as ours" "$line" "PFY2."
 
@@ -129,29 +139,35 @@ fi
 
 section "one paste finishes the pair"
 
-if [ -n "$CORE" ] && [ -f "$CFG_DIR/udp-99.toml" ]; then
+if [ -n "$CORE" ] && [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
     iran=$SANDBOX/iran.toml
-    cp "$CFG_DIR/udp-99.toml" "$iran"
+    cp "$CFG_DIR/iran-udp-8443.toml" "$iran"
     line=$(token_encode "$iran")
 
     # The far server, from nothing but that line.
     rm -f "$CFG_DIR"/*.toml
     out=$(printf '%s\ny\n' "$line" | wizard_paste 2>&1)
-    kharej=$CFG_DIR/udp-99.toml
+    kharej=$CFG_DIR/kharej-udp-8443.toml
 
     if [ ! -f "$kharej" ]; then
         FAIL=$((FAIL + 1))
         printf '    \033[31mx\033[0m the paste did not produce a config\n'
         printf '%s\n' "$out" | tail -15 | sed 's/^/        /'
+        ls "$CFG_DIR" | sed 's/^/        found: /'
     else
         check "the far side knows which side it is" \
             "$(toml_get "$kharej" tunnel side)" "kharej"
+        check "and renamed itself to match" \
+            "$(toml_get "$kharej" tunnel name)" "kharej-udp-8443"
 
-        # The property the whole design rests on. Two files, one changed line.
+        # The property the whole design rests on: one file, two servers. Two
+        # lines differ now rather than one, and the second is the name, which
+        # is the price of a name that says which end it is.
         d=$(diff "$iran" "$kharej" | grep -c '^[<>]')
-        check "exactly one line differs between the two servers" "$d" "2"
-        check "and it is the side" \
-            "$(diff "$iran" "$kharej" | grep '^>' | sed 's/^> //')" 'side = "kharej"'
+        check "two lines differ between the two servers" "$d" "4"
+        check "and they are the side and the name" \
+            "$(diff "$iran" "$kharej" | grep '^>' | sed 's/^> //' | LC_ALL=C sort | tr '\n' ' ')" \
+            'name = "kharej-udp-8443" side = "kharej" '
         check "the core accepts the far side too" \
             "$("$CORE" -c "$kharej" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
     fi

@@ -185,14 +185,27 @@ free_device() {
     return 1
 }
 
-# default_name is <transport>-<octet>, suffixed -2, -3 on collision.
+# The name a tunnel is given, which is also the name of its file.
+#
+# It starts with the side, and that is the whole point of it: on a server with
+# three tunnels, the first thing anybody needs to know about each one is which
+# end of the border they are looking at - and `ls /root/pingify` should say so
+# without opening anything.
+#
+# Then the transport, then the one number that tells two tunnels apart: the
+# port for a tunnel that has one, and the private link's octet for ICMP, which
+# has no port at all.
+#
+#   iran-udp-8443     kharej-udp-8443
+#   iran-icmp-99      kharej-icmp-99
 #
 # It is built from those two because neither can name a side. The name lives in
 # the shared file, so a name like iran-9443 - which is what the old scheme
 # produced - is a lie on one of the two servers from the moment it is written.
 default_name() {
-    local trans=${1:-$T_TRANSPORT} oct=${2:-$T_OCTET} base n i
-    base="$trans-$oct"
+    local side=${1:-$T_SIDE} trans=${2:-$T_TRANSPORT} port=${3:-$T_PORT} oct=${4:-$T_OCTET}
+    local base n i
+    base="$side-$trans-${port:-$oct}"
     n=$base
     i=2
     while [ -e "$(cfg_file "$n")" ]; do
@@ -201,6 +214,20 @@ default_name() {
         [ "$i" -gt 20 ] && break
     done
     printf '%s' "$n"
+}
+
+# The same tunnel's name on the other server.
+#
+# The side is the first word of the name, so this replaces the first word. It
+# is why the two files differ in two lines now rather than one: the side, and
+# the name that carries it. A name that does not begin with a side is left
+# alone - somebody chose it by hand and it is not this function's to rewrite.
+name_for_side() {
+    local name=$1 side=$2
+    case $name in
+    iran-* | kharej-*) printf '%s-%s' "$side" "${name#*-}" ;;
+    *) printf '%s' "$name" ;;
+    esac
 }
 
 # The status endpoint is one loopback port per tunnel. It is written into the
@@ -335,42 +362,58 @@ q_side() {
 # the server abroad on both. The old wizard asked one side for "the remote" and
 # the other for "the local", and the two answers were the same address written
 # from two points of view, which is how the pair came to disagree.
-q_kharej() {
+# An address, in the colour addresses are printed in.
+addr_text() { printf '%s%s%s' "$C_ADDR" "$1" "$C_OFF"; }
+
+# Two questions, one for each end of the tunnel, and this server comes first
+# because it is the one the script can answer for you.
+#
+# The address is read off this machine's own interfaces and offered as the
+# default: if it is right, enter. When a server answers on more than one they
+# are listed and picked from - taking the first and saying nothing is how the
+# wrong one ends up in the file, and nothing says so until the other end has
+# been dialling it for a quarter of an hour.
+q_here() {
     local def= n i=0
     local -a addrs=()
-    wiz_ask "The server abroad"
+    wiz_ask "This server's address"
     blank
-    dim "Both servers name this one, so the file is the same on each."
-    blank
+    while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
-    if [ "$T_SIDE" = kharej ]; then
-        while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
-        # A server with more than one address is a server where the wrong one
-        # writes a config the far end cannot reach - and nothing says so until
-        # IRAN has been dialling nothing for a while. So it is asked, not
-        # guessed, and only when there is something to choose between.
-        if [ "${#addrs[@]}" -gt 1 ]; then
-            dim "this server answers on more than one address"
-            dim "pick the one IRAN should dial"
-            blank
-            while [ "$i" -lt "${#addrs[@]}" ]; do
-                item "$((i + 1))" "${addrs[i]}"
-                i=$((i + 1))
-            done
-            item "$((i + 1))" "Something else" "a hostname, or an address not listed"
-            blank
-            pick n "select" 1 $((i + 1)) || return 1
-            if [ "$n" -le "${#addrs[@]}" ]; then
-                T_KHAREJ=${addrs[n - 1]}
-                return 0
-            fi
-            blank
-        else
-            def=${addrs[0]:-}
+    if [ "${#addrs[@]}" -gt 1 ]; then
+        dim "this server answers on more than one address - pick the right one"
+        blank
+        while [ "$i" -lt "${#addrs[@]}" ]; do
+            item "$((i + 1))" "$(addr_text "${addrs[i]}")"
+            i=$((i + 1))
+        done
+        item "$((i + 1))" "Something else" "a hostname, or an address not listed"
+        blank
+        pick n "select" 1 $((i + 1)) || return 1
+        if [ "$n" -le "${#addrs[@]}" ]; then
+            T_HERE=${addrs[n - 1]}
+            return 0
         fi
+        blank
+    else
+        def=${addrs[0]:-}
+        [ -n "$def" ] && dim "this is what the server says its address is - enter takes it"
+        [ -n "$def" ] && blank
     fi
 
-    ask T_KHAREJ "address of the KHAREJ server" "$def" v_host || return 1
+    ask T_HERE "address of this server" "$def" v_host || return 1
+    return 0
+}
+
+q_there() {
+    local other=KHAREJ
+    [ "$T_SIDE" = kharej ] && other=IRAN
+    wiz_ask "The other server's address"
+    blank
+    dim "The $other server, which you are not sitting on. Both files carry"
+    dim "both addresses, so this answer is the same on each of them."
+    blank
+    ask T_THERE "address of the $other server" "" v_host || return 1
     return 0
 }
 
@@ -406,8 +449,8 @@ q_port() {
     fi
     wiz_ask "Port"
     blank
-    dim "KHAREJ waits on this port and IRAN dials it. The same"
-    dim "number goes on both servers."
+    dim "KHAREJ listens on this port and IRAN dials it. The same number goes"
+    dim "on both servers, and it is the only port the tunnel itself needs open."
     blank
     while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
@@ -433,7 +476,9 @@ q_link() {
     local def n a dev addr
     wiz_ask "The private link"
     blank
-    dim "Two addresses nothing else uses. Pick the middle number."
+    dim "The two servers talk to each other on a pair of private addresses"
+    dim "that nothing else on either machine uses. Pick the middle number and"
+    dim "both are worked out from it."
     blank
     while IFS= read -r n; do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
@@ -457,8 +502,8 @@ q_link() {
         return 1
     }
     blank
-    field "IRAN" "10.$T_OCTET.10.1/24"
-    field "KHAREJ" "10.$T_OCTET.10.2/24"
+    field "IRAN" "$(addr_text "10.$T_OCTET.10.1/24")"
+    field "KHAREJ" "$(addr_text "10.$T_OCTET.10.2/24")"
     field "device" "$T_DEV"
     return 0
 }
@@ -540,8 +585,12 @@ wiz_review() {
     prof=${T_PROFILE:-balanced}
     blank
     panel_open "$T_NAME"
-    panel_field "This server" "${T_SIDE^^}"
-    panel_field "Abroad" "$T_KHAREJ"
+    panel_field "This server" "${T_SIDE^^}   $(addr_text "${T_HERE:-$([ "$T_SIDE" = iran ] && printf '%s' "$T_IRAN" || printf '%s' "$T_KHAREJ")}")"
+    if [ "$T_SIDE" = iran ]; then
+        panel_field "KHAREJ" "$(addr_text "$T_KHAREJ")"
+    else
+        panel_field "IRAN" "$(addr_text "$T_IRAN")"
+    fi
     panel_field "Transport" "$trans"
     # "Link", not "Private link": it is the widest key any panel in the script
     # has, and one key a column wider than the rest puts one value out of line
@@ -594,7 +643,7 @@ wiz_confirm() {
 wiz_render() {
     printf '# Pingify %s\n' "$PINGIFY_VERSION"
     printf '#\n'
-    printf '# The same file runs on both servers. Only the side line differs.\n'
+    printf '# The same file runs on both servers, but for the side and the name.\n'
     printf '\n[tunnel]\n'
     printf 'name = "%s"\n' "$T_NAME"
     printf 'side = "%s"\n' "$T_SIDE"
@@ -602,6 +651,10 @@ wiz_render() {
     printf '\n[transport]\n'
     printf 'type = "%s"\n' "$T_TRANSPORT"
     printf 'kharej = "%s"\n' "$T_KHAREJ"
+    # Recorded, not dialled. KHAREJ never dials anything, so nothing uses this
+    # - but both files carry it, so the operator of either server can see
+    # which pair a tunnel belongs to without logging into the other one.
+    [ -n "$T_IRAN" ] && printf 'iran = "%s"\n' "$T_IRAN"
     # No port key at all for icmp. Writing port = 0 would pass the core's check
     # and then sit in the file looking like a setting somebody chose.
     [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"
@@ -742,11 +795,11 @@ token_decode() {
 wizard_new() {
     local f other
     WIZ_QUIT=0
-    T_SIDE= T_KHAREJ= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
+    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
-    wipe
+    screen_top
     blank
     rule "New tunnel"
     blank
@@ -760,7 +813,21 @@ wizard_new() {
         return $?
     fi
     blank
-    q_kharej || return 1
+    q_here || return 1
+    blank
+    q_there || return 1
+
+    # Which of the two answers is which key. The file names both ends, and it
+    # names them the same way on both servers, so the mapping happens once
+    # here rather than at every place that reads them.
+    if [ "$T_SIDE" = iran ]; then
+        T_IRAN=$T_HERE
+        T_KHAREJ=$T_THERE
+    else
+        T_KHAREJ=$T_HERE
+        T_IRAN=$T_THERE
+    fi
+
     blank
     q_transport || return 1
     blank
@@ -851,6 +918,7 @@ wizard_paste() {
     T_SIDE=$(toml_get "$f" tunnel side)
     T_TRANSPORT=$(toml_get "$f" transport type)
     T_KHAREJ=$(toml_get "$f" transport kharej)
+    T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
@@ -881,6 +949,12 @@ wizard_paste() {
     *) bad "that token does not say which server made it"; rm -f "$f"; return 1 ;;
     esac
     toml_set "$f" tunnel side "$T_SIDE"
+
+    # And the name goes with it. The name begins with the side, so a file
+    # pasted onto KHAREJ that still called itself iran-udp-8443 would be the
+    # one thing on this server whose name was a lie about it.
+    T_NAME=$(name_for_side "$T_NAME" "$T_SIDE")
+    toml_set "$f" tunnel name "$T_NAME"
 
     # The file is shared, so a clash here can only be fixed on both servers.
     # This is the one thing the shared-file design costs, and it is the

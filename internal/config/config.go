@@ -60,8 +60,13 @@ type Config struct {
 	Mode string // tun
 
 	Transport struct {
-		Type      string // udp
-		Kharej    string // the abroad server's address
+		Type   string // udp
+		Kharej string // the abroad server's address
+		// The Iran server's address. Nothing here dials it - KHAREJ never
+		// dials anything - so it is recorded rather than used: both files
+		// carry it, so either server can say which pair it belongs to, and
+		// the operator of one can see the other without logging into it.
+		Iran      string
 		Port      int
 		Keepalive int // seconds
 	}
@@ -182,6 +187,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Type, err = str()
 	case "transport.kharej":
 		c.Transport.Kharej, err = str()
+	case "transport.iran":
+		c.Transport.Iran, err = str()
 	case "transport.port":
 		c.Transport.Port, err = num()
 	case "transport.keepalive_sec":

@@ -31,7 +31,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="2.0.0"
+PINGIFY_VERSION="2.1.0"
 
 # --------------------------------------------------------------------------
 # what this terminal can do
@@ -84,7 +84,7 @@ ui_detect() {
 
 ui_palette() {
     if [ "$UI_COLOR" = none ]; then
-        C_OFF= C_B= C_ACCENT= C_OK= C_WARN= C_BAD= C_MUTE= C_KEY= C_RULE=
+        C_OFF= C_B= C_ACCENT= C_OK= C_WARN= C_BAD= C_MUTE= C_KEY= C_RULE= C_ADDR=
         return
     fi
     C_OFF=$'\033[0m'
@@ -95,10 +95,16 @@ ui_palette() {
     C_MUTE=$'\033[90m'
     C_KEY=$'\033[2m'
     C_RULE=$'\033[90m'
+    # A sixth role, and the only one that is about what a value *is* rather
+    # than how it is doing: an address. They are the things a person copies
+    # from one screen onto another server, and picking them out of a line of
+    # prose is most of what this tool asks anybody to do.
+    C_ADDR=$'\033[1m'
     # Raw cyan is unreadable on the white-background terminals a lot of people
     # actually run. Where there are 256 colours, use a desaturated teal.
     if [ "$UI_COLOR" = 256 ]; then
         C_ACCENT=$'\033[38;5;37m'
+        C_ADDR=$'\033[38;5;180m'
     else
         C_ACCENT=$'\033[36m'
     fi
@@ -206,6 +212,15 @@ wipe() {
     [ -t 1 ] || return 0
     [ "$UI_COLOR" = none ] && return 0
     printf '\033[H\033[2J'
+}
+
+# How every screen in this script opens: a clean page with the name at the top
+# of it. The name is there on every screen and not only the first, so that a
+# person three screens deep still knows what they are looking at, and so that
+# every screen begins at the same place on the page.
+screen_top() {
+    wipe
+    banner
 }
 
 say() { printf '%s\n' "$*"; }
