@@ -238,6 +238,36 @@ name_for_side() {
 # $STATUS_BASE with status 0 - the one port it had just proved was taken - and
 # both callers wrote that number into the config without a word, so the new
 # core lost the race for the loopback port and the tunnel never came up.
+# Whether something on this machine already holds a port on every address.
+#
+# A listener on one address is not in the way: the health port is bound to the
+# tunnel's own tun address, and no two tunnels have the same one. A listener
+# on the wildcard *is* in the way - and on Linux an IPv6 wildcard holds the
+# IPv4 one along with it, so [::]:19999 blocks 10.99.10.1:19999 too.
+#
+# This is why the health port is not a question. There is nothing for a person
+# to know here that the machine does not already know.
+wiz_health_bound() {
+    local p=$1 a
+    have ss || return 1
+    while read -r a; do
+        case $a in
+        "0.0.0.0:$p" | "*:$p" | "[::]:$p" | ":::$p") return 0 ;;
+        esac
+    done < <(ss -ltnH 2>/dev/null | awk '{ print $4 }')
+    return 1
+}
+
+wiz_free_health() {
+    local p=$HEALTH_PORT n=0
+    while wiz_health_bound "$p"; do
+        p=$((p + 1))
+        n=$((n + 1))
+        [ "$n" -gt 20 ] && return 1
+    done
+    printf '%s' "$p"
+}
+
 wiz_free_status_port() {
     local keep=${1:-$WIZ_KEEP} i=0 p n taken
     while [ "$i" -lt 100 ]; do
@@ -675,7 +705,7 @@ wiz_render() {
     printf 'port = %s\n' "${T_STATUS:-$STATUS_BASE}"
     # The same on both servers, and it stays that way: it is bound to this
     # tunnel's private address, which nothing else on either machine has.
-    printf 'health_port = %s\n' "$HEALTH_PORT"
+    printf 'health_port = %s\n' "${T_HEALTH:-$HEALTH_PORT}"
 }
 
 # --------------------------------------------------------------------------
@@ -798,7 +828,7 @@ token_decode() {
 wizard_new() {
     local f other
     WIZ_QUIT=0
-    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
+    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -841,6 +871,20 @@ wizard_new() {
     q_profile || return 1
 
     T_NAME=$(default_name)
+
+    # The health port is not asked for, and this is the reason: the only thing
+    # that could be wrong with it is something else on this machine holding it
+    # on every address, and that is a question the machine answers faster than
+    # a person can. It goes in the shared file, so both servers get the number
+    # this one settled on.
+    if ! T_HEALTH=$(wiz_free_health); then
+        T_HEALTH=$HEALTH_PORT
+        warn "$HEALTH_PORT and the twenty above it are all taken on this server"
+        fix "the tunnel will work; its round trip will not be measurable"
+    elif [ "$T_HEALTH" != "$HEALTH_PORT" ]; then
+        blank
+        dim "$HEALTH_PORT is taken here, so the health port is $T_HEALTH on both servers"
+    fi
     # Stop here rather than build a tunnel whose core cannot bind its status
     # port: the home screen reads every number through that endpoint, so a
     # tunnel without one is a tunnel nothing can report on.
@@ -978,6 +1022,18 @@ wizard_paste() {
         fix "the device is in the shared file - change both"
         clash=1
     fi
+    # The health port comes with the file and this server has to be able to
+    # bind it too. It is a warning rather than a clash: the tunnel carries
+    # traffic without it, and what is lost is the round trip measurement and
+    # the check that asks the far end whether it is there.
+    a=$(toml_get "$f" status health_port)
+    case $a in '' | *[!0-9]*) a=$HEALTH_PORT ;; esac
+    if wiz_health_bound "$a"; then
+        warn "something here already holds port $a on every address"
+        fix "the tunnel works; its round trip will not be measurable"
+        fix "to fix it, set status.health_port to a free number on both servers"
+    fi
+
     if [ "$T_SIDE" = kharej ] && [ "$T_TRANSPORT" != icmp ]; then
         if own=$(wiz_port_owner "$T_PORT"); then
             bad "port $T_PORT already belongs to $own"
