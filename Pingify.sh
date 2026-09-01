@@ -3905,6 +3905,9 @@ func newWebSocketCarrier(cfg *config.Config, kind string,
 		return nil, err
 	}
 
+	// The name the far end is dialled by is the name the Host header carries
+	// and the name TLS is checked against. Behind a CDN they have to be the
+	// same one: the edge answers on it and routes on it.
 	host := cfg.DialHost()
 	addr := net.JoinHostPort(host, fmt.Sprint(cfg.Transport.Port))
 	path := cfg.Path()
@@ -4355,21 +4358,12 @@ type Config struct {
 		Iran string
 		Port int
 
-		// The name the dialling side asks for, and the Host header it sends
-		// with it. Behind a CDN this is the only address that matters: the
-		// edge is what answers on it, and the name is how the edge knows
-		// which origin the request belongs to.
-		Domain string
-
 		// The path a WebSocket handshake asks for. Anything else that arrives
 		// gets a 404, which is what a web server would have said.
 		Path string
 
-		// Which side opens the connection. Iran, unless something in the
-		// middle only works the other way round - a CDN in front of the Iran
-		// server is exactly that: the edge answers on the domain and connects
-		// inward to the origin, so the origin is the side that waits and the
-		// server abroad is the side that dials.
+		// Which side opens the connection, when it is not the side the
+		// addresses imply. Almost nothing sets this: see DialSide.
 		Dials string
 
 		// Where the side that waits binds, when that is not the port the
@@ -4454,19 +4448,41 @@ type Config struct {
 // dials the edge. transport.dials says so when that is the arrangement.
 func (c *Config) Dials() bool { return c.Side == c.DialSide() }
 
+// DialSide is worked out from the two addresses rather than asked for.
+//
+// Iran dials out, and that is the default because connections into the Iran
+// server are blackholed after about six exchanges - measured, repeatedly.
+//
+// The exception is a name. A CDN answers on a name and connects *inward* to
+// the origin it was given, so a name can only ever front the side that waits:
+// if the Iran server is named and the one abroad is an address, then Iran is
+// the origin behind the edge, and the server abroad is the one that dials it.
+// There is nothing to ask - the two addresses already say which it is.
 func (c *Config) DialSide() string {
-	if c.Transport.Dials == SideKharej {
+	switch c.Transport.Dials {
+	case SideIran, SideKharej:
+		return c.Transport.Dials
+	}
+	if isName(c.Transport.Iran) && !isName(c.Transport.Kharej) {
 		return SideKharej
 	}
 	return SideIran
 }
 
-// DialHost is what the side that dials connects to: the domain when there is
-// one, and otherwise the address of whichever server is waiting.
-func (c *Config) DialHost() string {
-	if c.Transport.Domain != "" {
-		return c.Transport.Domain
+// isName is "this is a domain and not an address", which is the whole of what
+// has to be told apart here: an address is digits and dots.
+func isName(s string) bool {
+	if s == "" {
+		return false
 	}
+	return strings.ContainsFunc(s, func(r rune) bool {
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+	})
+}
+
+// DialHost is what the side that dials connects to, which is the other
+// server's address - and that address is the domain when somebody typed one.
+func (c *Config) DialHost() string {
 	if c.DialSide() == SideIran {
 		return c.Transport.Kharej
 	}
@@ -4482,10 +4498,24 @@ func (c *Config) Path() string {
 	return c.Transport.Path
 }
 
-// ListenPort is where the side that waits binds.
+// ListenPort is where the side that waits binds, which behind a CDN is not
+// the port the other side dialled.
+//
+// An edge takes the connection on one of its own ports and comes to the
+// origin on another. Cloudflare's flexible mode - which is what somebody with
+// no certificate on the origin is using, and that is nearly everybody putting
+// a name in front of a server in Iran - terminates the TLS at the edge and
+// arrives here in plain HTTP on 80. So a tunnel dialled on one of the HTTPS
+// ports waits on 80 unless the file says otherwise.
 func (c *Config) ListenPort() int {
 	if c.Transport.ListenPort > 0 {
 		return c.Transport.ListenPort
+	}
+	if isName(c.DialHost()) {
+		switch c.Transport.Port {
+		case 443, 2053, 2083, 2087, 2096, 8443:
+			return 80
+		}
 	}
 	return c.Transport.Port
 }
@@ -4572,8 +4602,6 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Port, err = num()
 	case "transport.connections":
 		c.Transport.Connections, err = num()
-	case "transport.domain":
-		c.Transport.Domain, err = str()
 	case "transport.path":
 		c.Transport.Path, err = str()
 	case "transport.dials":
@@ -6345,6 +6373,13 @@ q_addresses() {
 
     wiz_ask "The two servers"
     blank
+    # A name rather than an address is the whole of the CDN arrangement, and
+    # it is one word rather than a question: a name can only ever front the
+    # side that waits, because an edge answers on the name and connects
+    # inward to the origin behind it. So a name here is what decides which
+    # side dials, and nothing else needs asking.
+    dim "an address, or a domain - a domain is what puts a CDN in front of it"
+    blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
     if [ "${#addrs[@]}" -gt 1 ]; then
@@ -6366,6 +6401,14 @@ q_addresses() {
     fi
     [ -n "$T_HERE" ] || ask T_HERE "this server (${T_SIDE^^})" "$def" v_host || return 1
     ask T_THERE "the other one ($other)" "" v_host || return 1
+
+    # Generated, never asked. Any path works and none is better than another,
+    # so it is not a question - it exists so that a request for anything else
+    # gets the 404 a web server would have given. The Advanced screen has it
+    # for the rare case where a domain is shared with something else.
+    case $T_TRANSPORT in
+    ws | wss) T_PATH=$(wiz_path) ;;
+    esac
     return 0
 }
 
@@ -6429,63 +6472,6 @@ q_port() {
 # One question, not three. The old wizard asked for the octet and then re-asked
 # both addresses it had just derived from it, so a hand edit at the second
 # prompt walked straight past the checks that guarded the first.
-# The one extra step a WebSocket transport needs, and it is skipped entirely
-# by the three that do not.
-#
-# A domain is what makes these worth having: a name in front of a server can
-# be a CDN, and a CDN answers on its own addresses, terminates the TLS itself
-# and comes to the origin from its own network. That is also why it changes
-# which side dials - an edge connects *inward* to the origin, so a name in
-# front of the IRAN server can only be reached by KHAREJ dialling it.
-q_web() {
-    local n def_listen
-    case $T_TRANSPORT in ws | wss) ;; *) return 0 ;; esac
-
-    wiz_ask "The web address"
-    blank
-    if [ "$T_TRANSPORT" = wss ]; then
-        dim "TLS is checked against this name, and a CDN answers only for names"
-        dim "it has been given."
-        blank
-        ask T_DOMAIN "domain" "" v_host || return 1
-    else
-        dim "With a domain this goes through whatever answers for it; without"
-        dim "one it dials the address directly."
-        blank
-        ask T_DOMAIN "domain, or - for none" "-" v_domain_or_none || return 1
-        [ "$T_DOMAIN" = "-" ] && T_DOMAIN=
-    fi
-
-    # Generated rather than asked. Any path works and none is better than
-    # another, so this is one more question with no wrong answer - and a
-    # random one is not a path anybody scans for.
-    T_PATH=$(wiz_path)
-    field "path" "$T_PATH"
-
-    [ -z "$T_DOMAIN" ] && { T_DIALS=; T_LISTEN=; return 0; }
-
-    blank
-    item "1" "the name points at KHAREJ" "the usual - IRAN dials it"
-    item "2" "a CDN in front of IRAN" "KHAREJ dials it, and this side waits"
-    blank
-    pick n "select" 1 2 || return 1
-    if [ "$n" = 1 ]; then
-        T_DIALS= T_LISTEN=
-        return 0
-    fi
-
-    T_DIALS=kharej
-    # A CDN takes the connection on the port that was asked for and comes to
-    # the origin on a port of its own. Cloudflare's flexible mode terminates
-    # the TLS at the edge and arrives here in plain HTTP on 80, which is why
-    # that is the default when the port dialled is 443.
-    def_listen=$T_PORT
-    [ "$T_PORT" = 443 ] && def_listen=80
-    blank
-    ask T_LISTEN "port the edge will reach this server on" "$def_listen" v_listen_port || return 1
-    return 0
-}
-
 # A path nobody scans for: six hex characters, from the kernel's own random
 # device where there is one and from the shell's when there is not.
 wiz_path() {
@@ -6493,23 +6479,6 @@ wiz_path() {
     h=$(head -c 3 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
     [ -n "$h" ] || h=$(printf '%06x' $((RANDOM * RANDOM % 16777216)))
     printf '/%s' "$h"
-}
-
-v_domain_or_none() {
-    [ "$1" = "-" ] && return 0
-    v_host "$1"
-}
-
-# The port this server will bind when it is the one that waits. Unlike the
-# port a tunnel is dialled on, this one is opened here and now, so something
-# else already holding it is a refusal rather than a note.
-v_listen_port() {
-    v_port "$1" || return 1
-    if wiz_port_bound "$1" tcp; then
-        echo "something here already listens on tcp/$1; see: ss -lntp | grep :$1"
-        return 1
-    fi
-    return 0
 }
 
 q_link() {
@@ -6631,19 +6600,18 @@ wiz_review() {
         panel_field "IRAN" "$(addr_text "$T_IRAN")"
     fi
     panel_field "Transport" "$trans"
-    if [ -n "$T_DOMAIN" ]; then
-        panel_field "Address" "$(addr_text "$T_DOMAIN")$T_PATH"
-        # Written from where it is being read. The same file is shown on both
-        # servers and this line said "this server waits on 80" on the one
-        # doing the dialling.
-        local dialer=${T_DIALS:-iran}
-        if [ "$T_SIDE" = "$dialer" ]; then
-            panel_field "Direction" "this server dials the name"
-        else
-            panel_field "Direction" "${dialer^^} dials it; this server waits on ${T_LISTEN:-$T_PORT}"
-        fi
-    elif [ -n "$T_PATH" ]; then
-        panel_field "Path" "$T_PATH"
+    # Which end dials, said out loud, because for a WebSocket tunnel it is
+    # worked out from the addresses rather than chosen - and the one thing a
+    # person should be able to check on this screen is that it came out the
+    # way they meant.
+    local dialer=iran
+    case $T_IRAN in *[a-zA-Z]*) case $T_KHAREJ in *[a-zA-Z]*) ;; *) dialer=kharej ;; esac ;; esac
+    local target=$T_KHAREJ
+    [ "$dialer" = kharej ] && target=$T_IRAN
+    if [ "$T_SIDE" = "$dialer" ]; then
+        panel_field "Dials" "out to $(addr_text "$target")"
+    else
+        panel_field "Waits" "${dialer^^} dials in"
     fi
     # "Link", not "Private link": it is the widest key any panel in the script
     # has, and one key a column wider than the rest puts one value out of line
@@ -6717,12 +6685,7 @@ wiz_render() {
     case $T_TRANSPORT in
     tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
     esac
-    [ -n "$T_DOMAIN" ] && printf 'domain = "%s"\n' "$T_DOMAIN"
     [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
-    # Which side opens the connection, written only when it is not the usual
-    # one - a line saying "iran" would be a setting nobody chose.
-    [ -n "$T_DIALS" ] && printf 'dials = "%s"\n' "$T_DIALS"
-    [ -n "$T_LISTEN" ] && printf 'listen_port = %s\n' "$T_LISTEN"
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -6864,7 +6827,7 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
-    T_DOMAIN= T_PATH= T_DIALS= T_LISTEN=
+    T_PATH=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -6899,8 +6862,6 @@ wizard_new() {
     q_transport || return 1
     blank
     q_port || return 1
-    blank
-    q_web || return 1
     blank
     q_link || return 1
     blank
@@ -7003,10 +6964,7 @@ wizard_paste() {
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
-    T_DOMAIN=$(toml_get "$f" transport domain)
     T_PATH=$(toml_get "$f" transport path)
-    T_DIALS=$(toml_get "$f" transport dials)
-    T_LISTEN=$(toml_get "$f" transport listen_port)
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
     T_DEV=$(toml_get "$f" tun name)
@@ -7341,6 +7299,14 @@ screen_tunnel() {
             fi
             [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
         fi
+        # The name and the path, for the transports that have one. It is the
+        # one thing about a WebSocket tunnel that is not in the line above,
+        # and the one somebody putting a proxy in front of it needs.
+        local dom
+        dom=$(toml_get "$f" transport domain)
+        if [ -n "$dom" ]; then
+            field "Address" "$(addr_text "$dom")$(toml_get "$f" transport path)"
+        fi
         field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
 
         # One measurement to a line, each with the name of what it is. They
@@ -7534,7 +7500,10 @@ screen_advanced() {
         fi
         item2 4 "Device queues" "${qs:-the core chooses}"
         item2 5 "Health port" "$(health_port_of "$name") on $(my_addr "$name")"
-        item 6 "Show the config file"
+        case $(toml_get "$f" transport type) in
+        ws | wss) item2 6 "Web path" "$(toml_get "$f" transport path)" ;;
+        esac
+        item 7 "Show the config file"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -7567,7 +7536,19 @@ screen_advanced() {
             local v
             ask v "port (-1 turns it off)" "$(health_port_of "$name")" v_hport || continue
             HEALTH_WANT=$v; cfg_apply "$name" _edit_health_port yes; pause ;;
-        6) blank; sed 's/^/    /' "$f"; pause ;;
+        6) case $(toml_get "$f" transport type) in
+            ws | wss) ;;
+            *) blank; warn "there is nothing on 6"; pause; continue ;;
+            esac
+            blank
+            dim "What the WebSocket handshake asks for. Anything else that"
+            dim "arrives gets a 404, the way a web server would answer it."
+            dim "It has to match on both servers."
+            blank
+            local v
+            ask v "path" "$(toml_get "$f" transport path)" v_path || continue
+            PATH_WANT=$v; cfg_apply "$name" _edit_path yes; pause ;;
+        7) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -7578,6 +7559,15 @@ _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
 _edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
+_edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
+
+v_path() {
+    case $1 in
+    /*) return 0 ;;
+    esac
+    echo "a path starts with a slash"
+    return 1
+}
 
 v_hport() {
     case $1 in

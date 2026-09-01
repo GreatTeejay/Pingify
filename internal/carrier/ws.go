@@ -61,6 +61,9 @@ func newWebSocketCarrier(cfg *config.Config, kind string,
 		return nil, err
 	}
 
+	// The name the far end is dialled by is the name the Host header carries
+	// and the name TLS is checked against. Behind a CDN they have to be the
+	// same one: the edge answers on it and routes on it.
 	host := cfg.DialHost()
 	addr := net.JoinHostPort(host, fmt.Sprint(cfg.Transport.Port))
 	path := cfg.Path()

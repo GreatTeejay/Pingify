@@ -90,21 +90,12 @@ type Config struct {
 		Iran string
 		Port int
 
-		// The name the dialling side asks for, and the Host header it sends
-		// with it. Behind a CDN this is the only address that matters: the
-		// edge is what answers on it, and the name is how the edge knows
-		// which origin the request belongs to.
-		Domain string
-
 		// The path a WebSocket handshake asks for. Anything else that arrives
 		// gets a 404, which is what a web server would have said.
 		Path string
 
-		// Which side opens the connection. Iran, unless something in the
-		// middle only works the other way round - a CDN in front of the Iran
-		// server is exactly that: the edge answers on the domain and connects
-		// inward to the origin, so the origin is the side that waits and the
-		// server abroad is the side that dials.
+		// Which side opens the connection, when it is not the side the
+		// addresses imply. Almost nothing sets this: see DialSide.
 		Dials string
 
 		// Where the side that waits binds, when that is not the port the
@@ -189,19 +180,41 @@ type Config struct {
 // dials the edge. transport.dials says so when that is the arrangement.
 func (c *Config) Dials() bool { return c.Side == c.DialSide() }
 
+// DialSide is worked out from the two addresses rather than asked for.
+//
+// Iran dials out, and that is the default because connections into the Iran
+// server are blackholed after about six exchanges - measured, repeatedly.
+//
+// The exception is a name. A CDN answers on a name and connects *inward* to
+// the origin it was given, so a name can only ever front the side that waits:
+// if the Iran server is named and the one abroad is an address, then Iran is
+// the origin behind the edge, and the server abroad is the one that dials it.
+// There is nothing to ask - the two addresses already say which it is.
 func (c *Config) DialSide() string {
-	if c.Transport.Dials == SideKharej {
+	switch c.Transport.Dials {
+	case SideIran, SideKharej:
+		return c.Transport.Dials
+	}
+	if isName(c.Transport.Iran) && !isName(c.Transport.Kharej) {
 		return SideKharej
 	}
 	return SideIran
 }
 
-// DialHost is what the side that dials connects to: the domain when there is
-// one, and otherwise the address of whichever server is waiting.
-func (c *Config) DialHost() string {
-	if c.Transport.Domain != "" {
-		return c.Transport.Domain
+// isName is "this is a domain and not an address", which is the whole of what
+// has to be told apart here: an address is digits and dots.
+func isName(s string) bool {
+	if s == "" {
+		return false
 	}
+	return strings.ContainsFunc(s, func(r rune) bool {
+		return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+	})
+}
+
+// DialHost is what the side that dials connects to, which is the other
+// server's address - and that address is the domain when somebody typed one.
+func (c *Config) DialHost() string {
 	if c.DialSide() == SideIran {
 		return c.Transport.Kharej
 	}
@@ -217,10 +230,24 @@ func (c *Config) Path() string {
 	return c.Transport.Path
 }
 
-// ListenPort is where the side that waits binds.
+// ListenPort is where the side that waits binds, which behind a CDN is not
+// the port the other side dialled.
+//
+// An edge takes the connection on one of its own ports and comes to the
+// origin on another. Cloudflare's flexible mode - which is what somebody with
+// no certificate on the origin is using, and that is nearly everybody putting
+// a name in front of a server in Iran - terminates the TLS at the edge and
+// arrives here in plain HTTP on 80. So a tunnel dialled on one of the HTTPS
+// ports waits on 80 unless the file says otherwise.
 func (c *Config) ListenPort() int {
 	if c.Transport.ListenPort > 0 {
 		return c.Transport.ListenPort
+	}
+	if isName(c.DialHost()) {
+		switch c.Transport.Port {
+		case 443, 2053, 2083, 2087, 2096, 8443:
+			return 80
+		}
 	}
 	return c.Transport.Port
 }
@@ -307,8 +334,6 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Port, err = num()
 	case "transport.connections":
 		c.Transport.Connections, err = num()
-	case "transport.domain":
-		c.Transport.Domain, err = str()
 	case "transport.path":
 		c.Transport.Path, err = str()
 	case "transport.dials":

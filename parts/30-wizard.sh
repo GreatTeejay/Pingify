@@ -427,6 +427,13 @@ q_addresses() {
 
     wiz_ask "The two servers"
     blank
+    # A name rather than an address is the whole of the CDN arrangement, and
+    # it is one word rather than a question: a name can only ever front the
+    # side that waits, because an edge answers on the name and connects
+    # inward to the origin behind it. So a name here is what decides which
+    # side dials, and nothing else needs asking.
+    dim "an address, or a domain - a domain is what puts a CDN in front of it"
+    blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
     if [ "${#addrs[@]}" -gt 1 ]; then
@@ -448,6 +455,14 @@ q_addresses() {
     fi
     [ -n "$T_HERE" ] || ask T_HERE "this server (${T_SIDE^^})" "$def" v_host || return 1
     ask T_THERE "the other one ($other)" "" v_host || return 1
+
+    # Generated, never asked. Any path works and none is better than another,
+    # so it is not a question - it exists so that a request for anything else
+    # gets the 404 a web server would have given. The Advanced screen has it
+    # for the rare case where a domain is shared with something else.
+    case $T_TRANSPORT in
+    ws | wss) T_PATH=$(wiz_path) ;;
+    esac
     return 0
 }
 
@@ -511,63 +526,6 @@ q_port() {
 # One question, not three. The old wizard asked for the octet and then re-asked
 # both addresses it had just derived from it, so a hand edit at the second
 # prompt walked straight past the checks that guarded the first.
-# The one extra step a WebSocket transport needs, and it is skipped entirely
-# by the three that do not.
-#
-# A domain is what makes these worth having: a name in front of a server can
-# be a CDN, and a CDN answers on its own addresses, terminates the TLS itself
-# and comes to the origin from its own network. That is also why it changes
-# which side dials - an edge connects *inward* to the origin, so a name in
-# front of the IRAN server can only be reached by KHAREJ dialling it.
-q_web() {
-    local n def_listen
-    case $T_TRANSPORT in ws | wss) ;; *) return 0 ;; esac
-
-    wiz_ask "The web address"
-    blank
-    if [ "$T_TRANSPORT" = wss ]; then
-        dim "TLS is checked against this name, and a CDN answers only for names"
-        dim "it has been given."
-        blank
-        ask T_DOMAIN "domain" "" v_host || return 1
-    else
-        dim "With a domain this goes through whatever answers for it; without"
-        dim "one it dials the address directly."
-        blank
-        ask T_DOMAIN "domain, or - for none" "-" v_domain_or_none || return 1
-        [ "$T_DOMAIN" = "-" ] && T_DOMAIN=
-    fi
-
-    # Generated rather than asked. Any path works and none is better than
-    # another, so this is one more question with no wrong answer - and a
-    # random one is not a path anybody scans for.
-    T_PATH=$(wiz_path)
-    field "path" "$T_PATH"
-
-    [ -z "$T_DOMAIN" ] && { T_DIALS=; T_LISTEN=; return 0; }
-
-    blank
-    item "1" "the name points at KHAREJ" "the usual - IRAN dials it"
-    item "2" "a CDN in front of IRAN" "KHAREJ dials it, and this side waits"
-    blank
-    pick n "select" 1 2 || return 1
-    if [ "$n" = 1 ]; then
-        T_DIALS= T_LISTEN=
-        return 0
-    fi
-
-    T_DIALS=kharej
-    # A CDN takes the connection on the port that was asked for and comes to
-    # the origin on a port of its own. Cloudflare's flexible mode terminates
-    # the TLS at the edge and arrives here in plain HTTP on 80, which is why
-    # that is the default when the port dialled is 443.
-    def_listen=$T_PORT
-    [ "$T_PORT" = 443 ] && def_listen=80
-    blank
-    ask T_LISTEN "port the edge will reach this server on" "$def_listen" v_listen_port || return 1
-    return 0
-}
-
 # A path nobody scans for: six hex characters, from the kernel's own random
 # device where there is one and from the shell's when there is not.
 wiz_path() {
@@ -575,23 +533,6 @@ wiz_path() {
     h=$(head -c 3 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
     [ -n "$h" ] || h=$(printf '%06x' $((RANDOM * RANDOM % 16777216)))
     printf '/%s' "$h"
-}
-
-v_domain_or_none() {
-    [ "$1" = "-" ] && return 0
-    v_host "$1"
-}
-
-# The port this server will bind when it is the one that waits. Unlike the
-# port a tunnel is dialled on, this one is opened here and now, so something
-# else already holding it is a refusal rather than a note.
-v_listen_port() {
-    v_port "$1" || return 1
-    if wiz_port_bound "$1" tcp; then
-        echo "something here already listens on tcp/$1; see: ss -lntp | grep :$1"
-        return 1
-    fi
-    return 0
 }
 
 q_link() {
@@ -713,19 +654,18 @@ wiz_review() {
         panel_field "IRAN" "$(addr_text "$T_IRAN")"
     fi
     panel_field "Transport" "$trans"
-    if [ -n "$T_DOMAIN" ]; then
-        panel_field "Address" "$(addr_text "$T_DOMAIN")$T_PATH"
-        # Written from where it is being read. The same file is shown on both
-        # servers and this line said "this server waits on 80" on the one
-        # doing the dialling.
-        local dialer=${T_DIALS:-iran}
-        if [ "$T_SIDE" = "$dialer" ]; then
-            panel_field "Direction" "this server dials the name"
-        else
-            panel_field "Direction" "${dialer^^} dials it; this server waits on ${T_LISTEN:-$T_PORT}"
-        fi
-    elif [ -n "$T_PATH" ]; then
-        panel_field "Path" "$T_PATH"
+    # Which end dials, said out loud, because for a WebSocket tunnel it is
+    # worked out from the addresses rather than chosen - and the one thing a
+    # person should be able to check on this screen is that it came out the
+    # way they meant.
+    local dialer=iran
+    case $T_IRAN in *[a-zA-Z]*) case $T_KHAREJ in *[a-zA-Z]*) ;; *) dialer=kharej ;; esac ;; esac
+    local target=$T_KHAREJ
+    [ "$dialer" = kharej ] && target=$T_IRAN
+    if [ "$T_SIDE" = "$dialer" ]; then
+        panel_field "Dials" "out to $(addr_text "$target")"
+    else
+        panel_field "Waits" "${dialer^^} dials in"
     fi
     # "Link", not "Private link": it is the widest key any panel in the script
     # has, and one key a column wider than the rest puts one value out of line
@@ -799,12 +739,7 @@ wiz_render() {
     case $T_TRANSPORT in
     tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
     esac
-    [ -n "$T_DOMAIN" ] && printf 'domain = "%s"\n' "$T_DOMAIN"
     [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
-    # Which side opens the connection, written only when it is not the usual
-    # one - a line saying "iran" would be a setting nobody chose.
-    [ -n "$T_DIALS" ] && printf 'dials = "%s"\n' "$T_DIALS"
-    [ -n "$T_LISTEN" ] && printf 'listen_port = %s\n' "$T_LISTEN"
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -946,7 +881,7 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
-    T_DOMAIN= T_PATH= T_DIALS= T_LISTEN=
+    T_PATH=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -981,8 +916,6 @@ wizard_new() {
     q_transport || return 1
     blank
     q_port || return 1
-    blank
-    q_web || return 1
     blank
     q_link || return 1
     blank
@@ -1085,10 +1018,7 @@ wizard_paste() {
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
-    T_DOMAIN=$(toml_get "$f" transport domain)
     T_PATH=$(toml_get "$f" transport path)
-    T_DIALS=$(toml_get "$f" transport dials)
-    T_LISTEN=$(toml_get "$f" transport listen_port)
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
     T_DEV=$(toml_get "$f" tun name)
