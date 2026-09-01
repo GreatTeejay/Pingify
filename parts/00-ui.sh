@@ -97,10 +97,12 @@ ui_glyphs() {
         G_H='─' G_V='│' G_TL='╭' G_TR='╮' G_BL='╰' G_BR='╯'
         G_CUR='▸' G_ON='●' G_OFF='○' G_OK='✓' G_BAD='✗' G_WARN='!'
         G_ARROW='→' G_BOTH='⇄' G_CUT='…' G_DASH='—'
+        G_ITEM='►' G_DOT='·'
     else
         G_H='-' G_V='|' G_TL='+' G_TR='+' G_BL='+' G_BR='+'
         G_CUR='>' G_ON='*' G_OFF='o' G_OK='+' G_BAD='x' G_WARN='!'
         G_ARROW='->' G_BOTH='<->' G_CUT='~' G_DASH='-'
+        G_ITEM='>' G_DOT='-'
     fi
 }
 
@@ -227,19 +229,39 @@ field() {
         "$(trunc_to "$2" $((UI_W - UI_KEYW - 8)))"
 }
 
-# item is a menu line. The key is what you type.
+# item is one line of a menu: the number you type, what it does, and - where it
+# needs one - what that means in three or four words.
+#
+# The hint is its own argument rather than spaces inside the label. Five of
+# these had the hint padded into the label by hand, and every one of them went
+# crooked the moment somebody renamed the thing beside it; the width here is
+# measured, once, from the label that is actually being drawn.
+# Twenty columns for the label. It is the width at which the longest label in
+# the script still leaves room for a hint on a sixty column terminal, which is
+# the narrowest this UI draws at.
+UI_ITEMW=20
 item() {
-    printf '   %s%2s%s  %s\n' "$C_ACCENT" "$1" "$C_OFF" "$2"
+    local w=$UI_ITEMW n hint=${3:-} hw
+    n=$(vislen "$2")
+    [ "$n" -ge "$w" ] && w=$((n + 2))
+    hw=$((UI_W - w - 10))
+    # A hint with four columns left for it is not a hint, it is a cut mark.
+    # Below that the label takes the whole line and the note is dropped.
+    if [ -n "$hint" ] && [ "$hw" -ge 6 ]; then
+        printf '   %s%2s%s %s%s%s %s%s%s%s\n' \
+            "$C_ACCENT$C_B" "$1" "$C_OFF" "$C_MUTE" "$G_ITEM" "$C_OFF" \
+            "$(pad_to "$2" "$w")" "$C_MUTE" "$(trunc_to "$hint" "$hw")" "$C_OFF"
+    else
+        printf '   %s%2s%s %s%s%s %s\n' \
+            "$C_ACCENT$C_B" "$1" "$C_OFF" "$C_MUTE" "$G_ITEM" "$C_OFF" \
+            "$(trunc_to "$2" $((UI_W - 8)))"
+    fi
 }
 
-# item2 is a menu line with a note to its right, for settings that show their
-# current value.
-item2() {
-    local left
-    left=$(pad_to "$2" $((UI_W - 30)))
-    printf '   %s%2s%s  %s%s%s%s\n' \
-        "$C_ACCENT" "$1" "$C_OFF" "$left" "$C_MUTE" "$3" "$C_OFF"
-}
+# item2 was the same line with the current value of a setting on the right of
+# it. It is the same call, so there is one renderer and the two cannot drift
+# into two different looking menus.
+item2() { item "$@"; }
 
 group() { printf '  %s%s%s\n' "$C_B" "$1" "$C_OFF"; }
 
@@ -262,6 +284,9 @@ row() {
 }
 
 # The three lines of a box must come to the same width or it is not a box.
+panel_top() {
+    printf '%s\n' "$(fill_to "  $C_RULE$G_TL" "$G_H" "$G_TR")"
+}
 panel_open() {
     printf '%s\n' "$(fill_to "  $C_RULE$G_TL$G_H$C_OFF $C_B$1$C_OFF " "$G_H" "$G_TR")"
 }
@@ -302,10 +327,51 @@ rtt_colour() {
     esac
 }
 
+# The name, drawn large, in a frame it fills. It is the first thing on the
+# screen and the only decoration in the whole script.
+#
+# Two renderings and no third. A terminal without a UTF-8 locale - PuTTY out
+# of the box, a serial console, a phone client with the wrong setting - draws
+# the block glyphs as a screen of question marks, so there is an ASCII one
+# beside it, and a test refuses any byte above 127 in it.
+banner_art() {
+    if [ "$UI_GLYPH" = utf8 ]; then
+        printf '%s\n' \
+            '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
+            '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
+            '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
+            '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
+            '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
+            '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
+    else
+        printf '%s\n' \
+            ' ____   ___  _   _   ____  ___  _____ __   __' \
+            '|  _ \ |_ _|| \ | | / ___||_ _||  ___|\ \ / /' \
+            '| |_) | | | |  \| || |  _  | | | |_    \ V / ' \
+            '|  __/  | | | |\  || |_| | | | |  _|    | |  ' \
+            '|_|    |___||_| \_| \____||___||_|      |_|  '
+    fi
+}
+
+# banner_line centres one line inside the frame. Centring is done on the
+# measured width rather than the character count, because the block glyphs and
+# the escape codes around them are not the same thing as bytes.
+banner_line() {
+    local text=$1 colour=$2 inner=$((UI_W - 6)) pad
+    pad=$(( (inner - $(vislen "$text")) / 2 ))
+    [ "$pad" -lt 0 ] && pad=0
+    panel_row "$(printf '%*s%s%s%s' "$pad" '' "$colour" "$text" "$C_OFF")"
+}
+
 banner() {
+    local extra=${1:-} line
     blank
-    panel_open "P I N G I F Y   $PINGIFY_VERSION"
-    panel_row "$1"
+    panel_top
+    while IFS= read -r line; do
+        banner_line "$line" "$C_ACCENT$C_B"
+    done < <(banner_art)
+    banner_line "by Teejay   $G_DOT   Iran $G_ITEM Kharej tunnel" "$C_MUTE"
+    [ -n "$extra" ] && banner_line "$extra" "$C_MUTE"
     panel_close
 }
 
@@ -387,18 +453,20 @@ confirm() {
     done
 }
 
-# menu_key reads a single keystroke for a screen whose choices are not all
-# numbers. It falls back to a line when there is no terminal to read a key
-# from, so the tests can drive it.
+# menu_key reads the number a screen is waiting for.
+#
+# A line, and no longer a single keystroke. Every choice in this script is a
+# number now, and a screen with more than ten things on it needs two digits -
+# which a one-character read cannot take. It also means a pasted answer works,
+# and that the answer arrives the same way when there is no terminal at all,
+# which is how the tests drive these screens.
 menu_key() {
     local _pk_var=$1 _pk_in
-    printf '  %s%s%s select: ' "$C_ACCENT" "$G_CUR" "$C_OFF" >&2
-    if [ -t 0 ]; then
-        IFS= read -rn1 _pk_in || return 1
-        printf '\n' >&2
-    else
-        IFS= read -r _pk_in || return 1
-    fi
+    printf '  %s%s%s select: ' "$C_ACCENT" "$G_ITEM" "$C_OFF" >&2
+    IFS= read -r _pk_in || return 1
+    # Whitespace around a pasted answer is not an answer of its own.
+    _pk_in=${_pk_in#"${_pk_in%%[![:space:]]*}"}
+    _pk_in=${_pk_in%"${_pk_in##*[![:space:]]}"}
     printf -v "$_pk_var" '%s' "$_pk_in"
 }
 

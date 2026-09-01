@@ -289,8 +289,8 @@ q_side() {
     local n
     rule "1 - Which server is this?"
     blank
-    item "1" "IRAN     users connect here; this side dials out"
-    item "2" "KHAREJ   your panel runs here; this side waits"
+    item "1" "IRAN" "users connect here, dials out"
+    item "2" "KHAREJ" "your panel runs here; waits"
     blank
     pick n "select" 1 2 || return 1
     case $n in
@@ -319,13 +319,13 @@ q_transport() {
     local n
     rule "3 - How it crosses"
     blank
-    item "1" "UDP    fastest, and the usual choice."
-    dim "            needs one open port on KHAREJ"
-    item "2" "ICMP   ping packets, so there is no port to"
-    dim "            open and nothing to block by port. It"
-    dim "            survives where UDP does not, and while"
-    dim "            it runs neither server answers an"
-    dim "            ordinary ping. That is deliberate."
+    item "1" "UDP" "fastest, and usually right"
+    dim "        one open port on KHAREJ is all it needs"
+    blank
+    item "2" "ICMP" "ping packets; no open port"
+    dim "        nothing to block by port, so it survives"
+    dim "        where UDP does not. While it runs neither"
+    dim "        server answers an ordinary ping, on purpose."
     blank
     pick n "select" 1 2 || return 1
     case $n in

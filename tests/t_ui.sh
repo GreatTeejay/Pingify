@@ -149,11 +149,24 @@ check_rc "an octet in range" 0 v_octet 99
 check_rc "zero is not an octet" 1 v_octet 0
 check_rc "255 is not an octet" 1 v_octet 255
 
+section "every menu key is a number"
+
+# Not a phrase, a rule: every choice in this script is typed as a number.
+#
+# They were letters - n for new, p for ports, u for update, a for advanced -
+# and the tunnels themselves were keys on the home screen, so the letter for
+# Uninstall moved every time somebody added one. The one screen that kept a
+# letter after the rest were changed would be the one nobody could find their
+# way out of, and nothing else here would notice.
+letters=$(grep -hoE '^[[:space:]]*item2? +"?[A-Za-z][A-Za-z0-9]*"?' parts/*.sh |
+    sed 's/^[[:space:]]*//' | LC_ALL=C sort -u)
+check "no menu key is a letter" "$letters" ""
+
 section "every ask is validated"
 
-# The one grep in the suite, and it enforces a rule rather than a phrase: an
-# unvalidated answer is a value the core rejects half an hour later with a
-# message the user cannot act on.
+# The other grep of the source, and like the one above it enforces a rule
+# rather than a phrase: an unvalidated answer is a value the core rejects half
+# an hour later with a message the user cannot act on.
 bare=$(grep -hn 'ask [A-Za-z_]' parts/*.sh |
     grep -v '^\s*#' |
     awk '{ n = gsub(/"/, "\""); if (NF < 5) print }' | head -5)

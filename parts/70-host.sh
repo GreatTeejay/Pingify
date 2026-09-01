@@ -243,9 +243,9 @@ screen_host() {
         1)
             blank
             group "WHAT THIS MACHINE MOSTLY CARRIES"
-            item "1" "Gaming     small queues, so a small packet waits behind less"
-            item "2" "Balanced   the one to pick if the answer is 'everything'"
-            item "3" "Download   deep queues and long drain cycles, for bulk"
+            item "1" "Gaming" "small queues; less waiting"
+            item "2" "Balanced" "pick this one if unsure"
+            item "3" "Download" "deep queues, for bulk"
             blank
             pick n "select" 2 3 || continue
             case $n in
