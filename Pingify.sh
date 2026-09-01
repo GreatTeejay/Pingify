@@ -1957,11 +1957,11 @@ type fecCarrier struct {
 	onPacket atomic.Pointer[func([]byte)]
 }
 
-// WrapFEC puts parity on a carrier, or returns it untouched when there is no
-// reason to. A stream carrier is never wrapped - it cannot lose a packet, so
-// the parity would be a tenth of the bandwidth spent on nothing.
-func WrapFEC(c Full, n int, stream bool) Full {
-	if n <= 0 || stream {
+// WrapFEC puts parity on a carrier, or returns it untouched when the transport
+// cannot take it - see noParity, which is where the two reasons are written
+// down.
+func WrapFEC(c Full, n int, blocked bool) Full {
+	if n <= 0 || blocked {
 		return c
 	}
 	if n < fecMinGroup {
@@ -4795,11 +4795,23 @@ type Full interface {
 	Lost() (missing, late, gaps uint64)
 }
 
-// stream reports whether a transport cannot lose a packet, which is the one
-// thing that decides whether parity is worth adding to it.
-func stream(kind string) bool {
+// noParity reports whether a transport must not be given parity packets, and
+// there are two quite different reasons for it.
+//
+// A stream carrier cannot lose one. TCP underneath has already seen to that,
+// so the parity would be a tenth of the bandwidth spent on nothing.
+//
+// GRE is the other, and it is not about waste. Ours carries a bare IP packet
+// with the tag and the sequence in GRE's own header fields, because a path that
+// carries GRE at all still drops the ones whose payload is not a well formed IP
+// packet. Four bytes of parity header in front of that header is no longer an
+// IP packet, and a parity packet - the exclusive-or of ten payloads - was never
+// going to look like one. Measured on the Tehran path: with parity on, not a
+// single packet crossed in either direction. It does not slow GRE down, it
+// stops it dead.
+func noParity(kind string) bool {
 	switch kind {
-	case "tcp", "ws", "wss", "utls":
+	case "tcp", "ws", "wss", "utls", "gre":
 		return true
 	}
 	return false
@@ -4810,7 +4822,7 @@ func Open(cfg *config.Config) (Full, error) {
 	if err != nil {
 		return nil, err
 	}
-	return WrapFEC(c, cfg.Tuning.FEC, stream(cfg.Transport.Type)), nil
+	return WrapFEC(c, cfg.Tuning.FEC, noParity(cfg.Transport.Type)), nil
 }
 
 func open(cfg *config.Config) (Full, error) {
@@ -21177,8 +21189,11 @@ screen_advanced() {
         case $(toml_get "$f" transport type) in
         ws | wss) item2 6 "Web path" "$(toml_get "$f" transport path)" ;;
         esac
+        # Parity is not offered where the core would ignore it: a stream
+        # cannot lose a packet, and GRE's payload has to stay a well formed IP
+        # packet or the path drops every one of them.
         case $(toml_get "$f" transport type) in
-        tcp | ws | wss | utls) ;;
+        tcp | ws | wss | utls | gre) ;;
         *) item2 7 "Parity" "$(fec_label "$f")" ;;
         esac
         item 8 "Show the config file"
@@ -22630,7 +22645,7 @@ health_check() {
             # that.
             local fec_advice=
             case $CK_TRANSPORT in
-            tcp | ws | wss | utls) ;;
+            tcp | ws | wss | utls | gre) ;;
             *) [ "$(toml_get "$CK_FILE" tuning fec)" -gt 0 ] 2>/dev/null ||
                 fec_advice="turn on Parity: tunnel screen, Advanced, 7" ;;
             esac

@@ -384,8 +384,11 @@ screen_advanced() {
         case $(toml_get "$f" transport type) in
         ws | wss) item2 6 "Web path" "$(toml_get "$f" transport path)" ;;
         esac
+        # Parity is not offered where the core would ignore it: a stream
+        # cannot lose a packet, and GRE's payload has to stay a well formed IP
+        # packet or the path drops every one of them.
         case $(toml_get "$f" transport type) in
-        tcp | ws | wss | utls) ;;
+        tcp | ws | wss | utls | gre) ;;
         *) item2 7 "Parity" "$(fec_label "$f")" ;;
         esac
         item 8 "Show the config file"

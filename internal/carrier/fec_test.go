@@ -159,3 +159,23 @@ func TestTheWrapperCarriesAndRepairs(t *testing.T) {
 		}
 	}
 }
+
+// Parity is kept off the transports that cannot take it, for the two reasons
+// noParity gives: a stream cannot lose a packet, and GRE's payload has to stay
+// a well formed IP packet or the path drops every one of them.
+func TestParityIsKeptOffTheTransportsThatCannotTakeIt(t *testing.T) {
+	for _, kind := range []string{"tcp", "ws", "wss", "utls", "gre"} {
+		if !noParity(kind) {
+			t.Errorf("%s would be given parity", kind)
+		}
+		lc := &loopCarrier{head: 12}
+		if got := WrapFEC(lc, 10, noParity(kind)); got != Full(lc) {
+			t.Errorf("%s came back wrapped", kind)
+		}
+	}
+	for _, kind := range []string{"udp", "icmp", "rawtcp", "awg"} {
+		if noParity(kind) {
+			t.Errorf("%s would never get parity", kind)
+		}
+	}
+}

@@ -138,6 +138,16 @@ UNIT_DIR=$_old_unit CORE_BIN=$_old_core CFG_DIR=$_old_cfg
 rm -rf "$_ud"
 unset -f systemctl
 
+section "parity is not offered where the core ignores it"
+
+# Measured, on the Tehran path: a GRE tunnel with parity turned on carries
+# nothing at all in either direction, because our GRE payload is a bare IP
+# packet and four bytes of parity header in front of it is not one. The core
+# refuses the setting; these two screens must not go on offering it, and the
+# check must never advise turning it on.
+check_contains "the Advanced screen leaves gre out of Parity"     "$(grep -A5 'Parity is not offered' parts/40-manage.sh)" "utls | gre"
+check_contains "and the check does not advise it on gre"     "$(grep -B4 'turn on Parity' parts/60-check.sh)" "utls | gre"
+
 section "the guard that lets this file be sourced at all"
 
 # build.sh and every test here source the script. Without the guard on the

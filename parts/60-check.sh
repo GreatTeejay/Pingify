@@ -531,7 +531,7 @@ health_check() {
             # that.
             local fec_advice=
             case $CK_TRANSPORT in
-            tcp | ws | wss | utls) ;;
+            tcp | ws | wss | utls | gre) ;;
             *) [ "$(toml_get "$CK_FILE" tuning fec)" -gt 0 ] 2>/dev/null ||
                 fec_advice="turn on Parity: tunnel screen, Advanced, 7" ;;
             esac

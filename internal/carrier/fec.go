@@ -62,11 +62,11 @@ type fecCarrier struct {
 	onPacket atomic.Pointer[func([]byte)]
 }
 
-// WrapFEC puts parity on a carrier, or returns it untouched when there is no
-// reason to. A stream carrier is never wrapped - it cannot lose a packet, so
-// the parity would be a tenth of the bandwidth spent on nothing.
-func WrapFEC(c Full, n int, stream bool) Full {
-	if n <= 0 || stream {
+// WrapFEC puts parity on a carrier, or returns it untouched when the transport
+// cannot take it - see noParity, which is where the two reasons are written
+// down.
+func WrapFEC(c Full, n int, blocked bool) Full {
+	if n <= 0 || blocked {
 		return c
 	}
 	if n < fecMinGroup {
