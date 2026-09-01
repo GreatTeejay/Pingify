@@ -234,7 +234,7 @@ screen_host() {
         blank
         item2 "1" "Profile" "${p:-none}"
         item2 "2" "BBR" "$bbr"
-        item2 "3" "Raise descriptor limits" "$([ -f "$HOST_LIMITS" ] && printf 'done' || printf 'not done')"
+        item2 "3" "Descriptor limits" "$([ -f "$HOST_LIMITS" ] && printf 'raised' || printf 'not raised')"
         item "4" "Revert everything this screen did"
         item "0" "Back"
         blank
@@ -246,12 +246,20 @@ screen_host() {
             item "1" "Gaming" "small queues; less waiting"
             item "2" "Balanced" "pick this one if unsure"
             item "3" "Download" "deep queues, for bulk"
+            item "0" "Back"
             blank
-            pick n "select" 2 3 || continue
+            # menu_key rather than pick, because this screen was reached from
+            # a menu and every one of those has a numeric way back out. pick
+            # answers 1 to 3 and nothing else, which is right for a question
+            # in the wizard and wrong here: 0 was refused and it asked again.
+            menu_key n || continue
+            [ -z "$n" ] && n=2
             case $n in
             1) p=gaming ;;
+            2) p=balanced ;;
             3) p=download ;;
-            *) p=balanced ;;
+            0) continue ;;
+            *) blank; warn "there is nothing on $n"; pause; continue ;;
             esac
             blank
             host_write_sysctl "$p" "$(host_bbr_state)" && ok "$p host tuning applied"

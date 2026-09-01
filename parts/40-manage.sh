@@ -42,7 +42,7 @@ tun_line() {
         # Running and the far end has been seen is the only state that earns a
         # green dot. Running and alone looks identical from here and is not
         # the same thing at all.
-        if [ "$ST_UP" = true ]; then
+        if [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ]; then
             TL_STATE=running
         else
             TL_STATE=idle
@@ -248,10 +248,25 @@ edit_profile() {
 
     local def=2
     case $cur in gaming) def=1 ;; download) def=3 ;; esac
-    pick choice "select" "$def" 3 || return 0
+
+    # A way out that is a number, like every other screen reached from a menu.
+    # This used pick, which answers 1 to 3 and nothing else on purpose - that
+    # is right for a question in the wizard and wrong here: 0 was refused and
+    # the screen asked again, so the only exit was the q nothing on it
+    # mentions. Enter still keeps what the tunnel already has.
+    item 0 "Leave it on $cur"
+    blank
+    menu_key choice || return 0
+    [ -z "$choice" ] && choice=$def
 
     local want
-    case $choice in 1) want=gaming ;; 2) want=balanced ;; 3) want=download ;; esac
+    case $choice in
+    1) want=gaming ;;
+    2) want=balanced ;;
+    3) want=download ;;
+    0) return 0 ;;
+    *) blank; warn "there is nothing on $choice"; pause; return 0 ;;
+    esac
     [ "$want" = "$cur" ] && return 0
 
     PROFILE_WANT=$want
@@ -273,16 +288,29 @@ profile_row() {
 }
 
 screen_advanced() {
-    local name=$1 f k
+    local name=$1 f k q qs
     f=$(cfg_file "$name")
     while :; do
+        # Two of these are not in the file until somebody sets them: the
+        # profile carries the queue depth, and the core picks the number of
+        # device queues. Reading the file alone drew "Queue depth  packets,
+        # from the profile" with the number missing out of the middle of it,
+        # and then offered an empty default that the validator refused - so
+        # pressing enter at the question did nothing at all, twice.
+        q=$(toml_get "$f" tuning queue_packets)
+        qs=$(toml_get "$f" tun queues)
         blank
         rule "Advanced $G_DASH $name"
         blank
         item2 1 "MTU" "$(toml_get "$f" tun mtu)"
         item2 2 "Log level" "$(toml_get "$f" logging level)"
-        item2 3 "Queue depth" "$(toml_get "$f" tuning queue_packets) packets, from the profile"
-        item2 4 "Device queues" "$(toml_get "$f" tun queues)"
+        if [ -n "$q" ]; then
+            item2 3 "Queue depth" "$q packets, set here"
+        else
+            q=$(wiz_queue "$(toml_get "$f" tuning profile)")
+            item2 3 "Queue depth" "$q packets, from the profile"
+        fi
+        item2 4 "Device queues" "${qs:-the core chooses}"
         item 5 "Show the config file"
         item 0 "Back"
         blank
@@ -299,10 +327,10 @@ screen_advanced() {
             dim "This comes from the profile and is the one number a profile moves."
             dim "Set it directly only if you have measured your own path."
             local v
-            ask v "packets" "$(toml_get "$f" tuning queue_packets)" v_queue || continue
+            ask v "packets" "$q" v_queue || continue
             QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; pause ;;
         4) local v
-            ask v "queues (0 lets the core choose)" "$(toml_get "$f" tun queues)" v_queues || continue
+            ask v "queues (0 lets the core choose)" "${qs:-0}" v_queues || continue
             QUEUES_WANT=$v; cfg_apply "$name" _edit_queues yes; pause ;;
         5) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;

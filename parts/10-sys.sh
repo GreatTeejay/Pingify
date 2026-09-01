@@ -271,7 +271,14 @@ svc_do() {
         ;;
     stop | disable)
         systemctl "$what" "pingify@$name" >/dev/null 2>&1
-        ok "$name $what""ped"
+        # Two verbs, two sentences. One line built the past tense by adding
+        # "ped" to whichever word came in, which is right for stop and made
+        # "disableped" out of disable - on the uninstall screen, where every
+        # other line is plain English.
+        case $what in
+        stop) ok "$name stopped" ;;
+        *) ok "$name will not start at boot" ;;
+        esac
         ;;
     enable)
         systemctl enable --now "pingify@$name" 2>&1 | sed 's/^/       /'
@@ -303,12 +310,18 @@ svc_do() {
 tun_stats() {
     local name=$1 json
     ST_UP= ST_IN= ST_OUT= ST_LOST= ST_GAPS= ST_LATE= ST_UPTIME= ST_DROPPED=
-    ST_TRANSPORT= ST_PROFILE= ST_SIDE=
+    ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB=
 
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
 
     ST_UP=$(json_field "$json" up)
+    # Bytes in, and it is not a statistic: it is the only thing on this report
+    # that says somebody is at the other end. The core's `up` means the
+    # carrier knows where to send, and on the side that dials that is true the
+    # moment it starts, answer or no answer - so a tunnel pointed at a dead
+    # address reported itself up, with a green dot, for ever.
+    ST_INB=$(json_field "$json" in_bytes)
     ST_IN=$(json_field "$json" in_mbit)
     ST_OUT=$(json_field "$json" out_mbit)
     ST_LOST=$(json_field "$json" path_lost)
