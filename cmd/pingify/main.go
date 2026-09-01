@@ -42,7 +42,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "2.0.0"
+const version = "2.1.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having

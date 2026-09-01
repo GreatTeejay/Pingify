@@ -31,7 +31,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="2.0.0"
+PINGIFY_VERSION="2.1.0"
 
 # --------------------------------------------------------------------------
 # what this terminal can do
@@ -84,7 +84,7 @@ ui_detect() {
 
 ui_palette() {
     if [ "$UI_COLOR" = none ]; then
-        C_OFF= C_B= C_ACCENT= C_OK= C_WARN= C_BAD= C_MUTE= C_KEY= C_RULE=
+        C_OFF= C_B= C_ACCENT= C_OK= C_WARN= C_BAD= C_MUTE= C_KEY= C_RULE= C_ADDR=
         return
     fi
     C_OFF=$'\033[0m'
@@ -95,10 +95,16 @@ ui_palette() {
     C_MUTE=$'\033[90m'
     C_KEY=$'\033[2m'
     C_RULE=$'\033[90m'
+    # A sixth role, and the only one that is about what a value *is* rather
+    # than how it is doing: an address. They are the things a person copies
+    # from one screen onto another server, and picking them out of a line of
+    # prose is most of what this tool asks anybody to do.
+    C_ADDR=$'\033[1m'
     # Raw cyan is unreadable on the white-background terminals a lot of people
     # actually run. Where there are 256 colours, use a desaturated teal.
     if [ "$UI_COLOR" = 256 ]; then
         C_ACCENT=$'\033[38;5;37m'
+        C_ADDR=$'\033[38;5;180m'
     else
         C_ACCENT=$'\033[36m'
     fi
@@ -206,6 +212,15 @@ wipe() {
     [ -t 1 ] || return 0
     [ "$UI_COLOR" = none ] && return 0
     printf '\033[H\033[2J'
+}
+
+# How every screen in this script opens: a clean page with the name at the top
+# of it. The name is there on every screen and not only the first, so that a
+# person three screens deep still knows what they are looking at, and so that
+# every screen begins at the same place on the page.
+screen_top() {
+    wipe
+    banner
 }
 
 say() { printf '%s\n' "$*"; }
@@ -602,20 +617,32 @@ trap 'ui_detect' WINCH
 # from: reading and writing a config, asking systemd what it thinks, and asking
 # a running tunnel how it is.
 #
-# The layout is ordinary FHS. The old manager kept everything under /root,
-# which meant a second administrator could not find it, backups that skip /root
-# skipped the tunnel, and the configs sat beside the operator's ssh keys.
+# Everything Pingify has lives in one directory: the tunnels, the core, and
+# the little state the manager keeps. It was spread over /etc, /var/lib and
+# /usr/local/src, which is the ordinary place for each of those things and
+# means four directories to look in when something is wrong, four to copy when
+# a server is rebuilt, and four to be sure of when one is taken apart.
+#
+#   /root/pingify/                 the tunnels, one .toml each
+#   /root/pingify/core/            the core binary
+#   /root/pingify/core/src/        its sources, so it can be built with no network
+#   /root/pingify/state/           what the manager remembers between runs
+#
+# Two things stay where they are because nothing else would find them: the
+# pingify command on PATH, and the systemd units.
 
 # Every path takes its value from the environment if there is one. Not for
 # flexibility - nobody moves these - but so that a test can point the whole
 # script at a temporary directory and be certain it cannot touch the machine
 # it is running on. Two of the five already did, which meant a test could
 # redirect the configs and then have the real core binary invoked on them.
+BASE_DIR=${PINGIFY_BASE_DIR:-/root/pingify}
 PINGIFY_BIN=${PINGIFY_BIN:-/usr/local/bin/pingify}
-CORE_BIN=${PINGIFY_CORE_BIN:-/usr/local/bin/pingify-core}
-CFG_DIR=${PINGIFY_CFG_DIR:-/etc/pingify}
-STATE_DIR=${PINGIFY_STATE_DIR:-/var/lib/pingify}
-SRC_DIR=${PINGIFY_SRC_DIR:-/usr/local/src/pingify}
+CFG_DIR=${PINGIFY_CFG_DIR:-$BASE_DIR}
+CORE_DIR=${PINGIFY_CORE_DIR:-$BASE_DIR/core}
+CORE_BIN=${PINGIFY_CORE_BIN:-$CORE_DIR/pingify-core}
+SRC_DIR=${PINGIFY_SRC_DIR:-$CORE_DIR/src}
+STATE_DIR=${PINGIFY_STATE_DIR:-$BASE_DIR/state}
 UNIT_DIR=${PINGIFY_UNIT_DIR:-/etc/systemd/system}
 
 # The status endpoint listens on the loopback address. One port per tunnel,
@@ -648,8 +675,66 @@ require_root() {
 # ensure_dirs is called before anything writes. 0700 on the config directory
 # because the files in it contain the security token.
 ensure_dirs() {
-    mkdir -p "$CFG_DIR" "$STATE_DIR" "$SRC_DIR"
+    mkdir -p "$CFG_DIR" "$CORE_DIR" "$SRC_DIR" "$STATE_DIR"
     chmod 0700 "$CFG_DIR"
+}
+
+# migrate_layout moves a server from the layout before this one.
+#
+# It runs on the interactive path only, and it does nothing at all after the
+# first time, because what it looks for is not there any more. It is not on
+# the --status path on purpose: that one is called from cron, and a monitoring
+# call is no place to be restarting tunnels.
+#
+# The order matters. The units name the core by its path, so they are written
+# again after the binary has moved, and every tunnel that was running is
+# restarted onto the new one - otherwise the running core is a deleted file
+# and the next restart finds nothing where the unit says it is.
+migrate_layout() {
+    local moved=0 f n
+    # A tunnel of the same name in both places is the one thing here that
+    # cannot be decided without asking. The new one wins - it is the one the
+    # units point at - and the old one is left where it is and named, so
+    # whoever has to look at it can.
+    for f in /etc/pingify/*.toml; do
+        [ -e "$f" ] || continue
+        n=${f##*/}
+        if [ -e "$CFG_DIR/$n" ]; then
+            warn "$f was left behind - $CFG_DIR/$n already exists"
+        else
+            mv -f "$f" "$CFG_DIR/$n" && moved=1
+        fi
+    done
+    rmdir /etc/pingify 2>/dev/null
+
+    if [ -x /usr/local/bin/pingify-core ] && [ ! -x "$CORE_BIN" ]; then
+        mkdir -p "$CORE_DIR"
+        mv -f /usr/local/bin/pingify-core "$CORE_BIN" && moved=1
+    fi
+    rm -f /usr/local/bin/pingify-core
+
+    # State is ours and the newer copy is the true one, so a name that exists
+    # in both places is not a conflict: the old file goes.
+    for f in /var/lib/pingify/*; do
+        [ -e "$f" ] || continue
+        n=${f##*/}
+        if [ -e "$STATE_DIR/$n" ]; then
+            rm -f "$f"
+        else
+            mv -f "$f" "$STATE_DIR/$n" && moved=1
+        fi
+    done
+    rmdir /var/lib/pingify 2>/dev/null
+    rm -rf /usr/local/src/pingify
+
+    [ "$moved" = 1 ] || return 0
+
+    chmod 0700 "$CFG_DIR"
+    unit_write
+    while IFS= read -r n; do
+        systemctl is-enabled --quiet "pingify@$n" 2>/dev/null && svc_do restart "$n"
+    done < <(cfg_list)
+    ok "moved into $BASE_DIR"
 }
 
 arch_go() {
@@ -806,24 +891,36 @@ status_port() {
 # change - not on every tunnel creation, which is a global side effect from a
 # per-tunnel action and how the old script came to rewrite four units whenever
 # anybody added one.
+# The unit names the core and the config by path, and it takes both from the
+# constants at the top of this file rather than writing them out again.
+#
+# It used to write them out again, inside a quoted heredoc, so the two paths in
+# the unit were the two paths this script used *when the unit was written* -
+# and moving either of them left every tunnel on the machine pointing at a
+# file that was not there any more. systemd's answer to that is 203/EXEC, and
+# nothing else on the screen says what happened.
 unit_write() {
-    cat >"$UNIT_DIR/pingify@.service" <<'UNIT'
+    cat >"$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
 Documentation=https://github.com/GreatTeejay/Pingify
 After=network-online.target
 Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/pingify-core -c /etc/pingify/%i.toml
-Restart=always
-RestartSec=2
-# A limit that means something. The old unit had StartLimitIntervalSec=0, which
+# In [Unit], which is where systemd reads them. They were in [Service], and
+# systemd said so on every start - "Unknown key name 'StartLimitIntervalSec'"
+# - and then applied its own default instead of the limit written here.
+#
+# A limit that means something: the old unit had StartLimitIntervalSec=0, which
 # turns the limit off entirely and lets a config the core refuses restart every
 # two seconds for ever, filling the journal and hiding the reason.
 StartLimitIntervalSec=300
 StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.toml
+Restart=always
+RestartSec=2
 
 # A raw ICMP socket and a tun device need these two, and nothing needs more.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
@@ -1058,7 +1155,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "2.0.0"
+const version = "2.1.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -3145,8 +3242,13 @@ type Config struct {
 	Mode string // tun
 
 	Transport struct {
-		Type      string // udp
-		Kharej    string // the abroad server's address
+		Type   string // udp
+		Kharej string // the abroad server's address
+		// The Iran server's address. Nothing here dials it - KHAREJ never
+		// dials anything - so it is recorded rather than used: both files
+		// carry it, so either server can say which pair it belongs to, and
+		// the operator of one can see the other without logging into it.
+		Iran      string
 		Port      int
 		Keepalive int // seconds
 	}
@@ -3267,6 +3369,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Type, err = str()
 	case "transport.kharej":
 		c.Transport.Kharej, err = str()
+	case "transport.iran":
+		c.Transport.Iran, err = str()
 	case "transport.port":
 		c.Transport.Port, err = num()
 	case "transport.keepalive_sec":
@@ -4711,14 +4815,27 @@ free_device() {
     return 1
 }
 
-# default_name is <transport>-<octet>, suffixed -2, -3 on collision.
+# The name a tunnel is given, which is also the name of its file.
+#
+# It starts with the side, and that is the whole point of it: on a server with
+# three tunnels, the first thing anybody needs to know about each one is which
+# end of the border they are looking at - and `ls /root/pingify` should say so
+# without opening anything.
+#
+# Then the transport, then the one number that tells two tunnels apart: the
+# port for a tunnel that has one, and the private link's octet for ICMP, which
+# has no port at all.
+#
+#   iran-udp-8443     kharej-udp-8443
+#   iran-icmp-99      kharej-icmp-99
 #
 # It is built from those two because neither can name a side. The name lives in
 # the shared file, so a name like iran-9443 - which is what the old scheme
 # produced - is a lie on one of the two servers from the moment it is written.
 default_name() {
-    local trans=${1:-$T_TRANSPORT} oct=${2:-$T_OCTET} base n i
-    base="$trans-$oct"
+    local side=${1:-$T_SIDE} trans=${2:-$T_TRANSPORT} port=${3:-$T_PORT} oct=${4:-$T_OCTET}
+    local base n i
+    base="$side-$trans-${port:-$oct}"
     n=$base
     i=2
     while [ -e "$(cfg_file "$n")" ]; do
@@ -4727,6 +4844,20 @@ default_name() {
         [ "$i" -gt 20 ] && break
     done
     printf '%s' "$n"
+}
+
+# The same tunnel's name on the other server.
+#
+# The side is the first word of the name, so this replaces the first word. It
+# is why the two files differ in two lines now rather than one: the side, and
+# the name that carries it. A name that does not begin with a side is left
+# alone - somebody chose it by hand and it is not this function's to rewrite.
+name_for_side() {
+    local name=$1 side=$2
+    case $name in
+    iran-* | kharej-*) printf '%s-%s' "$side" "${name#*-}" ;;
+    *) printf '%s' "$name" ;;
+    esac
 }
 
 # The status endpoint is one loopback port per tunnel. It is written into the
@@ -4861,42 +4992,58 @@ q_side() {
 # the server abroad on both. The old wizard asked one side for "the remote" and
 # the other for "the local", and the two answers were the same address written
 # from two points of view, which is how the pair came to disagree.
-q_kharej() {
+# An address, in the colour addresses are printed in.
+addr_text() { printf '%s%s%s' "$C_ADDR" "$1" "$C_OFF"; }
+
+# Two questions, one for each end of the tunnel, and this server comes first
+# because it is the one the script can answer for you.
+#
+# The address is read off this machine's own interfaces and offered as the
+# default: if it is right, enter. When a server answers on more than one they
+# are listed and picked from - taking the first and saying nothing is how the
+# wrong one ends up in the file, and nothing says so until the other end has
+# been dialling it for a quarter of an hour.
+q_here() {
     local def= n i=0
     local -a addrs=()
-    wiz_ask "The server abroad"
+    wiz_ask "This server's address"
     blank
-    dim "Both servers name this one, so the file is the same on each."
-    blank
+    while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
-    if [ "$T_SIDE" = kharej ]; then
-        while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
-        # A server with more than one address is a server where the wrong one
-        # writes a config the far end cannot reach - and nothing says so until
-        # IRAN has been dialling nothing for a while. So it is asked, not
-        # guessed, and only when there is something to choose between.
-        if [ "${#addrs[@]}" -gt 1 ]; then
-            dim "this server answers on more than one address"
-            dim "pick the one IRAN should dial"
-            blank
-            while [ "$i" -lt "${#addrs[@]}" ]; do
-                item "$((i + 1))" "${addrs[i]}"
-                i=$((i + 1))
-            done
-            item "$((i + 1))" "Something else" "a hostname, or an address not listed"
-            blank
-            pick n "select" 1 $((i + 1)) || return 1
-            if [ "$n" -le "${#addrs[@]}" ]; then
-                T_KHAREJ=${addrs[n - 1]}
-                return 0
-            fi
-            blank
-        else
-            def=${addrs[0]:-}
+    if [ "${#addrs[@]}" -gt 1 ]; then
+        dim "this server answers on more than one address - pick the right one"
+        blank
+        while [ "$i" -lt "${#addrs[@]}" ]; do
+            item "$((i + 1))" "$(addr_text "${addrs[i]}")"
+            i=$((i + 1))
+        done
+        item "$((i + 1))" "Something else" "a hostname, or an address not listed"
+        blank
+        pick n "select" 1 $((i + 1)) || return 1
+        if [ "$n" -le "${#addrs[@]}" ]; then
+            T_HERE=${addrs[n - 1]}
+            return 0
         fi
+        blank
+    else
+        def=${addrs[0]:-}
+        [ -n "$def" ] && dim "this is what the server says its address is - enter takes it"
+        [ -n "$def" ] && blank
     fi
 
-    ask T_KHAREJ "address of the KHAREJ server" "$def" v_host || return 1
+    ask T_HERE "address of this server" "$def" v_host || return 1
+    return 0
+}
+
+q_there() {
+    local other=KHAREJ
+    [ "$T_SIDE" = kharej ] && other=IRAN
+    wiz_ask "The other server's address"
+    blank
+    dim "The $other server, which you are not sitting on. Both files carry"
+    dim "both addresses, so this answer is the same on each of them."
+    blank
+    ask T_THERE "address of the $other server" "" v_host || return 1
     return 0
 }
 
@@ -4932,8 +5079,8 @@ q_port() {
     fi
     wiz_ask "Port"
     blank
-    dim "KHAREJ waits on this port and IRAN dials it. The same"
-    dim "number goes on both servers."
+    dim "KHAREJ listens on this port and IRAN dials it. The same number goes"
+    dim "on both servers, and it is the only port the tunnel itself needs open."
     blank
     while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
@@ -4959,7 +5106,9 @@ q_link() {
     local def n a dev addr
     wiz_ask "The private link"
     blank
-    dim "Two addresses nothing else uses. Pick the middle number."
+    dim "The two servers talk to each other on a pair of private addresses"
+    dim "that nothing else on either machine uses. Pick the middle number and"
+    dim "both are worked out from it."
     blank
     while IFS= read -r n; do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
@@ -4983,8 +5132,8 @@ q_link() {
         return 1
     }
     blank
-    field "IRAN" "10.$T_OCTET.10.1/24"
-    field "KHAREJ" "10.$T_OCTET.10.2/24"
+    field "IRAN" "$(addr_text "10.$T_OCTET.10.1/24")"
+    field "KHAREJ" "$(addr_text "10.$T_OCTET.10.2/24")"
     field "device" "$T_DEV"
     return 0
 }
@@ -5066,8 +5215,12 @@ wiz_review() {
     prof=${T_PROFILE:-balanced}
     blank
     panel_open "$T_NAME"
-    panel_field "This server" "${T_SIDE^^}"
-    panel_field "Abroad" "$T_KHAREJ"
+    panel_field "This server" "${T_SIDE^^}   $(addr_text "${T_HERE:-$([ "$T_SIDE" = iran ] && printf '%s' "$T_IRAN" || printf '%s' "$T_KHAREJ")}")"
+    if [ "$T_SIDE" = iran ]; then
+        panel_field "KHAREJ" "$(addr_text "$T_KHAREJ")"
+    else
+        panel_field "IRAN" "$(addr_text "$T_IRAN")"
+    fi
     panel_field "Transport" "$trans"
     # "Link", not "Private link": it is the widest key any panel in the script
     # has, and one key a column wider than the rest puts one value out of line
@@ -5120,7 +5273,7 @@ wiz_confirm() {
 wiz_render() {
     printf '# Pingify %s\n' "$PINGIFY_VERSION"
     printf '#\n'
-    printf '# The same file runs on both servers. Only the side line differs.\n'
+    printf '# The same file runs on both servers, but for the side and the name.\n'
     printf '\n[tunnel]\n'
     printf 'name = "%s"\n' "$T_NAME"
     printf 'side = "%s"\n' "$T_SIDE"
@@ -5128,6 +5281,10 @@ wiz_render() {
     printf '\n[transport]\n'
     printf 'type = "%s"\n' "$T_TRANSPORT"
     printf 'kharej = "%s"\n' "$T_KHAREJ"
+    # Recorded, not dialled. KHAREJ never dials anything, so nothing uses this
+    # - but both files carry it, so the operator of either server can see
+    # which pair a tunnel belongs to without logging into the other one.
+    [ -n "$T_IRAN" ] && printf 'iran = "%s"\n' "$T_IRAN"
     # No port key at all for icmp. Writing port = 0 would pass the core's check
     # and then sit in the file looking like a setting somebody chose.
     [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"
@@ -5268,11 +5425,11 @@ token_decode() {
 wizard_new() {
     local f other
     WIZ_QUIT=0
-    T_SIDE= T_KHAREJ= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
+    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
-    wipe
+    screen_top
     blank
     rule "New tunnel"
     blank
@@ -5286,7 +5443,21 @@ wizard_new() {
         return $?
     fi
     blank
-    q_kharej || return 1
+    q_here || return 1
+    blank
+    q_there || return 1
+
+    # Which of the two answers is which key. The file names both ends, and it
+    # names them the same way on both servers, so the mapping happens once
+    # here rather than at every place that reads them.
+    if [ "$T_SIDE" = iran ]; then
+        T_IRAN=$T_HERE
+        T_KHAREJ=$T_THERE
+    else
+        T_KHAREJ=$T_HERE
+        T_IRAN=$T_THERE
+    fi
+
     blank
     q_transport || return 1
     blank
@@ -5377,6 +5548,7 @@ wizard_paste() {
     T_SIDE=$(toml_get "$f" tunnel side)
     T_TRANSPORT=$(toml_get "$f" transport type)
     T_KHAREJ=$(toml_get "$f" transport kharej)
+    T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
@@ -5407,6 +5579,12 @@ wizard_paste() {
     *) bad "that token does not say which server made it"; rm -f "$f"; return 1 ;;
     esac
     toml_set "$f" tunnel side "$T_SIDE"
+
+    # And the name goes with it. The name begins with the side, so a file
+    # pasted onto KHAREJ that still called itself iran-udp-8443 would be the
+    # one thing on this server whose name was a lie about it.
+    T_NAME=$(name_for_side "$T_NAME" "$T_SIDE")
+    toml_set "$f" tunnel name "$T_NAME"
 
     # The file is shared, so a clash here can only be fixed on both servers.
     # This is the one thing the shared-file design costs, and it is the
@@ -5638,7 +5816,7 @@ screen_tunnel() {
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
 
     while :; do
-        wipe
+        screen_top
         tun_line "$name"
         blank
         printf '  %s%s%s%s%s %s\n' "$C_B" "$name" "$C_OFF" \
@@ -5660,16 +5838,19 @@ screen_tunnel() {
         # left the reader to remember which of the two does what.
         if [ "$side" = iran ]; then
             if [ "$transport" = icmp ]; then
-                field "This end" "IRAN $G_DASH dials $kharej inside ping packets"
+                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") inside ping packets"
             else
-                field "This end" "IRAN $G_DASH dials $kharej on udp/$port"
+                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") on udp/$port"
             fi
         else
+            local iran_addr
+            iran_addr=$(toml_get "$f" transport iran)
             if [ "$transport" = icmp ]; then
                 field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
             else
                 field "This end" "KHAREJ $G_DASH waits on udp/$port"
             fi
+            [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
         fi
         field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
 
@@ -5751,7 +5932,7 @@ pause() {
 }
 
 show_log() {
-    wipe
+    screen_top
     blank
     rule "Log $G_DASH $1"
     blank
@@ -5771,7 +5952,7 @@ edit_profile() {
     local name=$1 cur choice
     cur=$(toml_get "$(cfg_file "$name")" tuning profile)
 
-    wipe
+    screen_top
     blank
     rule "What crosses this link"
     blank
@@ -5837,7 +6018,7 @@ screen_advanced() {
     local name=$1 f k q qs
     f=$(cfg_file "$name")
     while :; do
-        wipe
+        screen_top
         # Two of these are not in the file until somebody sets them: the
         # profile carries the queue depth, and the core picks the number of
         # device queues. Reading the file alone drew "Queue depth  packets,
@@ -6581,7 +6762,7 @@ screen_ports() {
     local name=$1 f side peer cur tuples proto lo hi dsth dstp key
     f=$(cfg_file "$name")
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
-    wipe
+    screen_top
 
     while :; do
         side=$(toml_get "$f" tunnel side)
@@ -7741,7 +7922,7 @@ revert_tuning() {
 screen_host() {
     local key p n bbr cc qd
     while :; do
-        wipe
+        screen_top
         blank
         rule "Host tuning"
         dim "The kernel's own network settings, which apply to everything this"
@@ -8180,7 +8361,7 @@ why_block_quic() {
 screen_firewall() {
     local key
     while :; do
-        wipe
+        screen_top
         blank
         rule "Blocking"
         dim "state lives in $STATE_DIR. Every apply flushes our two chains and"
@@ -8380,7 +8561,7 @@ home_panels() {
     srv_info
     blank
     panel_open "SERVER"
-    panel_field "IP" "$SRV_IP"
+    panel_field "IP" "$(addr_text "$SRV_IP")"
     panel_field "Location" "$SRV_LOC"
     panel_field "Datacenter" "$SRV_ORG"
     panel_field "Side" "$side"
@@ -8530,8 +8711,7 @@ screen_home() {
     local n names=()
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
-    wipe
-    banner
+    screen_top
     home_panels
 
     if [ "${#names[@]}" -gt 0 ]; then
@@ -8570,12 +8750,13 @@ screen_home() {
 screen_tunnels() {
     local names=() n i k
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
-    wipe
 
     if [ "${#names[@]}" -eq 0 ]; then
+        screen_top
         blank
-        warn "there are no tunnels on this server yet"
-        fix "choose 1 to build one, or to paste the line the other server gave you"
+        rule "Manage tunnels"
+        blank
+        dim "no tunnels on this server yet - pick New tunnel to make one"
         pause
         return 0
     fi
@@ -8585,8 +8766,9 @@ screen_tunnels() {
     fi
 
     while :; do
+        screen_top
         blank
-        rule "Tunnels"
+        rule "Manage tunnels"
         blank
         home_cols
         home_head
@@ -8626,7 +8808,7 @@ screen_tunnels() {
 screen_health() {
     local names=() n rc=0 one
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
-    wipe
+    screen_top
 
     if [ "${#names[@]}" -eq 0 ]; then
         blank
@@ -8809,7 +8991,7 @@ PINGIFY_REPO=${PINGIFY_REPO:-GreatTeejay/Pingify}
 
 update_pingify() {
     local tmp rc=1 url
-    wipe
+    screen_top
     blank
     rule "Update"
     blank
@@ -8917,17 +9099,16 @@ uninstall_all() {
     local names=() n keep=yes unit rc=0 units=0
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
-    wipe
+    screen_top
     blank
     rule "Uninstall"
     field "manager" "$PINGIFY_BIN"
     field "core" "$CORE_BIN"
     field "units" "$UNIT_DIR/pingify@.service and every pingify-* unit"
     field "firewall" "the PINGIFY_* chains, flushed and removed"
-    field "sources" "$SRC_DIR"
     field "state" "$STATE_DIR"
     [ "${#names[@]}" -gt 0 ] && field "tunnels" "${names[*]}"
-    field "configs" "$CFG_DIR - kept, unless you say so below"
+    field "tunnels in" "$CFG_DIR - kept, unless you say so below"
     blank
     # 2, not 1. Saying no is a decision rather than a failure, and main turns
     # this into an exit 0 so that `pingify --uninstall` does not report an
@@ -8973,14 +9154,18 @@ uninstall_all() {
         bad "some units are still in $UNIT_DIR"
     fi
 
-    rm -rf "$SRC_DIR" "$STATE_DIR"
-    rm -f "$CORE_BIN"
+    # The core and its sources go whatever the answer below was: they are the
+    # program, not the settings, and keeping them without a manager to run
+    # them leaves a binary nothing on the machine explains.
+    rm -rf "$CORE_DIR" "$STATE_DIR"
     if [ "$keep" = no ]; then
         rm -rf "$CFG_DIR"
-        ok "configs deleted"
+        ok "tunnels deleted"
     else
-        ok "configs left in $CFG_DIR"
+        ok "tunnels left in $CFG_DIR"
     fi
+    # Only if it is empty, which it is when the tunnels went too.
+    rmdir "$BASE_DIR" 2>/dev/null
     rm -f "$PINGIFY_BIN"
     # The closing line reports what happened rather than what was intended.
     if [ "$rc" = 0 ]; then
@@ -9054,6 +9239,11 @@ main() {
     # --status every minute has no business rewriting /usr/local/bin, and if
     # it did it would rewrite it from whatever stale copy that cron line
     # happens to point at.
+    # Before install_self, not after. install_self writes its version stamp
+    # into the state directory, so running it first put a file in the new
+    # place that the move then refused to overwrite - and left the old
+    # directory behind with one file in it, for ever.
+    migrate_layout
     install_self
 
     # A missing core warns rather than exits: Uninstall and the host screens

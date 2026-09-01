@@ -146,7 +146,7 @@ home_panels() {
     srv_info
     blank
     panel_open "SERVER"
-    panel_field "IP" "$SRV_IP"
+    panel_field "IP" "$(addr_text "$SRV_IP")"
     panel_field "Location" "$SRV_LOC"
     panel_field "Datacenter" "$SRV_ORG"
     panel_field "Side" "$side"
@@ -296,8 +296,7 @@ screen_home() {
     local n names=()
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
-    wipe
-    banner
+    screen_top
     home_panels
 
     if [ "${#names[@]}" -gt 0 ]; then
@@ -336,12 +335,13 @@ screen_home() {
 screen_tunnels() {
     local names=() n i k
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
-    wipe
 
     if [ "${#names[@]}" -eq 0 ]; then
+        screen_top
         blank
-        warn "there are no tunnels on this server yet"
-        fix "choose 1 to build one, or to paste the line the other server gave you"
+        rule "Manage tunnels"
+        blank
+        dim "no tunnels on this server yet - pick New tunnel to make one"
         pause
         return 0
     fi
@@ -351,8 +351,9 @@ screen_tunnels() {
     fi
 
     while :; do
+        screen_top
         blank
-        rule "Tunnels"
+        rule "Manage tunnels"
         blank
         home_cols
         home_head
@@ -392,7 +393,7 @@ screen_tunnels() {
 screen_health() {
     local names=() n rc=0 one
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
-    wipe
+    screen_top
 
     if [ "${#names[@]}" -eq 0 ]; then
         blank
@@ -575,7 +576,7 @@ PINGIFY_REPO=${PINGIFY_REPO:-GreatTeejay/Pingify}
 
 update_pingify() {
     local tmp rc=1 url
-    wipe
+    screen_top
     blank
     rule "Update"
     blank
@@ -683,17 +684,16 @@ uninstall_all() {
     local names=() n keep=yes unit rc=0 units=0
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
-    wipe
+    screen_top
     blank
     rule "Uninstall"
     field "manager" "$PINGIFY_BIN"
     field "core" "$CORE_BIN"
     field "units" "$UNIT_DIR/pingify@.service and every pingify-* unit"
     field "firewall" "the PINGIFY_* chains, flushed and removed"
-    field "sources" "$SRC_DIR"
     field "state" "$STATE_DIR"
     [ "${#names[@]}" -gt 0 ] && field "tunnels" "${names[*]}"
-    field "configs" "$CFG_DIR - kept, unless you say so below"
+    field "tunnels in" "$CFG_DIR - kept, unless you say so below"
     blank
     # 2, not 1. Saying no is a decision rather than a failure, and main turns
     # this into an exit 0 so that `pingify --uninstall` does not report an
@@ -739,14 +739,18 @@ uninstall_all() {
         bad "some units are still in $UNIT_DIR"
     fi
 
-    rm -rf "$SRC_DIR" "$STATE_DIR"
-    rm -f "$CORE_BIN"
+    # The core and its sources go whatever the answer below was: they are the
+    # program, not the settings, and keeping them without a manager to run
+    # them leaves a binary nothing on the machine explains.
+    rm -rf "$CORE_DIR" "$STATE_DIR"
     if [ "$keep" = no ]; then
         rm -rf "$CFG_DIR"
-        ok "configs deleted"
+        ok "tunnels deleted"
     else
-        ok "configs left in $CFG_DIR"
+        ok "tunnels left in $CFG_DIR"
     fi
+    # Only if it is empty, which it is when the tunnels went too.
+    rmdir "$BASE_DIR" 2>/dev/null
     rm -f "$PINGIFY_BIN"
     # The closing line reports what happened rather than what was intended.
     if [ "$rc" = 0 ]; then
@@ -820,6 +824,11 @@ main() {
     # --status every minute has no business rewriting /usr/local/bin, and if
     # it did it would rewrite it from whatever stale copy that cron line
     # happens to point at.
+    # Before install_self, not after. install_self writes its version stamp
+    # into the state directory, so running it first put a file in the new
+    # place that the move then refused to overwrite - and left the old
+    # directory behind with one file in it, for ever.
+    migrate_layout
     install_self
 
     # A missing core warns rather than exits: Uninstall and the host screens

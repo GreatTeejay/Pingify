@@ -102,6 +102,31 @@ for fn in screen_home screen_tunnel main_menu; do
     fi
 done
 
+section "the unit names the paths this script uses"
+
+# It wrote them out again instead, inside a quoted heredoc, so the unit named
+# wherever the core and the configs were on the day it was written. Moving
+# either of them left every tunnel's ExecStart pointing at a file that was not
+# there any more, and systemd's whole answer to that is "203/EXEC".
+_ud=$(mktemp -d)
+_old_unit=$UNIT_DIR _old_core=$CORE_BIN _old_cfg=$CFG_DIR
+UNIT_DIR=$_ud
+CORE_BIN=/somewhere/else/pingify-core
+CFG_DIR=/somewhere/else/tunnels
+systemctl() { :; }
+unit_write
+u=$(cat "$_ud/pingify@.service" 2>/dev/null)
+check_contains "ExecStart names the core this script would run" "$u" "$CORE_BIN "
+check_contains "and the directory the configs are in" "$u" "$CFG_DIR/%i.toml"
+
+# systemd reads these in [Unit] and says "Unknown key name" when they are in
+# [Service] - and then quietly applies its own default instead.
+check_contains "the restart limit is in the Unit section" \
+    "$(printf '%s\n' "$u" | sed -n '/^\[Unit\]/,/^\[Service\]/p')" "StartLimitIntervalSec"
+UNIT_DIR=$_old_unit CORE_BIN=$_old_core CFG_DIR=$_old_cfg
+rm -rf "$_ud"
+unset -f systemctl
+
 section "the guard that lets this file be sourced at all"
 
 # build.sh and every test here source the script. Without the guard on the

@@ -211,7 +211,7 @@ revert_tuning() {
 screen_host() {
     local key p n bbr cc qd
     while :; do
-        wipe
+        screen_top
         blank
         rule "Host tuning"
         dim "The kernel's own network settings, which apply to everything this"
@@ -650,7 +650,7 @@ why_block_quic() {
 screen_firewall() {
     local key
     while :; do
-        wipe
+        screen_top
         blank
         rule "Blocking"
         dim "state lives in $STATE_DIR. Every apply flushes our two chains and"

@@ -124,7 +124,7 @@ screen_tunnel() {
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
 
     while :; do
-        wipe
+        screen_top
         tun_line "$name"
         blank
         printf '  %s%s%s%s%s %s\n' "$C_B" "$name" "$C_OFF" \
@@ -146,16 +146,19 @@ screen_tunnel() {
         # left the reader to remember which of the two does what.
         if [ "$side" = iran ]; then
             if [ "$transport" = icmp ]; then
-                field "This end" "IRAN $G_DASH dials $kharej inside ping packets"
+                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") inside ping packets"
             else
-                field "This end" "IRAN $G_DASH dials $kharej on udp/$port"
+                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") on udp/$port"
             fi
         else
+            local iran_addr
+            iran_addr=$(toml_get "$f" transport iran)
             if [ "$transport" = icmp ]; then
                 field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
             else
                 field "This end" "KHAREJ $G_DASH waits on udp/$port"
             fi
+            [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
         fi
         field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
 
@@ -237,7 +240,7 @@ pause() {
 }
 
 show_log() {
-    wipe
+    screen_top
     blank
     rule "Log $G_DASH $1"
     blank
@@ -257,7 +260,7 @@ edit_profile() {
     local name=$1 cur choice
     cur=$(toml_get "$(cfg_file "$name")" tuning profile)
 
-    wipe
+    screen_top
     blank
     rule "What crosses this link"
     blank
@@ -323,7 +326,7 @@ screen_advanced() {
     local name=$1 f k q qs
     f=$(cfg_file "$name")
     while :; do
-        wipe
+        screen_top
         # Two of these are not in the file until somebody sets them: the
         # profile carries the queue depth, and the core picks the number of
         # device queues. Reading the file alone drew "Queue depth  packets,

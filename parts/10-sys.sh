@@ -4,20 +4,32 @@
 # from: reading and writing a config, asking systemd what it thinks, and asking
 # a running tunnel how it is.
 #
-# The layout is ordinary FHS. The old manager kept everything under /root,
-# which meant a second administrator could not find it, backups that skip /root
-# skipped the tunnel, and the configs sat beside the operator's ssh keys.
+# Everything Pingify has lives in one directory: the tunnels, the core, and
+# the little state the manager keeps. It was spread over /etc, /var/lib and
+# /usr/local/src, which is the ordinary place for each of those things and
+# means four directories to look in when something is wrong, four to copy when
+# a server is rebuilt, and four to be sure of when one is taken apart.
+#
+#   /root/pingify/                 the tunnels, one .toml each
+#   /root/pingify/core/            the core binary
+#   /root/pingify/core/src/        its sources, so it can be built with no network
+#   /root/pingify/state/           what the manager remembers between runs
+#
+# Two things stay where they are because nothing else would find them: the
+# pingify command on PATH, and the systemd units.
 
 # Every path takes its value from the environment if there is one. Not for
 # flexibility - nobody moves these - but so that a test can point the whole
 # script at a temporary directory and be certain it cannot touch the machine
 # it is running on. Two of the five already did, which meant a test could
 # redirect the configs and then have the real core binary invoked on them.
+BASE_DIR=${PINGIFY_BASE_DIR:-/root/pingify}
 PINGIFY_BIN=${PINGIFY_BIN:-/usr/local/bin/pingify}
-CORE_BIN=${PINGIFY_CORE_BIN:-/usr/local/bin/pingify-core}
-CFG_DIR=${PINGIFY_CFG_DIR:-/etc/pingify}
-STATE_DIR=${PINGIFY_STATE_DIR:-/var/lib/pingify}
-SRC_DIR=${PINGIFY_SRC_DIR:-/usr/local/src/pingify}
+CFG_DIR=${PINGIFY_CFG_DIR:-$BASE_DIR}
+CORE_DIR=${PINGIFY_CORE_DIR:-$BASE_DIR/core}
+CORE_BIN=${PINGIFY_CORE_BIN:-$CORE_DIR/pingify-core}
+SRC_DIR=${PINGIFY_SRC_DIR:-$CORE_DIR/src}
+STATE_DIR=${PINGIFY_STATE_DIR:-$BASE_DIR/state}
 UNIT_DIR=${PINGIFY_UNIT_DIR:-/etc/systemd/system}
 
 # The status endpoint listens on the loopback address. One port per tunnel,
@@ -50,8 +62,66 @@ require_root() {
 # ensure_dirs is called before anything writes. 0700 on the config directory
 # because the files in it contain the security token.
 ensure_dirs() {
-    mkdir -p "$CFG_DIR" "$STATE_DIR" "$SRC_DIR"
+    mkdir -p "$CFG_DIR" "$CORE_DIR" "$SRC_DIR" "$STATE_DIR"
     chmod 0700 "$CFG_DIR"
+}
+
+# migrate_layout moves a server from the layout before this one.
+#
+# It runs on the interactive path only, and it does nothing at all after the
+# first time, because what it looks for is not there any more. It is not on
+# the --status path on purpose: that one is called from cron, and a monitoring
+# call is no place to be restarting tunnels.
+#
+# The order matters. The units name the core by its path, so they are written
+# again after the binary has moved, and every tunnel that was running is
+# restarted onto the new one - otherwise the running core is a deleted file
+# and the next restart finds nothing where the unit says it is.
+migrate_layout() {
+    local moved=0 f n
+    # A tunnel of the same name in both places is the one thing here that
+    # cannot be decided without asking. The new one wins - it is the one the
+    # units point at - and the old one is left where it is and named, so
+    # whoever has to look at it can.
+    for f in /etc/pingify/*.toml; do
+        [ -e "$f" ] || continue
+        n=${f##*/}
+        if [ -e "$CFG_DIR/$n" ]; then
+            warn "$f was left behind - $CFG_DIR/$n already exists"
+        else
+            mv -f "$f" "$CFG_DIR/$n" && moved=1
+        fi
+    done
+    rmdir /etc/pingify 2>/dev/null
+
+    if [ -x /usr/local/bin/pingify-core ] && [ ! -x "$CORE_BIN" ]; then
+        mkdir -p "$CORE_DIR"
+        mv -f /usr/local/bin/pingify-core "$CORE_BIN" && moved=1
+    fi
+    rm -f /usr/local/bin/pingify-core
+
+    # State is ours and the newer copy is the true one, so a name that exists
+    # in both places is not a conflict: the old file goes.
+    for f in /var/lib/pingify/*; do
+        [ -e "$f" ] || continue
+        n=${f##*/}
+        if [ -e "$STATE_DIR/$n" ]; then
+            rm -f "$f"
+        else
+            mv -f "$f" "$STATE_DIR/$n" && moved=1
+        fi
+    done
+    rmdir /var/lib/pingify 2>/dev/null
+    rm -rf /usr/local/src/pingify
+
+    [ "$moved" = 1 ] || return 0
+
+    chmod 0700 "$CFG_DIR"
+    unit_write
+    while IFS= read -r n; do
+        systemctl is-enabled --quiet "pingify@$n" 2>/dev/null && svc_do restart "$n"
+    done < <(cfg_list)
+    ok "moved into $BASE_DIR"
 }
 
 arch_go() {
@@ -208,24 +278,36 @@ status_port() {
 # change - not on every tunnel creation, which is a global side effect from a
 # per-tunnel action and how the old script came to rewrite four units whenever
 # anybody added one.
+# The unit names the core and the config by path, and it takes both from the
+# constants at the top of this file rather than writing them out again.
+#
+# It used to write them out again, inside a quoted heredoc, so the two paths in
+# the unit were the two paths this script used *when the unit was written* -
+# and moving either of them left every tunnel on the machine pointing at a
+# file that was not there any more. systemd's answer to that is 203/EXEC, and
+# nothing else on the screen says what happened.
 unit_write() {
-    cat >"$UNIT_DIR/pingify@.service" <<'UNIT'
+    cat >"$UNIT_DIR/pingify@.service" <<UNIT
 [Unit]
 Description=Pingify tunnel %i
 Documentation=https://github.com/GreatTeejay/Pingify
 After=network-online.target
 Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/pingify-core -c /etc/pingify/%i.toml
-Restart=always
-RestartSec=2
-# A limit that means something. The old unit had StartLimitIntervalSec=0, which
+# In [Unit], which is where systemd reads them. They were in [Service], and
+# systemd said so on every start - "Unknown key name 'StartLimitIntervalSec'"
+# - and then applied its own default instead of the limit written here.
+#
+# A limit that means something: the old unit had StartLimitIntervalSec=0, which
 # turns the limit off entirely and lets a config the core refuses restart every
 # two seconds for ever, filling the journal and hiding the reason.
 StartLimitIntervalSec=300
 StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStart=$CORE_BIN -c $CFG_DIR/%i.toml
+Restart=always
+RestartSec=2
 
 # A raw ICMP socket and a tun device need these two, and nothing needs more.
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
