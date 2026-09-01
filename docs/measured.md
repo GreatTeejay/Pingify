@@ -175,6 +175,100 @@ happily.
 Off by default. What is wanted from this tunnel is speed, ping and stability,
 and the traffic inside it is already TLS.
 
+## 17. The bursts the path drops are the ones we make
+
+A tunnel does not generate traffic, it repeats it, and the TCP inside has
+already decided when each packet should go. Draining the device and firing
+sixty-four packets into the wire in one sendmmsg undoes that pacing and hands
+the path a burst at line rate. Something on the way polices a burst by dropping
+a run of it - a hundred and seventy-three packets in a row, twice in fifteen
+seconds.
+
+Counted at the far end by looking for gaps in our own sequence numbers, which
+is the only place this is visible:
+
+	  send_batch    the path lost    one stream
+	      64           2.870%         129.8 Mbit/s
+	      16           0.728%         144.1
+	       4           1.145%         157.0
+	       1           0.000%         170.6
+
+flagtun on the same path in the same minute lost nothing, which is what said
+the loss was ours and not the route's. Batching cost nothing to give up:
+sixteen streams carried 442.7 Mbit/s at a batch of one against 443.2 at
+sixty-four, because with sixteen streams the packets are already there when you
+look. It is the single stream, the one that arrives paced, that a batch can
+only damage - and the single stream is what the batch was added to help.
+
+**One packet per crossing on the way out. Batch on the way in, never on the
+way out.**
+
+## 18. fq on the egress, and a rate the tunnel works out for itself
+
+fq spaces a socket's packets instead of letting a backlog leave in a clump.
+That alone is most of the difference, and it needs no number:
+
+	  eth0 qdisc      one stream    retransmissions
+	  fq_codel        187.2 Mbit/s  247, 847, 201
+	  fq              229.7         86
+	  fq, paced       243.7         none
+
+A rate on top helps further and cannot be chosen in advance. Half the link
+speed is unavailable - every server this runs on is a virtual machine and
+virtio_net reports its speed as -1. A number in the config is worse: nobody can
+compute what a path between two countries will carry.
+
+So it is measured. Once a second, work out the rate, keep the best second seen,
+hold the cap half again above it. The peak decays by a sixty-fourth on a busy
+second that is slower, so it follows what the tunnel is doing now rather than
+the best it ever did - without that, a sixteen-stream run leaves the cap at 793
+Mbit/s and a single stream afterwards gets no help from it at all, falling from
+255 to 228.
+
+**The first version of that loop deadlocked and it is worth remembering why.**
+It started at a floor of 25 Mbit/s, which throttled the TCP inside from the
+first second, so the measured rate never grew, so the cap never grew. Three
+runs at 23 Mbit/s. A loop that learns from what it limits has to be allowed to
+see the thing unlimited first.
+
+## 19. The queue is one straight trade, and it is the profile
+
+fq's flow_limit must be above the burst it is smoothing - the default of a
+hundred packets would drop exactly what it was set to space out - and below the
+depth at which the queue becomes the delay. Twenty thousand is a quarter of a
+second at four hundred megabits and behaves like one: measured once with the
+rate cap still catching up, p50 302 ms and a tail at 1174.
+
+Between those two ends there is a straight line with nothing free on it.
+Restarted fresh at each depth:
+
+	  profile     queue    16 streams   one stream   under load
+	  gaming        600     397 Mbit/s   167 Mbit/s   84.5 / 92.5 ms
+	  balanced      900     448          254          93.3 / 106.5
+	  download     1500     466          253         115.8 / 139.3
+
+Deeper than 1500 buys nothing at all and costs a great deal: 2500, 4000 and
+6000 leave one stream at 250, 251 and 247 while p99 goes 462, 626, 928. The
+ceiling is the path, not the queue.
+
+Balanced is not the average of the other two - it carries a single stream
+faster than either. The quiet round trip does not move between them at all,
+81.0 / 81.1 / 81.2, because an empty queue is an empty queue however deep it
+was allowed to get. **A profile changes what happens when the link is busy,
+which is the only time any of it is felt.**
+
+## 20. Count the gaps in your own sequence numbers
+
+Nothing else on either machine can see what the path takes. The device says
+zero, the qdisc says zero, the socket says d0, and a thousand packets a minute
+are disappearing. The sender's counter is consecutive, so a number that never
+arrives is a packet the path lost, and the run length - how many went together
+- matters more than the total. Losses spread one at a time are noise a window
+shrugs off; the same number in runs is a window halved once per run.
+
+Verified against an independent count, an iptables rule at each end: the tunnel
+said 993 and the kernels said 996.
+
 ---
 
 # How to measure, so the numbers mean something
