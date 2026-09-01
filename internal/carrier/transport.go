@@ -35,6 +35,10 @@ func Open(cfg *config.Config) (Full, error) {
 		return newUDPCarrier(cfg)
 	case "tcp":
 		return newTCPCarrier(cfg)
+	case "ws":
+		return newWSCarrier(cfg)
+	case "wss":
+		return newWSSCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }

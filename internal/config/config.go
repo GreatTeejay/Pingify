@@ -90,6 +90,40 @@ type Config struct {
 		Iran string
 		Port int
 
+		// The name the dialling side asks for, and the Host header it sends
+		// with it. Behind a CDN this is the only address that matters: the
+		// edge is what answers on it, and the name is how the edge knows
+		// which origin the request belongs to.
+		Domain string
+
+		// The path a WebSocket handshake asks for. Anything else that arrives
+		// gets a 404, which is what a web server would have said.
+		Path string
+
+		// Which side opens the connection. Iran, unless something in the
+		// middle only works the other way round - a CDN in front of the Iran
+		// server is exactly that: the edge answers on the domain and connects
+		// inward to the origin, so the origin is the side that waits and the
+		// server abroad is the side that dials.
+		Dials string
+
+		// Where the side that waits binds, when that is not the port the
+		// other side asks for. Behind a CDN it usually is not: the edge takes
+		// the connection on one of its own ports and comes to the origin on
+		// another.
+		ListenPort int
+
+		// A certificate for the side that waits, when nothing in front of it
+		// is doing the TLS. Empty means something is - a CDN, or a proxy on
+		// the same machine.
+		Cert string
+		Key  string
+
+		// Whether the side that dials should accept a certificate nobody
+		// vouches for. For a pair that made its own; never for a CDN, where
+		// the whole point is that the name is one the internet trusts.
+		Insecure bool
+
 		// How many connections a stream carrier opens. One is not enough on a
 		// path that shapes a single flow, and it is measured rather than
 		// guessed - see the note on DefaultConnections.
@@ -144,11 +178,52 @@ type Config struct {
 
 // Dials reports whether this side is the one that opens the connection.
 //
-// Iran Dials out, always. Connections into the Iran server are blackholed
-// after about six exchanges - measured, repeatedly - so the side that owns the
-// ports users connect to is not the side that waits for the tunnel. This is
-// settled and nothing above needs to ask again.
-func (c *Config) Dials() bool { return c.Side == SideIran }
+// Iran dials out, and that is the default because connections into the Iran
+// server are blackholed after about six exchanges - measured, repeatedly - so
+// the side that owns the ports users connect to is not the side that waits
+// for the tunnel.
+//
+// The exception is a CDN. An edge answers on a name and connects inward to
+// the origin it was given, so a domain in front of the Iran server can only
+// be reached by dialling *into* it: the origin waits and the server abroad
+// dials the edge. transport.dials says so when that is the arrangement.
+func (c *Config) Dials() bool { return c.Side == c.DialSide() }
+
+func (c *Config) DialSide() string {
+	if c.Transport.Dials == SideKharej {
+		return SideKharej
+	}
+	return SideIran
+}
+
+// DialHost is what the side that dials connects to: the domain when there is
+// one, and otherwise the address of whichever server is waiting.
+func (c *Config) DialHost() string {
+	if c.Transport.Domain != "" {
+		return c.Transport.Domain
+	}
+	if c.DialSide() == SideIran {
+		return c.Transport.Kharej
+	}
+	return c.Transport.Iran
+}
+
+// Path is what a WebSocket handshake asks for, and what the side that waits
+// insists on before it will upgrade anything.
+func (c *Config) Path() string {
+	if c.Transport.Path == "" {
+		return "/"
+	}
+	return c.Transport.Path
+}
+
+// ListenPort is where the side that waits binds.
+func (c *Config) ListenPort() int {
+	if c.Transport.ListenPort > 0 {
+		return c.Transport.ListenPort
+	}
+	return c.Transport.Port
+}
 
 // Mine returns this side's tun address, and theirs.
 func (c *Config) Mine() (string, string) {
@@ -232,6 +307,20 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Port, err = num()
 	case "transport.connections":
 		c.Transport.Connections, err = num()
+	case "transport.domain":
+		c.Transport.Domain, err = str()
+	case "transport.path":
+		c.Transport.Path, err = str()
+	case "transport.dials":
+		c.Transport.Dials, err = str()
+	case "transport.listen_port":
+		c.Transport.ListenPort, err = num()
+	case "transport.cert":
+		c.Transport.Cert, err = str()
+	case "transport.key":
+		c.Transport.Key, err = str()
+	case "transport.insecure":
+		c.Transport.Insecure, err = boolean(raw)
 	case "transport.keepalive_sec":
 		c.Transport.Keepalive, err = num()
 
@@ -403,17 +492,30 @@ func (c *Config) check() error {
 		c.Transport.Type = "udp"
 	}
 	switch c.Transport.Type {
-	case "udp", "icmp", "tcp":
+	case "udp", "icmp", "tcp", "ws", "wss":
 	default:
-		return fmt.Errorf("transport.type %q: udp, tcp and icmp are what exist so far", c.Transport.Type)
+		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss and icmp are what exist so far",
+			c.Transport.Type)
+	}
+	switch c.Transport.Dials {
+	case "", SideIran, SideKharej:
+	default:
+		return fmt.Errorf("transport.dials %q must be %q or %q",
+			c.Transport.Dials, SideIran, SideKharej)
+	}
+	if c.Transport.ListenPort < 0 || c.Transport.ListenPort > 65535 {
+		return fmt.Errorf("transport.listen_port %d is not a port", c.Transport.ListenPort)
+	}
+	if c.Transport.Path != "" && !strings.HasPrefix(c.Transport.Path, "/") {
+		return fmt.Errorf("transport.path %q has to start with a slash", c.Transport.Path)
 	}
 	// ICMP has no ports. There is nothing to listen on and nothing to
 	// misconfigure, which is half of why it is the transport that survives.
 	if c.Transport.Type != "icmp" && (c.Transport.Port <= 0 || c.Transport.Port > 65535) {
 		return fmt.Errorf("transport.port %d is not a port", c.Transport.Port)
 	}
-	if c.Dials() && c.Transport.Kharej == "" {
-		return fmt.Errorf("transport.kharej: the Iran side needs the address it Dials")
+	if c.Dials() && c.DialHost() == "" {
+		return fmt.Errorf("transport: the side that dials needs an address or a domain to dial")
 	}
 	if c.Transport.Keepalive <= 0 {
 		c.Transport.Keepalive = 10

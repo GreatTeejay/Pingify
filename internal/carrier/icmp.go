@@ -111,10 +111,10 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 	c.pc = pc
 
 	if cfg.Dials() {
-		addr, err := net.ResolveIPAddr("ip4", cfg.Transport.Kharej)
+		addr, err := net.ResolveIPAddr("ip4", cfg.DialHost())
 		if err != nil {
 			pc.Close()
-			return nil, fmt.Errorf("resolve %s: %v", cfg.Transport.Kharej, err)
+			return nil, fmt.Errorf("resolve %s: %v", cfg.DialHost(), err)
 		}
 		c.setPeer(addr.IP)
 		logging.Info("carrier: echoing to %s, id %d", addr.IP, c.id)

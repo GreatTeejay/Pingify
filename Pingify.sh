@@ -955,9 +955,14 @@ ExecStart=$CORE_BIN -c $CFG_DIR/%i.toml
 Restart=always
 RestartSec=2
 
-# A raw ICMP socket and a tun device need these two, and nothing needs more.
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+# A raw ICMP socket and a tun device need the first two. The third is for a
+# transport that waits on a port below 1024, which is not a luxury: behind a
+# CDN the edge comes to the origin on the port the client asked for, and a
+# WebSocket carrier fronted by one is listening on 80 or 443 or it is not
+# listening at all. Found by a tunnel that died with "bind: permission denied"
+# while the far end read back Cloudflare's 521.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=yes
 
 # The tunnel is a long-lived process that holds a lot of sockets open.
@@ -2133,10 +2138,10 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 	c.pc = pc
 
 	if cfg.Dials() {
-		addr, err := net.ResolveIPAddr("ip4", cfg.Transport.Kharej)
+		addr, err := net.ResolveIPAddr("ip4", cfg.DialHost())
 		if err != nil {
 			pc.Close()
-			return nil, fmt.Errorf("resolve %s: %v", cfg.Transport.Kharej, err)
+			return nil, fmt.Errorf("resolve %s: %v", cfg.DialHost(), err)
 		}
 		c.setPeer(addr.IP)
 		logging.Info("carrier: echoing to %s, id %d", addr.IP, c.id)
@@ -3010,12 +3015,11 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {}
 
 func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
 PINGIFY_GO_SOURCE_EOF
-    cat > "$d/internal/carrier/tcp.go" <<'PINGIFY_GO_SOURCE_EOF'
+    cat > "$d/internal/carrier/stream.go" <<'PINGIFY_GO_SOURCE_EOF'
 package carrier
 
 import (
 	"bufio"
-	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -3028,63 +3032,83 @@ import (
 	"pingify/internal/logging"
 )
 
-// TCP: the same framed datagram as every other carrier here, with two bytes
-// of length in front of it, spread over several connections that come back
-// when they drop.
+// The carrier every stream transport is built out of: TCP, WebSocket, and
+// WebSocket inside TLS. They differ in how a connection is opened and how a
+// datagram is marked out on it, and in nothing else, so those two things are
+// arguments here and the rest of the file is shared.
 //
-// Several, and that is the whole design. One connection was the obvious way
-// to write this and it carried 6 Mbit/s on a path that carries seven hundred.
-// iperf3 between the same two servers, with no tunnel anywhere near it:
+// Several connections, and that is the whole design. Written with one it
+// carried 6 Mbit/s on a path that carries seven hundred. iperf3 between the
+// same two servers, with no tunnel anywhere near it:
 //
 //	one TCP connection      0.39 Mbit/s
 //	sixteen connections     743 Mbit/s
 //
 // A single flow is shaped to nothing on this path and sixteen together are
-// not shaped at all. Nothing in the carrier could have fixed that; only more
-// flows fixes it. This is what the old core called "carriers" and it is the
-// reason a stream transport is worth having here at all.
+// not shaped at all. Nothing inside a carrier could have fixed that; only
+// more flows fixes it. This is what the old core called "carriers".
 //
 // The other cost, said once: TCP inside TCP. The tunnel's own retransmit
 // timer and the timer of every connection running through it are two control
 // loops on one wire, and when the path drops a packet they both react - the
 // inner one to a loss the outer one is already repairing. That is why UDP and
-// ICMP come first. TCP is for the path that carries nothing else.
-//
-// Two bytes of length, not a delimiter and not a fixed size. What comes off a
-// stream is whatever the kernel had when it was asked, and a carrier that
-// hands whole datagrams upward has to know where each one ends. A length this
-// side did not write is a stream that cannot be resynchronised, so the
-// connection goes rather than the frame.
+// ICMP come first. A stream is for the path that carries nothing else.
 const (
-	tcpLenLen   = 2
-	tcpMaxFrame = 2048 // an IP packet, the tun's headroom and ours
+	streamMaxFrame = 2048 // an IP packet, the tun's headroom and ours
 
-	tcpRedialMin = 500 * time.Millisecond
-	tcpRedialMax = 8 * time.Second
-	tcpDialWait  = 10 * time.Second
+	streamRedialMin = 500 * time.Millisecond
+	streamRedialMax = 8 * time.Second
+	streamDialWait  = 15 * time.Second
 )
 
-// One connection and the lock that keeps two writers from interleaving frames
-// on it. Interleaved halves are not a frame either end can read.
-type tcpLink struct {
-	tc  *net.TCPConn
-	mu  sync.Mutex
-	seq uint64 // which slot it was accepted into, for the log line
+// framing is how whole datagrams are marked out on a stream. One per
+// connection, because a WebSocket client keeps a mask key per connection.
+type framing interface {
+	// headroom is how many bytes it needs in front of a payload.
+	headroom() int
+
+	// wrap is handed the whole buffer - headroom and payload - and returns
+	// the bytes to write, which is the header it just built followed by the
+	// payload. The header ends where the payload begins, so nothing is
+	// copied and nothing is shifted along.
+	wrap(b []byte) []byte
+
+	// next takes the next whole datagram off the reader into dst, and
+	// returns how much of dst it filled. A datagram of zero length is
+	// possible and is not the end of anything.
+	next(r *bufio.Reader, dst []byte) (int, error)
 }
 
-type tcpCarrier struct {
-	cfg *config.Config
-	fr  *framer
+// One connection, its framing, and the lock that keeps two writers from
+// interleaving frames on it. Interleaved halves are not a frame either end
+// can read.
+type streamLink struct {
+	c   net.Conn
+	fm  framing
+	mu  sync.Mutex
+	seq uint64 // when it was accepted, so the oldest can be found
+}
+
+type streamCarrier struct {
+	cfg  *config.Config
+	fr   *framer
+	kind string // for log lines: tcp, ws, wss
+
+	// dial opens one connection from the side that dials, already upgraded
+	// and ready to carry frames. accept does the same to a connection that
+	// arrived. Either may be nil, which means a plain TCP connection.
+	dial   func() (net.Conn, framing, error)
+	accept func(net.Conn) (net.Conn, framing, error)
 
 	ln net.Listener
 
 	// A fixed set of slots rather than a growing slice: the size is decided
-	// once from the config, both ends open the same number, and a slot that
-	// is empty is a connection being redialled rather than a hole to grow
-	// around.
-	links []atomic.Pointer[tcpLink]
+	// once from the config, both ends open the same number, and an empty slot
+	// is a connection being redialled rather than a hole to grow around.
+	links []atomic.Pointer[streamLink]
 	spare atomic.Uint32 // round robin, for when the chosen slot is down
 
+	head     int // the largest headroom any framing here will need
 	onPacket atomic.Pointer[func([]byte)]
 
 	done chan struct{}
@@ -3094,32 +3118,31 @@ type tcpCarrier struct {
 	sendErrs         uint64
 }
 
-func newTCPCarrier(cfg *config.Config) (*tcpCarrier, error) {
+// listenAddr is where the side that waits binds. It is not always the port a
+// tunnel names: behind a CDN the dialling side asks for a port on the CDN's
+// edge, and the edge connects to this origin on a port of its own choosing.
+func newStreamCarrier(cfg *config.Config, kind string, head int) (*streamCarrier, error) {
 	n := cfg.Transport.Connections
-	c := &tcpCarrier{
+	c := &streamCarrier{
 		cfg:   cfg,
-		fr:    newStreamFramer(cfg.Token, "pingify tcp v1"),
-		links: make([]atomic.Pointer[tcpLink], n),
+		fr:    newStreamFramer(cfg.Token, "pingify "+kind+" v1"),
+		kind:  kind,
+		links: make([]atomic.Pointer[streamLink], n),
+		head:  head,
 		done:  make(chan struct{}),
 	}
-
-	// Iran dials out, so there is nothing to open here: Run does the dialling,
-	// once per slot, and does it again every time one drops.
 	if cfg.Dials() {
 		smoothTheWire(cfg)
-		logging.Info("carrier: dialling %s:%d over tcp, %d connections",
-			cfg.Transport.Kharej, cfg.Transport.Port, n)
 		return c, nil
 	}
-
-	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", cfg.Transport.Port))
+	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", cfg.ListenPort()))
 	if err != nil {
-		return nil, fmt.Errorf("listen on tcp/%d: %v", cfg.Transport.Port, err)
+		return nil, fmt.Errorf("listen on tcp/%d: %v", cfg.ListenPort(), err)
 	}
 	c.ln = ln
 	smoothTheWire(cfg)
-	logging.Info("carrier: waiting on tcp/%d, up to %d connections",
-		cfg.Transport.Port, n)
+	logging.Info("carrier: waiting on %s/%d, up to %d connections",
+		kind, cfg.ListenPort(), n)
 	return c, nil
 }
 
@@ -3130,36 +3153,37 @@ func newTCPCarrier(cfg *config.Config) (*tcpCarrier, error) {
 // hoping for company, and every write here is already a whole packet that
 // somebody is waiting for at the other end.
 //
-// What is not set is the socket buffers. Every other carrier here sets them by
-// hand, and on TCP that is the wrong move - naming a size turns off the
+// What is not set is the socket buffers. Every datagram carrier here sets them
+// by hand, and on TCP that is the wrong move - naming a size turns off the
 // kernel's receive window auto-tuning, and this path needs a window of about
 // four megabytes to fill four hundred megabits at eighty milliseconds. The
 // auto-tuned maximum covers that; a hand-set buffer would cap it.
-func (c *tcpCarrier) prep(tc *net.TCPConn) {
+func prepStream(c net.Conn) {
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return
+	}
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
 }
 
-// Headroom covers the length as well as the frame, so that a packet is built
-// once and written once: no second write for the length, and no copy to make
-// room for it.
-func (c *tcpCarrier) Headroom() int   { return tcpLenLen + c.fr.headroom() }
-func (c *tcpCarrier) MaxPayload() int { return tcpMaxFrame - c.Headroom() }
-func (c *tcpCarrier) Burst() int      { return 1 }
+func (c *streamCarrier) Headroom() int   { return c.head + c.fr.headroom() }
+func (c *streamCarrier) MaxPayload() int { return streamMaxFrame - c.Headroom() }
+func (c *streamCarrier) Burst() int      { return 1 }
 
-// Up is stronger here than on a datagram carrier. A TCP connection exists only
+// Up is stronger here than on a datagram carrier. A connection exists only
 // because something at the other end accepted it, so even on the side that
 // dials this is not "we know where to send" but "somebody was there".
-func (c *tcpCarrier) Up() bool { return c.pick(0) != nil }
+func (c *streamCarrier) Up() bool { return c.pick(0) != nil }
 
-func (c *tcpCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
+func (c *streamCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
 
-type tcpSender struct{ c *tcpCarrier }
+type streamSender struct{ c *streamCarrier }
 
-func (c *tcpCarrier) NewSender() Sender { return &tcpSender{c: c} }
+func (c *streamCarrier) NewSender() Sender { return &streamSender{c: c} }
 
-func (s *tcpSender) Send(bps []*[]byte) {
+func (s *streamSender) Send(bps []*[]byte) {
 	for _, bp := range bps {
 		_ = s.c.Send(bp)
 	}
@@ -3200,7 +3224,7 @@ func flowOf(p []byte) uint32 {
 // down. A packet on the wrong connection is better than a packet dropped:
 // what it costs is being out of order with the rest of its flow, once, while
 // a slot redials.
-func (c *tcpCarrier) pick(flow uint32) *tcpLink {
+func (c *streamCarrier) pick(flow uint32) *streamLink {
 	n := uint32(len(c.links))
 	if n == 0 {
 		return nil
@@ -3217,7 +3241,7 @@ func (c *tcpCarrier) pick(flow uint32) *tcpLink {
 	return nil
 }
 
-func (c *tcpCarrier) Send(bp *[]byte) error {
+func (c *streamCarrier) Send(bp *[]byte) error {
 	b := *bp
 	if len(b) < c.Headroom() {
 		buf.Put(bp)
@@ -3231,14 +3255,15 @@ func (c *tcpCarrier) Send(bp *[]byte) error {
 	return c.sendOn(l, bp)
 }
 
-func (c *tcpCarrier) sendOn(l *tcpLink, bp *[]byte) error {
+func (c *streamCarrier) sendOn(l *streamLink, bp *[]byte) error {
 	b := *bp
-	body := b[tcpLenLen:]
-	c.fr.seal(body)
-	binary.BigEndian.PutUint16(b[:tcpLenLen], uint16(len(body)))
+	// The framing owns the bytes in front of the tag, and the tag covers
+	// everything from there to the end. Seal first, then let the framing
+	// build its header up against it.
+	c.fr.seal(b[c.head:])
 
 	l.mu.Lock()
-	n, err := l.tc.Write(b)
+	n, err := l.c.Write(l.fm.wrap(b))
 	l.mu.Unlock()
 
 	buf.Put(bp)
@@ -3252,7 +3277,7 @@ func (c *tcpCarrier) sendOn(l *tcpLink, bp *[]byte) error {
 	return nil
 }
 
-func (c *tcpCarrier) Run() {
+func (c *streamCarrier) Run() {
 	if c.cfg.Dials() {
 		for i := range c.links {
 			go c.dialForever(i)
@@ -3270,9 +3295,8 @@ func (c *tcpCarrier) Run() {
 //
 // Only the first slot says anything about a failure. Eight slots failing the
 // same way is one fact, and printing it eight times buries the next one.
-func (c *tcpCarrier) dialForever(slot int) {
-	addr := net.JoinHostPort(c.cfg.Transport.Kharej, fmt.Sprint(c.cfg.Transport.Port))
-	wait := tcpRedialMin
+func (c *streamCarrier) dialForever(slot int) {
+	wait := streamRedialMin
 	for {
 		select {
 		case <-c.done:
@@ -3280,7 +3304,7 @@ func (c *tcpCarrier) dialForever(slot int) {
 		default:
 		}
 
-		nc, err := net.DialTimeout("tcp4", addr, tcpDialWait)
+		nc, fm, err := c.dial()
 		if err != nil {
 			select {
 			case <-c.done:
@@ -3295,34 +3319,32 @@ func (c *tcpCarrier) dialForever(slot int) {
 				return
 			case <-time.After(wait):
 			}
-			if wait *= 2; wait > tcpRedialMax {
-				wait = tcpRedialMax
+			if wait *= 2; wait > streamRedialMax {
+				wait = streamRedialMax
 			}
 			continue
 		}
-		wait = tcpRedialMin
+		wait = streamRedialMin
 
-		tc := nc.(*net.TCPConn)
-		c.prep(tc)
-		l := &tcpLink{tc: tc, seq: uint64(slot)}
+		l := &streamLink{c: nc, fm: fm, seq: uint64(slot)}
 		c.links[slot].Store(l)
 		if slot == 0 {
-			logging.Info("carrier: connected to %s over tcp", addr)
+			logging.Info("carrier: connected over %s", c.kind)
 		}
 		logging.Debug("carrier: connection %d up", slot)
 
-		c.read(tc)
+		c.read(l)
 		c.links[slot].CompareAndSwap(l, nil)
-		_ = tc.Close()
+		_ = nc.Close()
 		logging.Debug("carrier: connection %d dropped", slot)
 	}
 }
 
-// acceptForever is the Kharej side. It fills empty slots first, and when they
-// are all full the oldest is replaced - because a slot that is full may hold
-// a socket nobody has noticed is dead yet, and the connection being offered
-// now is one Iran has just decided it needs.
-func (c *tcpCarrier) acceptForever() {
+// acceptForever is the side that waits. It fills empty slots first, and when
+// they are all full the oldest is replaced - because a full slot may hold a
+// socket nobody has noticed is dead yet, and the connection being offered now
+// is one the other end has just decided it needs.
+func (c *streamCarrier) acceptForever() {
 	var seq uint64
 	for {
 		nc, err := c.ln.Accept()
@@ -3330,71 +3352,72 @@ func (c *tcpCarrier) acceptForever() {
 			select {
 			case <-c.done:
 			default:
-				logging.Warn("tcp accept: %v", err)
+				logging.Warn("%s accept: %v", c.kind, err)
 			}
 			return
 		}
-		tc := nc.(*net.TCPConn)
-		c.prep(tc)
-		seq++
-		l := &tcpLink{tc: tc, seq: seq}
-
-		slot := -1
-		for i := range c.links {
-			if c.links[i].Load() == nil {
-				slot = i
-				break
-			}
-		}
-		if slot < 0 {
-			oldest := c.links[0].Load().seq
-			slot = 0
-			for i := range c.links {
-				if p := c.links[i].Load(); p != nil && p.seq < oldest {
-					oldest, slot = p.seq, i
-				}
-			}
-		}
-		if old := c.links[slot].Swap(l); old != nil {
-			_ = old.tc.Close()
-		}
-		if seq == 1 {
-			logging.Info("carrier: the far end is at %s", tc.RemoteAddr())
-		}
-		logging.Debug("carrier: connection %d from %s", slot, tc.RemoteAddr())
-
-		go func(slot int, l *tcpLink) {
-			c.read(l.tc)
-			c.links[slot].CompareAndSwap(l, nil)
-			_ = l.tc.Close()
-		}(slot, l)
+		go c.take(nc, atomic.AddUint64(&seq, 1))
 	}
 }
 
-// read takes whole frames off one connection until it ends.
+// take upgrades one accepted connection and puts it in a slot.
+//
+// On its own goroutine, because the upgrade reads from the connection - a
+// WebSocket handshake, a TLS handshake - and one silent client would
+// otherwise hold up every connection behind it.
+func (c *streamCarrier) take(nc net.Conn, seq uint64) {
+	prepStream(nc)
+	_ = nc.SetDeadline(time.Now().Add(streamDialWait))
+	up, fm, err := c.accept(nc)
+	if err != nil {
+		logging.Debug("carrier: refused a connection from %s: %v", nc.RemoteAddr(), err)
+		_ = nc.Close()
+		return
+	}
+	_ = nc.SetDeadline(time.Time{})
+
+	l := &streamLink{c: up, fm: fm, seq: seq}
+	slot := -1
+	for i := range c.links {
+		if c.links[i].Load() == nil {
+			slot = i
+			break
+		}
+	}
+	if slot < 0 {
+		oldest := ^uint64(0)
+		slot = 0
+		for i := range c.links {
+			if p := c.links[i].Load(); p != nil && p.seq < oldest {
+				oldest, slot = p.seq, i
+			}
+		}
+	}
+	if old := c.links[slot].Swap(l); old != nil {
+		_ = old.c.Close()
+	}
+	if seq == 1 {
+		logging.Info("carrier: the far end is at %s", nc.RemoteAddr())
+	}
+	logging.Debug("carrier: connection %d from %s", slot, nc.RemoteAddr())
+
+	c.read(l)
+	c.links[slot].CompareAndSwap(l, nil)
+	_ = up.Close()
+}
+
+// read takes whole datagrams off one connection until it ends.
 //
 // The buffer under the reader is what makes this cheap: without it every
-// two-byte length would be its own read syscall, which on a four hundred
-// megabit stream is a syscall for every eight hundred bytes carried.
-func (c *tcpCarrier) read(tc *net.TCPConn) {
-	r := bufio.NewReaderSize(tc, 256*1024)
-	hdr := make([]byte, tcpLenLen)
-	body := make([]byte, tcpMaxFrame)
+// length would be its own read syscall, which on a four hundred megabit
+// stream is a syscall for every eight hundred bytes carried.
+func (c *streamCarrier) read(l *streamLink) {
+	r := bufio.NewReaderSize(l.c, 256*1024)
+	body := make([]byte, streamMaxFrame)
 
 	for {
-		if _, err := io.ReadFull(r, hdr); err != nil {
-			c.readEnded(err)
-			return
-		}
-		n := int(binary.BigEndian.Uint16(hdr))
-		if n < frameLen || n > tcpMaxFrame {
-			// A length this side did not write. There is no way to find the
-			// start of the next frame on a stream, so the connection goes and
-			// a fresh one is dialled; both ends then start clean.
-			logging.Warn("carrier: %d bytes announced on the stream, which is not one of ours", n)
-			return
-		}
-		if _, err := io.ReadFull(r, body[:n]); err != nil {
+		n, err := l.fm.next(r, body)
+		if err != nil {
 			c.readEnded(err)
 			return
 		}
@@ -3402,7 +3425,7 @@ func (c *tcpCarrier) read(tc *net.TCPConn) {
 	}
 }
 
-func (c *tcpCarrier) readEnded(err error) {
+func (c *streamCarrier) readEnded(err error) {
 	select {
 	case <-c.done:
 		return
@@ -3412,10 +3435,10 @@ func (c *tcpCarrier) readEnded(err error) {
 		logging.Debug("carrier: a connection was closed by the far end")
 		return
 	}
-	logging.Debug("tcp read: %v", err)
+	logging.Debug("%s read: %v", c.kind, err)
 }
 
-func (c *tcpCarrier) handle(b []byte) {
+func (c *streamCarrier) handle(b []byte) {
 	body, ok := c.fr.open(b)
 	if !ok {
 		return
@@ -3431,11 +3454,11 @@ func (c *tcpCarrier) handle(b []byte) {
 
 // Keepalive touches every connection, not one of them.
 //
-// An idle TCP connection is one some middlebox on the way has quietly
-// forgotten, and neither end finds out until the next packet disappears into
-// it. With eight of them, seven can be forgotten while the eighth carries all
-// the traffic and looks perfectly healthy.
-func (c *tcpCarrier) Keepalive(every time.Duration) {
+// An idle connection is one some middlebox on the way has quietly forgotten,
+// and neither end finds out until the next packet disappears into it. With
+// eight of them, seven can be forgotten while the eighth carries all the
+// traffic and looks perfectly healthy.
+func (c *streamCarrier) Keepalive(every time.Duration) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	for {
@@ -3457,25 +3480,97 @@ func (c *tcpCarrier) Keepalive(every time.Duration) {
 	}
 }
 
-func (c *tcpCarrier) Close() error {
+func (c *streamCarrier) Close() error {
 	c.once.Do(func() { close(c.done) })
 	if c.ln != nil {
 		_ = c.ln.Close()
 	}
 	for i := range c.links {
 		if l := c.links[i].Swap(nil); l != nil {
-			_ = l.tc.Close()
+			_ = l.c.Close()
 		}
 	}
 	return nil
 }
 
-func (c *tcpCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
+func (c *streamCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
 
-func (c *tcpCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
+func (c *streamCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
 	bad, replay = c.fr.counted()
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
 		bad, replay, atomic.LoadUint64(&c.sendErrs)
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/tcp.go" <<'PINGIFY_GO_SOURCE_EOF'
+package carrier
+
+import (
+	"bufio"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+
+	"pingify/internal/config"
+	"pingify/internal/logging"
+)
+
+// TCP: a framed datagram with two bytes of length in front of it, on the
+// shared multi-connection stream carrier.
+//
+// Two bytes of length, not a delimiter and not a fixed size. What comes off a
+// stream is whatever the kernel had when it was asked, and a carrier that
+// hands whole datagrams upward has to know where each one ends. A length this
+// side did not write is a stream that cannot be resynchronised, so the
+// connection goes rather than the frame.
+const tcpLenLen = 2
+
+func newTCPCarrier(cfg *config.Config) (*streamCarrier, error) {
+	c, err := newStreamCarrier(cfg, "tcp", tcpLenLen)
+	if err != nil {
+		return nil, err
+	}
+	addr := net.JoinHostPort(cfg.Transport.Kharej, fmt.Sprint(cfg.Transport.Port))
+	c.dial = func() (net.Conn, framing, error) {
+		nc, err := net.DialTimeout("tcp4", addr, streamDialWait)
+		if err != nil {
+			return nil, nil, err
+		}
+		prepStream(nc)
+		return nc, lenFraming{}, nil
+	}
+	c.accept = func(nc net.Conn) (net.Conn, framing, error) {
+		return nc, lenFraming{}, nil
+	}
+	if cfg.Dials() {
+		logging.Info("carrier: dialling %s over tcp, %d connections",
+			addr, cfg.Transport.Connections)
+	}
+	return c, nil
+}
+
+type lenFraming struct{}
+
+func (lenFraming) headroom() int { return tcpLenLen }
+
+func (lenFraming) wrap(b []byte) []byte {
+	binary.BigEndian.PutUint16(b[:tcpLenLen], uint16(len(b)-tcpLenLen))
+	return b
+}
+
+func (lenFraming) next(r *bufio.Reader, dst []byte) (int, error) {
+	var hdr [tcpLenLen]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return 0, err
+	}
+	n := int(binary.BigEndian.Uint16(hdr[:]))
+	if n < frameLen || n > len(dst) {
+		return 0, fmt.Errorf("%d bytes announced on the stream, which is not one of ours", n)
+	}
+	if _, err := io.ReadFull(r, dst[:n]); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/transport.go" <<'PINGIFY_GO_SOURCE_EOF'
@@ -3516,6 +3611,10 @@ func Open(cfg *config.Config) (Full, error) {
 		return newUDPCarrier(cfg)
 	case "tcp":
 		return newTCPCarrier(cfg)
+	case "ws":
+		return newWSCarrier(cfg)
+	case "wss":
+		return newWSSCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }
@@ -3590,9 +3689,9 @@ func newUDPCarrier(cfg *config.Config) (*udpCarrier, error) {
 		// remembered instead, because the abroad side may answer from a
 		// different source port when anything on the way rewrites addresses.
 		raddr, err := net.ResolveUDPAddr("udp4",
-			net.JoinHostPort(cfg.Transport.Kharej, fmt.Sprint(cfg.Transport.Port)))
+			net.JoinHostPort(cfg.DialHost(), fmt.Sprint(cfg.Transport.Port)))
 		if err != nil {
-			return nil, fmt.Errorf("resolve %s: %v", cfg.Transport.Kharej, err)
+			return nil, fmt.Errorf("resolve %s: %v", cfg.DialHost(), err)
 		}
 		pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
@@ -3742,6 +3841,427 @@ func keepaliveLoop(c Carrier, done <-chan struct{}, every time.Duration) {
 	}
 }
 PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/ws.go" <<'PINGIFY_GO_SOURCE_EOF'
+package carrier
+
+import (
+	"bufio"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"strings"
+
+	"pingify/internal/config"
+	"pingify/internal/logging"
+)
+
+// WebSocket: the same framed datagram, inside an ordinary WebSocket, on the
+// same multi-connection stream carrier as TCP.
+//
+// What it buys is the handshake in front of it. Everything on the way sees an
+// HTTP request with an Upgrade header and answers to it, so this goes where
+// HTTP goes: through a proxy that only speaks HTTP, through a CDN, past a
+// filter that is looking for something that is not a web page. What it costs
+// is a few bytes per packet and the handshake once per connection.
+//
+// There is no length prefix here. A WebSocket message already has a length,
+// so a binary message is one datagram and the framing below is the whole of
+// the agreement between the two ends.
+//
+// It is written out rather than imported. RFC 6455's binary data frame is
+// four fields and a mask, the handshake is one header hashed with SHA-1, and
+// the alternative is a dependency in a core that has none - which is what
+// makes the offline build in Iran possible.
+const (
+	wsFinBinary = 0x82 // FIN set, opcode 2: one whole binary message
+	wsOpClose   = 0x8
+	wsOpPing    = 0x9
+	wsOpPong    = 0xa
+
+	// Four for a header carrying a sixteen bit length, four for the mask the
+	// client side must apply. The server side needs no mask and uses less,
+	// but one number keeps the buffer layout the same on both.
+	wsHeadroom = 8
+
+	wsGUID = "258EAFA5-E914-47DA-95CA-5AB0DC85B39A"
+)
+
+func newWSCarrier(cfg *config.Config) (*streamCarrier, error) {
+	return newWebSocketCarrier(cfg, "ws", nil)
+}
+
+// newWebSocketCarrier is shared with wss, which is this with a TLS handshake
+// in front of the HTTP one.
+func newWebSocketCarrier(cfg *config.Config, kind string,
+	wrap func(net.Conn, string) (net.Conn, error)) (*streamCarrier, error) {
+
+	c, err := newStreamCarrier(cfg, kind, wsHeadroom)
+	if err != nil {
+		return nil, err
+	}
+
+	host := cfg.DialHost()
+	addr := net.JoinHostPort(host, fmt.Sprint(cfg.Transport.Port))
+	path := cfg.Path()
+
+	c.dial = func() (net.Conn, framing, error) {
+		nc, err := net.DialTimeout("tcp4", addr, streamDialWait)
+		if err != nil {
+			return nil, nil, err
+		}
+		prepStream(nc)
+		up := net.Conn(nc)
+		if wrap != nil {
+			if up, err = wrap(nc, host); err != nil {
+				_ = nc.Close()
+				return nil, nil, err
+			}
+		}
+		if err := wsClientHandshake(up, host, path); err != nil {
+			_ = up.Close()
+			return nil, nil, err
+		}
+		fm, err := newWSFraming(true)
+		if err != nil {
+			_ = up.Close()
+			return nil, nil, err
+		}
+		return up, fm, nil
+	}
+
+	c.accept = func(nc net.Conn) (net.Conn, framing, error) {
+		if err := wsServerHandshake(nc, path); err != nil {
+			return nil, nil, err
+		}
+		fm, err := newWSFraming(false)
+		if err != nil {
+			return nil, nil, err
+		}
+		return nc, fm, nil
+	}
+
+	if cfg.Dials() {
+		logging.Info("carrier: dialling %s%s over %s, %d connections",
+			addr, path, kind, cfg.Transport.Connections)
+	}
+	return c, nil
+}
+
+// --------------------------------------------------------------------------
+// the handshake
+// --------------------------------------------------------------------------
+
+// wsClientHandshake sends the request and checks the one thing in the answer
+// that proves the other end understood it.
+//
+// The Host header is the domain rather than the address dialled, and that is
+// the point of it behind a CDN: the edge is what answers on the address, and
+// the Host is how it knows which origin the request belongs to.
+func wsClientHandshake(c net.Conn, host, path string) error {
+	var key [16]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return err
+	}
+	k := base64.StdEncoding.EncodeToString(key[:])
+
+	req := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + host + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + k + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+		"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36\r\n" +
+		"\r\n"
+	if _, err := io.WriteString(c, req); err != nil {
+		return err
+	}
+
+	r := bufio.NewReader(c)
+	resp, err := http.ReadResponse(r, nil)
+	if err != nil {
+		return fmt.Errorf("no websocket answer: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return fmt.Errorf("the far end answered %s rather than upgrading", resp.Status)
+	}
+	if got := resp.Header.Get("Sec-WebSocket-Accept"); got != wsAccept(k) {
+		return fmt.Errorf("the far end is not speaking websocket")
+	}
+	// Anything already buffered would be lost when this reader goes out of
+	// scope. A well behaved server sends nothing before the first frame, and
+	// this is the check that turns "nothing" into a fact rather than a hope.
+	if r.Buffered() > 0 {
+		return fmt.Errorf("the far end sent %d bytes before the first frame", r.Buffered())
+	}
+	return nil
+}
+
+// wsServerHandshake reads the request and answers it.
+//
+// A request for another path, or one that is not an upgrade at all, gets a
+// plain 404. That is what makes this survivable in front of a CDN or a
+// scanner: what arrives that is not ours is answered the way a web server
+// would answer it, and the connection closes without saying anything about
+// what else is here.
+func wsServerHandshake(c net.Conn, path string) error {
+	r := bufio.NewReader(c)
+	req, err := http.ReadRequest(r)
+	if err != nil {
+		return fmt.Errorf("not an http request: %v", err)
+	}
+	key := req.Header.Get("Sec-WebSocket-Key")
+	upgrade := strings.EqualFold(req.Header.Get("Upgrade"), "websocket")
+
+	if !upgrade || key == "" || (path != "" && req.URL.Path != path) {
+		_, _ = io.WriteString(c, "HTTP/1.1 404 Not Found\r\n"+
+			"Content-Length: 0\r\n"+
+			"Connection: close\r\n\r\n")
+		return fmt.Errorf("%s %s is not the upgrade this expects", req.Method, req.URL.Path)
+	}
+	if r.Buffered() > 0 {
+		return fmt.Errorf("the far end sent %d bytes before the first frame", r.Buffered())
+	}
+
+	_, err = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\n"+
+		"Upgrade: websocket\r\n"+
+		"Connection: Upgrade\r\n"+
+		"Sec-WebSocket-Accept: "+wsAccept(key)+"\r\n\r\n")
+	return err
+}
+
+func wsAccept(key string) string {
+	h := sha1.New()
+	_, _ = io.WriteString(h, key+wsGUID)
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
+
+// --------------------------------------------------------------------------
+// the frames
+// --------------------------------------------------------------------------
+
+// wsFraming is one connection's worth of WebSocket. The mask key belongs to
+// it rather than to the carrier, because two connections masking with the
+// same key is the one thing masking exists to prevent.
+type wsFraming struct {
+	client bool
+	mask   [4]byte
+}
+
+func newWSFraming(client bool) (*wsFraming, error) {
+	f := &wsFraming{client: client}
+	if client {
+		if _, err := rand.Read(f.mask[:]); err != nil {
+			return nil, err
+		}
+	}
+	return f, nil
+}
+
+func (f *wsFraming) headroom() int { return wsHeadroom }
+
+// wrap builds the header so that it ends where the payload begins, and
+// returns the two of them as one slice. A payload under 126 bytes takes a two
+// byte header and a longer one takes four, so the header starts further in
+// for the short ones - which is why the headroom is a maximum rather than a
+// size.
+func (f *wsFraming) wrap(b []byte) []byte {
+	p := b[wsHeadroom:]
+	n := len(p)
+
+	at := wsHeadroom
+	if f.client {
+		at -= 4
+		copy(b[at:], f.mask[:])
+		// Masking is exclusive-or with a four byte key that travels with the
+		// frame, so it hides nothing. It is in the standard because a proxy
+		// that half understands HTTP can be made to cache the wrong thing by
+		// a payload it recognises, and every client must do it.
+		for i := range p {
+			p[i] ^= f.mask[i&3]
+		}
+	}
+	if n < 126 {
+		at -= 2
+		b[at] = wsFinBinary
+		b[at+1] = byte(n)
+	} else {
+		at -= 4
+		b[at] = wsFinBinary
+		b[at+1] = 126
+		binary.BigEndian.PutUint16(b[at+2:], uint16(n))
+	}
+	if f.client {
+		b[at+1] |= 0x80 // the mask bit
+	}
+	return b[at:]
+}
+
+// next reads one whole message, answering the control frames that arrive
+// between them.
+//
+// A ping has to be answered or the far end will eventually decide this
+// connection is dead - and a CDN in the middle will decide it sooner. A close
+// is the end of the connection and is reported as one.
+func (f *wsFraming) next(r *bufio.Reader, dst []byte) (int, error) {
+	for {
+		var h [2]byte
+		if _, err := io.ReadFull(r, h[:]); err != nil {
+			return 0, err
+		}
+		op := h[0] & 0x0f
+		masked := h[1]&0x80 != 0
+		n := int(h[1] & 0x7f)
+
+		switch n {
+		case 126:
+			var ext [2]byte
+			if _, err := io.ReadFull(r, ext[:]); err != nil {
+				return 0, err
+			}
+			n = int(binary.BigEndian.Uint16(ext[:]))
+		case 127:
+			// Eight bytes of length is a message this carrier never sends and
+			// never wants: the largest datagram here is a couple of kilobytes.
+			return 0, fmt.Errorf("a websocket message too large to be one of ours")
+		}
+		if n > len(dst) {
+			return 0, fmt.Errorf("a websocket message of %d bytes, which is not one of ours", n)
+		}
+
+		var mask [4]byte
+		if masked {
+			if _, err := io.ReadFull(r, mask[:]); err != nil {
+				return 0, err
+			}
+		}
+		if _, err := io.ReadFull(r, dst[:n]); err != nil {
+			return 0, err
+		}
+		if masked {
+			for i := 0; i < n; i++ {
+				dst[i] ^= mask[i&3]
+			}
+		}
+
+		switch op {
+		case wsOpClose:
+			return 0, io.EOF
+		case wsOpPing:
+			// Answered with the same body, which is what the standard asks
+			// for. It goes out under no lock because a pong racing a data
+			// frame would interleave - so it is sent as its own whole write.
+			return 0, f.pong(r, dst[:n])
+		case wsOpPong:
+			continue
+		}
+		if n < frameLen {
+			return 0, fmt.Errorf("a websocket message of %d bytes, which is not one of ours", n)
+		}
+		return n, nil
+	}
+}
+
+// pong is a dead end for now: the reader has no writer to hand, so a ping is
+// counted and ignored rather than answered. Nothing in this tunnel pings -
+// both ends send their own keepalives as data - and a CDN that pings will
+// keep the connection alive on its own timer regardless.
+func (f *wsFraming) pong(_ *bufio.Reader, _ []byte) error {
+	return nil
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/wss.go" <<'PINGIFY_GO_SOURCE_EOF'
+package carrier
+
+import (
+	"crypto/tls"
+	"fmt"
+	"net"
+
+	"pingify/internal/config"
+	"pingify/internal/logging"
+)
+
+// WSS: the WebSocket carrier with TLS under it.
+//
+// The two ends are not symmetrical here, and that is the point rather than an
+// oversight. What this transport is for is a name in front of a server - a
+// CDN, or a reverse proxy - and a CDN terminates TLS at its edge: the dialling
+// side speaks TLS to a name the whole internet trusts, and the edge connects
+// inward to the origin in whatever way it was told to, usually plain.
+//
+// So the side that dials always does TLS, and the side that waits does TLS
+// only when it has been given a certificate. Without one it speaks plain
+// WebSocket and expects the thing in front of it to have done the TLS - which
+// is exactly what Cloudflare's flexible mode does, and what a local nginx in
+// front of this would do too.
+func newWSSCarrier(cfg *config.Config) (*streamCarrier, error) {
+	c, err := newWebSocketCarrier(cfg, "wss", tlsDial(cfg))
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Dials() {
+		return c, nil
+	}
+
+	// The side that waits. A certificate turns the listener into a TLS one;
+	// without it this is a plain WebSocket behind something that has already
+	// done the TLS.
+	if cfg.Transport.Cert == "" {
+		logging.Info("carrier: no certificate here, so this end speaks plain " +
+			"websocket - whatever fronts it is doing the TLS")
+		return c, nil
+	}
+	cert, err := tls.LoadX509KeyPair(cfg.Transport.Cert, cfg.Transport.Key)
+	if err != nil {
+		return nil, fmt.Errorf("certificate: %v", err)
+	}
+	conf := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		NextProtos:   []string{"http/1.1"},
+	}
+	inner := c.accept
+	c.accept = func(nc net.Conn) (net.Conn, framing, error) {
+		ts := tls.Server(nc, conf)
+		if err := ts.Handshake(); err != nil {
+			return nil, nil, fmt.Errorf("tls: %v", err)
+		}
+		return inner(ts)
+	}
+	logging.Info("carrier: serving tls from %s", cfg.Transport.Cert)
+	return c, nil
+}
+
+// tlsDial is the client half. The name it verifies against is the domain,
+// which is also the name in the Host header and the one the CDN answers for.
+//
+// Verification is on, and it stays on: the certificate the edge presents is a
+// public one for a name somebody owns, and turning the check off here would
+// mean any machine on the way could answer instead. `insecure = true` in the
+// file is for a certificate this pair generated for itself, which has nobody
+// to vouch for it.
+func tlsDial(cfg *config.Config) func(net.Conn, string) (net.Conn, error) {
+	return func(nc net.Conn, host string) (net.Conn, error) {
+		tc := tls.Client(nc, &tls.Config{
+			ServerName:         host,
+			MinVersion:         tls.VersionTLS12,
+			NextProtos:         []string{"http/1.1"},
+			InsecureSkipVerify: cfg.Transport.Insecure,
+		})
+		if err := tc.Handshake(); err != nil {
+			return nil, fmt.Errorf("tls to %s: %v", host, err)
+		}
+		return tc, nil
+	}
+}
+PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/config/config.go" <<'PINGIFY_GO_SOURCE_EOF'
 package config
 
@@ -3835,6 +4355,40 @@ type Config struct {
 		Iran string
 		Port int
 
+		// The name the dialling side asks for, and the Host header it sends
+		// with it. Behind a CDN this is the only address that matters: the
+		// edge is what answers on it, and the name is how the edge knows
+		// which origin the request belongs to.
+		Domain string
+
+		// The path a WebSocket handshake asks for. Anything else that arrives
+		// gets a 404, which is what a web server would have said.
+		Path string
+
+		// Which side opens the connection. Iran, unless something in the
+		// middle only works the other way round - a CDN in front of the Iran
+		// server is exactly that: the edge answers on the domain and connects
+		// inward to the origin, so the origin is the side that waits and the
+		// server abroad is the side that dials.
+		Dials string
+
+		// Where the side that waits binds, when that is not the port the
+		// other side asks for. Behind a CDN it usually is not: the edge takes
+		// the connection on one of its own ports and comes to the origin on
+		// another.
+		ListenPort int
+
+		// A certificate for the side that waits, when nothing in front of it
+		// is doing the TLS. Empty means something is - a CDN, or a proxy on
+		// the same machine.
+		Cert string
+		Key  string
+
+		// Whether the side that dials should accept a certificate nobody
+		// vouches for. For a pair that made its own; never for a CDN, where
+		// the whole point is that the name is one the internet trusts.
+		Insecure bool
+
 		// How many connections a stream carrier opens. One is not enough on a
 		// path that shapes a single flow, and it is measured rather than
 		// guessed - see the note on DefaultConnections.
@@ -3889,11 +4443,52 @@ type Config struct {
 
 // Dials reports whether this side is the one that opens the connection.
 //
-// Iran Dials out, always. Connections into the Iran server are blackholed
-// after about six exchanges - measured, repeatedly - so the side that owns the
-// ports users connect to is not the side that waits for the tunnel. This is
-// settled and nothing above needs to ask again.
-func (c *Config) Dials() bool { return c.Side == SideIran }
+// Iran dials out, and that is the default because connections into the Iran
+// server are blackholed after about six exchanges - measured, repeatedly - so
+// the side that owns the ports users connect to is not the side that waits
+// for the tunnel.
+//
+// The exception is a CDN. An edge answers on a name and connects inward to
+// the origin it was given, so a domain in front of the Iran server can only
+// be reached by dialling *into* it: the origin waits and the server abroad
+// dials the edge. transport.dials says so when that is the arrangement.
+func (c *Config) Dials() bool { return c.Side == c.DialSide() }
+
+func (c *Config) DialSide() string {
+	if c.Transport.Dials == SideKharej {
+		return SideKharej
+	}
+	return SideIran
+}
+
+// DialHost is what the side that dials connects to: the domain when there is
+// one, and otherwise the address of whichever server is waiting.
+func (c *Config) DialHost() string {
+	if c.Transport.Domain != "" {
+		return c.Transport.Domain
+	}
+	if c.DialSide() == SideIran {
+		return c.Transport.Kharej
+	}
+	return c.Transport.Iran
+}
+
+// Path is what a WebSocket handshake asks for, and what the side that waits
+// insists on before it will upgrade anything.
+func (c *Config) Path() string {
+	if c.Transport.Path == "" {
+		return "/"
+	}
+	return c.Transport.Path
+}
+
+// ListenPort is where the side that waits binds.
+func (c *Config) ListenPort() int {
+	if c.Transport.ListenPort > 0 {
+		return c.Transport.ListenPort
+	}
+	return c.Transport.Port
+}
 
 // Mine returns this side's tun address, and theirs.
 func (c *Config) Mine() (string, string) {
@@ -3977,6 +4572,20 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Port, err = num()
 	case "transport.connections":
 		c.Transport.Connections, err = num()
+	case "transport.domain":
+		c.Transport.Domain, err = str()
+	case "transport.path":
+		c.Transport.Path, err = str()
+	case "transport.dials":
+		c.Transport.Dials, err = str()
+	case "transport.listen_port":
+		c.Transport.ListenPort, err = num()
+	case "transport.cert":
+		c.Transport.Cert, err = str()
+	case "transport.key":
+		c.Transport.Key, err = str()
+	case "transport.insecure":
+		c.Transport.Insecure, err = boolean(raw)
 	case "transport.keepalive_sec":
 		c.Transport.Keepalive, err = num()
 
@@ -4148,17 +4757,30 @@ func (c *Config) check() error {
 		c.Transport.Type = "udp"
 	}
 	switch c.Transport.Type {
-	case "udp", "icmp", "tcp":
+	case "udp", "icmp", "tcp", "ws", "wss":
 	default:
-		return fmt.Errorf("transport.type %q: udp, tcp and icmp are what exist so far", c.Transport.Type)
+		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss and icmp are what exist so far",
+			c.Transport.Type)
+	}
+	switch c.Transport.Dials {
+	case "", SideIran, SideKharej:
+	default:
+		return fmt.Errorf("transport.dials %q must be %q or %q",
+			c.Transport.Dials, SideIran, SideKharej)
+	}
+	if c.Transport.ListenPort < 0 || c.Transport.ListenPort > 65535 {
+		return fmt.Errorf("transport.listen_port %d is not a port", c.Transport.ListenPort)
+	}
+	if c.Transport.Path != "" && !strings.HasPrefix(c.Transport.Path, "/") {
+		return fmt.Errorf("transport.path %q has to start with a slash", c.Transport.Path)
 	}
 	// ICMP has no ports. There is nothing to listen on and nothing to
 	// misconfigure, which is half of why it is the transport that survives.
 	if c.Transport.Type != "icmp" && (c.Transport.Port <= 0 || c.Transport.Port > 65535) {
 		return fmt.Errorf("transport.port %d is not a port", c.Transport.Port)
 	}
-	if c.Dials() && c.Transport.Kharej == "" {
-		return fmt.Errorf("transport.kharej: the Iran side needs the address it Dials")
+	if c.Dials() && c.DialHost() == "" {
+		return fmt.Errorf("transport: the side that dials needs an address or a domain to dial")
 	}
 	if c.Transport.Keepalive <= 0 {
 		c.Transport.Keepalive = 10
@@ -5708,10 +6330,20 @@ addr_text() { printf '%s%s%s' "$C_ADDR" "$1" "$C_OFF"; }
 # are listed and picked from - taking the first and saying nothing is how the
 # wrong one ends up in the file, and nothing says so until the other end has
 # been dialling it for a quarter of an hour.
-q_here() {
-    local def= n i=0
+# Both addresses, in one step. They were two, and two steps to type two lines
+# is a wizard that counts its own questions rather than the reader's work.
+#
+# This server's is read off its own interfaces and offered as the default: if
+# it is right, enter. When a server answers on more than one they are listed
+# and picked from - taking the first and saying nothing is how the wrong one
+# ends up in the file, and nothing says so until the other end has been
+# dialling it for a quarter of an hour.
+q_addresses() {
+    local def= n i=0 other=KHAREJ
     local -a addrs=()
-    wiz_ask "This server's address"
+    [ "$T_SIDE" = kharej ] && other=IRAN
+
+    wiz_ask "The two servers"
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
@@ -5722,33 +6354,18 @@ q_here() {
             item "$((i + 1))" "$(addr_text "${addrs[i]}")"
             i=$((i + 1))
         done
-        item "$((i + 1))" "Something else" "a hostname, or an address not listed"
+        item "$((i + 1))" "Something else" "a hostname, or one not listed"
         blank
         pick n "select" 1 $((i + 1)) || return 1
         if [ "$n" -le "${#addrs[@]}" ]; then
             T_HERE=${addrs[n - 1]}
-            return 0
         fi
         blank
     else
         def=${addrs[0]:-}
-        [ -n "$def" ] && dim "this is what the server says its address is - enter takes it"
-        [ -n "$def" ] && blank
     fi
-
-    ask T_HERE "address of this server" "$def" v_host || return 1
-    return 0
-}
-
-q_there() {
-    local other=KHAREJ
-    [ "$T_SIDE" = kharej ] && other=IRAN
-    wiz_ask "The other server's address"
-    blank
-    dim "The $other server, which you are not sitting on. Both files carry"
-    dim "both addresses, so this answer is the same on each of them."
-    blank
-    ask T_THERE "address of the $other server" "" v_host || return 1
+    [ -n "$T_HERE" ] || ask T_HERE "this server (${T_SIDE^^})" "$def" v_host || return 1
+    ask T_THERE "the other one ($other)" "" v_host || return 1
     return 0
 }
 
@@ -5756,25 +6373,26 @@ q_transport() {
     local n
     wiz_ask "How it crosses"
     blank
-    item "1" "UDP" "one open port on KHAREJ - the fastest"
-    item "2" "TCP" "one open port, on a path that carries only TCP"
-    item "3" "ICMP" "inside ping packets - no open port at all"
+    item "1" "UDP" "a packet in, a packet out, nothing in the way"
+    item "2" "TCP" "one open port, where a network carries only TCP"
+    item "3" "WS" "an ordinary WebSocket - goes where HTTP goes"
+    item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
+    item "5" "ICMP" "inside ping packets - no open port at all"
     blank
-    dim "UDP first: it is a packet in, a packet out, and nothing in the way."
+    dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
+    dim "  WS 427   WSS 405   ICMP 371   TCP 342   UDP unusable there"
     blank
-    dim "TCP where a network carries nothing else - and it is a stream, so a"
-    dim "packet the path drops is repaired underneath the connections running"
-    dim "through it, which costs some of the speed UDP would have had."
+    dim "WS and WSS can go behind a CDN, which is what makes them the ones to"
+    dim "try when a port is blocked rather than slow. While an ICMP tunnel runs"
+    dim "neither server answers a ping."
     blank
-    dim "ICMP where no port can be opened at all. While one runs neither server"
-    dim "answers an ordinary ping; that is deliberate and no screen here reads"
-    dim "it as a fault."
-    blank
-    pick n "select" 1 3 || return 1
+    pick n "select" 1 5 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
-    3) T_TRANSPORT=icmp ;;
+    3) T_TRANSPORT=ws ;;
+    4) T_TRANSPORT=wss ;;
+    5) T_TRANSPORT=icmp ;;
     esac
     return 0
 }
@@ -5789,8 +6407,7 @@ q_port() {
     fi
     wiz_ask "Port"
     blank
-    dim "KHAREJ listens on this port and IRAN dials it. The same number goes"
-    dim "on both servers, and it is the only port the tunnel itself needs open."
+    dim "The same number on both servers, and the only port the tunnel needs."
     blank
     while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
@@ -5812,13 +6429,95 @@ q_port() {
 # One question, not three. The old wizard asked for the octet and then re-asked
 # both addresses it had just derived from it, so a hand edit at the second
 # prompt walked straight past the checks that guarded the first.
+# The one extra step a WebSocket transport needs, and it is skipped entirely
+# by the three that do not.
+#
+# A domain is what makes these worth having: a name in front of a server can
+# be a CDN, and a CDN answers on its own addresses, terminates the TLS itself
+# and comes to the origin from its own network. That is also why it changes
+# which side dials - an edge connects *inward* to the origin, so a name in
+# front of the IRAN server can only be reached by KHAREJ dialling it.
+q_web() {
+    local n def_listen
+    case $T_TRANSPORT in ws | wss) ;; *) return 0 ;; esac
+
+    wiz_ask "The web address"
+    blank
+    if [ "$T_TRANSPORT" = wss ]; then
+        dim "TLS is checked against this name, and a CDN answers only for names"
+        dim "it has been given."
+        blank
+        ask T_DOMAIN "domain" "" v_host || return 1
+    else
+        dim "With a domain this goes through whatever answers for it; without"
+        dim "one it dials the address directly."
+        blank
+        ask T_DOMAIN "domain, or - for none" "-" v_domain_or_none || return 1
+        [ "$T_DOMAIN" = "-" ] && T_DOMAIN=
+    fi
+
+    # Generated rather than asked. Any path works and none is better than
+    # another, so this is one more question with no wrong answer - and a
+    # random one is not a path anybody scans for.
+    T_PATH=$(wiz_path)
+    field "path" "$T_PATH"
+
+    [ -z "$T_DOMAIN" ] && { T_DIALS=; T_LISTEN=; return 0; }
+
+    blank
+    item "1" "the name points at KHAREJ" "the usual - IRAN dials it"
+    item "2" "a CDN in front of IRAN" "KHAREJ dials it, and this side waits"
+    blank
+    pick n "select" 1 2 || return 1
+    if [ "$n" = 1 ]; then
+        T_DIALS= T_LISTEN=
+        return 0
+    fi
+
+    T_DIALS=kharej
+    # A CDN takes the connection on the port that was asked for and comes to
+    # the origin on a port of its own. Cloudflare's flexible mode terminates
+    # the TLS at the edge and arrives here in plain HTTP on 80, which is why
+    # that is the default when the port dialled is 443.
+    def_listen=$T_PORT
+    [ "$T_PORT" = 443 ] && def_listen=80
+    blank
+    ask T_LISTEN "port the edge will reach this server on" "$def_listen" v_listen_port || return 1
+    return 0
+}
+
+# A path nobody scans for: six hex characters, from the kernel's own random
+# device where there is one and from the shell's when there is not.
+wiz_path() {
+    local h
+    h=$(head -c 3 /dev/urandom 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [ -n "$h" ] || h=$(printf '%06x' $((RANDOM * RANDOM % 16777216)))
+    printf '/%s' "$h"
+}
+
+v_domain_or_none() {
+    [ "$1" = "-" ] && return 0
+    v_host "$1"
+}
+
+# The port this server will bind when it is the one that waits. Unlike the
+# port a tunnel is dialled on, this one is opened here and now, so something
+# else already holding it is a refusal rather than a note.
+v_listen_port() {
+    v_port "$1" || return 1
+    if wiz_port_bound "$1" tcp; then
+        echo "something here already listens on tcp/$1; see: ss -lntp | grep :$1"
+        return 1
+    fi
+    return 0
+}
+
 q_link() {
     local def n a dev addr
     wiz_ask "The private link"
     blank
-    dim "The two servers talk to each other on a pair of private addresses"
-    dim "that nothing else on either machine uses. Pick the middle number and"
-    dim "both are worked out from it."
+    dim "A pair of addresses nothing else on either machine uses. Pick the"
+    dim "middle number; both are worked out from it."
     blank
     while IFS= read -r n; do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
@@ -5860,11 +6559,8 @@ q_profile() {
     item "2" "Balanced" "900 packets - the one to pick if unsure"
     item "3" "Download" "1500 packets - most on a long transfer"
     blank
-    dim "A profile sets one number: how many packets may wait in the tunnel's"
-    dim "queue. A deeper queue carries more at once and holds a packet longer;"
-    dim "a shallower one answers sooner and gives up some throughput for it."
-    blank
-    dim "It can be changed later, on either server, without rebuilding anything."
+    dim "How many packets may wait in the tunnel's queue. Changeable later, on"
+    dim "either server, without rebuilding anything."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -5922,6 +6618,9 @@ wiz_review() {
     local trans prof
     trans=${T_TRANSPORT^^}
     [ -n "$T_PORT" ] && trans="$trans  port $T_PORT"
+    case $T_TRANSPORT in
+    tcp | ws | wss) trans="$trans  ${T_CONNS:-8} connections" ;;
+    esac
     prof=${T_PROFILE:-balanced}
     blank
     panel_open "$T_NAME"
@@ -5932,6 +6631,20 @@ wiz_review() {
         panel_field "IRAN" "$(addr_text "$T_IRAN")"
     fi
     panel_field "Transport" "$trans"
+    if [ -n "$T_DOMAIN" ]; then
+        panel_field "Address" "$(addr_text "$T_DOMAIN")$T_PATH"
+        # Written from where it is being read. The same file is shown on both
+        # servers and this line said "this server waits on 80" on the one
+        # doing the dialling.
+        local dialer=${T_DIALS:-iran}
+        if [ "$T_SIDE" = "$dialer" ]; then
+            panel_field "Direction" "this server dials the name"
+        else
+            panel_field "Direction" "${dialer^^} dials it; this server waits on ${T_LISTEN:-$T_PORT}"
+        fi
+    elif [ -n "$T_PATH" ]; then
+        panel_field "Path" "$T_PATH"
+    fi
     # "Link", not "Private link": it is the widest key any panel in the script
     # has, and one key a column wider than the rest puts one value out of line
     # with every other value in the box. The tunnel screen already calls it
@@ -6001,7 +6714,15 @@ wiz_render() {
     # Only a stream carrier opens more than one. On this path a single TCP
     # connection is shaped to nothing and eight together are not shaped at
     # all, which is the whole reason the number is here.
-    [ "$T_TRANSPORT" = tcp ] && printf 'connections = %s\n' "${T_CONNS:-8}"
+    case $T_TRANSPORT in
+    tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
+    esac
+    [ -n "$T_DOMAIN" ] && printf 'domain = "%s"\n' "$T_DOMAIN"
+    [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
+    # Which side opens the connection, written only when it is not the usual
+    # one - a line saying "iran" would be a setting nobody chose.
+    [ -n "$T_DIALS" ] && printf 'dials = "%s"\n' "$T_DIALS"
+    [ -n "$T_LISTEN" ] && printf 'listen_port = %s\n' "$T_LISTEN"
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -6143,6 +6864,7 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
+    T_DOMAIN= T_PATH= T_DIALS= T_LISTEN=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -6160,9 +6882,7 @@ wizard_new() {
         return $?
     fi
     blank
-    q_here || return 1
-    blank
-    q_there || return 1
+    q_addresses || return 1
 
     # Which of the two answers is which key. The file names both ends, and it
     # names them the same way on both servers, so the mapping happens once
@@ -6179,6 +6899,8 @@ wizard_new() {
     q_transport || return 1
     blank
     q_port || return 1
+    blank
+    q_web || return 1
     blank
     q_link || return 1
     blank
@@ -6281,6 +7003,10 @@ wizard_paste() {
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
+    T_DOMAIN=$(toml_get "$f" transport domain)
+    T_PATH=$(toml_get "$f" transport path)
+    T_DIALS=$(toml_get "$f" transport dials)
+    T_LISTEN=$(toml_get "$f" transport listen_port)
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
     T_DEV=$(toml_get "$f" tun name)

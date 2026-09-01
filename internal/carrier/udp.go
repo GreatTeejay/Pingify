@@ -67,9 +67,9 @@ func newUDPCarrier(cfg *config.Config) (*udpCarrier, error) {
 		// remembered instead, because the abroad side may answer from a
 		// different source port when anything on the way rewrites addresses.
 		raddr, err := net.ResolveUDPAddr("udp4",
-			net.JoinHostPort(cfg.Transport.Kharej, fmt.Sprint(cfg.Transport.Port)))
+			net.JoinHostPort(cfg.DialHost(), fmt.Sprint(cfg.Transport.Port)))
 		if err != nil {
-			return nil, fmt.Errorf("resolve %s: %v", cfg.Transport.Kharej, err)
+			return nil, fmt.Errorf("resolve %s: %v", cfg.DialHost(), err)
 		}
 		pc, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
 		if err != nil {
