@@ -343,7 +343,7 @@ profile_row() {
 }
 
 screen_advanced() {
-    local name=$1 f k q qs
+    local name=$1 f k q qs lv
     f=$(cfg_file "$name")
     while :; do
         screen_top
@@ -355,11 +355,16 @@ screen_advanced() {
         # pressing enter at the question did nothing at all, twice.
         q=$(toml_get "$f" tuning queue_packets)
         qs=$(toml_get "$f" tun queues)
+        lv=$(toml_get "$f" logging level)
+        # Same as the two below: the core fills this in when the file leaves
+        # it out, so reading the file alone drew an empty row and offered an
+        # empty default that the validator then refused.
+        [ -n "$lv" ] || lv=info
         blank
         rule "Advanced $G_DASH $name"
         blank
         item2 1 "MTU" "$(toml_get "$f" tun mtu)"
-        item2 2 "Log level" "$(toml_get "$f" logging level)"
+        item2 2 "Log level" "$lv"
         if [ -n "$q" ]; then
             item2 3 "Queue depth" "$q packets, set here"
         else
@@ -367,7 +372,8 @@ screen_advanced() {
             item2 3 "Queue depth" "$q packets, from the profile"
         fi
         item2 4 "Device queues" "${qs:-the core chooses}"
-        item 5 "Show the config file"
+        item2 5 "Health port" "$(health_port_of "$name") on $(my_addr "$name")"
+        item 6 "Show the config file"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -377,7 +383,7 @@ screen_advanced() {
             MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes; pause ;;
         2) local v
             blank; dim "debug says a great deal; info says what changed"; blank
-            ask v "level" "$(toml_get "$f" logging level)" v_level || continue
+            ask v "level" "$lv" v_level || continue
             LEVEL_WANT=$v; cfg_apply "$name" _edit_level yes; pause ;;
         3) blank
             dim "This comes from the profile and is the one number a profile moves."
@@ -388,7 +394,19 @@ screen_advanced() {
         4) local v
             ask v "queues (0 lets the core choose)" "${qs:-0}" v_queues || continue
             QUEUES_WANT=$v; cfg_apply "$name" _edit_queues yes; pause ;;
-        5) blank; sed 's/^/    /' "$f"; pause ;;
+        5) blank
+            dim "The port the server at the other end is asked on, over the"
+            dim "private link. It is bound to this tunnel's own address, so"
+            dim "nothing else on this machine can be in the way of it unless"
+            dim "something holds that port on every address."
+            blank
+            dim "Both servers must use the same number, and changing it here"
+            dim "changes it here only."
+            blank
+            local v
+            ask v "port (-1 turns it off)" "$(health_port_of "$name")" v_hport || continue
+            HEALTH_WANT=$v; cfg_apply "$name" _edit_health_port yes; pause ;;
+        6) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -398,6 +416,15 @@ _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
 _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
+_edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
+
+v_hport() {
+    case $1 in
+    -1) return 0 ;;
+    '' | *[!0-9]*) echo "a port, or -1 to turn it off"; return 1 ;;
+    esac
+    { [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; } || { echo "a port is between 1 and 65535"; return 1; }
+}
 
 v_level() {
     case $1 in

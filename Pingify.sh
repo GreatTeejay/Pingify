@@ -4974,6 +4974,36 @@ name_for_side() {
 # $STATUS_BASE with status 0 - the one port it had just proved was taken - and
 # both callers wrote that number into the config without a word, so the new
 # core lost the race for the loopback port and the tunnel never came up.
+# Whether something on this machine already holds a port on every address.
+#
+# A listener on one address is not in the way: the health port is bound to the
+# tunnel's own tun address, and no two tunnels have the same one. A listener
+# on the wildcard *is* in the way - and on Linux an IPv6 wildcard holds the
+# IPv4 one along with it, so [::]:19999 blocks 10.99.10.1:19999 too.
+#
+# This is why the health port is not a question. There is nothing for a person
+# to know here that the machine does not already know.
+wiz_health_bound() {
+    local p=$1 a
+    have ss || return 1
+    while read -r a; do
+        case $a in
+        "0.0.0.0:$p" | "*:$p" | "[::]:$p" | ":::$p") return 0 ;;
+        esac
+    done < <(ss -ltnH 2>/dev/null | awk '{ print $4 }')
+    return 1
+}
+
+wiz_free_health() {
+    local p=$HEALTH_PORT n=0
+    while wiz_health_bound "$p"; do
+        p=$((p + 1))
+        n=$((n + 1))
+        [ "$n" -gt 20 ] && return 1
+    done
+    printf '%s' "$p"
+}
+
 wiz_free_status_port() {
     local keep=${1:-$WIZ_KEEP} i=0 p n taken
     while [ "$i" -lt 100 ]; do
@@ -5411,7 +5441,7 @@ wiz_render() {
     printf 'port = %s\n' "${T_STATUS:-$STATUS_BASE}"
     # The same on both servers, and it stays that way: it is bound to this
     # tunnel's private address, which nothing else on either machine has.
-    printf 'health_port = %s\n' "$HEALTH_PORT"
+    printf 'health_port = %s\n' "${T_HEALTH:-$HEALTH_PORT}"
 }
 
 # --------------------------------------------------------------------------
@@ -5534,7 +5564,7 @@ token_decode() {
 wizard_new() {
     local f other
     WIZ_QUIT=0
-    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
+    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -5577,6 +5607,20 @@ wizard_new() {
     q_profile || return 1
 
     T_NAME=$(default_name)
+
+    # The health port is not asked for, and this is the reason: the only thing
+    # that could be wrong with it is something else on this machine holding it
+    # on every address, and that is a question the machine answers faster than
+    # a person can. It goes in the shared file, so both servers get the number
+    # this one settled on.
+    if ! T_HEALTH=$(wiz_free_health); then
+        T_HEALTH=$HEALTH_PORT
+        warn "$HEALTH_PORT and the twenty above it are all taken on this server"
+        fix "the tunnel will work; its round trip will not be measurable"
+    elif [ "$T_HEALTH" != "$HEALTH_PORT" ]; then
+        blank
+        dim "$HEALTH_PORT is taken here, so the health port is $T_HEALTH on both servers"
+    fi
     # Stop here rather than build a tunnel whose core cannot bind its status
     # port: the home screen reads every number through that endpoint, so a
     # tunnel without one is a tunnel nothing can report on.
@@ -5714,6 +5758,18 @@ wizard_paste() {
         fix "the device is in the shared file - change both"
         clash=1
     fi
+    # The health port comes with the file and this server has to be able to
+    # bind it too. It is a warning rather than a clash: the tunnel carries
+    # traffic without it, and what is lost is the round trip measurement and
+    # the check that asks the far end whether it is there.
+    a=$(toml_get "$f" status health_port)
+    case $a in '' | *[!0-9]*) a=$HEALTH_PORT ;; esac
+    if wiz_health_bound "$a"; then
+        warn "something here already holds port $a on every address"
+        fix "the tunnel works; its round trip will not be measurable"
+        fix "to fix it, set status.health_port to a free number on both servers"
+    fi
+
     if [ "$T_SIDE" = kharej ] && [ "$T_TRANSPORT" != icmp ]; then
         if own=$(wiz_port_owner "$T_PORT"); then
             bad "port $T_PORT already belongs to $own"
@@ -6144,7 +6200,7 @@ profile_row() {
 }
 
 screen_advanced() {
-    local name=$1 f k q qs
+    local name=$1 f k q qs lv
     f=$(cfg_file "$name")
     while :; do
         screen_top
@@ -6156,11 +6212,16 @@ screen_advanced() {
         # pressing enter at the question did nothing at all, twice.
         q=$(toml_get "$f" tuning queue_packets)
         qs=$(toml_get "$f" tun queues)
+        lv=$(toml_get "$f" logging level)
+        # Same as the two below: the core fills this in when the file leaves
+        # it out, so reading the file alone drew an empty row and offered an
+        # empty default that the validator then refused.
+        [ -n "$lv" ] || lv=info
         blank
         rule "Advanced $G_DASH $name"
         blank
         item2 1 "MTU" "$(toml_get "$f" tun mtu)"
-        item2 2 "Log level" "$(toml_get "$f" logging level)"
+        item2 2 "Log level" "$lv"
         if [ -n "$q" ]; then
             item2 3 "Queue depth" "$q packets, set here"
         else
@@ -6168,7 +6229,8 @@ screen_advanced() {
             item2 3 "Queue depth" "$q packets, from the profile"
         fi
         item2 4 "Device queues" "${qs:-the core chooses}"
-        item 5 "Show the config file"
+        item2 5 "Health port" "$(health_port_of "$name") on $(my_addr "$name")"
+        item 6 "Show the config file"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -6178,7 +6240,7 @@ screen_advanced() {
             MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes; pause ;;
         2) local v
             blank; dim "debug says a great deal; info says what changed"; blank
-            ask v "level" "$(toml_get "$f" logging level)" v_level || continue
+            ask v "level" "$lv" v_level || continue
             LEVEL_WANT=$v; cfg_apply "$name" _edit_level yes; pause ;;
         3) blank
             dim "This comes from the profile and is the one number a profile moves."
@@ -6189,7 +6251,19 @@ screen_advanced() {
         4) local v
             ask v "queues (0 lets the core choose)" "${qs:-0}" v_queues || continue
             QUEUES_WANT=$v; cfg_apply "$name" _edit_queues yes; pause ;;
-        5) blank; sed 's/^/    /' "$f"; pause ;;
+        5) blank
+            dim "The port the server at the other end is asked on, over the"
+            dim "private link. It is bound to this tunnel's own address, so"
+            dim "nothing else on this machine can be in the way of it unless"
+            dim "something holds that port on every address."
+            blank
+            dim "Both servers must use the same number, and changing it here"
+            dim "changes it here only."
+            blank
+            local v
+            ask v "port (-1 turns it off)" "$(health_port_of "$name")" v_hport || continue
+            HEALTH_WANT=$v; cfg_apply "$name" _edit_health_port yes; pause ;;
+        6) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -6199,6 +6273,15 @@ _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
 _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
+_edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
+
+v_hport() {
+    case $1 in
+    -1) return 0 ;;
+    '' | *[!0-9]*) echo "a port, or -1 to turn it off"; return 1 ;;
+    esac
+    { [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; } || { echo "a port is between 1 and 65535"; return 1; }
+}
 
 v_level() {
     case $1 in
