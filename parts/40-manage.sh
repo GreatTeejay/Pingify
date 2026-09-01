@@ -290,7 +290,7 @@ edit_profile() {
 
     screen_top
     blank
-    rule "What crosses this link"
+    rule "Profile"
     blank
     profile_row 1 gaming "$cur" "600 packets - a small one waits behind less"
     profile_row 2 balanced "$cur" "900 packets - the one to pick if unsure"
