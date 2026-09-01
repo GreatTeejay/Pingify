@@ -65,11 +65,24 @@ grep -q '@@CORE_FILES@@' "$tmp" || { red "the @@CORE_FILES@@ marker is missing f
     printf '    mkdir -p'
     printf ' "$d/%s"' $(printf '%s\n' "${gofiles[@]}" | xargs -n1 dirname | LC_ALL=C sort -u)
     printf '\n'
-    for f in go.mod "${gofiles[@]}"; do
+    for f in go.mod go.sum "${gofiles[@]}"; do
+        [ -f "$f" ] || continue
         printf "    cat > \"\$d/%s\" <<'%s'\n" "$f" "$DELIM"
         cat "$f"
         printf '%s\n' "$DELIM"
     done
+
+    # The vendored dependencies, as one compressed blob rather than a heredoc
+    # each. There are two hundred and eighty two files of them and five
+    # megabytes; written out plainly the installer would be a five megabyte
+    # shell script that nobody can read a line of. Compressed it is under a
+    # megabyte, and the tools to undo it - base64 and tar - are on every
+    # server that has a shell.
+    if [ -d vendor ]; then
+        printf "    base64 -d <<'%s' | tar -xzf - -C \"\$d\"\n" "$DELIM"
+        tar -cf - vendor | gzip -9 | base64 -w 100
+        printf '%s\n' "$DELIM"
+    fi
 } > "$core"
 
 awk -v corefile="$core" '
@@ -90,15 +103,19 @@ PINGIFY_NO_MAIN=1 bash -c 'set -e; . "$1"; write_core_sources "$2"' _ "./$OUT" "
 for f in go.mod "${gofiles[@]}"; do
     cmp -s "$f" "$check/$f" || { red "$f did not survive the round trip"; rm -f "$OUT"; exit 1; }
 done
+if [ -d vendor ]; then
+    [ -f "$check/vendor/modules.txt" ] ||
+        { red "the vendored dependencies did not survive the round trip"; rm -f "$OUT"; exit 1; }
+fi
 
 # And it must still compile out of the extracted copy, offline, for both
 # architectures a server might be. This is the check that matters: everything
 # above proves the bytes match, and only this proves they are enough.
 for arch in amd64 arm64; do
-    ( cd "$check" && GOFLAGS=-mod=mod GOPROXY=off GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+    ( cd "$check" && GOPROXY=off GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
         go build -o /dev/null ./cmd/pingify ) ||
         { red "the extracted sources do not build for linux/$arch"; rm -f "$OUT"; exit 1; }
 done
 
 green "Wrote $OUT ($(wc -l < "$OUT") lines, $(wc -c < "$OUT") bytes)"
-green "  ${#gofiles[@]} Go files embedded, both architectures build offline from them"
+green "  ${#gofiles[@]} Go files embedded$([ -d vendor ] && printf ' and %s vendored' "$(find vendor -name '*.go' | wc -l)"), both architectures build offline from them"
