@@ -523,13 +523,27 @@ health_check() {
             chk_add note loss "too early to say anything about loss yet"
             ;;
         *)
+            # The advice for a lossy path is different now that there is
+            # something to do about it. Parity repairs an isolated loss where
+            # it happens, which is what most of these are; the mtu is still
+            # the first thing to check, because a wrong one loses only the
+            # large packets and no amount of parity is the right answer to
+            # that.
+            local fec_advice=
+            case $CK_TRANSPORT in
+            tcp | ws | wss | utls) ;;
+            *) [ "$(toml_get "$CK_FILE" tuning fec)" -gt 0 ] 2>/dev/null ||
+                fec_advice="turn on Parity: tunnel screen, Advanced, 7" ;;
+            esac
             if [ "${lpm%%.*}" -ge 60 ]; then
                 chk_add bad loss "the path is losing $lpm packets a minute" \
                     "run Measure MTU; a large mtu loses big packets" \
+                    ${fec_advice:+"$fec_advice"} \
                     "if the mtu is right, the path is congested"
             elif [ "${lpm%%.*}" -ge 5 ]; then
                 chk_add warn loss "the path is losing $lpm packets a minute" \
-                    "run Measure MTU: a slightly large mtu does this"
+                    "run Measure MTU: a slightly large mtu does this" \
+                    ${fec_advice:+"$fec_advice"}
             else
                 chk_add ok loss "loss is $lpm a minute, ${ST_LATE:-0} arrived late"
             fi

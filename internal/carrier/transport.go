@@ -27,7 +27,25 @@ type Full interface {
 	Lost() (missing, late, gaps uint64)
 }
 
+// stream reports whether a transport cannot lose a packet, which is the one
+// thing that decides whether parity is worth adding to it.
+func stream(kind string) bool {
+	switch kind {
+	case "tcp", "ws", "wss", "utls":
+		return true
+	}
+	return false
+}
+
 func Open(cfg *config.Config) (Full, error) {
+	c, err := open(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return WrapFEC(c, cfg.Tuning.FEC, stream(cfg.Transport.Type)), nil
+}
+
+func open(cfg *config.Config) (Full, error) {
 	switch cfg.Transport.Type {
 	case "icmp":
 		return newICMPCarrier(cfg)

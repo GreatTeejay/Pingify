@@ -133,6 +133,12 @@ type Config struct {
 		Profile   string // gaming | balanced | download
 		QueuePkts int    // how deep that queue may get; the profile sets it
 
+		// One parity packet per this many, on a carrier that can lose one.
+		// Zero is off, and off is the default: it is a tenth of the bandwidth
+		// spent on a path that may not need it, and the health check says so
+		// when it finds one that does.
+		FEC int
+
 		// Whether the file said anything, so a default can tell itself apart
 		// from a deliberate zero.
 		PaceSet     bool
@@ -416,6 +422,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.Profile, err = str()
 	case "tuning.queue_packets":
 		c.Tuning.QueuePkts, err = num()
+	case "tuning.fec":
+		c.Tuning.FEC, err = num()
 
 	case "tun.name":
 		c.TUN.Name, err = str()
@@ -665,6 +673,9 @@ func (c *Config) check() error {
 	}
 	if c.Name == "" {
 		c.Name = "pingify"
+	}
+	if c.Tuning.FEC != 0 && (c.Tuning.FEC < 4 || c.Tuning.FEC > 32) {
+		return fmt.Errorf("tuning.fec %d: 0 turns it off, otherwise 4 to 32", c.Tuning.FEC)
 	}
 	if c.StatusPort < 0 || c.StatusPort > 65535 {
 		return fmt.Errorf("status.port %d is not a port", c.StatusPort)

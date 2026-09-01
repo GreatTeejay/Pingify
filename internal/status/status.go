@@ -41,6 +41,10 @@ type Link interface {
 	Packets() (toWire, toDevice uint64)
 }
 
+// Repairer is a carrier that can put a lost packet back together. Only the
+// ones wrapped in parity can, so it is asked for rather than required.
+type Repairer interface{ Repaired() uint64 }
+
 type Report struct {
 	Version string `json:"version"`
 	Name    string `json:"name"`
@@ -70,6 +74,11 @@ type Report struct {
 	ToWire   uint64 `json:"to_wire"`
 	ToDevice uint64 `json:"to_device"`
 	Dropped  uint64 `json:"dropped"`
+
+	// How many packets came back from parity rather than from the wire. It is
+	// the one number that says whether the parity is earning its bandwidth,
+	// and it is absent on a transport that has none.
+	Repaired uint64 `json:"fec_repaired"`
 }
 
 type Server struct {
@@ -208,6 +217,7 @@ func (s *Server) Report() Report {
 		ToWire:        toWire,
 		ToDevice:      toDevice,
 		Dropped:       s.link.Dropped(),
+		Repaired:      s.repaired(),
 	}
 }
 
@@ -286,4 +296,13 @@ func max(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+// repaired is what the carrier put back together from parity, or zero when it
+// has no parity to put anything back together with.
+func (s *Server) repaired() uint64 {
+	if r, ok := s.car.(Repairer); ok {
+		return r.Repaired()
+	}
+	return 0
 }
