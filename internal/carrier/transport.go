@@ -41,6 +41,12 @@ func Open(cfg *config.Config) (Full, error) {
 		return newWSSCarrier(cfg)
 	case "gre":
 		return newGRECarrier(cfg)
+	// AmneziaWG is not a carrier of ours. The link is theirs, brought up by
+	// awg-quick from their own packages, and what runs inside it is the same
+	// UDP carrier as anywhere else - which is how a tunnel over it still has
+	// this core's queue, its counters, its status and its health port.
+	case "awg":
+		return newUDPCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }
