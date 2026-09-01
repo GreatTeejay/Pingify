@@ -52,6 +52,12 @@ const (
 
 	SideIran   = "iran"
 	SideKharej = "kharej"
+
+	// The port the far end is asked on, over the private link. Fixed rather
+	// than configured, because both servers have to agree on it and there is
+	// nothing for it to collide with: it is bound to this tunnel's own tun
+	// address. Set status.health_port to -1 to turn it off.
+	DefaultHealthPort = 19999
 )
 
 type Config struct {
@@ -101,6 +107,19 @@ type Config struct {
 	// Where to answer questions about itself. Loopback only, and zero turns
 	// it off.
 	StatusPort int
+
+	// And the same answers on this tunnel's own private address, where the
+	// server at the other end can reach them.
+	//
+	// It exists because an ICMP tunnel cannot be pinged: the carrier stops
+	// both kernels answering echo, deliberately, so there is nothing left
+	// that will tell you the round trip across the link or whether anything
+	// at the far end is alive. A port that answers does both.
+	//
+	// The same number on both servers, and it needs to be: the address it is
+	// bound to belongs to this tunnel and to nothing else on the machine, so
+	// two tunnels can hold the same port without meeting. Zero turns it off.
+	HealthPort int
 }
 
 // Dials reports whether this side is the one that opens the connection.
@@ -230,6 +249,8 @@ func assign(c *Config, table, key, raw string) error {
 
 	case "status.port":
 		c.StatusPort, err = num()
+	case "status.health_port":
+		c.HealthPort, err = num()
 
 	default:
 		return fmt.Errorf("unknown setting %q", table+"."+key)
@@ -396,6 +417,18 @@ func (c *Config) check() error {
 	}
 	if c.StatusPort < 0 || c.StatusPort > 65535 {
 		return fmt.Errorf("status.port %d is not a port", c.StatusPort)
+	}
+	// Absent means the default, and a negative number is how the file says
+	// "none" - because zero is already what an absent key looks like, and a
+	// setting whose off switch cannot be told from its default is a setting
+	// nobody can turn off.
+	switch {
+	case c.HealthPort == 0:
+		c.HealthPort = DefaultHealthPort
+	case c.HealthPort < 0:
+		c.HealthPort = 0
+	case c.HealthPort > 65535:
+		return fmt.Errorf("status.health_port %d is not a port", c.HealthPort)
 	}
 	// Measured on the real path, sweeping the receive buffer against latency
 	// and throughput: below about two megabytes the kernel drops packets the

@@ -31,7 +31,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="2.1.0"
+PINGIFY_VERSION="2.2.0"
 
 # --------------------------------------------------------------------------
 # what this terminal can do
@@ -649,6 +649,39 @@ UNIT_DIR=${PINGIFY_UNIT_DIR:-/etc/systemd/system}
 # from a base, so two tunnels on one server do not collide.
 STATUS_BASE=19900
 
+# And the health port, which the core binds on the tunnel's own private
+# address so that the server at the other end can ask it questions.
+#
+# One number for every tunnel on every server, and it can be: the address it
+# is bound to belongs to one tunnel, so two of them hold the same port without
+# ever meeting. It has to be the same number the core uses - config's
+# DefaultHealthPort is the other half of it, and a test compares the two.
+HEALTH_PORT=19999
+
+health_port_of() {
+    local p
+    p=$(toml_get "$(cfg_file "$1")" status health_port)
+    case $p in '' | *[!0-9]*) p=$HEALTH_PORT ;; esac
+    printf '%s' "$p"
+}
+
+# far_report is the other server's own status, fetched across the tunnel.
+#
+# Nothing else in this script can see the far end. The carrier being up says
+# the two carriers have found each other over the wire; it does not say that a
+# packet put into the tun device here comes out of the one over there, and it
+# says nothing at all about what version or profile the other server is on -
+# which is the commonest reason a pair that was working stops working.
+far_report() {
+    local name=$1 peer hp
+    hp=$(health_port_of "$name")
+    [ "$hp" -gt 0 ] 2>/dev/null || return 1
+    peer=$(peer_addr "$name")
+    [ -n "$peer" ] || return 1
+    have curl || return 1
+    curl -s --max-time 3 "http://$peer:$hp/" 2>/dev/null
+}
+
 # --------------------------------------------------------------------------
 # the small things everything uses
 # --------------------------------------------------------------------------
@@ -1155,7 +1188,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "2.1.0"
+const version = "2.2.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -1225,7 +1258,7 @@ func main() {
 		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
 	}
 	go reportEvery(30*time.Second, car, l)
-	go status.New(cfg, version, car, l).Serve(cfg.StatusPort)
+	go status.New(cfg, version, car, l).Serve(cfg.StatusPort, cfg.HealthPort)
 
 	logging.Info("running")
 
@@ -3234,6 +3267,12 @@ const (
 
 	SideIran   = "iran"
 	SideKharej = "kharej"
+
+	// The port the far end is asked on, over the private link. Fixed rather
+	// than configured, because both servers have to agree on it and there is
+	// nothing for it to collide with: it is bound to this tunnel's own tun
+	// address. Set status.health_port to -1 to turn it off.
+	DefaultHealthPort = 19999
 )
 
 type Config struct {
@@ -3283,6 +3322,19 @@ type Config struct {
 	// Where to answer questions about itself. Loopback only, and zero turns
 	// it off.
 	StatusPort int
+
+	// And the same answers on this tunnel's own private address, where the
+	// server at the other end can reach them.
+	//
+	// It exists because an ICMP tunnel cannot be pinged: the carrier stops
+	// both kernels answering echo, deliberately, so there is nothing left
+	// that will tell you the round trip across the link or whether anything
+	// at the far end is alive. A port that answers does both.
+	//
+	// The same number on both servers, and it needs to be: the address it is
+	// bound to belongs to this tunnel and to nothing else on the machine, so
+	// two tunnels can hold the same port without meeting. Zero turns it off.
+	HealthPort int
 }
 
 // Dials reports whether this side is the one that opens the connection.
@@ -3412,6 +3464,8 @@ func assign(c *Config, table, key, raw string) error {
 
 	case "status.port":
 		c.StatusPort, err = num()
+	case "status.health_port":
+		c.HealthPort, err = num()
 
 	default:
 		return fmt.Errorf("unknown setting %q", table+"."+key)
@@ -3578,6 +3632,18 @@ func (c *Config) check() error {
 	}
 	if c.StatusPort < 0 || c.StatusPort > 65535 {
 		return fmt.Errorf("status.port %d is not a port", c.StatusPort)
+	}
+	// Absent means the default, and a negative number is how the file says
+	// "none" - because zero is already what an absent key looks like, and a
+	// setting whose off switch cannot be told from its default is a setting
+	// nobody can turn off.
+	switch {
+	case c.HealthPort == 0:
+		c.HealthPort = DefaultHealthPort
+	case c.HealthPort < 0:
+		c.HealthPort = 0
+	case c.HealthPort > 65535:
+		return fmt.Errorf("status.health_port %d is not a port", c.HealthPort)
 	}
 	// Measured on the real path, sweeping the receive buffer against latency
 	// and throughput: below about two megabytes the kernel drops packets the
@@ -4185,12 +4251,7 @@ func New(cfg *config.Config, ver string, car Source, l Link) *Server {
 // Serve answers on the loopback address until the process ends. A port that
 // cannot be opened is not fatal: the tunnel's job is to carry traffic, and it
 // carries it just as well with nobody watching.
-func (s *Server) Serve(port int) {
-	if port <= 0 {
-		return
-	}
-	go s.sample()
-
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -4207,15 +4268,60 @@ func (s *Server) Serve(port int) {
 		}
 		fmt.Fprintln(w, "up")
 	})
+	return mux
+}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	ln, err := net.Listen("tcp", addr)
+// Serve answers on two addresses, and they are not the same audience.
+//
+// The loopback port is for this machine: the manager reads it every time it
+// draws a screen, and nothing outside can reach it.
+//
+// The link port is for the server at the other end, on this tunnel's own
+// private address. It exists because an ICMP tunnel cannot be pinged - the
+// carrier stops both kernels answering echo, on purpose - so a port that
+// answers is the only thing left that can say what the round trip across the
+// link is, or whether there is anybody at the other end of it at all. What it
+// serves is what loopback serves, so the far server can also see this one's
+// version and profile, which is how a mismatched pair is found without
+// logging into both.
+//
+// It is bound to the tun address alone. That address is reachable through
+// this tunnel and nowhere else, so what is open here is open to one server.
+func (s *Server) Serve(port, linkPort int) {
+	go s.sample()
+	h := s.handler()
+	if port > 0 {
+		go serveOn(fmt.Sprintf("127.0.0.1:%d", port), h, "status")
+	}
+	if linkPort > 0 {
+		mine, _ := s.cfg.Mine()
+		if ip, _, ok := strings.Cut(mine, "/"); ok && ip != "" {
+			go serveOn(fmt.Sprintf("%s:%d", ip, linkPort), h, "health")
+		}
+	}
+}
+
+// serveOn binds and answers, and waits a little for the address to exist.
+//
+// The link listener is bound to the tun device's address, and the device is
+// brought up moments earlier by another goroutine. Two seconds of retrying
+// costs nothing and removes a race that would otherwise show up as "no health
+// port" on a tunnel that is working perfectly well.
+func serveOn(addr string, h http.Handler, what string) {
+	var ln net.Listener
+	var err error
+	for i := 0; i < 10; i++ {
+		if ln, err = net.Listen("tcp", addr); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if err != nil {
-		logging.Warn("no status on %s (%v) - the tunnel runs either way", addr, err)
+		logging.Warn("no %s on %s (%v) - the tunnel runs either way", what, addr, err)
 		return
 	}
-	logging.Info("status on http://%s", addr)
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	logging.Info("%s on http://%s", what, addr)
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 	_ = srv.Serve(ln)
 }
 
@@ -5303,6 +5409,9 @@ wiz_render() {
     printf 'level = "info"\n'
     printf '\n[status]\n'
     printf 'port = %s\n' "${T_STATUS:-$STATUS_BASE}"
+    # The same on both servers, and it stays that way: it is bound to this
+    # tunnel's private address, which nothing else on either machine has.
+    printf 'health_port = %s\n' "$HEALTH_PORT"
 }
 
 # --------------------------------------------------------------------------
@@ -5793,9 +5902,29 @@ my_addr() {
 # out and is deliberately ignored. The old manager would have drawn that in red
 # and told the user their working tunnel was dead.
 tun_rtt() {
-    local name=$1 t out
+    local name=$1 t out hp peer
     t=$(toml_get "$(cfg_file "$name")" transport type)
-    [ "$t" = icmp ] && return 0
+
+    # An ICMP tunnel cannot be pinged. The carrier stops both kernels
+    # answering echo - it has to, or every packet it sends is answered twice -
+    # so the ping goes out and is deliberately ignored, and for a long time
+    # this returned nothing at all and every screen showed a dash.
+    #
+    # The far end answers on its health port instead, and curl's time_connect
+    # is the TCP handshake: one round trip across the link and nothing else in
+    # it. It is the same measurement a ping would have made.
+    if [ "$t" = icmp ]; then
+        have curl || return 0
+        hp=$(health_port_of "$name")
+        peer=$(peer_addr "$name")
+        [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
+        out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 \
+            -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
+        case $out in '' | 0 | 0.000000) return 0 ;; esac
+        LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
+        return 0
+    fi
+
     have ping || return 0
     # Two packets a fifth of a second apart, and one second to wait. This is
     # on the path of every redraw of the home screen: -c 2 -W 2 meant a tunnel
@@ -7211,7 +7340,15 @@ health_check() {
             if [ "${ST_INB:-0}" = 0 ]; then
                 chk_add note peer "started $(human_secs "$ST_UPTIME") ago; nothing back yet"
             else
-                chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
+                # "has been heard from", not "is there": this counts bytes
+                # that have arrived since the tunnel started, so it is a fact
+                # about the past. Whether anybody is at the far end *now* is
+                # the next check, and the two disagree exactly when something
+                # has just broken. The time is this tunnel's own, not the far
+                # end's - it used to read "the far end is there, up for 3m",
+                # which is our uptime wearing their name.
+                chk_add ok peer \
+                    "the far end has been heard from - this tunnel has run $(human_secs "$ST_UPTIME")"
             fi
             ;;
         *)
@@ -7232,6 +7369,42 @@ health_check() {
             fi
             ;;
         esac
+
+        # The far end, asked through the tunnel.
+        #
+        # Everything above is this server's own opinion of the tunnel. This is
+        # the one question in the check whose answer comes from the other
+        # server, and the asking is the test: if it answers, a packet put into
+        # the tun device here came out of the one over there and the reply
+        # found its way back. The carrier being up does not say that.
+        if [ "$heard" = true ]; then
+            local far fv fp mine_p
+            if far=$(far_report "$name") && [ -n "$far" ]; then
+                chk_add ok link-end "the far end answers on the private link"
+
+                # Two servers on two versions is the commonest way a pair that
+                # worked stops working, and until now finding it meant logging
+                # into both of them.
+                fv=$(json_field "$far" version)
+                if [ -n "$fv" ] && [ -n "$core_ver" ] && [ "$fv" != "$core_ver" ]; then
+                    chk_add warn far-version \
+                        "the far end runs core $fv, this one runs $core_ver" \
+                        "update both servers:  pingify --update"
+                fi
+                fp=$(json_field "$far" profile)
+                mine_p=$(toml_get "$CK_FILE" tuning profile)
+                if [ -n "$fp" ] && [ -n "$mine_p" ] && [ "$fp" != "$mine_p" ]; then
+                    chk_add warn far-profile \
+                        "the far end is on $fp, this one on $mine_p" \
+                        "pick one on both, from the tunnel screen"
+                fi
+            else
+                chk_add warn link-end "the far end does not answer on the private link" \
+                    "the carrier is up, so this is the link and not the path" \
+                    "on the other server:  pingify --status" \
+                    "a core older than $PINGIFY_VERSION has no health port"
+            fi
+        fi
     else
         if have curl; then
             chk_add bad status \
@@ -7318,11 +7491,15 @@ health_check() {
         fi
     fi
 
-    # The ICMP note, last, because it explains an absence rather than reporting
-    # one. Grey, uncounted, and one line. This line is why the health check has
-    # the shape it does.
+    # The ICMP note, last, because it explains something rather than reporting
+    # it. Grey, uncounted, one line.
+    #
+    # An ordinary ping across this link gets nothing back and that is correct:
+    # the carrier stops both kernels answering echo. The round trip on the
+    # screens above is not a ping - it is the handshake with the far end's
+    # health port, which is a real crossing of the link and back.
     if [ "$CK_TRANSPORT" = icmp ]; then
-        chk_add note icmp "ping does not answer across an ICMP tunnel: by design"
+        chk_add note icmp "ping gets no answer here by design; the round trip is measured on the health port"
     fi
 
     chk_finish "$name" "$mode"

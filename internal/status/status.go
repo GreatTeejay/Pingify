@@ -91,12 +91,7 @@ func New(cfg *config.Config, ver string, car Source, l Link) *Server {
 // Serve answers on the loopback address until the process ends. A port that
 // cannot be opened is not fatal: the tunnel's job is to carry traffic, and it
 // carries it just as well with nobody watching.
-func (s *Server) Serve(port int) {
-	if port <= 0 {
-		return
-	}
-	go s.sample()
-
+func (s *Server) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -113,15 +108,60 @@ func (s *Server) Serve(port int) {
 		}
 		fmt.Fprintln(w, "up")
 	})
+	return mux
+}
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
-	ln, err := net.Listen("tcp", addr)
+// Serve answers on two addresses, and they are not the same audience.
+//
+// The loopback port is for this machine: the manager reads it every time it
+// draws a screen, and nothing outside can reach it.
+//
+// The link port is for the server at the other end, on this tunnel's own
+// private address. It exists because an ICMP tunnel cannot be pinged - the
+// carrier stops both kernels answering echo, on purpose - so a port that
+// answers is the only thing left that can say what the round trip across the
+// link is, or whether there is anybody at the other end of it at all. What it
+// serves is what loopback serves, so the far server can also see this one's
+// version and profile, which is how a mismatched pair is found without
+// logging into both.
+//
+// It is bound to the tun address alone. That address is reachable through
+// this tunnel and nowhere else, so what is open here is open to one server.
+func (s *Server) Serve(port, linkPort int) {
+	go s.sample()
+	h := s.handler()
+	if port > 0 {
+		go serveOn(fmt.Sprintf("127.0.0.1:%d", port), h, "status")
+	}
+	if linkPort > 0 {
+		mine, _ := s.cfg.Mine()
+		if ip, _, ok := strings.Cut(mine, "/"); ok && ip != "" {
+			go serveOn(fmt.Sprintf("%s:%d", ip, linkPort), h, "health")
+		}
+	}
+}
+
+// serveOn binds and answers, and waits a little for the address to exist.
+//
+// The link listener is bound to the tun device's address, and the device is
+// brought up moments earlier by another goroutine. Two seconds of retrying
+// costs nothing and removes a race that would otherwise show up as "no health
+// port" on a tunnel that is working perfectly well.
+func serveOn(addr string, h http.Handler, what string) {
+	var ln net.Listener
+	var err error
+	for i := 0; i < 10; i++ {
+		if ln, err = net.Listen("tcp", addr); err == nil {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 	if err != nil {
-		logging.Warn("no status on %s (%v) - the tunnel runs either way", addr, err)
+		logging.Warn("no %s on %s (%v) - the tunnel runs either way", what, addr, err)
 		return
 	}
-	logging.Info("status on http://%s", addr)
-	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	logging.Info("%s on http://%s", what, addr)
+	srv := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 	_ = srv.Serve(ln)
 }
 

@@ -31,7 +31,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="2.1.0"
+PINGIFY_VERSION="2.2.0"
 
 # --------------------------------------------------------------------------
 # what this terminal can do

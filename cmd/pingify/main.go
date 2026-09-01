@@ -42,7 +42,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "2.1.0"
+const version = "2.2.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -112,7 +112,7 @@ func main() {
 		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
 	}
 	go reportEvery(30*time.Second, car, l)
-	go status.New(cfg, version, car, l).Serve(cfg.StatusPort)
+	go status.New(cfg, version, car, l).Serve(cfg.StatusPort, cfg.HealthPort)
 
 	logging.Info("running")
 
