@@ -245,7 +245,7 @@ chk_forward_spec() {
 
 health_check() {
     local name=$1 mode=${2:-}
-    local core_ver out st since addr fl live_mtu lpm
+    local core_ver out st since addr fl live_mtu lpm heard
     local spec proto lo hi rhost rport total missing unknown
 
     chk_reset
@@ -359,9 +359,20 @@ health_check() {
         # answered 1, this line would have said the far end was there while
         # the loss check vanished and the speed test called the same tunnel
         # unseen.
-        case $ST_UP in
+        # up alone is not the question. On the side that dials, the core's up
+        # is true from the first second because it knows the address it was
+        # given; only bytes arriving prove there is anybody at it. Twenty
+        # seconds of grace so that a check run right after a start does not
+        # call a healthy tunnel dead.
+        heard=$ST_UP
+        case $ST_INB in '' | 0) [ "${ST_UPTIME:-0}" -ge 20 ] && heard=false ;; esac
+        case $heard in
         true)
-            chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
+            if [ "${ST_INB:-0}" = 0 ]; then
+                chk_add note peer "started $(human_secs "$ST_UPTIME") ago; nothing back yet"
+            else
+                chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
+            fi
             ;;
         *)
             if [ "$CK_TRANSPORT" = icmp ]; then

@@ -221,7 +221,11 @@ home_row() {
     active)
         dot=idle
         if tun_stats "$name"; then
-            [ "$ST_UP" = true ] && dot=running
+            # Green means somebody is at the other end, which is not what the
+            # core's up says on the side that dials: there, up is true from
+            # the first second because the address was in the config. Amber
+            # for running-and-alone, which is what the dot has always meant.
+            [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ] && dot=running
             [ -n "$ST_TRANSPORT" ] && transport=$ST_TRANSPORT
             rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT") Mbit/s"
         else
@@ -618,7 +622,19 @@ update_pingify() {
     blank
     dim "the core is rebuilt to match, and every running tunnel is restarted"
     blank
-    confirm "update to $newver?" || { rm -f "$tmp"; return 1; }
+
+    # Which way it is going. Anything that is not the version installed used to
+    # be offered as an update, so a release that had been rolled back - or a
+    # server running a build made by hand - was told to go backwards, with
+    # enter as the answer that did it. Backwards is allowed, and it is not the
+    # default and does not call itself an update.
+    if ver_ge "$newver" "$PINGIFY_VERSION"; then
+        confirm "update to $newver?" || { rm -f "$tmp"; return 1; }
+    else
+        warn "$newver is older than the $PINGIFY_VERSION on this server"
+        fix "the core is rebuilt to match, so both ends go back together"
+        confirm "go back to $newver?" n || { rm -f "$tmp"; return 1; }
+    fi
 
     install -m 0755 "$tmp" "$PINGIFY_BIN" || {
         rm -f "$tmp"

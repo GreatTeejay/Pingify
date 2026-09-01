@@ -285,9 +285,20 @@ v_wiz_paste() {
 # the six questions
 # --------------------------------------------------------------------------
 
+# The questions number themselves as they are asked.
+#
+# They used to carry the number in the title, and an ICMP tunnel does not have
+# a port to ask about - so the wizard counted 1, 2, 3, 5, 6 and the person
+# following it had every reason to wonder what they had missed.
+WIZ_STEP=0
+wiz_ask() {
+    WIZ_STEP=$((WIZ_STEP + 1))
+    rule "$WIZ_STEP - $1"
+}
+
 q_side() {
     local n
-    rule "1 - Which server is this?"
+    wiz_ask "Which server is this?"
     blank
     item "1" "IRAN" "users connect here, dials out"
     item "2" "KHAREJ" "your panel runs here; waits"
@@ -306,7 +317,7 @@ q_side() {
 # from two points of view, which is how the pair came to disagree.
 q_kharej() {
     local def=
-    rule "2 - The server abroad"
+    wiz_ask "The server abroad"
     blank
     dim "Both servers name it, so the file is the same on each."
     blank
@@ -317,7 +328,7 @@ q_kharej() {
 
 q_transport() {
     local n
-    rule "3 - How it crosses"
+    wiz_ask "How it crosses"
     blank
     item "1" "UDP" "fastest, and usually right"
     dim "        one open port on KHAREJ is all it needs"
@@ -343,7 +354,7 @@ q_port() {
         T_PORT=
         return 0
     fi
-    rule "4 - Port"
+    wiz_ask "Port"
     blank
     dim "KHAREJ waits on this port and IRAN dials it. The same"
     dim "number goes on both servers."
@@ -370,7 +381,7 @@ q_port() {
 # prompt walked straight past the checks that guarded the first.
 q_link() {
     local def n a dev addr
-    rule "5 - The private link"
+    wiz_ask "The private link"
     blank
     dim "Two addresses nothing else uses. Pick the middle number."
     blank
@@ -409,7 +420,7 @@ q_link() {
 q_profile() {
     local n
     local -a UI_COLS=(14 11 11 14)
-    rule "6 - What crosses this link"
+    wiz_ask "What crosses this link"
     blank
     row "" "16 streams" "one stream" "under load"
     row "  1  Gaming" "397 Mbit/s" "167 Mbit/s" "84.5 / 92.5 ms"
@@ -678,6 +689,7 @@ wizard_new() {
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
+    WIZ_STEP=0
 
     blank
     rule "Build a new tunnel"
@@ -906,7 +918,7 @@ screen_new() {
     blank
     rule "New tunnel"
     blank
-    item2 "1" "Build a new tunnel" "six questions"
+    item2 "1" "Build a new tunnel" "five or six questions"
     item2 "2" "Finish the pair" "one paste"
     item "0" "Back"
     blank

@@ -832,7 +832,14 @@ svc_do() {
         ;;
     stop | disable)
         systemctl "$what" "pingify@$name" >/dev/null 2>&1
-        ok "$name $what""ped"
+        # Two verbs, two sentences. One line built the past tense by adding
+        # "ped" to whichever word came in, which is right for stop and made
+        # "disableped" out of disable - on the uninstall screen, where every
+        # other line is plain English.
+        case $what in
+        stop) ok "$name stopped" ;;
+        *) ok "$name will not start at boot" ;;
+        esac
         ;;
     enable)
         systemctl enable --now "pingify@$name" 2>&1 | sed 's/^/       /'
@@ -864,12 +871,18 @@ svc_do() {
 tun_stats() {
     local name=$1 json
     ST_UP= ST_IN= ST_OUT= ST_LOST= ST_GAPS= ST_LATE= ST_UPTIME= ST_DROPPED=
-    ST_TRANSPORT= ST_PROFILE= ST_SIDE=
+    ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB=
 
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
 
     ST_UP=$(json_field "$json" up)
+    # Bytes in, and it is not a statistic: it is the only thing on this report
+    # that says somebody is at the other end. The core's `up` means the
+    # carrier knows where to send, and on the side that dials that is true the
+    # moment it starts, answer or no answer - so a tunnel pointed at a dead
+    # address reported itself up, with a green dot, for ever.
+    ST_INB=$(json_field "$json" in_bytes)
     ST_IN=$(json_field "$json" in_mbit)
     ST_OUT=$(json_field "$json" out_mbit)
     ST_LOST=$(json_field "$json" path_lost)
@@ -4761,9 +4774,20 @@ v_wiz_paste() {
 # the six questions
 # --------------------------------------------------------------------------
 
+# The questions number themselves as they are asked.
+#
+# They used to carry the number in the title, and an ICMP tunnel does not have
+# a port to ask about - so the wizard counted 1, 2, 3, 5, 6 and the person
+# following it had every reason to wonder what they had missed.
+WIZ_STEP=0
+wiz_ask() {
+    WIZ_STEP=$((WIZ_STEP + 1))
+    rule "$WIZ_STEP - $1"
+}
+
 q_side() {
     local n
-    rule "1 - Which server is this?"
+    wiz_ask "Which server is this?"
     blank
     item "1" "IRAN" "users connect here, dials out"
     item "2" "KHAREJ" "your panel runs here; waits"
@@ -4782,7 +4806,7 @@ q_side() {
 # from two points of view, which is how the pair came to disagree.
 q_kharej() {
     local def=
-    rule "2 - The server abroad"
+    wiz_ask "The server abroad"
     blank
     dim "Both servers name it, so the file is the same on each."
     blank
@@ -4793,7 +4817,7 @@ q_kharej() {
 
 q_transport() {
     local n
-    rule "3 - How it crosses"
+    wiz_ask "How it crosses"
     blank
     item "1" "UDP" "fastest, and usually right"
     dim "        one open port on KHAREJ is all it needs"
@@ -4819,7 +4843,7 @@ q_port() {
         T_PORT=
         return 0
     fi
-    rule "4 - Port"
+    wiz_ask "Port"
     blank
     dim "KHAREJ waits on this port and IRAN dials it. The same"
     dim "number goes on both servers."
@@ -4846,7 +4870,7 @@ q_port() {
 # prompt walked straight past the checks that guarded the first.
 q_link() {
     local def n a dev addr
-    rule "5 - The private link"
+    wiz_ask "The private link"
     blank
     dim "Two addresses nothing else uses. Pick the middle number."
     blank
@@ -4885,7 +4909,7 @@ q_link() {
 q_profile() {
     local n
     local -a UI_COLS=(14 11 11 14)
-    rule "6 - What crosses this link"
+    wiz_ask "What crosses this link"
     blank
     row "" "16 streams" "one stream" "under load"
     row "  1  Gaming" "397 Mbit/s" "167 Mbit/s" "84.5 / 92.5 ms"
@@ -5154,6 +5178,7 @@ wizard_new() {
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
+    WIZ_STEP=0
 
     blank
     rule "Build a new tunnel"
@@ -5382,7 +5407,7 @@ screen_new() {
     blank
     rule "New tunnel"
     blank
-    item2 "1" "Build a new tunnel" "six questions"
+    item2 "1" "Build a new tunnel" "five or six questions"
     item2 "2" "Finish the pair" "one paste"
     item "0" "Back"
     blank
@@ -5437,7 +5462,7 @@ tun_line() {
         # Running and the far end has been seen is the only state that earns a
         # green dot. Running and alone looks identical from here and is not
         # the same thing at all.
-        if [ "$ST_UP" = true ]; then
+        if [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ]; then
             TL_STATE=running
         else
             TL_STATE=idle
@@ -5643,10 +5668,25 @@ edit_profile() {
 
     local def=2
     case $cur in gaming) def=1 ;; download) def=3 ;; esac
-    pick choice "select" "$def" 3 || return 0
+
+    # A way out that is a number, like every other screen reached from a menu.
+    # This used pick, which answers 1 to 3 and nothing else on purpose - that
+    # is right for a question in the wizard and wrong here: 0 was refused and
+    # the screen asked again, so the only exit was the q nothing on it
+    # mentions. Enter still keeps what the tunnel already has.
+    item 0 "Leave it on $cur"
+    blank
+    menu_key choice || return 0
+    [ -z "$choice" ] && choice=$def
 
     local want
-    case $choice in 1) want=gaming ;; 2) want=balanced ;; 3) want=download ;; esac
+    case $choice in
+    1) want=gaming ;;
+    2) want=balanced ;;
+    3) want=download ;;
+    0) return 0 ;;
+    *) blank; warn "there is nothing on $choice"; pause; return 0 ;;
+    esac
     [ "$want" = "$cur" ] && return 0
 
     PROFILE_WANT=$want
@@ -5668,16 +5708,29 @@ profile_row() {
 }
 
 screen_advanced() {
-    local name=$1 f k
+    local name=$1 f k q qs
     f=$(cfg_file "$name")
     while :; do
+        # Two of these are not in the file until somebody sets them: the
+        # profile carries the queue depth, and the core picks the number of
+        # device queues. Reading the file alone drew "Queue depth  packets,
+        # from the profile" with the number missing out of the middle of it,
+        # and then offered an empty default that the validator refused - so
+        # pressing enter at the question did nothing at all, twice.
+        q=$(toml_get "$f" tuning queue_packets)
+        qs=$(toml_get "$f" tun queues)
         blank
         rule "Advanced $G_DASH $name"
         blank
         item2 1 "MTU" "$(toml_get "$f" tun mtu)"
         item2 2 "Log level" "$(toml_get "$f" logging level)"
-        item2 3 "Queue depth" "$(toml_get "$f" tuning queue_packets) packets, from the profile"
-        item2 4 "Device queues" "$(toml_get "$f" tun queues)"
+        if [ -n "$q" ]; then
+            item2 3 "Queue depth" "$q packets, set here"
+        else
+            q=$(wiz_queue "$(toml_get "$f" tuning profile)")
+            item2 3 "Queue depth" "$q packets, from the profile"
+        fi
+        item2 4 "Device queues" "${qs:-the core chooses}"
         item 5 "Show the config file"
         item 0 "Back"
         blank
@@ -5694,10 +5747,10 @@ screen_advanced() {
             dim "This comes from the profile and is the one number a profile moves."
             dim "Set it directly only if you have measured your own path."
             local v
-            ask v "packets" "$(toml_get "$f" tuning queue_packets)" v_queue || continue
+            ask v "packets" "$q" v_queue || continue
             QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; pause ;;
         4) local v
-            ask v "queues (0 lets the core choose)" "$(toml_get "$f" tun queues)" v_queues || continue
+            ask v "queues (0 lets the core choose)" "${qs:-0}" v_queues || continue
             QUEUES_WANT=$v; cfg_apply "$name" _edit_queues yes; pause ;;
         5) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;
@@ -6723,7 +6776,7 @@ chk_forward_spec() {
 
 health_check() {
     local name=$1 mode=${2:-}
-    local core_ver out st since addr fl live_mtu lpm
+    local core_ver out st since addr fl live_mtu lpm heard
     local spec proto lo hi rhost rport total missing unknown
 
     chk_reset
@@ -6837,9 +6890,20 @@ health_check() {
         # answered 1, this line would have said the far end was there while
         # the loss check vanished and the speed test called the same tunnel
         # unseen.
-        case $ST_UP in
+        # up alone is not the question. On the side that dials, the core's up
+        # is true from the first second because it knows the address it was
+        # given; only bytes arriving prove there is anybody at it. Twenty
+        # seconds of grace so that a check run right after a start does not
+        # call a healthy tunnel dead.
+        heard=$ST_UP
+        case $ST_INB in '' | 0) [ "${ST_UPTIME:-0}" -ge 20 ] && heard=false ;; esac
+        case $heard in
         true)
-            chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
+            if [ "${ST_INB:-0}" = 0 ]; then
+                chk_add note peer "started $(human_secs "$ST_UPTIME") ago; nothing back yet"
+            else
+                chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
+            fi
             ;;
         *)
             if [ "$CK_TRANSPORT" = icmp ]; then
@@ -7572,7 +7636,7 @@ screen_host() {
         blank
         item2 "1" "Profile" "${p:-none}"
         item2 "2" "BBR" "$bbr"
-        item2 "3" "Raise descriptor limits" "$([ -f "$HOST_LIMITS" ] && printf 'done' || printf 'not done')"
+        item2 "3" "Descriptor limits" "$([ -f "$HOST_LIMITS" ] && printf 'raised' || printf 'not raised')"
         item "4" "Revert everything this screen did"
         item "0" "Back"
         blank
@@ -7584,12 +7648,20 @@ screen_host() {
             item "1" "Gaming" "small queues; less waiting"
             item "2" "Balanced" "pick this one if unsure"
             item "3" "Download" "deep queues, for bulk"
+            item "0" "Back"
             blank
-            pick n "select" 2 3 || continue
+            # menu_key rather than pick, because this screen was reached from
+            # a menu and every one of those has a numeric way back out. pick
+            # answers 1 to 3 and nothing else, which is right for a question
+            # in the wizard and wrong here: 0 was refused and it asked again.
+            menu_key n || continue
+            [ -z "$n" ] && n=2
             case $n in
             1) p=gaming ;;
+            2) p=balanced ;;
             3) p=download ;;
-            *) p=balanced ;;
+            0) continue ;;
+            *) blank; warn "there is nothing on $n"; pause; continue ;;
             esac
             blank
             host_write_sysctl "$p" "$(host_bbr_state)" && ok "$p host tuning applied"
@@ -8245,7 +8317,11 @@ home_row() {
     active)
         dot=idle
         if tun_stats "$name"; then
-            [ "$ST_UP" = true ] && dot=running
+            # Green means somebody is at the other end, which is not what the
+            # core's up says on the side that dials: there, up is true from
+            # the first second because the address was in the config. Amber
+            # for running-and-alone, which is what the dot has always meant.
+            [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ] && dot=running
             [ -n "$ST_TRANSPORT" ] && transport=$ST_TRANSPORT
             rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT") Mbit/s"
         else
@@ -8642,7 +8718,19 @@ update_pingify() {
     blank
     dim "the core is rebuilt to match, and every running tunnel is restarted"
     blank
-    confirm "update to $newver?" || { rm -f "$tmp"; return 1; }
+
+    # Which way it is going. Anything that is not the version installed used to
+    # be offered as an update, so a release that had been rolled back - or a
+    # server running a build made by hand - was told to go backwards, with
+    # enter as the answer that did it. Backwards is allowed, and it is not the
+    # default and does not call itself an update.
+    if ver_ge "$newver" "$PINGIFY_VERSION"; then
+        confirm "update to $newver?" || { rm -f "$tmp"; return 1; }
+    else
+        warn "$newver is older than the $PINGIFY_VERSION on this server"
+        fix "the core is rebuilt to match, so both ends go back together"
+        confirm "go back to $newver?" n || { rm -f "$tmp"; return 1; }
+    fi
 
     install -m 0755 "$tmp" "$PINGIFY_BIN" || {
         rm -f "$tmp"
