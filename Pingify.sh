@@ -3975,6 +3975,12 @@ func Open(cfg *config.Config) (Full, error) {
 		return newWSSCarrier(cfg)
 	case "gre":
 		return newGRECarrier(cfg)
+	// AmneziaWG is not a carrier of ours. The link is theirs, brought up by
+	// awg-quick from their own packages, and what runs inside it is the same
+	// UDP carrier as anywhere else - which is how a tunnel over it still has
+	// this core's queue, its counters, its status and its health port.
+	case "awg":
+		return newUDPCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }
@@ -4777,6 +4783,36 @@ type Config struct {
 
 	Level string
 
+	// AmneziaWG, when that is the transport.
+	//
+	// The core does not speak it and does not want to: it is obfuscated
+	// WireGuard, it is somebody else's careful cryptography, and it is
+	// installed from their own repository rather than reimplemented here.
+	// What the core does is run over it - the carrier is ordinary UDP between
+	// the two private addresses of the AmneziaWG link - so everything above
+	// the carrier is unchanged and every number the manager shows is real.
+	//
+	// The rest of this table is the manager's: the keys and the obfuscation
+	// parameters that awg-quick needs. They are carried here because one file
+	// describes one tunnel, and both servers get the same file.
+	AWG struct {
+		Name   string // the interface, awg0 and so on
+		Iran   string // its address on the link, with the prefix
+		Kharej string
+		MTU    int
+		Port   int // where AmneziaWG itself listens
+
+		IranKey    string
+		IranPub    string
+		KharejKey  string
+		KharejPub  string
+		Jc         int
+		Jmin, Jmax int
+		S1, S2     int
+		H1, H2     int
+		H3, H4     int
+	}
+
 	// Where to answer questions about itself. Loopback only, and zero turns
 	// it off.
 	StatusPort int
@@ -4842,11 +4878,29 @@ func isName(s string) bool {
 
 // DialHost is what the side that dials connects to, which is the other
 // server's address - and that address is the domain when somebody typed one.
+//
+// Over AmneziaWG it is neither: the carrier runs inside that link, so the
+// far end is its address on the link and the public addresses are the
+// business of awg-quick rather than of this.
 func (c *Config) DialHost() string {
+	if c.Transport.Type == "awg" {
+		if c.DialSide() == SideIran {
+			return addrOnly(c.AWG.Kharej)
+		}
+		return addrOnly(c.AWG.Iran)
+	}
 	if c.DialSide() == SideIran {
 		return c.Transport.Kharej
 	}
 	return c.Transport.Iran
+}
+
+// addrOnly drops the prefix length from 10.9.0.1/24.
+func addrOnly(s string) string {
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // Path is what a WebSocket handshake asks for, and what the side that waits
@@ -5011,6 +5065,43 @@ func assign(c *Config, table, key, raw string) error {
 	case "logging.level":
 		c.Level, err = str()
 
+	case "awg.name":
+		c.AWG.Name, err = str()
+	case "awg.iran":
+		c.AWG.Iran, err = str()
+	case "awg.kharej":
+		c.AWG.Kharej, err = str()
+	case "awg.mtu":
+		c.AWG.MTU, err = num()
+	case "awg.port":
+		c.AWG.Port, err = num()
+	case "awg.iran_key":
+		c.AWG.IranKey, err = str()
+	case "awg.iran_pub":
+		c.AWG.IranPub, err = str()
+	case "awg.kharej_key":
+		c.AWG.KharejKey, err = str()
+	case "awg.kharej_pub":
+		c.AWG.KharejPub, err = str()
+	case "awg.jc":
+		c.AWG.Jc, err = num()
+	case "awg.jmin":
+		c.AWG.Jmin, err = num()
+	case "awg.jmax":
+		c.AWG.Jmax, err = num()
+	case "awg.s1":
+		c.AWG.S1, err = num()
+	case "awg.s2":
+		c.AWG.S2, err = num()
+	case "awg.h1":
+		c.AWG.H1, err = num()
+	case "awg.h2":
+		c.AWG.H2, err = num()
+	case "awg.h3":
+		c.AWG.H3, err = num()
+	case "awg.h4":
+		c.AWG.H4, err = num()
+
 	case "status.port":
 		c.StatusPort, err = num()
 	case "status.health_port":
@@ -5146,8 +5237,12 @@ func (c *Config) check() error {
 	}
 	switch c.Transport.Type {
 	case "udp", "icmp", "tcp", "ws", "wss", "gre":
+	case "awg":
+		if c.AWG.Iran == "" || c.AWG.Kharej == "" {
+			return fmt.Errorf("awg.iran and awg.kharej are both needed, on both servers")
+		}
 	default:
-		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre and icmp are what exist so far",
+		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre, awg and icmp are what exist so far",
 			c.Transport.Type)
 	}
 	switch c.Transport.Dials {
@@ -6311,6 +6406,239 @@ ensure_core() {
 }
 #!/usr/bin/env bash
 #
+# AmneziaWG: obfuscated WireGuard, from their packages rather than ours.
+#
+# This is the one transport Pingify does not implement. It is somebody else's
+# careful cryptography with a deliberate junk-and-header layer on top of it,
+# and the right thing to do with that is install it from the repository the
+# people who wrote it publish - ppa:amnezia/ppa, the same one their own
+# clients use - and drive it.
+#
+# What the tunnel does on top is unchanged. awg-quick brings up a private link
+# between the two servers; the core then runs its ordinary UDP carrier inside
+# that link, so the profile's queue depth, the socket buffers, the counters
+# every screen reads, the status endpoint and the health port all work exactly
+# as they do on every other transport. The obfuscation is theirs, the tuning
+# is ours, and neither has to know about the other.
+#
+# The keys are the one thing that does not fit the shared-file design without
+# help: WireGuard needs a private key on each side and the far side's public
+# key, which is four values rather than one shared secret. Both keypairs are
+# generated once, on the first server, and all four values travel in the file
+# - so the second server still needs nothing but the paste, and each side
+# picks out the half that is its own.
+
+AWG_DIR=${PINGIFY_AWG_DIR:-/etc/amnezia/amneziawg}
+AWG_PPA=${PINGIFY_AWG_PPA:-ppa:amnezia/ppa}
+
+awg_ready() { have awg && have awg-quick; }
+
+# awg_install adds their repository and installs from it.
+#
+# It is a network operation on a server that may not be able to reach a
+# launchpad mirror, so the failure is reported as what it is rather than as a
+# broken tunnel: the packages are missing, here is the command, and every
+# other transport still works.
+awg_install() {
+    awg_ready && return 0
+    blank
+    dim "installing AmneziaWG from $AWG_PPA"
+    if have add-apt-repository; then
+        add-apt-repository -y "$AWG_PPA" >/dev/null 2>&1
+    fi
+    if have apt-get; then
+        apt-get update >/dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            amneziawg amneziawg-tools >/dev/null 2>&1
+    fi
+    if awg_ready; then
+        ok "AmneziaWG installed - $(awg --version 2>/dev/null | head -1)"
+        return 0
+    fi
+    bad "AmneziaWG could not be installed on this server"
+    fix "it needs $AWG_PPA, which a server in Iran often cannot reach"
+    fix "install it from a server that can, or pick another transport"
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# what the wizard generates
+# --------------------------------------------------------------------------
+
+# awg_rand is a number in a range, from the kernel's own random device.
+awg_rand() {
+    local lo=$1 hi=$2 n
+    n=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' \n')
+    case $n in '' | *[!0-9]*) n=$((RANDOM * 32768 + RANDOM)) ;; esac
+    printf '%s' $((lo + n % (hi - lo + 1)))
+}
+
+# awg_generate fills in the keys and the obfuscation for a new tunnel.
+#
+# The obfuscation numbers are what make an AmneziaWG packet not look like a
+# WireGuard one: Jc junk packets of Jmin to Jmax bytes before the handshake,
+# S1 and S2 bytes of junk inside the first two handshake packets, and H1 to H4
+# in place of WireGuard's four fixed message types. They have to match on both
+# servers, which they do, because they are generated once and travel in the
+# file. The ranges are the ones Amnezia's own documentation gives.
+awg_generate() {
+    awg_ready || return 1
+    T_AWG_IKEY=$(awg genkey)
+    T_AWG_IPUB=$(printf '%s' "$T_AWG_IKEY" | awg pubkey)
+    T_AWG_KKEY=$(awg genkey)
+    T_AWG_KPUB=$(printf '%s' "$T_AWG_KKEY" | awg pubkey)
+    [ -n "$T_AWG_IPUB" ] && [ -n "$T_AWG_KPUB" ] || return 1
+
+    T_AWG_JC=$(awg_rand 3 10)
+    T_AWG_JMIN=$(awg_rand 50 100)
+    T_AWG_JMAX=$((T_AWG_JMIN + $(awg_rand 200 800)))
+    [ "$T_AWG_JMAX" -gt 1280 ] && T_AWG_JMAX=1280
+    T_AWG_S1=$(awg_rand 15 80)
+    T_AWG_S2=$(awg_rand 15 80)
+    # The one rule the documentation is explicit about: S1 + 56 must not equal
+    # S2, or the first handshake packet is the length of the second and the
+    # obfuscation gives back exactly what it was hiding.
+    while [ $((T_AWG_S1 + 56)) = "$T_AWG_S2" ]; do
+        T_AWG_S2=$(awg_rand 15 80)
+    done
+
+    # Four distinct header types, none of them the four WireGuard uses.
+    local i h
+    T_AWG_H1= T_AWG_H2= T_AWG_H3= T_AWG_H4=
+    for i in 1 2 3 4; do
+        while :; do
+            h=$(awg_rand 5 2147483000)
+            list_has "$h" "$T_AWG_H1" "$T_AWG_H2" "$T_AWG_H3" "$T_AWG_H4" || break
+        done
+        eval "T_AWG_H$i=\$h"
+    done
+    return 0
+}
+
+# --------------------------------------------------------------------------
+# the link itself
+# --------------------------------------------------------------------------
+
+awg_iface() { toml_get "$(cfg_file "$1")" awg name; }
+
+# awg_conf writes this server's half of the link.
+#
+# The file is built from the shared config every time rather than kept, so a
+# change to the tunnel is a change to the interface without anybody having to
+# remember there are two of them. 0600, because the private key is in it.
+awg_conf() {
+    local name=$1 f side iface mine peer_pub my_key peer_addr port endpoint
+    f=$(cfg_file "$name")
+    side=$(toml_get "$f" tunnel side)
+    iface=$(toml_get "$f" awg name)
+    [ -n "$iface" ] || return 1
+
+    if [ "$side" = iran ]; then
+        mine=$(toml_get "$f" awg iran)
+        my_key=$(toml_get "$f" awg iran_key)
+        peer_pub=$(toml_get "$f" awg kharej_pub)
+        peer_addr=$(toml_get "$f" awg kharej)
+    else
+        mine=$(toml_get "$f" awg kharej)
+        my_key=$(toml_get "$f" awg kharej_key)
+        peer_pub=$(toml_get "$f" awg iran_pub)
+        peer_addr=$(toml_get "$f" awg iran)
+    fi
+    port=$(toml_get "$f" awg port)
+
+    # Iran dials, the same way it does on every other transport: it is the end
+    # with an Endpoint line, and the far end waits with a ListenPort.
+    endpoint=
+    if [ "$side" = iran ]; then
+        endpoint="Endpoint = $(toml_get "$f" transport kharej):$port"
+    fi
+
+    mkdir -p "$AWG_DIR"
+    umask 077
+    cat >"$AWG_DIR/$iface.conf" <<CONF
+# Written by Pingify for the tunnel $name. Edited here, it is overwritten on
+# the next change: the tunnel's own file in $CFG_DIR is where it comes from.
+[Interface]
+PrivateKey = $my_key
+Address = $mine
+MTU = $(toml_get "$f" awg mtu)
+$([ "$side" = kharej ] && printf 'ListenPort = %s' "$port")
+Jc = $(toml_get "$f" awg jc)
+Jmin = $(toml_get "$f" awg jmin)
+Jmax = $(toml_get "$f" awg jmax)
+S1 = $(toml_get "$f" awg s1)
+S2 = $(toml_get "$f" awg s2)
+H1 = $(toml_get "$f" awg h1)
+H2 = $(toml_get "$f" awg h2)
+H3 = $(toml_get "$f" awg h3)
+H4 = $(toml_get "$f" awg h4)
+
+[Peer]
+PublicKey = $peer_pub
+AllowedIPs = ${peer_addr%%/*}/32
+$endpoint
+PersistentKeepalive = 25
+CONF
+    chmod 0600 "$AWG_DIR/$iface.conf"
+}
+
+# awg_up writes the interface's config and starts it, and is safe to call
+# again: awg-quick refuses a device that already exists, so the old one goes
+# first. That is also what makes a settings change take effect.
+awg_up() {
+    local name=$1 iface
+    iface=$(awg_iface "$name")
+    [ -n "$iface" ] || return 0
+    awg_conf "$name" || return 1
+    systemctl disable --now "awg-quick@$iface" >/dev/null 2>&1
+    ip link del "$iface" >/dev/null 2>&1
+    if ! systemctl enable --now "awg-quick@$iface" >/dev/null 2>&1; then
+        bad "the AmneziaWG link $iface would not come up"
+        fix "journalctl -u awg-quick@$iface -n 20"
+        return 1
+    fi
+    return 0
+}
+
+awg_down() {
+    local name=$1 iface
+    iface=$(awg_iface "$name")
+    [ -n "$iface" ] || return 0
+    systemctl disable --now "awg-quick@$iface" >/dev/null 2>&1
+    ip link del "$iface" >/dev/null 2>&1
+    rm -f "$AWG_DIR/$iface.conf"
+    return 0
+}
+
+# awg_free_iface is the first awgN nothing on this host is using. The tunnel's
+# own device is pfyN and this one is beside it, so a server with three tunnels
+# has three of each and no two of them meet.
+awg_free_iface() {
+    local i=0
+    while [ "$i" -lt 64 ]; do
+        if ! ip link show "awg$i" >/dev/null 2>&1 &&
+            [ ! -e "$AWG_DIR/awg$i.conf" ]; then
+            printf 'awg%s' "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# awg_handshake is how long ago the far end was last heard from, in seconds,
+# or nothing when there has been no handshake at all. It is the one number
+# that says whether the link underneath a tunnel is alive.
+awg_handshake() {
+    local iface=$1 t now
+    have awg || return 1
+    t=$(awg show "$iface" latest-handshakes 2>/dev/null | awk 'NR == 1 { print $2 }')
+    case $t in '' | 0 | *[!0-9]*) return 1 ;; esac
+    now=$(date +%s)
+    printf '%s' $((now - t))
+}
+#!/usr/bin/env bash
+#
 # The wizard: six questions on the first server, one paste on the second.
 #
 # That asymmetry is the whole design, and it falls out of one fact about the
@@ -6525,6 +6853,9 @@ free_device() {
 default_name() {
     local side=${1:-$T_SIDE} trans=${2:-$T_TRANSPORT} port=${3:-$T_PORT} oct=${4:-$T_OCTET}
     local base n i
+    # For AmneziaWG the number worth having in the name is the port somebody
+    # opened, not the one the carrier uses inside the link.
+    [ "$trans" = awg ] && port=${T_AWG_PORT:-$port}
     base="$side-$trans-${port:-$oct}"
     n=$base
     i=2
@@ -6788,6 +7119,7 @@ q_transport() {
     item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
     item "5" "ICMP" "inside ping packets - no open port at all"
     item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
+    item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
     blank
     dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317   UDP dead there"
@@ -6799,7 +7131,13 @@ q_transport() {
     dim "GRE needs no port either and is the plainest of them: 378 Mbit/s on"
     dim "the same pair, and visible for exactly what it is to anyone looking."
     blank
-    pick n "select" 1 6 || return 1
+    dim "AmneziaWG is the only one here this core does not implement: the link"
+    dim "is theirs, installed from their own repository, and the tunnel runs"
+    dim "inside it - so it is encrypted, and it is the one with a handshake."
+    dim "It is UDP underneath, so where UDP dies it dies with it - the same"
+    dim "Tehran pair carries its handshake and then nothing."
+    blank
+    pick n "select" 1 7 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
@@ -6807,6 +7145,9 @@ q_transport() {
     4) T_TRANSPORT=wss ;;
     5) T_TRANSPORT=icmp ;;
     6) T_TRANSPORT=gre ;;
+    7) T_TRANSPORT=awg
+       awg_install || return 1
+       ;;
     esac
     return 0
 }
@@ -6820,6 +7161,18 @@ q_port() {
     case $T_TRANSPORT in
     icmp | gre)
         T_PORT=
+        return 0
+        ;;
+    awg)
+        # The port asked for here is AmneziaWG's own, because that is the one
+        # somebody has to open in a firewall. The carrier inside the link gets
+        # a port of its own, worked out from the tunnel network below, where
+        # nothing outside can reach it and nothing has to be asked.
+        wiz_ask "Port"
+        blank
+        dim "AmneziaWG listens on this. The same number on both servers."
+        blank
+        ask T_AWG_PORT "port" "51820" v_port || return 1
         return 0
         ;;
     esac
@@ -6959,9 +7312,17 @@ wiz_fingerprint() {
 # --------------------------------------------------------------------------
 
 wiz_review() {
-    local trans prof
+    local trans prof f
+    f=$(cfg_file "$T_NAME")
     trans=${T_TRANSPORT^^}
-    [ -n "$T_PORT" ] && trans="$trans  port $T_PORT"
+    # For AmneziaWG the number worth showing is its own listening port, which
+    # is the one somebody has to open. The carrier's port is inside the link
+    # and nobody has to know it.
+    if [ "$T_TRANSPORT" = awg ]; then
+        trans="$trans  port ${T_AWG_PORT:-$(toml_get "$f" awg port)}"
+    elif [ -n "$T_PORT" ]; then
+        trans="$trans  port $T_PORT"
+    fi
     case $T_TRANSPORT in
     tcp | ws | wss) trans="$trans  ${T_CONNS:-8} connections" ;;
     esac
@@ -7061,6 +7422,31 @@ wiz_render() {
     tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
     esac
     [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
+    # AmneziaWG's own half of the tunnel. The keys are both pairs, because
+    # WireGuard needs a private key on each side and the other side's public
+    # one - four values where every other transport has a single shared token -
+    # and one file still has to describe the whole tunnel.
+    if [ "$T_TRANSPORT" = awg ]; then
+        printf '\n[awg]\n'
+        printf 'name = "%s"\n' "$T_AWG_IFACE"
+        printf 'iran = "10.%s.20.1/24"\n' "$T_OCTET"
+        printf 'kharej = "10.%s.20.2/24"\n' "$T_OCTET"
+        printf 'mtu = 1360\n'
+        printf 'port = %s\n' "$T_AWG_PORT"
+        printf 'iran_key = "%s"\n' "$T_AWG_IKEY"
+        printf 'iran_pub = "%s"\n' "$T_AWG_IPUB"
+        printf 'kharej_key = "%s"\n' "$T_AWG_KKEY"
+        printf 'kharej_pub = "%s"\n' "$T_AWG_KPUB"
+        printf 'jc = %s\n' "$T_AWG_JC"
+        printf 'jmin = %s\n' "$T_AWG_JMIN"
+        printf 'jmax = %s\n' "$T_AWG_JMAX"
+        printf 's1 = %s\n' "$T_AWG_S1"
+        printf 's2 = %s\n' "$T_AWG_S2"
+        printf 'h1 = %s\n' "$T_AWG_H1"
+        printf 'h2 = %s\n' "$T_AWG_H2"
+        printf 'h3 = %s\n' "$T_AWG_H3"
+        printf 'h4 = %s\n' "$T_AWG_H4"
+    fi
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -7136,6 +7522,18 @@ tunnel_create() {
     # anybody added one.
     [ -f "$UNIT_DIR/pingify@.service" ] || unit_write
 
+    # The AmneziaWG link is the wire this tunnel runs on, so it comes up
+    # first. If it will not, the tunnel is not started: a carrier dialling an
+    # address on a link that does not exist would sit there reporting nothing
+    # is wrong except that the far end has never been seen.
+    if [ "$(toml_get "$f" transport type)" = awg ]; then
+        if ! awg_up "$name"; then
+            rm -f "$f"
+            return 1
+        fi
+        ok "the AmneziaWG link $(awg_iface "$name") is up"
+    fi
+
     # svc_do enable returns the truth about is-active and prints the journal
     # when it failed. Returning its status is the point: the old caller printed
     # a green "is running" over a unit that had never started.
@@ -7202,7 +7600,10 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
-    T_PATH=
+    T_PATH= T_AWG_PORT= T_AWG_IFACE=
+    T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
+    T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
+    T_AWG_H1= T_AWG_H2= T_AWG_H3= T_AWG_H4=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -7241,6 +7642,23 @@ wizard_new() {
     q_link || return 1
     blank
     q_profile || return 1
+
+    # AmneziaWG carries two more things the tunnel network decides: the
+    # addresses of the link itself, beside the tunnel's own, and the port the
+    # carrier uses inside it - which is derived rather than asked because
+    # nothing outside the link can reach it and the octet already makes it
+    # unique on this host.
+    if [ "$T_TRANSPORT" = awg ]; then
+        T_PORT=$((20900 + T_OCTET))
+        T_AWG_IFACE=$(awg_free_iface) || {
+            bad "there is no free awg device left on this host"
+            return 1
+        }
+        awg_generate || {
+            bad "AmneziaWG would not generate a key here"
+            return 1
+        }
+    fi
 
     T_NAME=$(default_name)
 
@@ -7984,6 +8402,9 @@ delete_tunnel() {
     svc_do stop "$name" 2>/dev/null || true
     systemctl disable "pingify@$name" >/dev/null 2>&1 || true
     nat_drop "$name" 2>/dev/null || true
+    # The link underneath goes with it, and its config file with the private
+    # key in it goes too.
+    awg_down "$name" 2>/dev/null || true
     rm -f "$(cfg_file "$name")" "$STATE_DIR/$name.forwards"
     ok "$name is gone"
     pause
@@ -9111,6 +9532,15 @@ health_check() {
                     "watch there:  tcpdump -ni any icmp" \
                     "if nothing arrives at all, try tcp or udp"
                 ;;
+            awg)
+                # The port worth naming here is AmneziaWG's, not the carrier's:
+                # the carrier's is inside the link and nothing outside can
+                # reach it or block it.
+                chk_add bad peer "the far end has never been seen inside the link" \
+                    "the line below says whether the link itself is up" \
+                    "if it handshook, the path is dropping udp once it flows" \
+                    "on KHAREJ:  systemctl status pingify@$name"
+                ;;
             gre)
                 chk_add bad peer "the far end has never been seen" \
                     "on KHAREJ:  systemctl status pingify@$name" \
@@ -9147,6 +9577,33 @@ health_check() {
             esac
             ;;
         esac
+
+        # The link underneath, when there is one. An AmneziaWG tunnel has two
+        # things that can be down and they fail differently: the handshake is
+        # theirs and says whether the two servers have agreed on keys at all,
+        # and everything below this is ours and runs inside it.
+        if [ "$CK_TRANSPORT" = awg ]; then
+            local iface age
+            iface=$(awg_iface "$name")
+            if [ -z "$iface" ] || ! ip link show "$iface" >/dev/null 2>&1; then
+                chk_add bad awg "the AmneziaWG link ${iface:-for this tunnel} is not up" \
+                    "systemctl status awg-quick@${iface:-awg0}" \
+                    "nothing below this can work without it"
+            elif age=$(awg_handshake "$iface"); then
+                if [ "$age" -lt 180 ]; then
+                    chk_add ok awg "AmneziaWG handshook $(human_secs "$age") ago on $iface"
+                else
+                    chk_add warn awg "the last AmneziaWG handshake was $(human_secs "$age") ago" \
+                        "the far end may be down, or the path stopped carrying udp" \
+                        "awg show $iface"
+                fi
+            else
+                chk_add bad awg "AmneziaWG on $iface has never handshaken" \
+                    "the two servers have not agreed on keys" \
+                    "open udp/$(toml_get "$CK_FILE" awg port) on KHAREJ" \
+                    "awg show $iface"
+            fi
+        fi
 
         # The far end, asked through the tunnel.
         #

@@ -214,6 +214,9 @@ free_device() {
 default_name() {
     local side=${1:-$T_SIDE} trans=${2:-$T_TRANSPORT} port=${3:-$T_PORT} oct=${4:-$T_OCTET}
     local base n i
+    # For AmneziaWG the number worth having in the name is the port somebody
+    # opened, not the one the carrier uses inside the link.
+    [ "$trans" = awg ] && port=${T_AWG_PORT:-$port}
     base="$side-$trans-${port:-$oct}"
     n=$base
     i=2
@@ -477,6 +480,7 @@ q_transport() {
     item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
     item "5" "ICMP" "inside ping packets - no open port at all"
     item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
+    item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
     blank
     dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317   UDP dead there"
@@ -488,7 +492,13 @@ q_transport() {
     dim "GRE needs no port either and is the plainest of them: 378 Mbit/s on"
     dim "the same pair, and visible for exactly what it is to anyone looking."
     blank
-    pick n "select" 1 6 || return 1
+    dim "AmneziaWG is the only one here this core does not implement: the link"
+    dim "is theirs, installed from their own repository, and the tunnel runs"
+    dim "inside it - so it is encrypted, and it is the one with a handshake."
+    dim "It is UDP underneath, so where UDP dies it dies with it - the same"
+    dim "Tehran pair carries its handshake and then nothing."
+    blank
+    pick n "select" 1 7 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
@@ -496,6 +506,9 @@ q_transport() {
     4) T_TRANSPORT=wss ;;
     5) T_TRANSPORT=icmp ;;
     6) T_TRANSPORT=gre ;;
+    7) T_TRANSPORT=awg
+       awg_install || return 1
+       ;;
     esac
     return 0
 }
@@ -509,6 +522,18 @@ q_port() {
     case $T_TRANSPORT in
     icmp | gre)
         T_PORT=
+        return 0
+        ;;
+    awg)
+        # The port asked for here is AmneziaWG's own, because that is the one
+        # somebody has to open in a firewall. The carrier inside the link gets
+        # a port of its own, worked out from the tunnel network below, where
+        # nothing outside can reach it and nothing has to be asked.
+        wiz_ask "Port"
+        blank
+        dim "AmneziaWG listens on this. The same number on both servers."
+        blank
+        ask T_AWG_PORT "port" "51820" v_port || return 1
         return 0
         ;;
     esac
@@ -648,9 +673,17 @@ wiz_fingerprint() {
 # --------------------------------------------------------------------------
 
 wiz_review() {
-    local trans prof
+    local trans prof f
+    f=$(cfg_file "$T_NAME")
     trans=${T_TRANSPORT^^}
-    [ -n "$T_PORT" ] && trans="$trans  port $T_PORT"
+    # For AmneziaWG the number worth showing is its own listening port, which
+    # is the one somebody has to open. The carrier's port is inside the link
+    # and nobody has to know it.
+    if [ "$T_TRANSPORT" = awg ]; then
+        trans="$trans  port ${T_AWG_PORT:-$(toml_get "$f" awg port)}"
+    elif [ -n "$T_PORT" ]; then
+        trans="$trans  port $T_PORT"
+    fi
     case $T_TRANSPORT in
     tcp | ws | wss) trans="$trans  ${T_CONNS:-8} connections" ;;
     esac
@@ -750,6 +783,31 @@ wiz_render() {
     tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
     esac
     [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
+    # AmneziaWG's own half of the tunnel. The keys are both pairs, because
+    # WireGuard needs a private key on each side and the other side's public
+    # one - four values where every other transport has a single shared token -
+    # and one file still has to describe the whole tunnel.
+    if [ "$T_TRANSPORT" = awg ]; then
+        printf '\n[awg]\n'
+        printf 'name = "%s"\n' "$T_AWG_IFACE"
+        printf 'iran = "10.%s.20.1/24"\n' "$T_OCTET"
+        printf 'kharej = "10.%s.20.2/24"\n' "$T_OCTET"
+        printf 'mtu = 1360\n'
+        printf 'port = %s\n' "$T_AWG_PORT"
+        printf 'iran_key = "%s"\n' "$T_AWG_IKEY"
+        printf 'iran_pub = "%s"\n' "$T_AWG_IPUB"
+        printf 'kharej_key = "%s"\n' "$T_AWG_KKEY"
+        printf 'kharej_pub = "%s"\n' "$T_AWG_KPUB"
+        printf 'jc = %s\n' "$T_AWG_JC"
+        printf 'jmin = %s\n' "$T_AWG_JMIN"
+        printf 'jmax = %s\n' "$T_AWG_JMAX"
+        printf 's1 = %s\n' "$T_AWG_S1"
+        printf 's2 = %s\n' "$T_AWG_S2"
+        printf 'h1 = %s\n' "$T_AWG_H1"
+        printf 'h2 = %s\n' "$T_AWG_H2"
+        printf 'h3 = %s\n' "$T_AWG_H3"
+        printf 'h4 = %s\n' "$T_AWG_H4"
+    fi
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -825,6 +883,18 @@ tunnel_create() {
     # anybody added one.
     [ -f "$UNIT_DIR/pingify@.service" ] || unit_write
 
+    # The AmneziaWG link is the wire this tunnel runs on, so it comes up
+    # first. If it will not, the tunnel is not started: a carrier dialling an
+    # address on a link that does not exist would sit there reporting nothing
+    # is wrong except that the far end has never been seen.
+    if [ "$(toml_get "$f" transport type)" = awg ]; then
+        if ! awg_up "$name"; then
+            rm -f "$f"
+            return 1
+        fi
+        ok "the AmneziaWG link $(awg_iface "$name") is up"
+    fi
+
     # svc_do enable returns the truth about is-active and prints the journal
     # when it failed. Returning its status is the point: the old caller printed
     # a green "is running" over a unit that had never started.
@@ -891,7 +961,10 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
-    T_PATH=
+    T_PATH= T_AWG_PORT= T_AWG_IFACE=
+    T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
+    T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
+    T_AWG_H1= T_AWG_H2= T_AWG_H3= T_AWG_H4=
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
@@ -930,6 +1003,23 @@ wizard_new() {
     q_link || return 1
     blank
     q_profile || return 1
+
+    # AmneziaWG carries two more things the tunnel network decides: the
+    # addresses of the link itself, beside the tunnel's own, and the port the
+    # carrier uses inside it - which is derived rather than asked because
+    # nothing outside the link can reach it and the octet already makes it
+    # unique on this host.
+    if [ "$T_TRANSPORT" = awg ]; then
+        T_PORT=$((20900 + T_OCTET))
+        T_AWG_IFACE=$(awg_free_iface) || {
+            bad "there is no free awg device left on this host"
+            return 1
+        }
+        awg_generate || {
+            bad "AmneziaWG would not generate a key here"
+            return 1
+        }
+    fi
 
     T_NAME=$(default_name)
 

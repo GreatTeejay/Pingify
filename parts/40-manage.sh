@@ -490,6 +490,9 @@ delete_tunnel() {
     svc_do stop "$name" 2>/dev/null || true
     systemctl disable "pingify@$name" >/dev/null 2>&1 || true
     nat_drop "$name" 2>/dev/null || true
+    # The link underneath goes with it, and its config file with the private
+    # key in it goes too.
+    awg_down "$name" 2>/dev/null || true
     rm -f "$(cfg_file "$name")" "$STATE_DIR/$name.forwards"
     ok "$name is gone"
     pause

@@ -149,6 +149,36 @@ type Config struct {
 
 	Level string
 
+	// AmneziaWG, when that is the transport.
+	//
+	// The core does not speak it and does not want to: it is obfuscated
+	// WireGuard, it is somebody else's careful cryptography, and it is
+	// installed from their own repository rather than reimplemented here.
+	// What the core does is run over it - the carrier is ordinary UDP between
+	// the two private addresses of the AmneziaWG link - so everything above
+	// the carrier is unchanged and every number the manager shows is real.
+	//
+	// The rest of this table is the manager's: the keys and the obfuscation
+	// parameters that awg-quick needs. They are carried here because one file
+	// describes one tunnel, and both servers get the same file.
+	AWG struct {
+		Name   string // the interface, awg0 and so on
+		Iran   string // its address on the link, with the prefix
+		Kharej string
+		MTU    int
+		Port   int // where AmneziaWG itself listens
+
+		IranKey    string
+		IranPub    string
+		KharejKey  string
+		KharejPub  string
+		Jc         int
+		Jmin, Jmax int
+		S1, S2     int
+		H1, H2     int
+		H3, H4     int
+	}
+
 	// Where to answer questions about itself. Loopback only, and zero turns
 	// it off.
 	StatusPort int
@@ -214,11 +244,29 @@ func isName(s string) bool {
 
 // DialHost is what the side that dials connects to, which is the other
 // server's address - and that address is the domain when somebody typed one.
+//
+// Over AmneziaWG it is neither: the carrier runs inside that link, so the
+// far end is its address on the link and the public addresses are the
+// business of awg-quick rather than of this.
 func (c *Config) DialHost() string {
+	if c.Transport.Type == "awg" {
+		if c.DialSide() == SideIran {
+			return addrOnly(c.AWG.Kharej)
+		}
+		return addrOnly(c.AWG.Iran)
+	}
 	if c.DialSide() == SideIran {
 		return c.Transport.Kharej
 	}
 	return c.Transport.Iran
+}
+
+// addrOnly drops the prefix length from 10.9.0.1/24.
+func addrOnly(s string) string {
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // Path is what a WebSocket handshake asks for, and what the side that waits
@@ -383,6 +431,43 @@ func assign(c *Config, table, key, raw string) error {
 	case "logging.level":
 		c.Level, err = str()
 
+	case "awg.name":
+		c.AWG.Name, err = str()
+	case "awg.iran":
+		c.AWG.Iran, err = str()
+	case "awg.kharej":
+		c.AWG.Kharej, err = str()
+	case "awg.mtu":
+		c.AWG.MTU, err = num()
+	case "awg.port":
+		c.AWG.Port, err = num()
+	case "awg.iran_key":
+		c.AWG.IranKey, err = str()
+	case "awg.iran_pub":
+		c.AWG.IranPub, err = str()
+	case "awg.kharej_key":
+		c.AWG.KharejKey, err = str()
+	case "awg.kharej_pub":
+		c.AWG.KharejPub, err = str()
+	case "awg.jc":
+		c.AWG.Jc, err = num()
+	case "awg.jmin":
+		c.AWG.Jmin, err = num()
+	case "awg.jmax":
+		c.AWG.Jmax, err = num()
+	case "awg.s1":
+		c.AWG.S1, err = num()
+	case "awg.s2":
+		c.AWG.S2, err = num()
+	case "awg.h1":
+		c.AWG.H1, err = num()
+	case "awg.h2":
+		c.AWG.H2, err = num()
+	case "awg.h3":
+		c.AWG.H3, err = num()
+	case "awg.h4":
+		c.AWG.H4, err = num()
+
 	case "status.port":
 		c.StatusPort, err = num()
 	case "status.health_port":
@@ -518,8 +603,12 @@ func (c *Config) check() error {
 	}
 	switch c.Transport.Type {
 	case "udp", "icmp", "tcp", "ws", "wss", "gre":
+	case "awg":
+		if c.AWG.Iran == "" || c.AWG.Kharej == "" {
+			return fmt.Errorf("awg.iran and awg.kharej are both needed, on both servers")
+		}
 	default:
-		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre and icmp are what exist so far",
+		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre, awg and icmp are what exist so far",
 			c.Transport.Type)
 	}
 	switch c.Transport.Dials {

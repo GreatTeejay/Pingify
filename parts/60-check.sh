@@ -390,6 +390,15 @@ health_check() {
                     "watch there:  tcpdump -ni any icmp" \
                     "if nothing arrives at all, try tcp or udp"
                 ;;
+            awg)
+                # The port worth naming here is AmneziaWG's, not the carrier's:
+                # the carrier's is inside the link and nothing outside can
+                # reach it or block it.
+                chk_add bad peer "the far end has never been seen inside the link" \
+                    "the line below says whether the link itself is up" \
+                    "if it handshook, the path is dropping udp once it flows" \
+                    "on KHAREJ:  systemctl status pingify@$name"
+                ;;
             gre)
                 chk_add bad peer "the far end has never been seen" \
                     "on KHAREJ:  systemctl status pingify@$name" \
@@ -426,6 +435,33 @@ health_check() {
             esac
             ;;
         esac
+
+        # The link underneath, when there is one. An AmneziaWG tunnel has two
+        # things that can be down and they fail differently: the handshake is
+        # theirs and says whether the two servers have agreed on keys at all,
+        # and everything below this is ours and runs inside it.
+        if [ "$CK_TRANSPORT" = awg ]; then
+            local iface age
+            iface=$(awg_iface "$name")
+            if [ -z "$iface" ] || ! ip link show "$iface" >/dev/null 2>&1; then
+                chk_add bad awg "the AmneziaWG link ${iface:-for this tunnel} is not up" \
+                    "systemctl status awg-quick@${iface:-awg0}" \
+                    "nothing below this can work without it"
+            elif age=$(awg_handshake "$iface"); then
+                if [ "$age" -lt 180 ]; then
+                    chk_add ok awg "AmneziaWG handshook $(human_secs "$age") ago on $iface"
+                else
+                    chk_add warn awg "the last AmneziaWG handshake was $(human_secs "$age") ago" \
+                        "the far end may be down, or the path stopped carrying udp" \
+                        "awg show $iface"
+                fi
+            else
+                chk_add bad awg "AmneziaWG on $iface has never handshaken" \
+                    "the two servers have not agreed on keys" \
+                    "open udp/$(toml_get "$CK_FILE" awg port) on KHAREJ" \
+                    "awg show $iface"
+            fi
+        fi
 
         # The far end, asked through the tunnel.
         #
