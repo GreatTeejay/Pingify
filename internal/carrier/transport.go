@@ -33,6 +33,8 @@ func Open(cfg *config.Config) (Full, error) {
 		return newICMPCarrier(cfg)
 	case "udp":
 		return newUDPCarrier(cfg)
+	case "tcp":
+		return newTCPCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }

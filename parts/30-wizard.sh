@@ -106,13 +106,18 @@ wiz_device_owner() {
     return 1
 }
 
+# Who holds a port number, on the protocol that matters.
+#
+# 8443/udp and 8443/tcp are two different ports and always have been, so a UDP
+# tunnel on 8443 is not in the way of a TCP one, and refusing it would be a
+# refusal with nothing behind it. ICMP has no ports at all, so an icmp tunnel
+# matches no protocol and owns no number.
 wiz_port_owner() {
-    local p=$1 keep=${2:-$WIZ_KEEP} n f
+    local p=$1 keep=${2:-$WIZ_KEEP} proto=${3:-${T_TRANSPORT:-udp}} n f
     while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         f=$(cfg_file "$n")
-        # ICMP has no port, so an icmp tunnel owns no number.
-        [ "$(toml_get "$f" transport type)" = icmp ] && continue
+        [ "$(toml_get "$f" transport type)" = "$proto" ] || continue
         [ "$(toml_get "$f" transport port)" = "$p" ] &&
             { printf 'the tunnel %s' "$n"; return 0; }
     done < <(cfg_list)
@@ -123,9 +128,13 @@ wiz_port_owner() {
 # port. When ss is missing the answer is "no": refusing to go on because a
 # check could not run is a wall the user cannot climb, and the core will say so
 # plainly at start-up if the bind really fails.
+# And what the kernel says is listening, on that same protocol.
 wiz_port_bound() {
+    local p=$1 proto=${2:-${T_TRANSPORT:-udp}} flag=-lnu
     have ss || return 1
-    ss -lnu 2>/dev/null | awk -v want=":$1\$" 'NR > 1 && $4 ~ want { hit = 1 } END { exit !hit }'
+    [ "$proto" = tcp ] && flag=-lnt
+    ss "$flag" 2>/dev/null |
+        awk -v want=":$p\$" 'NR > 1 && $4 ~ want { hit = 1 } END { exit !hit }'
 }
 
 # wiz_public_ip is a default for the KHAREJ side, read from the interfaces
@@ -308,7 +317,7 @@ v_wiz_port() {
     # local listener on the same number there is not a conflict, and refusing
     # it would be a refusal with no action behind it.
     if [ "$T_SIDE" = kharej ] && wiz_port_bound "$1"; then
-        echo "udp/$1 is in use here; see: ss -lnup | grep :$1"
+        echo "$T_TRANSPORT/$1 is in use here; see: ss -lnp | grep :$1"
         return 1
     fi
     return 0
@@ -451,20 +460,25 @@ q_transport() {
     local n
     wiz_ask "How it crosses"
     blank
-    item "1" "UDP" "one open port on KHAREJ - fast, and usual"
-    item "2" "ICMP" "inside ping packets - no port at all"
+    item "1" "UDP" "one open port on KHAREJ - the fastest"
+    item "2" "TCP" "one open port, on a path that carries only TCP"
+    item "3" "ICMP" "inside ping packets - no open port at all"
     blank
-    dim "UDP is the one to pick unless the path will not carry it. ICMP goes"
-    dim "where a port cannot be opened or a port is being blocked, and it costs"
-    dim "a little speed for that."
+    dim "UDP first: it is a packet in, a packet out, and nothing in the way."
     blank
-    dim "While an ICMP tunnel runs neither server answers an ordinary ping. That"
-    dim "is deliberate, and no screen here reads it as a fault."
+    dim "TCP where a network carries nothing else - and it is a stream, so a"
+    dim "packet the path drops is repaired underneath the connections running"
+    dim "through it, which costs some of the speed UDP would have had."
     blank
-    pick n "select" 1 2 || return 1
+    dim "ICMP where no port can be opened at all. While one runs neither server"
+    dim "answers an ordinary ping; that is deliberate and no screen here reads"
+    dim "it as a fault."
+    blank
+    pick n "select" 1 3 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
-    2) T_TRANSPORT=icmp ;;
+    2) T_TRANSPORT=tcp ;;
+    3) T_TRANSPORT=icmp ;;
     esac
     return 0
 }
@@ -484,7 +498,7 @@ q_port() {
     blank
     while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
-        dim "taken here:  $(toml_get "$(cfg_file "$n")" transport port)/udp   $n"
+        dim "taken here:  $(toml_get "$(cfg_file "$n")" transport port)/$(toml_get "$(cfg_file "$n")" transport type)   $n"
     done < <(cfg_list)
     # Leaving the last candidate is the point of the bare break. The scan used
     # to end with def=8443, which is the number it had just proved was taken,
@@ -688,6 +702,10 @@ wiz_render() {
     # No port key at all for icmp. Writing port = 0 would pass the core's check
     # and then sit in the file looking like a setting somebody chose.
     [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"
+    # Only a stream carrier opens more than one. On this path a single TCP
+    # connection is shaped to nothing and eight together are not shaped at
+    # all, which is the whole reason the number is here.
+    [ "$T_TRANSPORT" = tcp ] && printf 'connections = %s\n' "${T_CONNS:-8}"
     printf '\n[security]\n'
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
@@ -1040,7 +1058,7 @@ wizard_paste() {
             fix "change the port on both servers, and paste again"
             clash=1
         elif wiz_port_bound "$T_PORT"; then
-            bad "something here already listens on udp/$T_PORT"
+            bad "something here already listens on $T_TRANSPORT/$T_PORT"
             fix "ss -lnup | grep :$T_PORT   shows what has it"
             clash=1
         fi

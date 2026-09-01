@@ -109,6 +109,18 @@ func (w *ReplayWindow) Fresh(seq uint32) bool {
 			return false
 		}
 		w.set(back)
+		// It was counted as missing when the packet after it arrived first,
+		// and here it is. Reordering was being reported as loss and as
+		// reordering at the same time, which on any path that reorders made
+		// the loss figure - the one number nothing else on either machine can
+		// show - the sum of two different things.
+		//
+		// It matters most to a carrier that spreads packets over several
+		// connections: there, packets arriving behind one another is the
+		// normal condition and not a fault at all.
+		if w.skipped > 0 {
+			w.skipped--
+		}
 		return true
 	}
 }

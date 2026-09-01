@@ -100,3 +100,37 @@ func TestTakeBufLeavesTheHeadroomAlone(t *testing.T) {
 	copy((*bp)[12:], make([]byte, 1320))
 	Put(bp)
 }
+
+// A packet that arrives behind a newer one was counted twice: once as missing
+// when the gap appeared, and once as late when it turned up. On a carrier that
+// spreads packets over several connections that is the normal condition, and
+// it made the loss figure the sum of two unrelated things.
+func TestALatePacketStopsBeingAMissingOne(t *testing.T) {
+	w := NewReplayWindow()
+	for _, seq := range []uint32{1, 2, 5, 3, 4} {
+		if !w.Fresh(seq) {
+			t.Fatalf("seq %d should have been fresh", seq)
+		}
+	}
+	missing, late, gaps := w.Lost()
+	if missing != 0 {
+		t.Errorf("missing = %d, want 0: 3 and 4 both arrived", missing)
+	}
+	if late != 2 {
+		t.Errorf("late = %d, want 2", late)
+	}
+	if gaps != 1 {
+		t.Errorf("gaps = %d, want 1", gaps)
+	}
+}
+
+// And a packet that never arrives is still missing.
+func TestAPacketThatNeverComesStaysMissing(t *testing.T) {
+	w := NewReplayWindow()
+	for _, seq := range []uint32{1, 2, 5, 4} {
+		w.Fresh(seq)
+	}
+	if missing, _, _ := w.Lost(); missing != 1 {
+		t.Errorf("missing = %d, want 1: 3 never came", missing)
+	}
+}

@@ -137,6 +137,14 @@ func max64(a, b uint64) uint64 {
 	return b
 }
 
+// since is now minus then, and never less than nothing.
+func since(now, then uint64) uint64 {
+	if now < then {
+		return 0
+	}
+	return now - then
+}
+
 func reportEvery(every time.Duration, c carrier.Full, l *link.Link) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
@@ -157,9 +165,16 @@ func reportEvery(every time.Duration, c carrier.Full, l *link.Link) {
 		// one at a time are noise a congestion window shrugs off; the same
 		// number arriving in runs is a window halved once per run.
 		if missing, late, gaps := c.Lost(); missing != lastMissing || late != lastLate {
-			run := float64(missing-lastMissing) / float64(max64(gaps-lastGaps, 1))
+			// since is a subtraction that cannot go backwards. The missing
+			// count does go backwards now - a packet that arrives late stops
+			// being a missing one - and an unsigned subtraction that went
+			// negative printed "the path lost 18446744073709551551", which is
+			// how this was found.
+			lost := since(missing, lastMissing)
+			gapped := since(gaps, lastGaps)
+			run := float64(lost) / float64(max64(gapped, 1))
 			logging.Info("the path lost %d and reordered %d in the last %s (%d gaps, %.0f packets each)",
-				missing-lastMissing, late-lastLate, every, gaps-lastGaps, run)
+				lost, since(late, lastLate), every, gapped, run)
 			lastMissing, lastLate, lastGaps = missing, late, gaps
 		}
 		if errs > 0 {

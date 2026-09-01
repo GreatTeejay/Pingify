@@ -381,8 +381,9 @@ func (c *icmpCarrier) Close() error {
 func (c *icmpCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
 
 func (c *icmpCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
+	bad, replay = c.fr.counted()
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
-		c.fr.badTag, c.fr.replayed,
+		bad, replay,
 		atomic.LoadUint64(&c.sendErrs) + atomic.LoadUint64(&c.dropped)
 }
 

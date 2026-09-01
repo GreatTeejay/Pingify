@@ -245,7 +245,7 @@ chk_forward_spec() {
 
 health_check() {
     local name=$1 mode=${2:-}
-    local core_ver out st since addr fl live_mtu lpm heard
+    local core_ver out st since addr fl live_mtu lpm heard cc
     local spec proto lo hi rhost rport total missing unknown
 
     chk_reset
@@ -383,12 +383,31 @@ health_check() {
             fi
             ;;
         *)
-            if [ "$CK_TRANSPORT" = icmp ]; then
+            case $CK_TRANSPORT in
+            icmp)
                 chk_add bad peer "the far end has never been seen" \
                     "on KHAREJ:  systemctl status pingify@$name" \
                     "watch there:  tcpdump -ni any icmp" \
-                    "if nothing arrives at all, use udp instead"
-            else
+                    "if nothing arrives at all, try tcp or udp"
+                ;;
+            tcp)
+                # TCP is the one transport whose far end can be tested from
+                # here without the tunnel: a connection either opens or it
+                # does not, and which of the two it is decides where to look.
+                if [ "$CK_SIDE" = iran ] && tcp_reach "$CK_KHAREJ" "$CK_PORT"; then
+                    chk_add bad peer \
+                        "tcp/$CK_PORT is open there, but nothing pingify sent has come back" \
+                        "the token differs between the two servers" \
+                        "compare:  grep token $CK_FILE   on both" \
+                        "or something else is answering on that port there"
+                else
+                    chk_add bad peer "the far end has never been seen" \
+                        "on KHAREJ:  systemctl status pingify@$name" \
+                        "open it there:  ufw allow $CK_PORT/tcp" \
+                        "from here:  nc -zv $CK_KHAREJ $CK_PORT"
+                fi
+                ;;
+            *)
                 # Bare again: the address on this line is a hostname somebody
                 # else chose, so the prefix is the only part of it there is
                 # room to give up.
@@ -397,7 +416,8 @@ health_check() {
                     "open it there:  ufw allow $CK_PORT/udp" \
                     "nc -uzv $CK_KHAREJ $CK_PORT" \
                     "a token edited on one side only does this"
-            fi
+                ;;
+            esac
             ;;
         esac
 
@@ -519,6 +539,26 @@ health_check() {
             fi
             [ "$unknown" -gt 0 ] &&
                 chk_add note ports-udp "$unknown are udp and cannot be tested here"
+        fi
+    fi
+
+    # A stream carrier on a path that drops packets lives or dies by the
+    # kernel's congestion control, and this is not a preference. Measured on
+    # the Tehran to Frankfurt pair, the same tunnel, minutes apart:
+    #
+    #	cubic    31 Mbit/s over sixteen streams
+    #	bbr     348
+    #
+    # Cubic reads a dropped packet as congestion and halves the window. On a
+    # path that drops packets for reasons of its own, that is a window that
+    # never opens again. It is worth a warning rather than a note because the
+    # tunnel is carrying a tenth of what it could.
+    if [ "$CK_TRANSPORT" = tcp ]; then
+        cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+        if [ -n "$cc" ] && [ "$cc" != bbr ]; then
+            chk_add warn bbr "a tcp tunnel, and this kernel is on $cc" \
+                "measured here: bbr carried 348 Mbit/s where cubic carried 31" \
+                "pingify, 4 Host tuning, 2 BBR - on both servers"
         fi
     fi
 
