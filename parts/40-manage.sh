@@ -493,6 +493,8 @@ delete_tunnel() {
     # The link underneath goes with it, and its config file with the private
     # key in it goes too.
     awg_down "$name" 2>/dev/null || true
+    [ "$(toml_get "$(cfg_file "$name")" transport type)" = rawtcp ] &&
+        rawtcp_unguard "$(toml_get "$(cfg_file "$name")" transport port)" 2>/dev/null
     rm -f "$(cfg_file "$name")" "$STATE_DIR/$name.forwards"
     ok "$name is gone"
     pause

@@ -481,6 +481,7 @@ q_transport() {
     item "5" "ICMP" "inside ping packets - no open port at all"
     item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
     item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
+    item "8" "Raw TCP" "packets inside TCP segments the kernel never sees"
     blank
     dim "sixteen streams, Tehran to Frankfurt:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
@@ -496,7 +497,11 @@ q_transport() {
     dim "it, which is a limit no setting on either can get around. Where UDP"
     dim "lives, both are good - AmneziaWG is also the only encrypted one here."
     blank
-    pick n "select" 1 7 || return 1
+    dim "Raw TCP looks like TCP on the wire and behaves like UDP above it: no"
+    dim "handshake, no retransmit, and none of the head-of-line waiting a real"
+    dim "TCP tunnel pays for. It needs iptables, and root."
+    blank
+    pick n "select" 1 8 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
@@ -507,6 +512,7 @@ q_transport() {
     7) T_TRANSPORT=awg
        awg_install || return 1
        ;;
+    8) T_TRANSPORT=rawtcp ;;
     esac
     return 0
 }
@@ -901,13 +907,26 @@ tunnel_create() {
     # first. If it will not, the tunnel is not started: a carrier dialling an
     # address on a link that does not exist would sit there reporting nothing
     # is wrong except that the far end has never been seen.
-    if [ "$(toml_get "$f" transport type)" = awg ]; then
+    case $(toml_get "$f" transport type) in
+    awg)
         if ! awg_up "$name"; then
             rm -f "$f"
             return 1
         fi
         ok "the AmneziaWG link $(awg_iface "$name") is up"
-    fi
+        ;;
+    rawtcp)
+        # Without this the kernel answers our own segments with an RST and
+        # the tunnel resets itself every few seconds.
+        if ! rawtcp_guard "$(toml_get "$f" transport port)"; then
+            bad "could not tell the firewall to stop answering for this port"
+            fix "iptables is needed for a raw tcp tunnel"
+            rm -f "$f"
+            return 1
+        fi
+        ok "the kernel will not answer on tcp/$(toml_get "$f" transport port)"
+        ;;
+    esac
 
     # svc_do enable returns the truth about is-active and prints the journal
     # when it failed. Returning its status is the point: the old caller printed
