@@ -6679,11 +6679,12 @@ wiz_ask() {
 
 q_side() {
     local n
-    wiz_ask "Which server is this?"
+    wiz_ask "Side"
     blank
     item "1" "IRAN" "clients connect here, and the ports live here"
     item "2" "KHAREJ" "your panel and inbounds run here"
     item "3" "Paste a token" "finish this server from the other one"
+    blank
     blank
     dim "q at any question leaves without building anything"
     blank
@@ -6728,7 +6729,7 @@ q_addresses() {
     local -a addrs=()
     [ "$T_SIDE" = kharej ] && other=IRAN
 
-    wiz_ask "The two servers"
+    wiz_ask "Endpoints"
     blank
     # A name rather than an address is the whole of the CDN arrangement, and
     # it is one word rather than a question: a name can only ever front the
@@ -6771,7 +6772,7 @@ q_addresses() {
 
 q_transport() {
     local n
-    wiz_ask "How it crosses"
+    wiz_ask "Transport"
     blank
     item "1" "UDP" "a packet in, a packet out, nothing in the way"
     item "2" "TCP" "one open port, where a network carries only TCP"
@@ -6849,7 +6850,7 @@ wiz_path() {
 
 q_link() {
     local def n a dev addr
-    wiz_ask "The private link"
+    wiz_ask "Tunnel network"
     blank
     dim "A pair of addresses nothing else on either machine uses. Pick the"
     dim "middle number; both are worked out from it."
@@ -6888,7 +6889,7 @@ q_link() {
 # buys is how the old tuning menu came to be scrolled past.
 q_profile() {
     local n
-    wiz_ask "What crosses this link"
+    wiz_ask "Profile"
     blank
     item "1" "Gaming" "600 packets - a small one waits behind less"
     item "2" "Balanced" "900 packets - the one to pick if unsure"
@@ -7775,7 +7776,7 @@ edit_profile() {
 
     screen_top
     blank
-    rule "What crosses this link"
+    rule "Profile"
     blank
     profile_row 1 gaming "$cur" "600 packets - a small one waits behind less"
     profile_row 2 balanced "$cur" "900 packets - the one to pick if unsure"
