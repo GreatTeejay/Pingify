@@ -104,6 +104,16 @@ type streamCarrier struct {
 // tunnel names: behind a CDN the dialling side asks for a port on the CDN's
 // edge, and the edge connects to this origin on a port of its own choosing.
 func newStreamCarrier(cfg *config.Config, kind string, head int) (*streamCarrier, error) {
+	return newStreamCarrierOn(cfg, kind, head, nil)
+}
+
+// newStreamCarrierOn is the same with the listening socket handed in, for a
+// transport whose idea of a connection is not a TCP one. KCP's listener is a
+// UDP socket that hands out sessions; everything above it here is unchanged,
+// which is the point of the split.
+func newStreamCarrierOn(cfg *config.Config, kind string, head int,
+	ln net.Listener) (*streamCarrier, error) {
+
 	n := cfg.Transport.Connections
 	c := &streamCarrier{
 		cfg:   cfg,
@@ -114,12 +124,17 @@ func newStreamCarrier(cfg *config.Config, kind string, head int) (*streamCarrier
 		done:  make(chan struct{}),
 	}
 	if cfg.Dials() {
+		if ln != nil {
+			_ = ln.Close()
+		}
 		smoothTheWire(cfg)
 		return c, nil
 	}
-	ln, err := net.Listen("tcp4", fmt.Sprintf(":%d", cfg.ListenPort()))
-	if err != nil {
-		return nil, fmt.Errorf("listen on tcp/%d: %v", cfg.ListenPort(), err)
+	if ln == nil {
+		var err error
+		if ln, err = net.Listen("tcp4", fmt.Sprintf(":%d", cfg.ListenPort())); err != nil {
+			return nil, fmt.Errorf("listen on tcp/%d: %v", cfg.ListenPort(), err)
+		}
 	}
 	c.ln = ln
 	smoothTheWire(cfg)
