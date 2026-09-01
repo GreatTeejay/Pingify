@@ -73,41 +73,134 @@ install_self() {
 # home
 # --------------------------------------------------------------------------
 
-# The keys tunnels are given, in order. The fixed actions own n p h u x q and
-# 0, so none of those appear here: a key that means "Uninstall" on a server
-# with four tunnels and "the fifth tunnel" on a server with five is how
-# somebody uninstalls from muscle memory.
-HOME_KEYS='123456789abcdefgijklmorstvwyz'
-HOME_NAMES=()
+# --------------------------------------------------------------------------
+# what this machine is, and what Pingify is doing on it
+# --------------------------------------------------------------------------
 
-# The line under the name: which core, which side of the border this server is
-# on, and how long the machine has been up. The side is here rather than in
-# every row because one server is one side - the config's `side` line is the
-# only thing that differs between the two ends, and it is the same in all of
-# this server's configs.
-home_subtitle() {
-    local core=$G_DASH side= up= rest= first=
+# srv_info fills in the three lines at the top of the home screen: the address
+# the outside world sees this server at, and where that address is.
+#
+# It is cached in a file and read back from there. The home screen is drawn
+# again every time you come back to it, and a lookup over the network inside
+# that loop is the difference between a manager that answers at once and one
+# that stops for six seconds on every return. A datacentre does not move: the
+# cache is a week old before anything is fetched again.
+#
+# None of it is required. A server with no route out shows the address on its
+# own interface and says plainly that it does not know the rest, because
+# "not known from here" in a panel is information and a blank line is a bug.
+SRV_TTL_DAYS=7
+
+srv_info() {
+    [ -n "${SRV_IP:-}" ] && return 0
+    local cache=$STATE_DIR/server.info j
+
+    if [ -f "$cache" ] && [ -z "$(find "$cache" -mtime "+$SRV_TTL_DAYS" 2>/dev/null)" ]; then
+        IFS='|' read -r SRV_IP SRV_LOC SRV_ORG <"$cache"
+    fi
+
+    # One request, three fields, six seconds at the outside. The address being
+    # looked up is this server's own. json_field is no use here - it reads the
+    # core's output, which is one field to a line, and this arrives as one.
+    if [ -z "${SRV_IP:-}" ] && have curl; then
+        j=$(curl -fsS --max-time 6 \
+            'http://ip-api.com/json/?fields=query,country,isp' 2>/dev/null)
+        SRV_IP=$(printf '%s' "$j" | sed -n 's/.*"query":"\([^"]*\)".*/\1/p')
+        SRV_LOC=$(printf '%s' "$j" | sed -n 's/.*"country":"\([^"]*\)".*/\1/p')
+        SRV_ORG=$(printf '%s' "$j" | sed -n 's/.*"isp":"\([^"]*\)".*/\1/p')
+        [ -n "$SRV_IP" ] &&
+            printf '%s|%s|%s\n' "$SRV_IP" "$SRV_LOC" "$SRV_ORG" >"$cache"
+    fi
+
+    [ -n "${SRV_IP:-}" ] || SRV_IP=$(wiz_public_ip)
+    [ -n "${SRV_IP:-}" ] || SRV_IP=$G_DASH
+    [ -n "${SRV_LOC:-}" ] || SRV_LOC="not known from here"
+    [ -n "${SRV_ORG:-}" ] || SRV_ORG="not known from here"
+    return 0
+}
+
+# home_panels is the two boxes under the name.
+#
+# Everything on them is one file read or one systemctl call, because they are
+# drawn again on every return to this screen. The side of the border is here
+# rather than on every tunnel row: one server is one side - `side` is the only
+# line that differs between the two ends - so it is the same in all of this
+# server's configs and belongs with the server, not with a tunnel.
+home_panels() {
+    local n st side= up=0 off=0 total=0 core=$G_DASH core_txt tun_txt dog secs rest
+
+    while IFS= read -r n; do
+        total=$((total + 1))
+        st=$(svc_state "$n")
+        [ "$st" = active ] && up=$((up + 1))
+        [ "$st" = disabled ] && off=$((off + 1))
+        [ -n "$side" ] || side=$(toml_get "$(cfg_file "$n")" tunnel side)
+    done < <(cfg_list)
+
+    case $side in
+    iran) side="IRAN $G_DASH users connect here" ;;
+    kharej) side="KHAREJ $G_DASH your panel is here" ;;
+    *) side="not decided yet" ;;
+    esac
+
+    srv_info
+    blank
+    panel_open "SERVER"
+    panel_field "IP" "$SRV_IP"
+    panel_field "Location" "$SRV_LOC"
+    panel_field "Datacenter" "$SRV_ORG"
+    panel_field "Side" "$side"
+    panel_close
+    blank
+
     # A core that is installed but will not run - built for another
     # architecture, or truncated - returns 1 with nothing on stdout, and the
-    # assignment used to keep that empty string: the banner then read
-    # "core   |  IRAN" with a hole where the version belongs. Put the dash
-    # back on either failure.
+    # assignment used to keep that empty string, so the line read "core" with
+    # a hole where the version belongs. Put the dash back on either failure.
     if [ -x "$CORE_BIN" ]; then
         core=$(core_version) || core=$G_DASH
         [ -n "$core" ] || core=$G_DASH
     fi
+    if [ "$core" = "$G_DASH" ]; then
+        core_txt="${C_BAD}not installed${C_OFF}"
+    elif [ "$core" = "$PINGIFY_VERSION" ]; then
+        core_txt=$core
+    else
+        # Not a detail. A core and a script from two versions is the one
+        # combination neither of them is built to work in.
+        core_txt="$core ${C_WARN}$G_DASH the script is $PINGIFY_VERSION${C_OFF}"
+    fi
 
-    while IFS= read -r first; do break; done < <(cfg_list)
-    [ -n "$first" ] && side=$(toml_get "$(cfg_file "$first")" tunnel side)
-    case $side in
-    iran) side=IRAN ;;
-    kharej) side=KHAREJ ;;
-    *) side="no tunnel yet" ;;
-    esac
+    if [ "$total" = 0 ]; then
+        tun_txt="$(state_dot none) none configured"
+        dog="$(state_dot none) nothing to watch yet"
+    else
+        if [ "$up" = "$total" ]; then
+            tun_txt="$(state_dot running) $up of $total up"
+        elif [ "$up" = 0 ]; then
+            tun_txt="$(state_dot stopped) none of $total up"
+        else
+            tun_txt="$(state_dot idle) $up of $total up"
+        fi
+        # There is no separate watchdog process and there should not be one.
+        # systemd is the watchdog: the unit brings a tunnel back two seconds
+        # after it dies. What can be wrong is a tunnel that was never enabled,
+        # so that is what this line reports.
+        if [ "$off" = 0 ]; then
+            dog="$(state_dot running) on, a dead tunnel is back in 2s"
+        else
+            dog="$(state_dot idle) $off not started at boot"
+        fi
+    fi
 
-    read -r up rest </proc/uptime 2>/dev/null || up=
-    printf 'core %s  %s  %s  %s  up %s' \
-        "$core" "$G_V" "$side" "$G_V" "$(human_secs "${up%%.*}")"
+    read -r secs rest </proc/uptime 2>/dev/null || secs=
+    panel_open "STATUS"
+    panel_field "Core ver" "$core_txt"
+    panel_field "Script ver" "$PINGIFY_VERSION"
+    panel_field "Tunnels" "$tun_txt"
+    panel_field "Watchdog" "$dog"
+    panel_field "Uptime" "$(human_secs "${secs%%.*}")"
+    panel_close
 }
 
 # home_row is one tunnel, and it is also the menu item for that tunnel. The
@@ -146,7 +239,11 @@ home_row() {
     disabled) dot=unknown ;;
     esac
 
-    row " $key $(state_dot "$dot")" "$name" "${transport^^}" "$rtt" "$rate"
+    # The key is right aligned in two columns so that the tenth tunnel's dot
+    # stands in the same place as the first one's, and so that the blank key
+    # --status passes costs the line nothing.
+    row "$(printf '%2s' "$key") $(state_dot "$dot")" \
+        "$name" "${transport^^}" "$rtt" "$rate"
 }
 
 # The widths the tunnel list is drawn at, in one place, because home and
@@ -167,71 +264,142 @@ home_cols() {
     UI_COLS=(4 "$nw" 6 8 17)
 }
 
+# The home screen: the name, the two panels, whatever is running, and a
+# numbered list of everything that can be done from here.
+#
+# The numbers are fixed, and that is the point of them. They were letters, and
+# the tunnels themselves were keys on this screen, so the key for Uninstall
+# moved down the alphabet every time somebody added a tunnel. Nothing here
+# moves now: 7 is Remove on a server with no tunnels and on a server with ten.
 screen_home() {
-    local n i=0 key
-    HOME_NAMES=()
-    while IFS= read -r n; do HOME_NAMES+=("$n"); done < <(cfg_list)
+    local n names=()
+    while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
-    banner "$(home_subtitle)"
+    banner
+    home_panels
+
+    if [ "${#names[@]}" -gt 0 ]; then
+        blank
+        group "RUNNING NOW"
+        home_cols
+        for n in "${names[@]}"; do home_row "$n" " "; done
+    fi
+
     blank
     group "TUNNELS"
-    if [ "${#HOME_NAMES[@]}" -eq 0 ]; then
-        blank
-        dim "no tunnels on this server yet."
-        dim "press n to build one, or to paste the line the other server gave you."
-    else
-        home_cols
-        while [ "$i" -lt "${#HOME_NAMES[@]}" ]; do
-            key=${HOME_KEYS:i:1}
-            home_row "${HOME_NAMES[i]}" "$key"
-            i=$((i + 1))
-        done
-    fi
+    item 1 "New tunnel" "six questions, or one paste"
+    item 2 "Manage tunnels" "ports, profile, logs, remove"
+    item 3 "Health check" "every tunnel, and the fix"
     blank
-    item "n" "New tunnel"
-    blank
-    group "HOST"
-    item "p" "Ports and firewall"
-    item2 "h" "Host tuning" "$(host_summary)"
+    group "NETWORK"
+    item 4 "Host tuning" "$(host_summary)"
+    item 5 "Blocking" "ping, QUIC, speedtest sites"
     blank
     group "MAINTENANCE"
-    item "u" "Update"
-    item "x" "Uninstall"
-    item "0" "Exit"
+    item 6 "Update Pingify" "script and core together"
+    item 7 "Remove" "part of it, or all of it"
+    blank
+    item 0 "Exit"
     blank
 }
 
-# home_pick turns a keystroke back into the tunnel it was drawn beside.
-home_pick() {
-    local k=$1 i=0
-    while [ "$i" -lt "${#HOME_NAMES[@]}" ]; do
-        [ "${HOME_KEYS:i:1}" = "$k" ] && { printf '%s' "${HOME_NAMES[i]}"; return 0; }
-        i=$((i + 1))
+# screen_tunnels is the list, and the way into one of them.
+#
+# One tunnel is the common case and it does not deserve a screen of its own:
+# with one there is nothing to choose, so this goes straight in. The list is
+# read again on the way back out of a tunnel, because the last thing that
+# screen offers is deleting it, and a tunnel that has just been deleted must
+# not still be on the list you are returned to.
+screen_tunnels() {
+    local names=() n i k
+    while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+
+    if [ "${#names[@]}" -eq 0 ]; then
+        blank
+        warn "there are no tunnels on this server yet"
+        fix "choose 1 to build one, or to paste the line the other server gave you"
+        pause
+        return 0
+    fi
+    if [ "${#names[@]}" -eq 1 ]; then
+        screen_tunnel "${names[0]}"
+        return 0
+    fi
+
+    while :; do
+        blank
+        rule "Tunnels"
+        blank
+        home_cols
+        i=0
+        while [ "$i" -lt "${#names[@]}" ]; do
+            home_row "${names[i]}" "$((i + 1))"
+            i=$((i + 1))
+        done
+        blank
+        item 0 "Back"
+        blank
+
+        menu_key k || return 0
+        case $k in
+        0 | '') return 0 ;;
+        *[!0-9]*) blank; warn "there is nothing on $k" ;;
+        *)
+            if [ "$k" -ge 1 ] && [ "$k" -le "${#names[@]}" ]; then
+                screen_tunnel "${names[k - 1]}"
+                names=()
+                while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+                [ "${#names[@]}" -eq 0 ] && return 0
+            else
+                blank
+                warn "there is nothing on $k"
+            fi
+            ;;
+        esac
     done
-    return 1
+}
+
+# screen_health runs the check over every tunnel rather than over one.
+#
+# The worst answer is the one that is kept. Returning whatever the last check
+# said would tell a server whose second tunnel of three is broken that it was
+# clean, because the third one was.
+screen_health() {
+    local names=() n rc=0 one
+    while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+
+    if [ "${#names[@]}" -eq 0 ]; then
+        blank
+        warn "there are no tunnels to check yet"
+        pause
+        return 0
+    fi
+    for n in "${names[@]}"; do
+        health_check "$n" || { one=$?; [ "$one" -gt "$rc" ] && rc=$one; }
+    done
+    pause
+    return "$rc"
 }
 
 main_menu() {
-    local c name
+    local c
     while :; do
         screen_home
         menu_key c || return 0
         case $c in
-        n) screen_new ;;
-        p) screen_firewall ;;
-        h) screen_host ;;
-        u) update_pingify ;;
-        x) uninstall_all && exit 0 ;;
+        1) screen_new ;;
+        2) screen_tunnels ;;
+        3) screen_health ;;
+        4) screen_host ;;
+        5) screen_firewall ;;
+        6) update_pingify ;;
+        7) uninstall_all && exit 0 ;;
+        # q is not on the screen and works anyway: it is what every question
+        # in the wizard takes for "let me out of this", and somebody who
+        # learned it there types it here.
         0 | q | Q) blank; return 0 ;;
         '') ;;
-        *)
-            if name=$(home_pick "$c"); then
-                screen_tunnel "$name"
-            else
-                blank
-                warn "there is nothing on $c"
-            fi
-            ;;
+        *) blank; warn "there is nothing on $c" ;;
         esac
     done
 }
@@ -488,7 +656,7 @@ uninstall_all() {
     blank
     # 2, not 1. Saying no is a decision rather than a failure, and main turns
     # this into an exit 0 so that `pingify --uninstall` does not report an
-    # error for a deliberate no. It cannot simply be 0 either: the menu's x key
+    # error for a deliberate no. It cannot simply be 0 either: the Remove key
     # exits the program when this function succeeds, and a decline has to leave
     # the operator on the screen they were looking at.
     confirm "remove all of that?" n || { dim "nothing was removed"; return 2; }
@@ -633,7 +801,7 @@ main() {
             ok "everything is on $PINGIFY_VERSION"
         else
             bad "the manager was updated but its core could not be built"
-            fix "run pingify and choose Update again once the reason is fixed"
+            fix "run pingify and choose 6, Update Pingify, once the reason is fixed"
             exit 1
         fi
         ;;

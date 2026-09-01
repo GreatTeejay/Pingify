@@ -170,7 +170,7 @@ screen_tunnel() {
         item 3 "Live view"
         blank
         group "CHECK"
-        item 4 "Health check          what is wrong, and what to do about it"
+        item 4 "Health check" "what is wrong, and the fix"
         item 5 "Log"
         item 6 "Measure MTU"
         item 7 "Speed test"
@@ -182,8 +182,8 @@ screen_tunnel() {
             item2 8 "Ports" "IRAN forwards them, not this side"
         fi
         item2 9 "Profile" "$prof"
-        item a "Advanced             mtu, log level, what it says"
-        item d "Delete this tunnel"
+        item 10 "Advanced" "mtu, log level, queues"
+        item 11 "Delete this tunnel"
         item 0 "Back"
         blank
 
@@ -200,8 +200,8 @@ screen_tunnel() {
         8) [ "$side" = iran ] && { screen_ports "$name"; } ||
             { warn "ports are forwarded from the IRAN side"; pause; } ;;
         9) edit_profile "$name" ;;
-        a | A) screen_advanced "$name" ;;
-        d | D) delete_tunnel "$name" && return 0 ;;
+        10) screen_advanced "$name" ;;
+        11) delete_tunnel "$name" && return 0 ;;
         0 | '') return 0 ;;
         esac
     done

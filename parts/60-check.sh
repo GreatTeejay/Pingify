@@ -260,7 +260,7 @@ health_check() {
     # doing, so a missing core makes the rest unanswerable rather than failed.
     if [ ! -x "$CORE_BIN" ]; then
         chk_add bad core "the core is not installed at $CORE_BIN" \
-            "choose Update in pingify to build or fetch it"
+            "run pingify and choose 6, Update Pingify"
         chk_add note core-rest "nothing below could be checked without it"
         chk_finish "$name" "$mode"
         return 2
