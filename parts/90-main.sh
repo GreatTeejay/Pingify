@@ -210,7 +210,7 @@ home_panels() {
 # The round trip is measured only for a tunnel that is running: probing a
 # stopped one costs three seconds of ping timeout for an answer already known.
 home_row() {
-    local name=$1 key=$2 st=stopped dot=stopped rtt=$G_DASH rate= transport=
+    local name=$1 key=$2 st=stopped dot=stopped rtt=$G_DASH up=$G_DASH rate= transport=
     st=$(svc_state "$name")
     transport=$(toml_get "$(cfg_file "$name")" transport type)
     [ -n "$transport" ] || transport=udp
@@ -220,13 +220,18 @@ home_row() {
     active)
         dot=idle
         if tun_stats "$name"; then
+            # How long this tunnel has been carrying, which is not how long
+            # the machine has been up and not how long the unit has existed:
+            # it is the core's own clock, so a tunnel that has been quietly
+            # restarting every few minutes says so here.
+            up=$(human_secs "$ST_UPTIME")
             # Green means somebody is at the other end, which is not what the
             # core's up says on the side that dials: there, up is true from
             # the first second because the address was in the config. Amber
             # for running-and-alone, which is what the dot has always meant.
             [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ] && dot=running
             [ -n "$ST_TRANSPORT" ] && transport=$ST_TRANSPORT
-            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT") Mbit/s"
+            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
         else
             rate="no answer"
         fi
@@ -246,7 +251,17 @@ home_row() {
     # stands in the same place as the first one's, and so that the blank key
     # --status passes costs the line nothing.
     row "$(printf '%2s' "$key") $(state_dot "$dot")" \
-        "$name" "${transport^^}" "$rtt" "$rate"
+        "$name" "${transport^^}" "$up" "$rtt" "$rate"
+}
+
+# The names of the columns, once, above them.
+#
+# Five numbers with no headings is a row somebody has to be told how to read.
+# It is dim because it is not the data, and it goes through row() like every
+# line under it, so a column cannot be renamed into the wrong place.
+home_head() {
+    printf '%s%s%s\n' "$C_KEY" \
+        "$(row "" "TUNNEL" "VIA" "UP" "PING" "MBIT/S")" "$C_OFF"
 }
 
 # The widths the tunnel list is drawn at, in one place, because home and
@@ -258,13 +273,16 @@ home_row() {
 # characters v_name allows and no further. A wide window should not stretch one
 # column across half the screen.
 home_cols() {
-    local nw=$((UI_W - 46))
+    local nw=$((UI_W - 50))
     # 24, not 26. v_name refuses a twenty-fifth character, so the two columns
     # of slack above it could never hold anything and only pushed the numbers
     # further from the name they belong to.
     [ "$nw" -gt 24 ] && nw=24
     [ "$nw" -lt 8 ] && nw=8
-    UI_COLS=(4 "$nw" 6 8 17)
+    # key and dot, name, transport, uptime, round trip, and the two rates.
+    # The rates lose their unit to make room for the uptime; the heading over
+    # the column carries it instead, which is where a unit belongs.
+    UI_COLS=(4 "$nw" 6 7 8 12)
 }
 
 # The home screen: the name, the two panels, whatever is running, and a
@@ -278,6 +296,7 @@ screen_home() {
     local n names=()
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
+    wipe
     banner
     home_panels
 
@@ -285,6 +304,7 @@ screen_home() {
         blank
         group "RUNNING NOW"
         home_cols
+        home_head
         for n in "${names[@]}"; do home_row "$n" " "; done
     fi
 
@@ -316,6 +336,7 @@ screen_home() {
 screen_tunnels() {
     local names=() n i k
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+    wipe
 
     if [ "${#names[@]}" -eq 0 ]; then
         blank
@@ -334,6 +355,7 @@ screen_tunnels() {
         rule "Tunnels"
         blank
         home_cols
+        home_head
         i=0
         while [ "$i" -lt "${#names[@]}" ]; do
             home_row "${names[i]}" "$((i + 1))"
@@ -370,6 +392,7 @@ screen_tunnels() {
 screen_health() {
     local names=() n rc=0 one
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+    wipe
 
     if [ "${#names[@]}" -eq 0 ]; then
         blank
@@ -461,6 +484,7 @@ cmd_status() {
     fi
 
     home_cols
+    home_head
     for n in "${names[@]}"; do
         home_row "$n" " "
         [ "$(svc_state "$n")" = active ] || rc=1
@@ -551,6 +575,7 @@ PINGIFY_REPO=${PINGIFY_REPO:-GreatTeejay/Pingify}
 
 update_pingify() {
     local tmp rc=1 url
+    wipe
     blank
     rule "Update"
     blank
@@ -658,6 +683,7 @@ uninstall_all() {
     local names=() n keep=yes unit rc=0 units=0
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
+    wipe
     blank
     rule "Uninstall"
     field "manager" "$PINGIFY_BIN"

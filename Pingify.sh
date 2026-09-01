@@ -190,6 +190,24 @@ rep() {
 # the pieces a screen is made of
 # --------------------------------------------------------------------------
 
+# wipe clears the screen at the top of a screen, and only there.
+#
+# The rule the rest of the script follows is that nothing is thrown away: over
+# a link with a hundred milliseconds of delay and real loss, scrollback is
+# where you look when the connection stutters. So this moves the cursor home
+# and erases what is on the screen, and does not touch the scrollback buffer -
+# everything drawn before is still a page up. A screen opens clean; the
+# history it opened from is still there.
+#
+# Not between the wizard's questions. Those answers stay on the page above the
+# one being asked, which is what you want when you are copying the same
+# numbers onto a second server.
+wipe() {
+    [ -t 1 ] || return 0
+    [ "$UI_COLOR" = none ] && return 0
+    printf '\033[H\033[2J'
+}
+
 say() { printf '%s\n' "$*"; }
 blank() { printf '\n'; }
 dim() { printf '  %s%s%s\n' "$C_MUTE" "$*" "$C_OFF"; }
@@ -4640,8 +4658,13 @@ wiz_port_bound() {
 # rather than from a lookup service. The first server is in Iran on a path that
 # blocks half the internet, so a wizard that pauses to curl an address service
 # is a wizard that hangs where it is hardest to debug.
-wiz_public_ip() {
-    local a
+# Every address of this server the outside world could reach, one to a line.
+#
+# The private ranges are struck out, carrier grade NAT included: an address in
+# 100.64/10 is one the machine's provider handed it behind a shared public one,
+# and a config naming it is a config nothing outside that provider can dial.
+wiz_public_ips() {
+    local a found=1
     for a in $(ip -4 -o addr show scope global 2>/dev/null |
         awk '$3 == "inet" { sub("/.*", "", $4); print $4 }'); do
         case $a in
@@ -4649,10 +4672,17 @@ wiz_public_ip() {
             172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | \
             100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) continue ;;
         esac
-        printf '%s' "$a"
-        return 0
+        printf '%s\n' "$a"
+        found=0
     done
-    return 1
+    return "$found"
+}
+
+wiz_public_ip() {
+    local a
+    a=$(wiz_public_ips | head -1)
+    [ -n "$a" ] || return 1
+    printf '%s' "$a"
 }
 
 # --------------------------------------------------------------------------
@@ -4801,20 +4831,28 @@ v_wiz_paste() {
 WIZ_STEP=0
 wiz_ask() {
     WIZ_STEP=$((WIZ_STEP + 1))
-    rule "$WIZ_STEP - $1"
+    rule "$WIZ_STEP $G_DOT $1"
 }
 
 q_side() {
     local n
     wiz_ask "Which server is this?"
     blank
-    item "1" "IRAN" "users connect here, dials out"
-    item "2" "KHAREJ" "your panel runs here; waits"
+    item "1" "IRAN" "clients connect here, and the ports live here"
+    item "2" "KHAREJ" "your panel and inbounds run here"
+    item "3" "Paste a token" "finish this server from the other one"
     blank
-    pick n "select" 1 2 || return 1
+    dim "q at any question leaves without building anything"
+    blank
+    pick n "select" 1 3 || return 1
     case $n in
     1) T_SIDE=iran ;;
     2) T_SIDE=kharej ;;
+    # Not a side. It is the other way in, and it is here rather than on a menu
+    # of its own because "which server is this" is the first thing anybody
+    # knows about the server they are sitting on, and finishing the second one
+    # is the commonest answer of the three.
+    3) T_SIDE=paste ;;
     esac
     return 0
 }
@@ -4824,12 +4862,40 @@ q_side() {
 # the other for "the local", and the two answers were the same address written
 # from two points of view, which is how the pair came to disagree.
 q_kharej() {
-    local def=
+    local def= n i=0
+    local -a addrs=()
     wiz_ask "The server abroad"
     blank
-    dim "Both servers name it, so the file is the same on each."
+    dim "Both servers name this one, so the file is the same on each."
     blank
-    [ "$T_SIDE" = kharej ] && def=$(wiz_public_ip)
+
+    if [ "$T_SIDE" = kharej ]; then
+        while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
+        # A server with more than one address is a server where the wrong one
+        # writes a config the far end cannot reach - and nothing says so until
+        # IRAN has been dialling nothing for a while. So it is asked, not
+        # guessed, and only when there is something to choose between.
+        if [ "${#addrs[@]}" -gt 1 ]; then
+            dim "this server answers on more than one address"
+            dim "pick the one IRAN should dial"
+            blank
+            while [ "$i" -lt "${#addrs[@]}" ]; do
+                item "$((i + 1))" "${addrs[i]}"
+                i=$((i + 1))
+            done
+            item "$((i + 1))" "Something else" "a hostname, or an address not listed"
+            blank
+            pick n "select" 1 $((i + 1)) || return 1
+            if [ "$n" -le "${#addrs[@]}" ]; then
+                T_KHAREJ=${addrs[n - 1]}
+                return 0
+            fi
+            blank
+        else
+            def=${addrs[0]:-}
+        fi
+    fi
+
     ask T_KHAREJ "address of the KHAREJ server" "$def" v_host || return 1
     return 0
 }
@@ -4838,13 +4904,15 @@ q_transport() {
     local n
     wiz_ask "How it crosses"
     blank
-    item "1" "UDP" "fastest, and usually right"
-    dim "        one open port on KHAREJ is all it needs"
+    item "1" "UDP" "one open port on KHAREJ - fast, and usual"
+    item "2" "ICMP" "inside ping packets - no port at all"
     blank
-    item "2" "ICMP" "ping packets; no open port"
-    dim "        nothing to block by port, so it survives"
-    dim "        where UDP does not. While it runs neither"
-    dim "        server answers an ordinary ping, on purpose."
+    dim "UDP is the one to pick unless the path will not carry it. ICMP goes"
+    dim "where a port cannot be opened or a port is being blocked, and it costs"
+    dim "a little speed for that."
+    blank
+    dim "While an ICMP tunnel runs neither server answers an ordinary ping. That"
+    dim "is deliberate, and no screen here reads it as a fault."
     blank
     pick n "select" 1 2 || return 1
     case $n in
@@ -4927,16 +4995,17 @@ q_link() {
 # buys is how the old tuning menu came to be scrolled past.
 q_profile() {
     local n
-    local -a UI_COLS=(14 11 11 14)
     wiz_ask "What crosses this link"
     blank
-    row "" "16 streams" "one stream" "under load"
-    row "  1  Gaming" "397 Mbit/s" "167 Mbit/s" "84.5 / 92.5 ms"
-    row "$G_CUR 2  Balanced" "448" "254" "93.3 / 106.5"
-    row "  3  Download" "466" "253" "115.8 / 139.3"
+    item "1" "Gaming" "600 packets - a small one waits behind less"
+    item "2" "Balanced" "900 packets - the one to pick if unsure"
+    item "3" "Download" "1500 packets - most on a long transfer"
     blank
-    dim "Balanced is not the middle of the three: it carries one"
-    dim "stream faster than either. Idle ping is 81 ms for all."
+    dim "A profile sets one number: how many packets may wait in the tunnel's"
+    dim "queue. A deeper queue carries more at once and holds a packet longer;"
+    dim "a shallower one answers sooner and gives up some throughput for it."
+    blank
+    dim "It can be changed later, on either server, without rebuilding anything."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -5203,12 +5272,19 @@ wizard_new() {
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
+    wipe
     blank
-    rule "Build a new tunnel"
-    dim "q at any question leaves without building anything"
+    rule "New tunnel"
     blank
 
     q_side || return 1
+    # The third answer to the first question is not a side. It is the other
+    # way in: on the second server everything this wizard would ask is already
+    # inside the token the first one printed, so there is nothing to ask.
+    if [ "$T_SIDE" = paste ]; then
+        wizard_paste
+        return $?
+    fi
     blank
     q_kharej || return 1
     blank
@@ -5279,7 +5355,7 @@ wizard_paste() {
     local line f err a own n clash moved
     WIZ_QUIT=0
     blank
-    rule "Finish the pair"
+    rule "Paste a token"
     blank
     dim "Paste the line the first server printed. It carries"
     dim "the whole config, so there is nothing left to answer."
@@ -5425,20 +5501,15 @@ wizard_paste() {
 # on purpose - a question with a numbered list of answers must not accept a
 # number that is not one of them. Navigation screens have a Back key; questions
 # do not.
+# The way in, and there is only one now.
+#
+# There were two, on a menu of their own: build a tunnel, or finish the pair.
+# It was a screen that asked which of two wizards you wanted before either had
+# said anything, and the answer is the same thing the first question of the
+# wizard asks anyway - which server am I sitting on. So the menu is gone and
+# "Paste a token" is the third answer to that question.
 screen_new() {
-    local k
-    blank
-    rule "New tunnel"
-    blank
-    item2 "1" "Build a new tunnel" "five or six questions"
-    item2 "2" "Finish the pair" "one paste"
-    item "0" "Back"
-    blank
-    menu_key k || return 0
-    case $k in
-    1) wizard_new ;;
-    2) wizard_paste ;;
-    esac
+    wizard_new
     return 0
 }
 #!/usr/bin/env bash
@@ -5463,9 +5534,19 @@ screen_new() {
 # reads the log, because a log line is prose and prose gets reworded - the old
 # manager took the eighth field of an English sentence and broke the day
 # somebody improved the sentence.
+# The queue depth beside the profile's name. "balanced" on its own does not
+# say what it does, and the depth is the whole of what a profile changes.
+prof_queue_note() {
+    local f=$1 q
+    q=$(toml_get "$f" tuning queue_packets)
+    [ -n "$q" ] || q=$(wiz_queue "$(toml_get "$f" tuning profile)")
+    [ -n "$q" ] || return 0
+    printf ' %s %s packets' "$G_DASH" "$q"
+}
+
 tun_line() {
     local name=$1 state
-    TL_STATE=unknown TL_RATE= TL_PEER= TL_RTT= TL_TRANSPORT= TL_SIDE=
+    TL_STATE=unknown TL_RATE= TL_PEER= TL_RTT= TL_TRANSPORT= TL_SIDE= TL_UPTIME=
 
     local f
     f=$(cfg_file "$name")
@@ -5490,7 +5571,8 @@ tun_line() {
         else
             TL_STATE=idle
         fi
-        TL_RATE="$(round1 "$ST_IN")/$(round1 "$ST_OUT") Mbit/s"
+        TL_RATE="$(round1 "$ST_IN") in, $(round1 "$ST_OUT") out"
+        TL_UPTIME=$(human_secs "$ST_UPTIME")
     else
         # The unit is up but the endpoint does not answer. That is a real
         # state and it is not a failure to report in red: it happens for the
@@ -5537,7 +5619,11 @@ tun_rtt() {
     t=$(toml_get "$(cfg_file "$name")" transport type)
     [ "$t" = icmp ] && return 0
     have ping || return 0
-    out=$(ping -c 2 -W 2 -q "$(peer_addr "$name")" 2>/dev/null |
+    # Two packets a fifth of a second apart, and one second to wait. This is
+    # on the path of every redraw of the home screen: -c 2 -W 2 meant a tunnel
+    # whose far end had stopped answering cost four seconds of nothing before
+    # the menu appeared, once for every tunnel on the server.
+    out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
         awk -F'/' '/^rtt|^round-trip/ {printf "%.0f", $5}')
     printf '%s' "$out"
 }
@@ -5552,6 +5638,7 @@ screen_tunnel() {
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
 
     while :; do
+        wipe
         tun_line "$name"
         blank
         printf '  %s%s%s%s%s %s\n' "$C_B" "$name" "$C_OFF" \
@@ -5568,35 +5655,42 @@ screen_tunnel() {
         dev=$(toml_get "$f" tun name)
         prof=$(toml_get "$f" tuning profile)
 
+        # What this server is, in one line, said the way round that matters:
+        # which end dials and which end waits. The old line said "iran" and
+        # left the reader to remember which of the two does what.
         if [ "$side" = iran ]; then
             if [ "$transport" = icmp ]; then
-                field "Side" "IRAN, dials $kharej over icmp"
+                field "This end" "IRAN $G_DASH dials $kharej inside ping packets"
             else
-                field "Side" "IRAN, dials $kharej:$port/udp"
+                field "This end" "IRAN $G_DASH dials $kharej on udp/$port"
             fi
         else
             if [ "$transport" = icmp ]; then
-                field "Side" "KHAREJ, waits for echo"
+                field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
             else
-                field "Side" "KHAREJ, waits on udp/$port"
+                field "This end" "KHAREJ $G_DASH waits on udp/$port"
             fi
         fi
         field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
 
+        # One measurement to a line, each with the name of what it is. They
+        # were one line with two numbers on it and nothing saying which was
+        # which, five blank columns apart.
         if [ -n "$TL_RATE" ]; then
-            local rtt=$TL_RTT
-            if [ -n "$rtt" ]; then
-                field "Carrying" "$TL_RATE      $(rtt_colour "$rtt")$rtt ms$C_OFF"
-            else
-                field "Carrying" "$TL_RATE"
-            fi
+            field "Traffic" "$TL_RATE  Mbit/s"
         fi
+        if [ -n "$TL_RTT" ]; then
+            field "Round trip" "$(rtt_colour "$TL_RTT")$TL_RTT ms$C_OFF"
+        elif [ "$transport" = icmp ]; then
+            field "Round trip" "$C_MUTE""not measurable across an ICMP tunnel""$C_OFF"
+        fi
+        [ -n "${TL_UPTIME:-}" ] && field "Up for" "$TL_UPTIME"
 
         # Losses only when there are some. A line saying zero every time is a
         # line people stop reading, and then they do not see it change.
         if [ -n "${ST_LOST:-}" ] && [ "${ST_LOST:-0}" -gt 0 ]; then
             local per=$((ST_LOST / (ST_GAPS > 0 ? ST_GAPS : 1)))
-            field "Path took" "$ST_LOST packets in $ST_GAPS runs, about $per at a time"
+            field "Path lost" "$ST_LOST packets in $ST_GAPS gaps, about $per at a time"
         fi
 
         local fw
@@ -5606,27 +5700,27 @@ screen_tunnel() {
         blank
         group "RUN"
         case $TL_STATE in
-        stopped | disabled) item 1 "Start" ;;
-        *) item 1 "Restart" ;;
+        stopped | disabled) item 1 "Start" "and start it again at every boot" ;;
+        *) item 1 "Restart" "stop it and start it again" ;;
         esac
-        item 2 "Stop"
-        item 3 "Live view"
+        item 2 "Stop" "until you start it, or the server reboots"
+        item 3 "Live view" "the numbers above, once a second"
         blank
         group "CHECK"
-        item 4 "Health check" "what is wrong, and the fix"
-        item 5 "Log"
-        item 6 "Measure MTU"
-        item 7 "Speed test"
+        item 4 "Health check" "what is wrong, and what to do about it"
+        item 5 "Log" "the last forty lines the core wrote"
+        item 6 "Measure MTU" "the largest packet this path will carry"
+        item 7 "Speed test" "iperf3 across the tunnel, sixteen streams"
         blank
         group "CHANGE"
         if [ "$side" = iran ]; then
-            item2 8 "Ports" "${fw:-none}"
+            item2 8 "Ports" "${fw:-nothing is forwarded yet}"
         else
             item2 8 "Ports" "IRAN forwards them, not this side"
         fi
-        item2 9 "Profile" "$prof"
-        item 10 "Advanced" "mtu, log level, queues"
-        item 11 "Delete this tunnel"
+        item2 9 "Profile" "$prof$(prof_queue_note "$f")"
+        item 10 "Advanced" "mtu, log level, queue depth, the file itself"
+        item 11 "Delete this tunnel" "here only - the other server keeps its copy"
         item 0 "Back"
         blank
 
@@ -5657,6 +5751,7 @@ pause() {
 }
 
 show_log() {
+    wipe
     blank
     rule "Log $G_DASH $1"
     blank
@@ -5676,17 +5771,20 @@ edit_profile() {
     local name=$1 cur choice
     cur=$(toml_get "$(cfg_file "$name")" tuning profile)
 
+    wipe
     blank
     rule "What crosses this link"
     blank
-    printf '    %s%s%s\n' "$C_KEY" \
-        "$(pad_to '' 14)16 streams   one stream   under load" "$C_OFF"
-    profile_row 1 gaming "$cur" "397 Mbit/s" "167 Mbit/s" "84.5 / 92.5 ms"
-    profile_row 2 balanced "$cur" "448" "254" "93.3 / 106.5"
-    profile_row 3 download "$cur" "466" "253" "115.8 / 139.3"
+    profile_row 1 gaming "$cur" "600 packets - a small one waits behind less"
+    profile_row 2 balanced "$cur" "900 packets - the one to pick if unsure"
+    profile_row 3 download "$cur" "1500 packets - most on a long transfer"
     blank
-    dim "Balanced is not the middle: it carries one stream faster than either"
-    dim "of the others. Idle ping is 81 ms whichever you choose."
+    dim "A profile sets one number: how many packets may wait in the tunnel's"
+    dim "queue. A deeper queue carries more at once and holds a packet longer;"
+    dim "a shallower one answers sooner and gives up some throughput for it."
+    blank
+    dim "Both servers should be on the same one. Changing it restarts the"
+    dim "tunnel here, which costs a second of traffic and nothing else."
     blank
 
     local def=2
@@ -5721,19 +5819,25 @@ edit_profile() {
 
 _edit_profile() { toml_set "$1" tuning profile "$PROFILE_WANT"; }
 
+# One profile, with a mark against the one this tunnel is on now.
+#
+# It is item() with that mark written over the left margin rather than a line
+# of its own, so the three of them line up with every other menu in the script
+# and there is only one place that decides how a menu line looks.
 profile_row() {
-    local key=$1 name=$2 cur=$3 a=$4 b=$5 c=$6 mark=' '
-    [ "$name" = "$cur" ] && mark=$G_CUR
-    printf '  %s%s%s %s%s%s  %s%s%s%s\n' \
-        "$C_ACCENT" "$mark" "$C_OFF" \
-        "$C_ACCENT" "$key" "$C_OFF" \
-        "$(pad_to "${name^}" 11)" "$(pad_to "$a" 13)" "$(pad_to "$b" 13)" "$c"
+    local key=$1 name=$2 cur=$3 hint=$4 line mark=' '
+    # A dot, not the same arrow the line already has: two arrows on one line
+    # is a line where neither of them means anything.
+    [ "$name" = "$cur" ] && mark=$G_ON
+    line=$(item "$key" "${name^}" "$hint")
+    printf ' %s%s%s%s\n' "$C_OK" "$mark" "$C_OFF" "${line#  }"
 }
 
 screen_advanced() {
     local name=$1 f k q qs
     f=$(cfg_file "$name")
     while :; do
+        wipe
         # Two of these are not in the file until somebody sets them: the
         # profile carries the queue depth, and the core picks the number of
         # device queues. Reading the file alone drew "Queue depth  packets,
@@ -6477,6 +6581,7 @@ screen_ports() {
     local name=$1 f side peer cur tuples proto lo hi dsth dstp key
     f=$(cfg_file "$name")
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
+    wipe
 
     while :; do
         side=$(toml_get "$f" tunnel side)
@@ -7636,10 +7741,15 @@ revert_tuning() {
 screen_host() {
     local key p n bbr cc qd
     while :; do
+        wipe
         blank
         rule "Host tuning"
-        dim "the kernel's own settings. The tunnel's queue profile is a different"
-        dim "thing with the same three names, and it lives on the tunnel screen."
+        dim "The kernel's own network settings, which apply to everything this"
+        dim "server does, not only to the tunnel. Every change is written to one"
+        dim "drop-in file and can be taken back from this screen."
+        blank
+        dim "A tunnel's queue profile is a different thing with the same three"
+        dim "names; it lives on that tunnel's screen."
         blank
         p=$(host_profile)
         bbr=$(host_bbr_state)
@@ -7657,10 +7767,11 @@ screen_host() {
         field "Open files" "$(ulimit -n) here, $([ -f "$HOST_LIMITS" ] && printf '1048576 at next login' || printf 'unchanged at login')"
         field "Drop-in" "$HOST_SYSCTL"
         blank
-        item2 "1" "Profile" "${p:-none}"
-        item2 "2" "BBR" "$bbr"
-        item2 "3" "Descriptor limits" "$([ -f "$HOST_LIMITS" ] && printf 'raised' || printf 'not raised')"
-        item "4" "Revert everything this screen did"
+        item2 "1" "Profile" "${p:-none applied}"
+        item2 "2" "BBR" "$bbr $G_DASH the congestion control the kernel uses"
+        item2 "3" "Descriptor limits" \
+            "$([ -f "$HOST_LIMITS" ] && printf 'raised to 1048576' || printf 'left at the distribution default')"
+        item "4" "Revert" "put every setting on this screen back"
         item "0" "Back"
         blank
         menu_key key || return 0
@@ -7668,10 +7779,13 @@ screen_host() {
         1)
             blank
             group "WHAT THIS MACHINE MOSTLY CARRIES"
-            item "1" "Gaming" "small queues; less waiting"
-            item "2" "Balanced" "pick this one if unsure"
-            item "3" "Download" "deep queues, for bulk"
+            item "1" "Gaming" "smaller socket buffers, so a reply waits less"
+            item "2" "Balanced" "the one to pick if the answer is everything"
+            item "3" "Download" "larger buffers, for long transfers"
             item "0" "Back"
+            blank
+            dim "This sets the kernel's socket buffer sizes and backlog. It is"
+            dim "written to $HOST_SYSCTL and applied at once."
             blank
             # menu_key rather than pick, because this screen was reached from
             # a menu and every one of those has a numeric way back out. pick
@@ -8066,6 +8180,7 @@ why_block_quic() {
 screen_firewall() {
     local key
     while :; do
+        wipe
         blank
         rule "Blocking"
         dim "state lives in $STATE_DIR. Every apply flushes our two chains and"
@@ -8329,7 +8444,7 @@ home_panels() {
 # The round trip is measured only for a tunnel that is running: probing a
 # stopped one costs three seconds of ping timeout for an answer already known.
 home_row() {
-    local name=$1 key=$2 st=stopped dot=stopped rtt=$G_DASH rate= transport=
+    local name=$1 key=$2 st=stopped dot=stopped rtt=$G_DASH up=$G_DASH rate= transport=
     st=$(svc_state "$name")
     transport=$(toml_get "$(cfg_file "$name")" transport type)
     [ -n "$transport" ] || transport=udp
@@ -8339,13 +8454,18 @@ home_row() {
     active)
         dot=idle
         if tun_stats "$name"; then
+            # How long this tunnel has been carrying, which is not how long
+            # the machine has been up and not how long the unit has existed:
+            # it is the core's own clock, so a tunnel that has been quietly
+            # restarting every few minutes says so here.
+            up=$(human_secs "$ST_UPTIME")
             # Green means somebody is at the other end, which is not what the
             # core's up says on the side that dials: there, up is true from
             # the first second because the address was in the config. Amber
             # for running-and-alone, which is what the dot has always meant.
             [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ] && dot=running
             [ -n "$ST_TRANSPORT" ] && transport=$ST_TRANSPORT
-            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT") Mbit/s"
+            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
         else
             rate="no answer"
         fi
@@ -8365,7 +8485,17 @@ home_row() {
     # stands in the same place as the first one's, and so that the blank key
     # --status passes costs the line nothing.
     row "$(printf '%2s' "$key") $(state_dot "$dot")" \
-        "$name" "${transport^^}" "$rtt" "$rate"
+        "$name" "${transport^^}" "$up" "$rtt" "$rate"
+}
+
+# The names of the columns, once, above them.
+#
+# Five numbers with no headings is a row somebody has to be told how to read.
+# It is dim because it is not the data, and it goes through row() like every
+# line under it, so a column cannot be renamed into the wrong place.
+home_head() {
+    printf '%s%s%s\n' "$C_KEY" \
+        "$(row "" "TUNNEL" "VIA" "UP" "PING" "MBIT/S")" "$C_OFF"
 }
 
 # The widths the tunnel list is drawn at, in one place, because home and
@@ -8377,13 +8507,16 @@ home_row() {
 # characters v_name allows and no further. A wide window should not stretch one
 # column across half the screen.
 home_cols() {
-    local nw=$((UI_W - 46))
+    local nw=$((UI_W - 50))
     # 24, not 26. v_name refuses a twenty-fifth character, so the two columns
     # of slack above it could never hold anything and only pushed the numbers
     # further from the name they belong to.
     [ "$nw" -gt 24 ] && nw=24
     [ "$nw" -lt 8 ] && nw=8
-    UI_COLS=(4 "$nw" 6 8 17)
+    # key and dot, name, transport, uptime, round trip, and the two rates.
+    # The rates lose their unit to make room for the uptime; the heading over
+    # the column carries it instead, which is where a unit belongs.
+    UI_COLS=(4 "$nw" 6 7 8 12)
 }
 
 # The home screen: the name, the two panels, whatever is running, and a
@@ -8397,6 +8530,7 @@ screen_home() {
     local n names=()
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
+    wipe
     banner
     home_panels
 
@@ -8404,6 +8538,7 @@ screen_home() {
         blank
         group "RUNNING NOW"
         home_cols
+        home_head
         for n in "${names[@]}"; do home_row "$n" " "; done
     fi
 
@@ -8435,6 +8570,7 @@ screen_home() {
 screen_tunnels() {
     local names=() n i k
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+    wipe
 
     if [ "${#names[@]}" -eq 0 ]; then
         blank
@@ -8453,6 +8589,7 @@ screen_tunnels() {
         rule "Tunnels"
         blank
         home_cols
+        home_head
         i=0
         while [ "$i" -lt "${#names[@]}" ]; do
             home_row "${names[i]}" "$((i + 1))"
@@ -8489,6 +8626,7 @@ screen_tunnels() {
 screen_health() {
     local names=() n rc=0 one
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
+    wipe
 
     if [ "${#names[@]}" -eq 0 ]; then
         blank
@@ -8580,6 +8718,7 @@ cmd_status() {
     fi
 
     home_cols
+    home_head
     for n in "${names[@]}"; do
         home_row "$n" " "
         [ "$(svc_state "$n")" = active ] || rc=1
@@ -8670,6 +8809,7 @@ PINGIFY_REPO=${PINGIFY_REPO:-GreatTeejay/Pingify}
 
 update_pingify() {
     local tmp rc=1 url
+    wipe
     blank
     rule "Update"
     blank
@@ -8777,6 +8917,7 @@ uninstall_all() {
     local names=() n keep=yes unit rc=0 units=0
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
+    wipe
     blank
     rule "Uninstall"
     field "manager" "$PINGIFY_BIN"

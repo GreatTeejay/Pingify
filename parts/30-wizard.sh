@@ -132,8 +132,13 @@ wiz_port_bound() {
 # rather than from a lookup service. The first server is in Iran on a path that
 # blocks half the internet, so a wizard that pauses to curl an address service
 # is a wizard that hangs where it is hardest to debug.
-wiz_public_ip() {
-    local a
+# Every address of this server the outside world could reach, one to a line.
+#
+# The private ranges are struck out, carrier grade NAT included: an address in
+# 100.64/10 is one the machine's provider handed it behind a shared public one,
+# and a config naming it is a config nothing outside that provider can dial.
+wiz_public_ips() {
+    local a found=1
     for a in $(ip -4 -o addr show scope global 2>/dev/null |
         awk '$3 == "inet" { sub("/.*", "", $4); print $4 }'); do
         case $a in
@@ -141,10 +146,17 @@ wiz_public_ip() {
             172.1[6-9].* | 172.2[0-9].* | 172.3[01].* | \
             100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) continue ;;
         esac
-        printf '%s' "$a"
-        return 0
+        printf '%s\n' "$a"
+        found=0
     done
-    return 1
+    return "$found"
+}
+
+wiz_public_ip() {
+    local a
+    a=$(wiz_public_ips | head -1)
+    [ -n "$a" ] || return 1
+    printf '%s' "$a"
 }
 
 # --------------------------------------------------------------------------
@@ -293,20 +305,28 @@ v_wiz_paste() {
 WIZ_STEP=0
 wiz_ask() {
     WIZ_STEP=$((WIZ_STEP + 1))
-    rule "$WIZ_STEP - $1"
+    rule "$WIZ_STEP $G_DOT $1"
 }
 
 q_side() {
     local n
     wiz_ask "Which server is this?"
     blank
-    item "1" "IRAN" "users connect here, dials out"
-    item "2" "KHAREJ" "your panel runs here; waits"
+    item "1" "IRAN" "clients connect here, and the ports live here"
+    item "2" "KHAREJ" "your panel and inbounds run here"
+    item "3" "Paste a token" "finish this server from the other one"
     blank
-    pick n "select" 1 2 || return 1
+    dim "q at any question leaves without building anything"
+    blank
+    pick n "select" 1 3 || return 1
     case $n in
     1) T_SIDE=iran ;;
     2) T_SIDE=kharej ;;
+    # Not a side. It is the other way in, and it is here rather than on a menu
+    # of its own because "which server is this" is the first thing anybody
+    # knows about the server they are sitting on, and finishing the second one
+    # is the commonest answer of the three.
+    3) T_SIDE=paste ;;
     esac
     return 0
 }
@@ -316,12 +336,40 @@ q_side() {
 # the other for "the local", and the two answers were the same address written
 # from two points of view, which is how the pair came to disagree.
 q_kharej() {
-    local def=
+    local def= n i=0
+    local -a addrs=()
     wiz_ask "The server abroad"
     blank
-    dim "Both servers name it, so the file is the same on each."
+    dim "Both servers name this one, so the file is the same on each."
     blank
-    [ "$T_SIDE" = kharej ] && def=$(wiz_public_ip)
+
+    if [ "$T_SIDE" = kharej ]; then
+        while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
+        # A server with more than one address is a server where the wrong one
+        # writes a config the far end cannot reach - and nothing says so until
+        # IRAN has been dialling nothing for a while. So it is asked, not
+        # guessed, and only when there is something to choose between.
+        if [ "${#addrs[@]}" -gt 1 ]; then
+            dim "this server answers on more than one address"
+            dim "pick the one IRAN should dial"
+            blank
+            while [ "$i" -lt "${#addrs[@]}" ]; do
+                item "$((i + 1))" "${addrs[i]}"
+                i=$((i + 1))
+            done
+            item "$((i + 1))" "Something else" "a hostname, or an address not listed"
+            blank
+            pick n "select" 1 $((i + 1)) || return 1
+            if [ "$n" -le "${#addrs[@]}" ]; then
+                T_KHAREJ=${addrs[n - 1]}
+                return 0
+            fi
+            blank
+        else
+            def=${addrs[0]:-}
+        fi
+    fi
+
     ask T_KHAREJ "address of the KHAREJ server" "$def" v_host || return 1
     return 0
 }
@@ -330,13 +378,15 @@ q_transport() {
     local n
     wiz_ask "How it crosses"
     blank
-    item "1" "UDP" "fastest, and usually right"
-    dim "        one open port on KHAREJ is all it needs"
+    item "1" "UDP" "one open port on KHAREJ - fast, and usual"
+    item "2" "ICMP" "inside ping packets - no port at all"
     blank
-    item "2" "ICMP" "ping packets; no open port"
-    dim "        nothing to block by port, so it survives"
-    dim "        where UDP does not. While it runs neither"
-    dim "        server answers an ordinary ping, on purpose."
+    dim "UDP is the one to pick unless the path will not carry it. ICMP goes"
+    dim "where a port cannot be opened or a port is being blocked, and it costs"
+    dim "a little speed for that."
+    blank
+    dim "While an ICMP tunnel runs neither server answers an ordinary ping. That"
+    dim "is deliberate, and no screen here reads it as a fault."
     blank
     pick n "select" 1 2 || return 1
     case $n in
@@ -419,16 +469,17 @@ q_link() {
 # buys is how the old tuning menu came to be scrolled past.
 q_profile() {
     local n
-    local -a UI_COLS=(14 11 11 14)
     wiz_ask "What crosses this link"
     blank
-    row "" "16 streams" "one stream" "under load"
-    row "  1  Gaming" "397 Mbit/s" "167 Mbit/s" "84.5 / 92.5 ms"
-    row "$G_CUR 2  Balanced" "448" "254" "93.3 / 106.5"
-    row "  3  Download" "466" "253" "115.8 / 139.3"
+    item "1" "Gaming" "600 packets - a small one waits behind less"
+    item "2" "Balanced" "900 packets - the one to pick if unsure"
+    item "3" "Download" "1500 packets - most on a long transfer"
     blank
-    dim "Balanced is not the middle of the three: it carries one"
-    dim "stream faster than either. Idle ping is 81 ms for all."
+    dim "A profile sets one number: how many packets may wait in the tunnel's"
+    dim "queue. A deeper queue carries more at once and holds a packet longer;"
+    dim "a shallower one answers sooner and gives up some throughput for it."
+    blank
+    dim "It can be changed later, on either server, without rebuilding anything."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -695,12 +746,19 @@ wizard_new() {
     T_NAME= T_DEV= T_TOKEN= T_MTU=1320 T_STATUS=
     WIZ_STEP=0
 
+    wipe
     blank
-    rule "Build a new tunnel"
-    dim "q at any question leaves without building anything"
+    rule "New tunnel"
     blank
 
     q_side || return 1
+    # The third answer to the first question is not a side. It is the other
+    # way in: on the second server everything this wizard would ask is already
+    # inside the token the first one printed, so there is nothing to ask.
+    if [ "$T_SIDE" = paste ]; then
+        wizard_paste
+        return $?
+    fi
     blank
     q_kharej || return 1
     blank
@@ -771,7 +829,7 @@ wizard_paste() {
     local line f err a own n clash moved
     WIZ_QUIT=0
     blank
-    rule "Finish the pair"
+    rule "Paste a token"
     blank
     dim "Paste the line the first server printed. It carries"
     dim "the whole config, so there is nothing left to answer."
@@ -917,19 +975,14 @@ wizard_paste() {
 # on purpose - a question with a numbered list of answers must not accept a
 # number that is not one of them. Navigation screens have a Back key; questions
 # do not.
+# The way in, and there is only one now.
+#
+# There were two, on a menu of their own: build a tunnel, or finish the pair.
+# It was a screen that asked which of two wizards you wanted before either had
+# said anything, and the answer is the same thing the first question of the
+# wizard asks anyway - which server am I sitting on. So the menu is gone and
+# "Paste a token" is the third answer to that question.
 screen_new() {
-    local k
-    blank
-    rule "New tunnel"
-    blank
-    item2 "1" "Build a new tunnel" "five or six questions"
-    item2 "2" "Finish the pair" "one paste"
-    item "0" "Back"
-    blank
-    menu_key k || return 0
-    case $k in
-    1) wizard_new ;;
-    2) wizard_paste ;;
-    esac
+    wizard_new
     return 0
 }
