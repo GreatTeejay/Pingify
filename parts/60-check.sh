@@ -213,10 +213,24 @@ tcp_reach() {
 # The forwarding part owns the port spec and where it is kept; this only reads
 # it. When forwarding was never set up the check says nothing about ports
 # rather than inventing a failure out of an absent file.
+#
+# The path comes from fwd_file rather than being spelled out a second time
+# here. It used to read $STATE_DIR/$1.ports, a name nothing has ever written -
+# the forwarding part writes $1.forwards - so the file was never found, section
+# 7 always took the absent-file branch, and a server forwarding six ports was
+# told in grey that it forwards none, with any dead backend behind them never
+# reported at all.
 chk_forward_spec() {
-    local f=$STATE_DIR/$1.ports
+    local f
+    declare -F fwd_file >/dev/null 2>&1 || return 1
+    f=$(fwd_file "$1")
     [ -f "$f" ] || return 1
-    tr -d '\r\n' <"$f"
+    # The tokens are stored one per line. Deleting the newlines glued 443 and
+    # 8080 into 4438080, forward_specs refused that as one impossible port, and
+    # the check told the user to set the list again about a list that was fine.
+    # fwd_tokens splits on newlines as readily as on commas, so the file is
+    # passed on as it stands.
+    cat "$f"
 }
 
 # --------------------------------------------------------------------------
@@ -289,9 +303,14 @@ health_check() {
         chk_add ok service "running since ${since:-a moment ago}"
         ;;
     stopped)
+        # The command goes on the fix line bare. The old "read why:  " prefix
+        # spent ten columns of a 46-column budget, so any tunnel name over ten
+        # characters wrapped, and fix() pads rather than cuts, so the wrapped
+        # half landed hard against the left margin and read as a line of its
+        # own.
         chk_add bad service "the service is enabled but not running" \
             "systemctl start pingify@$name" \
-            "read why:  journalctl -u pingify@$name -n 30"
+            "journalctl -u pingify@$name -n 30"
         ;;
     *)
         chk_add bad service "the service is neither running nor enabled" \
@@ -333,8 +352,15 @@ health_check() {
     # the link can be up, the config right and the service running with no
     # packet from over there having ever arrived.
     if tun_stats "$name"; then
+        # Only the word true. up is a Go bool in the core's report, so the
+        # value is true or false and never 1 or yes, and accepting those two
+        # here made this section disagree with the loss check and the speed
+        # test below, which both test for true alone. Had the core ever
+        # answered 1, this line would have said the far end was there while
+        # the loss check vanished and the speed test called the same tunnel
+        # unseen.
         case $ST_UP in
-        true | 1 | yes)
+        true)
             chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
             ;;
         *)
@@ -344,10 +370,13 @@ health_check() {
                     "watch there:  tcpdump -ni any icmp" \
                     "if nothing arrives at all, use udp instead"
             else
+                # Bare again: the address on this line is a hostname somebody
+                # else chose, so the prefix is the only part of it there is
+                # room to give up.
                 chk_add bad peer "the far end has never been seen" \
                     "on KHAREJ:  systemctl status pingify@$name" \
                     "open it there:  ufw allow $CK_PORT/udp" \
-                    "from here:  nc -uzv $CK_KHAREJ $CK_PORT" \
+                    "nc -uzv $CK_KHAREJ $CK_PORT" \
                     "a token edited on one side only does this"
             fi
             ;;
@@ -403,6 +432,13 @@ health_check() {
             total=0 missing=0 unknown=0
             while read -r proto lo hi rhost rport; do
                 [ -n "$proto" ] || continue
+                # forward_specs writes - in the destination column when the
+                # token named no host, and it means "the far end of this
+                # tunnel"; nat_rules_for substitutes the peer address before it
+                # builds a rule. This did not, so a plain 443 forward probed
+                # the host called - , always failed, and every ordinary forward
+                # drew a warning telling the operator to listen on -:443.
+                [ "$rhost" = - ] && rhost=$CK_PEER
                 total=$((total + 1))
                 if [ "$proto" != tcp ]; then
                     # There is no way to ask a udp port whether anybody is
@@ -447,12 +483,18 @@ health_check() {
 # chk_finish picks the renderer. One place, so an early return in health_check
 # cannot forget the --json case and print a screen at a caller that wanted
 # something a machine could read.
+#
+# Both spellings of the mode word are matched, and that is not tidiness. main
+# calls health_check with the bare word json, while this tested only for
+# --json, so `pingify --check NAME --json` rendered the escape-coded human
+# screen into whatever script was parsing it and exited 0, 1 or 2 as though it
+# had answered. Taking either word means neither side can break it again by
+# settling on the other one.
 chk_finish() {
-    if [ "$2" = --json ]; then
-        chk_json "$1"
-    else
-        chk_render "$1"
-    fi
+    case ${2:-} in
+    json | --json) chk_json "$1" ;;
+    *) chk_render "$1" ;;
+    esac
 }
 
 # --------------------------------------------------------------------------
@@ -648,7 +690,12 @@ measure_mtu() {
         blank
         if [ "$CK_MTU" != 1280 ] && confirm "set the mtu to 1280?" n; then
             MTU_WANT=1280
-            cfg_apply "$name" mtu_editor restart &&
+            # yes, not restart. cfg_apply compares its third argument against
+            # the word yes, so the literal restart passed here read as "do not
+            # restart" - and cfg_apply still returned 0, so this printed a
+            # green line over a tunnel still running the old mtu until somebody
+            # happened to restart it by hand.
+            cfg_apply "$name" mtu_editor yes &&
                 ok "mtu 1280 - set the same number on KHAREJ"
         fi
         return 0
@@ -701,7 +748,9 @@ measure_mtu() {
     blank
     if confirm "set the mtu to $best?" y; then
         MTU_WANT=$best
-        if cfg_apply "$name" mtu_editor restart; then
+        # yes is the word cfg_apply tests for; restart quietly meant no, and
+        # the measured mtu sat in the file unused.
+        if cfg_apply "$name" mtu_editor yes; then
             ok "mtu $best"
             dim "Set the same on KHAREJ: the file is shared."
         fi

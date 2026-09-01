@@ -147,7 +147,7 @@ ensure_go() {
     fi
     blank
     dim "This is the one step that wants the network. It would fetch:"
-    field "from" "$url"
+    dim "  $url"
     field "size" "about 80 MB, roughly 250 MB unpacked"
     field "into" "/usr/local/go, deleting whatever is there now"
     blank
@@ -165,10 +165,10 @@ ensure_go() {
 
     tmp=$(mktemp) || return 1
     if have curl; then
-        curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url" >/dev/null 2>&1 &
+        curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url"             >"$STATE_DIR/fetch.log" 2>&1 &
         pid=$!
     elif have wget; then
-        wget -q -O "$tmp" "$url" &
+        wget -O "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1 &
         pid=$!
     else
         rm -f "$tmp"
@@ -182,19 +182,35 @@ ensure_go() {
     if [ "$rc" != 0 ]; then
         rm -f "$tmp"
         bad "the download failed, exit $rc"
+        [ -s "$STATE_DIR/fetch.log" ] &&
+            tail -n 3 "$STATE_DIR/fetch.log" | sed 's/^/       /'
         fix "from a machine that can reach it:  curl -fLO $url"
         fix "copy it here, then:  tar -C /usr/local -xzf go$tar_ver.linux-$arch.tar.gz"
         return 1
     fi
 
-    rm -rf /usr/local/go
-    if ! tar -C /usr/local -xzf "$tmp"; then
+    # Unpack beside whatever is there and swap only when it worked. Deleting
+    # first is how a truncated download leaves a server with no compiler at
+    # all - including the too-old one it had a minute ago - and the advice
+    # printed after that failure needs the network that just failed.
+    rm -rf /usr/local/go.new
+    if ! tar -C /usr/local --one-top-level=go.new --strip-components=1 -xzf "$tmp"; then
+        rm -rf /usr/local/go.new
         rm -f "$tmp"
         bad "the tarball would not unpack - it is probably a truncated download"
         fix "run this again, or unpack it by hand into /usr/local"
         return 1
     fi
     rm -f "$tmp"
+    if [ ! -x /usr/local/go.new/bin/go ]; then
+        rm -rf /usr/local/go.new
+        bad "the tarball unpacked but there is no bin/go in it"
+        return 1
+    fi
+    rm -rf /usr/local/go.old
+    [ -d /usr/local/go ] && mv /usr/local/go /usr/local/go.old
+    mv /usr/local/go.new /usr/local/go
+    rm -rf /usr/local/go.old
 
     if [ ! -x /usr/local/go/bin/go ]; then
         bad "the tarball unpacked but there is no /usr/local/go/bin/go in it"
@@ -260,7 +276,23 @@ build_core() {
         bad "the core built but would not install to $CORE_BIN"
         return 1
     fi
-    ok "core $(core_version) is installed at $CORE_BIN"
+    # Ask the binary that just landed. `ok "core $(core_version) ..."` reads as
+    # a check and is not one: the substitution runs inside an argument, so a
+    # core that will not exec - wrong architecture, most likely - prints
+    # "core  is installed" in green and returns success, and every later run
+    # rebuilds it from scratch and says the same thing again.
+    local here
+    here=$(core_version)
+    if [ -z "$here" ]; then
+        bad "the core installed but will not run - is $(arch_go) really this machine?"
+        return 1
+    fi
+    if [ "$here" != "$PINGIFY_VERSION" ]; then
+        bad "the core says it is $here and this script is $PINGIFY_VERSION"
+        fix "they are built from the same file, so this means a stale copy somewhere"
+        return 1
+    fi
+    ok "core $here is installed at $CORE_BIN"
     return 0
 }
 
