@@ -103,3 +103,46 @@ func attachICMPFilter(pc net.PacketConn, id uint16) error {
 	runtime.KeepAlive(prog)
 	return serr
 }
+
+// attachPortFilter is the same idea for the raw TCP carrier: deliver only
+// segments between our port and itself, and drop every other conversation on
+// the host before it is queued.
+//
+// Both ports are checked. A server carrying real traffic on the same port -
+// a web server on 443 with a raw TCP tunnel beside it - would otherwise hand
+// every one of its segments to this socket to be thrown away in Go.
+func attachPortFilter(pc net.PacketConn, port uint16) error {
+	sc, ok := pc.(syscall.Conn)
+	if !ok {
+		return errNoFilter
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	prog := []sockFilter{
+		{code: bpfLDX | bpfB | bpfMSH, k: 0},                   // X = IP header length
+		{code: bpfLD | bpfH | bpfIND, k: 0},                    // A = source port
+		{code: bpfJMP | bpfJEQ | bpfK, jf: 3, k: uint32(port)}, // ours? else drop
+		{code: bpfLD | bpfH | bpfIND, k: 2},                    // A = destination port
+		{code: bpfJMP | bpfJEQ | bpfK, jt: 1, k: uint32(port)}, // ours? else drop
+		{code: bpfRET | bpfK, k: 0},
+		{code: bpfRET | bpfK, k: bpfPass},
+	}
+	fprog := sockFprog{length: uint16(len(prog)), filter: &prog[0]}
+
+	var serr error
+	if err := rc.Control(func(fd uintptr) {
+		_, _, e := syscall.Syscall6(syscall.SYS_SETSOCKOPT, fd,
+			uintptr(syscall.SOL_SOCKET), uintptr(soAttachFilter),
+			uintptr(unsafe.Pointer(&fprog)), unsafe.Sizeof(fprog), 0)
+		if e != 0 {
+			serr = e
+		}
+	}); err != nil {
+		return err
+	}
+	runtime.KeepAlive(prog)
+	return serr
+}

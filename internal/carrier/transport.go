@@ -47,6 +47,8 @@ func Open(cfg *config.Config) (Full, error) {
 	// this core's queue, its counters, its status and its health port.
 	case "awg":
 		return newUDPCarrier(cfg)
+	case "rawtcp":
+		return newRawTCPCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }

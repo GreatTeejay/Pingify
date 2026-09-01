@@ -2939,6 +2939,49 @@ func attachICMPFilter(pc net.PacketConn, id uint16) error {
 	runtime.KeepAlive(prog)
 	return serr
 }
+
+// attachPortFilter is the same idea for the raw TCP carrier: deliver only
+// segments between our port and itself, and drop every other conversation on
+// the host before it is queued.
+//
+// Both ports are checked. A server carrying real traffic on the same port -
+// a web server on 443 with a raw TCP tunnel beside it - would otherwise hand
+// every one of its segments to this socket to be thrown away in Go.
+func attachPortFilter(pc net.PacketConn, port uint16) error {
+	sc, ok := pc.(syscall.Conn)
+	if !ok {
+		return errNoFilter
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return err
+	}
+
+	prog := []sockFilter{
+		{code: bpfLDX | bpfB | bpfMSH, k: 0},                   // X = IP header length
+		{code: bpfLD | bpfH | bpfIND, k: 0},                    // A = source port
+		{code: bpfJMP | bpfJEQ | bpfK, jf: 3, k: uint32(port)}, // ours? else drop
+		{code: bpfLD | bpfH | bpfIND, k: 2},                    // A = destination port
+		{code: bpfJMP | bpfJEQ | bpfK, jt: 1, k: uint32(port)}, // ours? else drop
+		{code: bpfRET | bpfK, k: 0},
+		{code: bpfRET | bpfK, k: bpfPass},
+	}
+	fprog := sockFprog{length: uint16(len(prog)), filter: &prog[0]}
+
+	var serr error
+	if err := rc.Control(func(fd uintptr) {
+		_, _, e := syscall.Syscall6(syscall.SYS_SETSOCKOPT, fd,
+			uintptr(syscall.SOL_SOCKET), uintptr(soAttachFilter),
+			uintptr(unsafe.Pointer(&fprog)), unsafe.Sizeof(fprog), 0)
+		if e != 0 {
+			serr = e
+		}
+	}); err != nil {
+		return err
+	}
+	runtime.KeepAlive(prog)
+	return serr
+}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/pace_linux.go" <<'PINGIFY_GO_SOURCE_EOF'
 //go:build linux
@@ -3259,6 +3302,416 @@ import (
 func smoothTheWire(cfg *config.Config) {}
 
 func pace(pc net.PacketConn, cfg *config.Config, done <-chan struct{}, sent func() uint64) {}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/portfilter_other.go" <<'PINGIFY_GO_SOURCE_EOF'
+//go:build !linux
+
+package carrier
+
+import "net"
+
+func attachPortFilter(net.PacketConn, uint16) error { return errNoFilter }
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/rawtcp.go" <<'PINGIFY_GO_SOURCE_EOF'
+package carrier
+
+import (
+	"encoding/binary"
+	"fmt"
+	"net"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+
+	"pingify/internal/buf"
+	"pingify/internal/config"
+	"pingify/internal/logging"
+)
+
+// Raw TCP: our datagrams inside TCP segments the kernel never sees.
+//
+// The stream carrier gives a path that only carries TCP something it will
+// carry, and pays for it in head-of-line blocking: one lost packet stops
+// everything behind it while TCP repairs it, under connections that were
+// repairing it themselves. This is the other way round the same problem.
+// What goes on the wire is a TCP segment with a plausible sequence number,
+// window and checksum - to a filter counting protocols, and to anything that
+// does not keep state, this is a TCP conversation. What is inside is a
+// datagram, and a lost one is lost, exactly as with UDP or ICMP. No stream, no
+// retransmit, no head of line.
+//
+// The two things that make it work, and both are the kernel:
+//
+// It has to not answer. A segment arriving for a port with no socket on it
+// gets an RST from the kernel, which would tear down a conversation it is not
+// part of and tell anybody watching that nothing is listening here. The
+// manager drops those in the firewall - see the PINGIFY_RAWTCP chain - and
+// this carrier refuses to start if they are not being dropped, because a
+// tunnel that resets itself every few seconds is worse than one that says why
+// it will not start.
+//
+// It has to not be given every packet on the host. A raw TCP socket receives a
+// copy of every segment the machine sees, so on anything busy most of the work
+// would be throwing other people's traffic away in Go. The same socket filter
+// the ICMP carrier uses does it in the kernel, on the two ports that are ours.
+const (
+	rawTCPHdrLen = 20 // no options: a plain header, which is what a data segment carries
+	rawTCPMax    = 1500
+	rawTCPRead   = 2048
+
+	tcpFlagACK = 0x10
+	tcpFlagPSH = 0x08
+)
+
+type rawTCPCarrier struct {
+	pc *net.IPConn
+	fr *framer
+
+	myPort, peerPort uint16
+	burst            int
+
+	// Where our sequence number is up to. It is not TCP's - nothing acks it
+	// and nothing retransmits - but it has to move the way TCP's does or the
+	// segments do not look like a conversation.
+	seq  atomic.Uint32
+	ack  atomic.Uint32
+	mine [4]byte
+
+	peer     atomic.Pointer[net.IPAddr]
+	peer4    atomic.Uint32
+	onPacket atomic.Pointer[func([]byte)]
+
+	rc      syscall.RawConn
+	batched bool
+
+	sawIPHeader sync.Once
+	done        chan struct{}
+	once        sync.Once
+
+	rxBytes, txBytes uint64
+	sendErrs         uint64
+	notOurs          uint64
+}
+
+func newRawTCPCarrier(cfg *config.Config) (*rawTCPCarrier, error) {
+	port := uint16(cfg.Transport.Port)
+	c := &rawTCPCarrier{
+		fr:    newFramer(cfg.Token, "pingify rawtcp v1"),
+		done:  make(chan struct{}),
+		burst: cfg.Tuning.SendBatch,
+	}
+	if c.burst <= 0 {
+		c.burst = defaultSendBatch
+	}
+
+	// One port, both ends. There is no handshake to negotiate a second one
+	// with, and a conversation between the same port on two machines is a
+	// shape the internet is full of.
+	c.myPort, c.peerPort = port, port
+	c.seq.Store(uint32(time.Now().UnixNano()))
+
+	pc, err := net.ListenIP("ip4:tcp", &net.IPAddr{IP: net.IPv4zero})
+	if err != nil {
+		return nil, fmt.Errorf("open raw tcp socket: %v (this needs root)", err)
+	}
+	c.pc = pc
+
+	if cfg.Dials() {
+		addr, err := net.ResolveIPAddr("ip4", cfg.DialHost())
+		if err != nil {
+			pc.Close()
+			return nil, fmt.Errorf("resolve %s: %v", cfg.DialHost(), err)
+		}
+		c.setPeer(addr.IP)
+		logging.Info("carrier: raw tcp to %s:%d", addr.IP, port)
+	} else {
+		logging.Info("carrier: waiting for raw tcp on %d", port)
+	}
+	if err := c.findLocalAddress(cfg); err != nil {
+		logging.Warn("carrier: %v - the checksum will be wrong and the far end will drop us", err)
+	}
+
+	tuneSocket(pc, cfg)
+	smoothTheWire(cfg)
+	pace(pc, cfg, c.done, func() uint64 { return atomic.LoadUint64(&c.txBytes) })
+
+	if err := attachPortFilter(pc, port); err != nil {
+		logging.Debug("no socket filter (%v); every tcp segment this host sees is sorted here instead", err)
+	} else {
+		logging.Info("the kernel is filtering segments for us: only port %d arrives", port)
+	}
+
+	if canBatch {
+		if rc, err := pc.SyscallConn(); err == nil {
+			c.rc, c.batched = rc, true
+		}
+	}
+	return c, nil
+}
+
+// findLocalAddress works out which address this host will send from, because
+// a TCP checksum covers a header built from both ends and we are building it
+// ourselves. It asks the routing table the only way a program can without
+// parsing it: by opening a UDP socket to the far end and reading back the
+// address the kernel chose. Nothing is sent.
+func (c *rawTCPCarrier) findLocalAddress(cfg *config.Config) error {
+	host := cfg.DialHost()
+	if host == "" {
+		host = cfg.Transport.Iran
+	}
+	if host == "" {
+		return fmt.Errorf("no address to work out the local one from")
+	}
+	u, err := net.Dial("udp4", net.JoinHostPort(host, "9"))
+	if err != nil {
+		return fmt.Errorf("could not work out this host's address: %v", err)
+	}
+	defer u.Close()
+	la, ok := u.LocalAddr().(*net.UDPAddr)
+	if !ok || la.IP.To4() == nil {
+		return fmt.Errorf("could not work out this host's address")
+	}
+	copy(c.mine[:], la.IP.To4())
+	return nil
+}
+
+func (c *rawTCPCarrier) setPeer(ip net.IP) {
+	v4 := ip.To4()
+	if v4 == nil {
+		return
+	}
+	c.peer.Store(&net.IPAddr{IP: append(net.IP(nil), v4...)})
+	c.peer4.Store(binary.BigEndian.Uint32(v4))
+}
+
+func (c *rawTCPCarrier) Burst() int      { return c.burst }
+func (c *rawTCPCarrier) Headroom() int   { return rawTCPHdrLen + c.fr.headroom() }
+func (c *rawTCPCarrier) MaxPayload() int { return rawTCPMax - c.Headroom() }
+func (c *rawTCPCarrier) Up() bool        { return c.peer.Load() != nil }
+
+func (c *rawTCPCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
+
+// stamp writes the TCP header over the headroom, and the checksum over the
+// whole segment. The sequence number moves by the length of what is being
+// sent, which is what makes a capture of this look like a conversation rather
+// than a machine repeating itself.
+func (c *rawTCPCarrier) stamp(b []byte, peer [4]byte) {
+	n := len(b) - rawTCPHdrLen
+	binary.BigEndian.PutUint16(b[0:2], c.myPort)
+	binary.BigEndian.PutUint16(b[2:4], c.peerPort)
+	binary.BigEndian.PutUint32(b[4:8], c.seq.Add(uint32(n))-uint32(n))
+	binary.BigEndian.PutUint32(b[8:12], c.ack.Load())
+	b[12] = 5 << 4 // data offset: five words, no options
+	b[13] = tcpFlagACK | tcpFlagPSH
+	binary.BigEndian.PutUint16(b[14:16], 64240) // a window somebody could believe
+	b[16], b[17] = 0, 0                         // checksum, filled in below
+	b[18], b[19] = 0, 0                         // urgent pointer
+
+	binary.BigEndian.PutUint16(b[16:18], tcpChecksum(c.mine, peer, b))
+}
+
+// tcpChecksum is the ordinary one's complement sum over a pseudo header and
+// the segment. It is not optional: a segment with a wrong checksum is dropped
+// by the far kernel before any raw socket sees it, which is a tunnel that
+// sends perfectly and receives nothing.
+func tcpChecksum(src, dst [4]byte, seg []byte) uint16 {
+	var sum uint32
+	add := func(b []byte) {
+		for i := 0; i+1 < len(b); i += 2 {
+			sum += uint32(b[i])<<8 | uint32(b[i+1])
+		}
+		if len(b)%2 == 1 {
+			sum += uint32(b[len(b)-1]) << 8
+		}
+	}
+	add(src[:])
+	add(dst[:])
+	sum += uint32(syscall.IPPROTO_TCP)
+	sum += uint32(len(seg))
+	add(seg)
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func (c *rawTCPCarrier) Send(bp *[]byte) error {
+	peer := c.peer.Load()
+	b := *bp
+	if peer == nil || len(b) < c.Headroom() {
+		buf.Put(bp)
+		if peer == nil {
+			return ErrNoPeer
+		}
+		return nil
+	}
+	var to [4]byte
+	copy(to[:], peer.IP.To4())
+	c.fr.seal(b[rawTCPHdrLen:])
+	c.stamp(b, to)
+
+	n, err := c.pc.WriteToIP(b, peer)
+	buf.Put(bp)
+	if err != nil {
+		atomic.AddUint64(&c.sendErrs, 1)
+		return err
+	}
+	atomic.AddUint64(&c.txBytes, uint64(n))
+	return nil
+}
+
+type rawTCPSender struct {
+	c    *rawTCPCarrier
+	w    *batchWriter
+	bufs [][]byte
+}
+
+func (c *rawTCPCarrier) NewSender() Sender {
+	if !c.batched {
+		return &rawTCPPlain{c: c}
+	}
+	return &rawTCPSender{c: c, w: newBatchWriter(), bufs: make([][]byte, 0, sendBatch)}
+}
+
+func (s *rawTCPSender) Send(bps []*[]byte) {
+	c := s.c
+	peer := c.peer.Load()
+	if peer == nil {
+		for _, bp := range bps {
+			buf.Put(bp)
+		}
+		return
+	}
+	var to [4]byte
+	copy(to[:], peer.IP.To4())
+
+	s.bufs = s.bufs[:0]
+	for _, bp := range bps {
+		b := *bp
+		if len(b) < c.Headroom() {
+			continue
+		}
+		c.fr.seal(b[rawTCPHdrLen:])
+		c.stamp(b, to)
+		s.bufs = append(s.bufs, b)
+	}
+	out := s.bufs
+	for len(out) > 0 {
+		n, err := s.w.write(c.rc, out, to)
+		if err != nil {
+			atomic.AddUint64(&c.sendErrs, 1)
+			logging.Debug("raw tcp send batch: %v", err)
+			break
+		}
+		if n <= 0 {
+			break
+		}
+		for i := 0; i < n; i++ {
+			atomic.AddUint64(&c.txBytes, uint64(len(out[i])))
+		}
+		out = out[n:]
+	}
+	for _, bp := range bps {
+		buf.Put(bp)
+	}
+}
+
+type rawTCPPlain struct{ c *rawTCPCarrier }
+
+func (s *rawTCPPlain) Send(bps []*[]byte) {
+	for _, bp := range bps {
+		_ = s.c.Send(bp)
+	}
+}
+
+func (c *rawTCPCarrier) Run() {
+	b := make([]byte, rawTCPRead)
+	for {
+		n, from, err := c.pc.ReadFromIP(b)
+		if n > 0 {
+			var a [4]byte
+			if v4 := from.IP.To4(); v4 != nil {
+				copy(a[:], v4)
+			}
+			c.handle(b[:n], a)
+		}
+		if err != nil {
+			select {
+			case <-c.done:
+			default:
+				logging.Warn("raw tcp read: %v", err)
+			}
+			return
+		}
+	}
+}
+
+func (c *rawTCPCarrier) handle(b []byte, from [4]byte) {
+	if len(b) >= 20 && b[0]>>4 == 4 {
+		ihl := int(b[0]&0x0f) * 4
+		if ihl < 20 || len(b) <= ihl {
+			return
+		}
+		b = b[ihl:]
+		c.sawIPHeader.Do(func() {
+			logging.Debug("the ip header arrives with each segment; stepping over it")
+		})
+	}
+	if len(b) < rawTCPHdrLen {
+		return
+	}
+	if binary.BigEndian.Uint16(b[0:2]) != c.peerPort ||
+		binary.BigEndian.Uint16(b[2:4]) != c.myPort {
+		atomic.AddUint64(&c.notOurs, 1)
+		return
+	}
+	off := int(b[12]>>4) * 4
+	if off < rawTCPHdrLen || len(b) < off+frameLen {
+		return
+	}
+
+	// Their sequence plus what they sent is what we acknowledge next, which
+	// keeps the numbers in a capture consistent with each other.
+	their := binary.BigEndian.Uint32(b[4:8])
+	c.ack.Store(their + uint32(len(b)-off))
+
+	body, ok := c.fr.open(b[off:])
+	if !ok {
+		return
+	}
+	v := binary.BigEndian.Uint32(from[:])
+	if v != 0 && c.peer4.Load() != v {
+		c.setPeer(net.IPv4(from[0], from[1], from[2], from[3]))
+		logging.Info("carrier: the far end is at %d.%d.%d.%d", from[0], from[1], from[2], from[3])
+	}
+
+	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
+	if len(body) == 0 {
+		return
+	}
+	if f := c.onPacket.Load(); f != nil {
+		(*f)(body)
+	}
+}
+
+func (c *rawTCPCarrier) Keepalive(every time.Duration) {
+	keepaliveLoop(c, c.done, every)
+}
+
+func (c *rawTCPCarrier) Close() error {
+	c.once.Do(func() { close(c.done) })
+	return c.pc.Close()
+}
+
+func (c *rawTCPCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
+
+func (c *rawTCPCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
+	bad, replay = c.fr.counted()
+	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
+		bad + atomic.LoadUint64(&c.notOurs), replay,
+		atomic.LoadUint64(&c.sendErrs)
+}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/sockopt_linux.go" <<'PINGIFY_GO_SOURCE_EOF'
 //go:build linux
@@ -3981,6 +4434,8 @@ func Open(cfg *config.Config) (Full, error) {
 	// this core's queue, its counters, its status and its health port.
 	case "awg":
 		return newUDPCarrier(cfg)
+	case "rawtcp":
+		return newRawTCPCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }
@@ -5248,7 +5703,7 @@ func (c *Config) check() error {
 		c.Transport.Type = "udp"
 	}
 	switch c.Transport.Type {
-	case "udp", "icmp", "tcp", "ws", "wss", "gre":
+	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp":
 	case "awg":
 		if c.AWG.Iran == "" || c.AWG.Kharej == "" {
 			return fmt.Errorf("awg.iran and awg.kharej are both needed, on both servers")
@@ -7140,6 +7595,7 @@ q_transport() {
     item "5" "ICMP" "inside ping packets - no open port at all"
     item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
     item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
+    item "8" "Raw TCP" "packets inside TCP segments the kernel never sees"
     blank
     dim "sixteen streams, Tehran to Frankfurt:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
@@ -7155,7 +7611,11 @@ q_transport() {
     dim "it, which is a limit no setting on either can get around. Where UDP"
     dim "lives, both are good - AmneziaWG is also the only encrypted one here."
     blank
-    pick n "select" 1 7 || return 1
+    dim "Raw TCP looks like TCP on the wire and behaves like UDP above it: no"
+    dim "handshake, no retransmit, and none of the head-of-line waiting a real"
+    dim "TCP tunnel pays for. It needs iptables, and root."
+    blank
+    pick n "select" 1 8 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
@@ -7166,6 +7626,7 @@ q_transport() {
     7) T_TRANSPORT=awg
        awg_install || return 1
        ;;
+    8) T_TRANSPORT=rawtcp ;;
     esac
     return 0
 }
@@ -7560,13 +8021,26 @@ tunnel_create() {
     # first. If it will not, the tunnel is not started: a carrier dialling an
     # address on a link that does not exist would sit there reporting nothing
     # is wrong except that the far end has never been seen.
-    if [ "$(toml_get "$f" transport type)" = awg ]; then
+    case $(toml_get "$f" transport type) in
+    awg)
         if ! awg_up "$name"; then
             rm -f "$f"
             return 1
         fi
         ok "the AmneziaWG link $(awg_iface "$name") is up"
-    fi
+        ;;
+    rawtcp)
+        # Without this the kernel answers our own segments with an RST and
+        # the tunnel resets itself every few seconds.
+        if ! rawtcp_guard "$(toml_get "$f" transport port)"; then
+            bad "could not tell the firewall to stop answering for this port"
+            fix "iptables is needed for a raw tcp tunnel"
+            rm -f "$f"
+            return 1
+        fi
+        ok "the kernel will not answer on tcp/$(toml_get "$f" transport port)"
+        ;;
+    esac
 
     # svc_do enable returns the truth about is-active and prints the journal
     # when it failed. Returning its status is the point: the old caller printed
@@ -8443,6 +8917,8 @@ delete_tunnel() {
     # The link underneath goes with it, and its config file with the private
     # key in it goes too.
     awg_down "$name" 2>/dev/null || true
+    [ "$(toml_get "$(cfg_file "$name")" transport type)" = rawtcp ] &&
+        rawtcp_unguard "$(toml_get "$(cfg_file "$name")" transport port)" 2>/dev/null
     rm -f "$(cfg_file "$name")" "$STATE_DIR/$name.forwards"
     ok "$name is gone"
     pause
@@ -8490,6 +8966,39 @@ NAT_UNIT=pingify-nat.service
 # lock" - in a rebuild loop that is one rule of six missing, and nothing says
 # which one.
 ipt() { iptables -w 2 "$@"; }
+
+# Keeping the kernel out of a conversation it is not part of.
+#
+# The raw TCP carrier builds its own segments, so the kernel has no socket for
+# the port they arrive on - and its answer to a segment for a port nothing is
+# listening on is an RST. That RST tears down the far end's idea of the
+# conversation and tells anybody watching that nothing is there, which is the
+# opposite of the point.
+#
+# One rule, in its own chain so it can be found and removed, and the carrier
+# will not start without it.
+RAWTCP_CHAIN=PINGIFY_RAWTCP
+
+rawtcp_guard() {
+    local port=$1
+    ipt -t filter -N "$RAWTCP_CHAIN" 2>/dev/null
+    ipt -C OUTPUT -j "$RAWTCP_CHAIN" 2>/dev/null ||
+        ipt -I OUTPUT 1 -j "$RAWTCP_CHAIN" || return 1
+    ipt -C "$RAWTCP_CHAIN" -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null ||
+        ipt -A "$RAWTCP_CHAIN" -p tcp --sport "$port" --tcp-flags RST RST -j DROP || return 1
+    return 0
+}
+
+rawtcp_unguard() {
+    local port=$1
+    ipt -D "$RAWTCP_CHAIN" -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null
+    # The chain goes when the last tunnel using it does.
+    if [ "$(ipt -S "$RAWTCP_CHAIN" 2>/dev/null | wc -l)" -le 1 ]; then
+        ipt -D OUTPUT -j "$RAWTCP_CHAIN" 2>/dev/null
+        ipt -X "$RAWTCP_CHAIN" 2>/dev/null
+    fi
+    return 0
+}
 
 # Rejections are plain, unmarked, and on stderr. Plain because `ask` puts its
 # own mark in front of whatever a validator says, and two marks on one line

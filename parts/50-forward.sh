@@ -41,6 +41,39 @@ NAT_UNIT=pingify-nat.service
 # which one.
 ipt() { iptables -w 2 "$@"; }
 
+# Keeping the kernel out of a conversation it is not part of.
+#
+# The raw TCP carrier builds its own segments, so the kernel has no socket for
+# the port they arrive on - and its answer to a segment for a port nothing is
+# listening on is an RST. That RST tears down the far end's idea of the
+# conversation and tells anybody watching that nothing is there, which is the
+# opposite of the point.
+#
+# One rule, in its own chain so it can be found and removed, and the carrier
+# will not start without it.
+RAWTCP_CHAIN=PINGIFY_RAWTCP
+
+rawtcp_guard() {
+    local port=$1
+    ipt -t filter -N "$RAWTCP_CHAIN" 2>/dev/null
+    ipt -C OUTPUT -j "$RAWTCP_CHAIN" 2>/dev/null ||
+        ipt -I OUTPUT 1 -j "$RAWTCP_CHAIN" || return 1
+    ipt -C "$RAWTCP_CHAIN" -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null ||
+        ipt -A "$RAWTCP_CHAIN" -p tcp --sport "$port" --tcp-flags RST RST -j DROP || return 1
+    return 0
+}
+
+rawtcp_unguard() {
+    local port=$1
+    ipt -D "$RAWTCP_CHAIN" -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null
+    # The chain goes when the last tunnel using it does.
+    if [ "$(ipt -S "$RAWTCP_CHAIN" 2>/dev/null | wc -l)" -le 1 ]; then
+        ipt -D OUTPUT -j "$RAWTCP_CHAIN" 2>/dev/null
+        ipt -X "$RAWTCP_CHAIN" 2>/dev/null
+    fi
+    return 0
+}
+
 # Rejections are plain, unmarked, and on stderr. Plain because `ask` puts its
 # own mark in front of whatever a validator says, and two marks on one line
 # read as two problems. On stderr because stdout carries the tuples, and a
