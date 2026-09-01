@@ -49,6 +49,8 @@ func Open(cfg *config.Config) (Full, error) {
 		return newUDPCarrier(cfg)
 	case "rawtcp":
 		return newRawTCPCarrier(cfg)
+	case "utls":
+		return newUTLSCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }

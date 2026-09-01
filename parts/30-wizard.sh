@@ -482,6 +482,7 @@ q_transport() {
     item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
     item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
     item "8" "Raw TCP" "packets inside TCP segments the kernel never sees"
+    item "9" "TCP UTLS" "a TLS connection whose hello is Chrome's, not Go's"
     blank
     dim "sixteen streams, Tehran to Frankfurt:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
@@ -501,7 +502,11 @@ q_transport() {
     dim "handshake, no retransmit, and none of the head-of-line waiting a real"
     dim "TCP tunnel pays for. It needs iptables, and root."
     blank
-    pick n "select" 1 8 || return 1
+    dim "TCP UTLS is a plain TLS connection, and what a filter reads of one is"
+    dim "the hello: Go's own says \"a Go program\" in the first packet. This one"
+    dim "is Chrome's, from uTLS - the same thing fp=chrome selects elsewhere."
+    blank
+    pick n "select" 1 9 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
@@ -513,6 +518,7 @@ q_transport() {
        awg_install || return 1
        ;;
     8) T_TRANSPORT=rawtcp ;;
+    9) T_TRANSPORT=utls ;;
     esac
     return 0
 }
