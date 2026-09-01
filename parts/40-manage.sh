@@ -101,9 +101,29 @@ my_addr() {
 # out and is deliberately ignored. The old manager would have drawn that in red
 # and told the user their working tunnel was dead.
 tun_rtt() {
-    local name=$1 t out
+    local name=$1 t out hp peer
     t=$(toml_get "$(cfg_file "$name")" transport type)
-    [ "$t" = icmp ] && return 0
+
+    # An ICMP tunnel cannot be pinged. The carrier stops both kernels
+    # answering echo - it has to, or every packet it sends is answered twice -
+    # so the ping goes out and is deliberately ignored, and for a long time
+    # this returned nothing at all and every screen showed a dash.
+    #
+    # The far end answers on its health port instead, and curl's time_connect
+    # is the TCP handshake: one round trip across the link and nothing else in
+    # it. It is the same measurement a ping would have made.
+    if [ "$t" = icmp ]; then
+        have curl || return 0
+        hp=$(health_port_of "$name")
+        peer=$(peer_addr "$name")
+        [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
+        out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 \
+            -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
+        case $out in '' | 0 | 0.000000) return 0 ;; esac
+        LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
+        return 0
+    fi
+
     have ping || return 0
     # Two packets a fifth of a second apart, and one second to wait. This is
     # on the path of every redraw of the home screen: -c 2 -W 2 meant a tunnel

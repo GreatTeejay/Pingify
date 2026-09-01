@@ -36,6 +36,39 @@ UNIT_DIR=${PINGIFY_UNIT_DIR:-/etc/systemd/system}
 # from a base, so two tunnels on one server do not collide.
 STATUS_BASE=19900
 
+# And the health port, which the core binds on the tunnel's own private
+# address so that the server at the other end can ask it questions.
+#
+# One number for every tunnel on every server, and it can be: the address it
+# is bound to belongs to one tunnel, so two of them hold the same port without
+# ever meeting. It has to be the same number the core uses - config's
+# DefaultHealthPort is the other half of it, and a test compares the two.
+HEALTH_PORT=19999
+
+health_port_of() {
+    local p
+    p=$(toml_get "$(cfg_file "$1")" status health_port)
+    case $p in '' | *[!0-9]*) p=$HEALTH_PORT ;; esac
+    printf '%s' "$p"
+}
+
+# far_report is the other server's own status, fetched across the tunnel.
+#
+# Nothing else in this script can see the far end. The carrier being up says
+# the two carriers have found each other over the wire; it does not say that a
+# packet put into the tun device here comes out of the one over there, and it
+# says nothing at all about what version or profile the other server is on -
+# which is the commonest reason a pair that was working stops working.
+far_report() {
+    local name=$1 peer hp
+    hp=$(health_port_of "$name")
+    [ "$hp" -gt 0 ] 2>/dev/null || return 1
+    peer=$(peer_addr "$name")
+    [ -n "$peer" ] || return 1
+    have curl || return 1
+    curl -s --max-time 3 "http://$peer:$hp/" 2>/dev/null
+}
+
 # --------------------------------------------------------------------------
 # the small things everything uses
 # --------------------------------------------------------------------------

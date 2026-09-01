@@ -673,6 +673,9 @@ wiz_render() {
     printf 'level = "info"\n'
     printf '\n[status]\n'
     printf 'port = %s\n' "${T_STATUS:-$STATUS_BASE}"
+    # The same on both servers, and it stays that way: it is bound to this
+    # tunnel's private address, which nothing else on either machine has.
+    printf 'health_port = %s\n' "$HEALTH_PORT"
 }
 
 # --------------------------------------------------------------------------

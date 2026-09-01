@@ -102,6 +102,17 @@ for fn in screen_home screen_tunnel main_menu; do
     fi
 done
 
+section "the two halves of the health port agree"
+
+# The core binds it and the manager knocks on it, and they are two files in
+# two languages that have to hold the same number. Nothing at runtime would
+# notice them drifting: the knock would simply never be answered, and every
+# ICMP tunnel would go back to showing a dash where its round trip belongs.
+go_hp=$(grep -oE 'DefaultHealthPort = [0-9]+' core/internal/config/config.go 2>/dev/null ||
+    grep -oE 'DefaultHealthPort = [0-9]+' internal/config/config.go 2>/dev/null)
+check "the core's default and the script's are one number" \
+    "$go_hp" "DefaultHealthPort = $HEALTH_PORT"
+
 section "the unit names the paths this script uses"
 
 # It wrote them out again instead, inside a quoted heredoc, so the unit named

@@ -371,7 +371,15 @@ health_check() {
             if [ "${ST_INB:-0}" = 0 ]; then
                 chk_add note peer "started $(human_secs "$ST_UPTIME") ago; nothing back yet"
             else
-                chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
+                # "has been heard from", not "is there": this counts bytes
+                # that have arrived since the tunnel started, so it is a fact
+                # about the past. Whether anybody is at the far end *now* is
+                # the next check, and the two disagree exactly when something
+                # has just broken. The time is this tunnel's own, not the far
+                # end's - it used to read "the far end is there, up for 3m",
+                # which is our uptime wearing their name.
+                chk_add ok peer \
+                    "the far end has been heard from - this tunnel has run $(human_secs "$ST_UPTIME")"
             fi
             ;;
         *)
@@ -392,6 +400,42 @@ health_check() {
             fi
             ;;
         esac
+
+        # The far end, asked through the tunnel.
+        #
+        # Everything above is this server's own opinion of the tunnel. This is
+        # the one question in the check whose answer comes from the other
+        # server, and the asking is the test: if it answers, a packet put into
+        # the tun device here came out of the one over there and the reply
+        # found its way back. The carrier being up does not say that.
+        if [ "$heard" = true ]; then
+            local far fv fp mine_p
+            if far=$(far_report "$name") && [ -n "$far" ]; then
+                chk_add ok link-end "the far end answers on the private link"
+
+                # Two servers on two versions is the commonest way a pair that
+                # worked stops working, and until now finding it meant logging
+                # into both of them.
+                fv=$(json_field "$far" version)
+                if [ -n "$fv" ] && [ -n "$core_ver" ] && [ "$fv" != "$core_ver" ]; then
+                    chk_add warn far-version \
+                        "the far end runs core $fv, this one runs $core_ver" \
+                        "update both servers:  pingify --update"
+                fi
+                fp=$(json_field "$far" profile)
+                mine_p=$(toml_get "$CK_FILE" tuning profile)
+                if [ -n "$fp" ] && [ -n "$mine_p" ] && [ "$fp" != "$mine_p" ]; then
+                    chk_add warn far-profile \
+                        "the far end is on $fp, this one on $mine_p" \
+                        "pick one on both, from the tunnel screen"
+                fi
+            else
+                chk_add warn link-end "the far end does not answer on the private link" \
+                    "the carrier is up, so this is the link and not the path" \
+                    "on the other server:  pingify --status" \
+                    "a core older than $PINGIFY_VERSION has no health port"
+            fi
+        fi
     else
         if have curl; then
             chk_add bad status \
@@ -478,11 +522,15 @@ health_check() {
         fi
     fi
 
-    # The ICMP note, last, because it explains an absence rather than reporting
-    # one. Grey, uncounted, and one line. This line is why the health check has
-    # the shape it does.
+    # The ICMP note, last, because it explains something rather than reporting
+    # it. Grey, uncounted, one line.
+    #
+    # An ordinary ping across this link gets nothing back and that is correct:
+    # the carrier stops both kernels answering echo. The round trip on the
+    # screens above is not a ping - it is the handshake with the far end's
+    # health port, which is a real crossing of the link and back.
     if [ "$CK_TRANSPORT" = icmp ]; then
-        chk_add note icmp "ping does not answer across an ICMP tunnel: by design"
+        chk_add note icmp "ping gets no answer here by design; the round trip is measured on the health port"
     fi
 
     chk_finish "$name" "$mode"
