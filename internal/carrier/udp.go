@@ -195,8 +195,9 @@ func (c *udpCarrier) Close() error {
 func (c *udpCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
 
 func (c *udpCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
+	bad, replay = c.fr.counted()
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
-		c.fr.badTag, c.fr.replayed, atomic.LoadUint64(&c.sendErrs)
+		bad, replay, atomic.LoadUint64(&c.sendErrs)
 }
 
 // keepaliveLoop holds the path open, and on the side that waits it is the only

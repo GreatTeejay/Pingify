@@ -168,7 +168,7 @@ screen_tunnel() {
             if [ "$transport" = icmp ]; then
                 field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") inside ping packets"
             else
-                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") on udp/$port"
+                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") on $transport/$port"
             fi
         else
             local iran_addr
@@ -176,7 +176,7 @@ screen_tunnel() {
             if [ "$transport" = icmp ]; then
                 field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
             else
-                field "This end" "KHAREJ $G_DASH waits on udp/$port"
+                field "This end" "KHAREJ $G_DASH waits on $transport/$port"
             fi
             [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
         fi

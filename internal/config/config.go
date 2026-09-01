@@ -53,6 +53,21 @@ const (
 	SideIran   = "iran"
 	SideKharej = "kharej"
 
+	// How many connections a stream carrier opens between the two servers.
+	//
+	// Not a tuning knob with a taste behind it. Measured on the Tehran to
+	// Frankfurt path, with iperf3 and no tunnel anywhere near it:
+	//
+	//	one TCP connection      0.39 Mbit/s
+	//	sixteen connections     743 Mbit/s
+	//
+	// A single flow is shaped to nothing and sixteen together are not shaped
+	// at all, so a stream carrier that opens one connection carries 6 Mbit/s
+	// on a path that will carry seven hundred. This is the whole reason the
+	// old core had "carriers", and the number is what it is because that is
+	// where the measurement stopped improving.
+	DefaultConnections = 8
+
 	// The port the far end is asked on, over the private link. Fixed rather
 	// than configured, because both servers have to agree on it and there is
 	// nothing for it to collide with: it is bound to this tunnel's own tun
@@ -72,9 +87,14 @@ type Config struct {
 		// dials anything - so it is recorded rather than used: both files
 		// carry it, so either server can say which pair it belongs to, and
 		// the operator of one can see the other without logging into it.
-		Iran      string
-		Port      int
-		Keepalive int // seconds
+		Iran string
+		Port int
+
+		// How many connections a stream carrier opens. One is not enough on a
+		// path that shapes a single flow, and it is measured rather than
+		// guessed - see the note on DefaultConnections.
+		Connections int
+		Keepalive   int // seconds
 	}
 
 	Token string
@@ -210,6 +230,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Iran, err = str()
 	case "transport.port":
 		c.Transport.Port, err = num()
+	case "transport.connections":
+		c.Transport.Connections, err = num()
 	case "transport.keepalive_sec":
 		c.Transport.Keepalive, err = num()
 
@@ -380,8 +402,10 @@ func (c *Config) check() error {
 	if c.Transport.Type == "" {
 		c.Transport.Type = "udp"
 	}
-	if c.Transport.Type != "udp" && c.Transport.Type != "icmp" {
-		return fmt.Errorf("transport.type %q: udp and icmp are what exist so far", c.Transport.Type)
+	switch c.Transport.Type {
+	case "udp", "icmp", "tcp":
+	default:
+		return fmt.Errorf("transport.type %q: udp, tcp and icmp are what exist so far", c.Transport.Type)
 	}
 	// ICMP has no ports. There is nothing to listen on and nothing to
 	// misconfigure, which is half of why it is the transport that survives.
@@ -393,6 +417,12 @@ func (c *Config) check() error {
 	}
 	if c.Transport.Keepalive <= 0 {
 		c.Transport.Keepalive = 10
+	}
+	if c.Transport.Connections == 0 {
+		c.Transport.Connections = DefaultConnections
+	}
+	if c.Transport.Connections < 1 || c.Transport.Connections > 32 {
+		return fmt.Errorf("transport.connections %d: between 1 and 32", c.Transport.Connections)
 	}
 	if len(c.Token) < 8 {
 		return fmt.Errorf("security.token is too short to be worth having")

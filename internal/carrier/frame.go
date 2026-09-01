@@ -46,6 +46,18 @@ type framer struct {
 	seq  uint32
 	seen *buf.ReplayWindow
 
+	// Whether the carrier underneath can lose a datagram or deliver one
+	// twice. A stream carrier cannot do either: TCP has already done that
+	// work, and every frame is written once, to one connection. So the
+	// replay window is not consulted there - and must not be, because it is
+	// a plain sliding bitmap with no lock on it, and a stream carrier reads
+	// from one goroutine per connection rather than one in total.
+	//
+	// What it costs is the loss figure, which on such a carrier would have
+	// been a count of packets arriving behind one another rather than of
+	// packets lost. The path cannot lose one without the connection ending.
+	reliable bool
+
 	badTag, replayed uint64
 }
 
@@ -54,7 +66,15 @@ type framer struct {
 // the sender - so a gap in it is the one measure of the path that no counter
 // on either machine will show.
 func (f *framer) lost() (missing, late, gaps uint64) {
+	if f.reliable {
+		return 0, 0, 0
+	}
 	return f.seen.Lost()
+}
+
+// counted is what the tag check refused and what the window had already seen.
+func (f *framer) counted() (bad, replayed uint64) {
+	return atomic.LoadUint64(&f.badTag), atomic.LoadUint64(&f.replayed)
 }
 
 // newFramer derives this carrier's key from the token the user typed.
@@ -62,6 +82,14 @@ func (f *framer) lost() (missing, late, gaps uint64) {
 // Each carrier passes its own label, so a datagram built for one can never be
 // mistaken for a datagram built for another - which matters the moment two
 // tunnels between the same pair of servers are given the same token.
+// newStreamFramer is the same, for a carrier that cannot lose a datagram or
+// deliver one twice. See the note on framer.reliable.
+func newStreamFramer(token, label string) *framer {
+	f := newFramer(token, label)
+	f.reliable = true
+	return f
+}
+
 func newFramer(token, label string) *framer {
 	m := hmac.New(sha256.New, []byte(label))
 	m.Write([]byte(token))
@@ -109,11 +137,14 @@ func (f *framer) open(b []byte) ([]byte, bool) {
 	var want [tagLen]byte
 	f.tag(want[:], covered(b))
 	if !hmac.Equal(want[:], b[:tagLen]) {
-		f.badTag++
+		atomic.AddUint64(&f.badTag, 1)
 		return nil, false
 	}
+	if f.reliable {
+		return b[frameLen:], true
+	}
 	if !f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen])) {
-		f.replayed++
+		atomic.AddUint64(&f.replayed, 1)
 		return nil, false
 	}
 	return b[frameLen:], true
