@@ -6787,17 +6787,17 @@ q_transport() {
     item "3" "WS" "an ordinary WebSocket - goes where HTTP goes"
     item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
     item "5" "ICMP" "inside ping packets - no open port at all"
-    item "6" "GRE" "ip protocol 47 - no port, and measured dead from Iran"
+    item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
     blank
     dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
-    dim "  WS 427   WSS 405   ICMP 371   TCP 342   UDP unusable there"
+    dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317   UDP dead there"
     blank
     dim "WS and WSS can go behind a CDN, which is what makes them the ones to"
     dim "try when a port is blocked rather than slow. While an ICMP tunnel runs"
     dim "neither server answers a ping."
     blank
-    dim "GRE needs no port either, but one packet in each direction crossed the"
-    dim "Iran path and then nothing did. It is here for a path that carries it."
+    dim "GRE needs no port either and is the plainest of them: 378 Mbit/s on"
+    dim "the same pair, and visible for exactly what it is to anyone looking."
     blank
     pick n "select" 1 6 || return 1
     case $n in
