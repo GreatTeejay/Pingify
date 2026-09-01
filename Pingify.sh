@@ -2056,30 +2056,34 @@ import (
 // unchanged and every number the manager shows is real.
 //
 // What GRE buys over UDP is that it is not UDP: no ports to block, and a
-// protocol carriers route rather than shape. What it costs is that it is
-// plainly visible for what it is, so it is the transport for a path that is
-// indifferent rather than hostile.
+// protocol carriers route rather than shape.
 //
-// The Tehran to Frankfurt path is not indifferent. Measured with this carrier
-// and again with ten raw protocol-47 packets and no tunnel anywhere near it:
+// The tag and the sequence number are GRE's own fields rather than this
+// core's twelve bytes in front of the payload, and that is not a detail of
+// style. Written the other way it did not work at all, and the measurement
+// that found out why is worth keeping:
 //
-//	tunnel      one packet across in each direction, then nothing
-//	raw probe   0 of 10 arrived
+//	keyed GRE, a real IP packet inside      10 of 10 arrived
+//	plain GRE, a real IP packet inside      10 of 10
+//	keyed GRE, twelve bytes then a packet    0 of 30
+//	plain GRE, junk inside                   0 of 30
 //
-// Both ends sent - captures on both show GREv0 with the right key leaving -
-// and both received exactly 68 bytes, which is the first packet. It is the
-// shape UDP has on the same path, where six get through instead of one. So
-// this carrier is correct and this path will not carry it; somebody else's
-// will, and the wizard says which is which rather than leaving it to be
-// found the slow way.
+// Something on this path parses the inner packet, and a GRE packet whose
+// payload is not a well-formed IP packet does not cross it. Our framing was
+// what made it malformed. RFC 2890 has somewhere to put both things: a
+// 32-bit key and a 32-bit sequence number, in the header, where they belong -
+// so the payload is the bare IP packet, the packet is one any middlebox
+// parses happily, and it costs eight bytes fewer than the framing did.
 //
 // The key is derived from the token. It rides in the clear and protects
 // nothing; what it does is keep two tunnels between the same pair of servers
-// from reading each other's packets, which is the whole job GRE gives it.
+// from reading each other's packets, which is the whole job GRE gives it -
+// and it is the reason this transport is the plainly visible one.
 const (
-	greHdrLen    = 8 // flags and version, protocol type, key
-	greFlagKey   = 0x2000
-	greProtoIPv4 = 0x0800
+	// flags and version, protocol type, key, sequence.
+	greHdrLen     = 12
+	greFlagKeySeq = 0x3000
+	greProtoIPv4  = 0x0800
 
 	greMaxPacket = 1500
 	greReadBuf   = 2048
@@ -2087,9 +2091,13 @@ const (
 
 type greCarrier struct {
 	pc *net.IPConn
-	fr *framer
 
-	key   uint32
+	// No framer. Its two jobs - say a packet is ours, and number it so loss
+	// can be counted - are the key and the sequence in GRE's own header.
+	key  uint32
+	seq  atomic.Uint32
+	seen *buf.ReplayWindow
+
 	burst int
 
 	peer     atomic.Pointer[net.IPAddr]
@@ -2106,12 +2114,13 @@ type greCarrier struct {
 	rxBytes, txBytes uint64
 	sendErrs         uint64
 	notOurs          uint64
+	replayed         uint64
 }
 
 func newGRECarrier(cfg *config.Config) (*greCarrier, error) {
 	c := &greCarrier{
-		fr:    newFramer(cfg.Token, "pingify gre v1"),
 		key:   greKeyFrom(cfg.Token),
+		seen:  buf.NewReplayWindow(),
 		done:  make(chan struct{}),
 		burst: cfg.Tuning.SendBatch,
 	}
@@ -2161,19 +2170,20 @@ func (c *greCarrier) setPeer(ip net.IP) {
 }
 
 func (c *greCarrier) Burst() int      { return c.burst }
-func (c *greCarrier) Headroom() int   { return greHdrLen + c.fr.headroom() }
-func (c *greCarrier) MaxPayload() int { return greMaxPacket - c.Headroom() }
+func (c *greCarrier) Headroom() int   { return greHdrLen }
+func (c *greCarrier) MaxPayload() int { return greMaxPacket - greHdrLen }
 func (c *greCarrier) Up() bool        { return c.peer.Load() != nil }
 
 func (c *greCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
 
 // stamp writes the GRE header over the headroom the layer above left for it.
-// The protocol type says IPv4 because that is what is inside, once our own
-// twelve bytes have been taken off it.
+// The protocol type says IPv4 and means it: what follows this header is the
+// packet itself and nothing else.
 func (c *greCarrier) stamp(b []byte) {
-	binary.BigEndian.PutUint16(b[0:2], greFlagKey)
+	binary.BigEndian.PutUint16(b[0:2], greFlagKeySeq)
 	binary.BigEndian.PutUint16(b[2:4], greProtoIPv4)
 	binary.BigEndian.PutUint32(b[4:8], c.key)
+	binary.BigEndian.PutUint32(b[8:12], c.seq.Add(1))
 }
 
 func (c *greCarrier) Send(bp *[]byte) error {
@@ -2186,7 +2196,6 @@ func (c *greCarrier) Send(bp *[]byte) error {
 		}
 		return nil
 	}
-	c.fr.seal(b[greHdrLen:])
 	c.stamp(b)
 
 	n, err := c.pc.WriteToIP(b, peer)
@@ -2234,7 +2243,6 @@ func (s *greSender) Send(bps []*[]byte) {
 		if len(b) < c.Headroom() {
 			continue
 		}
-		c.fr.seal(b[greHdrLen:])
 		c.stamp(b)
 		s.bufs = append(s.bufs, b)
 	}
@@ -2306,22 +2314,23 @@ func (c *greCarrier) handle(b []byte, from [4]byte) {
 			logging.Debug("the ip header arrives with each gre packet; stepping over it")
 		})
 	}
-	if len(b) < greHdrLen+frameLen {
+	if len(b) < greHdrLen {
 		return
 	}
-	// Ours is the only shape we answer to: the key flag set, no others, and
-	// our key in it. A kernel GRE tunnel on the same host uses a different
-	// key or none, and either way its packets are not read as ours.
-	if binary.BigEndian.Uint16(b[0:2]) != greFlagKey ||
+	// Ours is the only shape we answer to: the key and sequence flags set,
+	// no others, and our key in it. A kernel GRE tunnel on the same host
+	// carries a different key or none, and either way its packets are not
+	// read as ours.
+	if binary.BigEndian.Uint16(b[0:2]) != greFlagKeySeq ||
 		binary.BigEndian.Uint32(b[4:8]) != c.key {
 		atomic.AddUint64(&c.notOurs, 1)
 		return
 	}
-
-	body, ok := c.fr.open(b[greHdrLen:])
-	if !ok {
+	if !c.seen.Fresh(binary.BigEndian.Uint32(b[8:12])) {
+		atomic.AddUint64(&c.replayed, 1)
 		return
 	}
+	body := b[greHdrLen:]
 
 	// The tag was right, so this is the far end, wherever it is speaking from.
 	// The side that waits learns the address here and nowhere else.
@@ -2349,12 +2358,11 @@ func (c *greCarrier) Close() error {
 	return c.pc.Close()
 }
 
-func (c *greCarrier) Lost() (missing, late, gaps uint64) { return c.fr.lost() }
+func (c *greCarrier) Lost() (missing, late, gaps uint64) { return c.seen.Lost() }
 
 func (c *greCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
-	bad, replay = c.fr.counted()
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
-		bad + atomic.LoadUint64(&c.notOurs), replay,
+		atomic.LoadUint64(&c.notOurs), atomic.LoadUint64(&c.replayed),
 		atomic.LoadUint64(&c.sendErrs)
 }
 
