@@ -27,11 +27,23 @@ type Full interface {
 	Lost() (missing, late, gaps uint64)
 }
 
-// stream reports whether a transport cannot lose a packet, which is the one
-// thing that decides whether parity is worth adding to it.
-func stream(kind string) bool {
+// noParity reports whether a transport must not be given parity packets, and
+// there are two quite different reasons for it.
+//
+// A stream carrier cannot lose one. TCP underneath has already seen to that,
+// so the parity would be a tenth of the bandwidth spent on nothing.
+//
+// GRE is the other, and it is not about waste. Ours carries a bare IP packet
+// with the tag and the sequence in GRE's own header fields, because a path that
+// carries GRE at all still drops the ones whose payload is not a well formed IP
+// packet. Four bytes of parity header in front of that header is no longer an
+// IP packet, and a parity packet - the exclusive-or of ten payloads - was never
+// going to look like one. Measured on the Tehran path: with parity on, not a
+// single packet crossed in either direction. It does not slow GRE down, it
+// stops it dead.
+func noParity(kind string) bool {
 	switch kind {
-	case "tcp", "ws", "wss", "utls":
+	case "tcp", "ws", "wss", "utls", "gre":
 		return true
 	}
 	return false
@@ -42,7 +54,7 @@ func Open(cfg *config.Config) (Full, error) {
 	if err != nil {
 		return nil, err
 	}
-	return WrapFEC(c, cfg.Tuning.FEC, stream(cfg.Transport.Type)), nil
+	return WrapFEC(c, cfg.Tuning.FEC, noParity(cfg.Transport.Type)), nil
 }
 
 func open(cfg *config.Config) (Full, error) {
