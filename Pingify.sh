@@ -7141,21 +7141,19 @@ q_transport() {
     item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
     item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
     blank
-    dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
-    dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317   UDP dead there"
+    dim "sixteen streams, Tehran to Frankfurt:"
+    dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
+    dim "and on a path with no such limits, Istanbul to Frankfurt:"
+    dim "  UDP 332   AmneziaWG 194"
     blank
-    dim "WS and WSS can go behind a CDN, which is what makes them the ones to"
-    dim "try when a port is blocked rather than slow. While an ICMP tunnel runs"
-    dim "neither server answers a ping."
+    dim "WS and WSS go behind a CDN, which makes them the ones to try when a"
+    dim "port is blocked rather than slow. ICMP and GRE need no open port at"
+    dim "all; while an ICMP tunnel runs, neither server answers a ping."
     blank
-    dim "GRE needs no port either and is the plainest of them: 378 Mbit/s on"
-    dim "the same pair, and visible for exactly what it is to anyone looking."
-    blank
-    dim "AmneziaWG is the only one here this core does not implement: the link"
-    dim "is theirs, installed from their own repository, and the tunnel runs"
-    dim "inside it - so it is encrypted, and it is the one with a handshake."
-    dim "It is UDP underneath, so where UDP dies it dies with it: on a server"
-    dim "whose UDP flows stop after six packets, its handshake is the six."
+    dim "UDP and AmneziaWG are the two that some Iranian networks stop: a UDP"
+    dim "flow there can be cut after a handful of packets whatever is inside"
+    dim "it, which is a limit no setting on either can get around. Where UDP"
+    dim "lives, both are good - AmneziaWG is also the only encrypted one here."
     blank
     pick n "select" 1 7 || return 1
     case $n in
