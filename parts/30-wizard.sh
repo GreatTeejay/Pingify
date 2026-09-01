@@ -475,6 +475,7 @@ q_transport() {
     item "3" "WS" "an ordinary WebSocket - goes where HTTP goes"
     item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
     item "5" "ICMP" "inside ping packets - no open port at all"
+    item "6" "GRE" "ip protocol 47 - no port, and measured dead from Iran"
     blank
     dim "measured on one Tehran-Frankfurt pair, sixteen streams:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   UDP unusable there"
@@ -483,13 +484,17 @@ q_transport() {
     dim "try when a port is blocked rather than slow. While an ICMP tunnel runs"
     dim "neither server answers a ping."
     blank
-    pick n "select" 1 5 || return 1
+    dim "GRE needs no port either, but one packet in each direction crossed the"
+    dim "Iran path and then nothing did. It is here for a path that carries it."
+    blank
+    pick n "select" 1 6 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
     3) T_TRANSPORT=ws ;;
     4) T_TRANSPORT=wss ;;
     5) T_TRANSPORT=icmp ;;
+    6) T_TRANSPORT=gre ;;
     esac
     return 0
 }
@@ -498,10 +503,14 @@ q_transport() {
 # nothing to misconfigure, and that is half of why it survives.
 q_port() {
     local def=8443 n
-    if [ "$T_TRANSPORT" = icmp ]; then
+    # Neither of these has ports at all: one rides in echo requests and the
+    # other is its own IP protocol.
+    case $T_TRANSPORT in
+    icmp | gre)
         T_PORT=
         return 0
-    fi
+        ;;
+    esac
     wiz_ask "Port"
     blank
     dim "The same number on both servers, and the only port the tunnel needs."

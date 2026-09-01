@@ -390,6 +390,12 @@ health_check() {
                     "watch there:  tcpdump -ni any icmp" \
                     "if nothing arrives at all, try tcp or udp"
                 ;;
+            gre)
+                chk_add bad peer "the far end has never been seen" \
+                    "on KHAREJ:  systemctl status pingify@$name" \
+                    "watch there:  tcpdump -ni any proto gre" \
+                    "some networks drop ip protocol 47 outright; try tcp or ws"
+                ;;
             tcp)
                 # TCP is the one transport whose far end can be tested from
                 # here without the tunnel: a connection either opens or it

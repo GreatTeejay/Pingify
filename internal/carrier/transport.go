@@ -39,6 +39,8 @@ func Open(cfg *config.Config) (Full, error) {
 		return newWSCarrier(cfg)
 	case "wss":
 		return newWSSCarrier(cfg)
+	case "gre":
+		return newGRECarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }
