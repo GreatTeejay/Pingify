@@ -180,6 +180,14 @@ screen_tunnel() {
             fi
             [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
         fi
+        # The name and the path, for the transports that have one. It is the
+        # one thing about a WebSocket tunnel that is not in the line above,
+        # and the one somebody putting a proxy in front of it needs.
+        local dom
+        dom=$(toml_get "$f" transport domain)
+        if [ -n "$dom" ]; then
+            field "Address" "$(addr_text "$dom")$(toml_get "$f" transport path)"
+        fi
         field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
 
         # One measurement to a line, each with the name of what it is. They
@@ -373,7 +381,10 @@ screen_advanced() {
         fi
         item2 4 "Device queues" "${qs:-the core chooses}"
         item2 5 "Health port" "$(health_port_of "$name") on $(my_addr "$name")"
-        item 6 "Show the config file"
+        case $(toml_get "$f" transport type) in
+        ws | wss) item2 6 "Web path" "$(toml_get "$f" transport path)" ;;
+        esac
+        item 7 "Show the config file"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -406,7 +417,19 @@ screen_advanced() {
             local v
             ask v "port (-1 turns it off)" "$(health_port_of "$name")" v_hport || continue
             HEALTH_WANT=$v; cfg_apply "$name" _edit_health_port yes; pause ;;
-        6) blank; sed 's/^/    /' "$f"; pause ;;
+        6) case $(toml_get "$f" transport type) in
+            ws | wss) ;;
+            *) blank; warn "there is nothing on 6"; pause; continue ;;
+            esac
+            blank
+            dim "What the WebSocket handshake asks for. Anything else that"
+            dim "arrives gets a 404, the way a web server would answer it."
+            dim "It has to match on both servers."
+            blank
+            local v
+            ask v "path" "$(toml_get "$f" transport path)" v_path || continue
+            PATH_WANT=$v; cfg_apply "$name" _edit_path yes; pause ;;
+        7) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -417,6 +440,15 @@ _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
 _edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
+_edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
+
+v_path() {
+    case $1 in
+    /*) return 0 ;;
+    esac
+    echo "a path starts with a slash"
+    return 1
+}
 
 v_hport() {
     case $1 in
