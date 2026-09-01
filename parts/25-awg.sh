@@ -83,18 +83,18 @@ awg_generate() {
     T_AWG_KPUB=$(printf '%s' "$T_AWG_KKEY" | awg pubkey)
     [ -n "$T_AWG_IPUB" ] && [ -n "$T_AWG_KPUB" ] || return 1
 
-    T_AWG_JC=$(awg_rand 3 10)
-    T_AWG_JMIN=$(awg_rand 50 100)
-    T_AWG_JMAX=$((T_AWG_JMIN + $(awg_rand 200 800)))
-    [ "$T_AWG_JMAX" -gt 1280 ] && T_AWG_JMAX=1280
-    T_AWG_S1=$(awg_rand 15 80)
-    T_AWG_S2=$(awg_rand 15 80)
-    # The one rule the documentation is explicit about: S1 + 56 must not equal
-    # S2, or the first handshake packet is the length of the second and the
-    # obfuscation gives back exactly what it was hiding.
-    while [ $((T_AWG_S1 + 56)) = "$T_AWG_S2" ]; do
-        T_AWG_S2=$(awg_rand 15 80)
-    done
+    # Not generated. These five are the set that has been run on this path and
+    # found stable - no periodic drops - and randomising them was how this
+    # transport came to hand shake and then carry nothing. The documentation
+    # gives ranges; the ranges contain combinations that do not work, and
+    # finding out which is not something to do on somebody's live tunnel.
+    #
+    # S1 + 56 must not equal S2, and 68 and 91 do not.
+    T_AWG_JC=5
+    T_AWG_JMIN=50
+    T_AWG_JMAX=1000
+    T_AWG_S1=68
+    T_AWG_S2=91
 
     # Four distinct header types, none of them the four WireGuard uses.
     local i h
@@ -140,11 +140,19 @@ awg_conf() {
     fi
     port=$(toml_get "$f" awg port)
 
-    # Iran dials, the same way it does on every other transport: it is the end
-    # with an Endpoint line, and the far end waits with a ListenPort.
-    endpoint=
+    # Both ends get an Endpoint and both get a ListenPort.
+    #
+    # WireGuard only needs one of them to know where the other is - the far
+    # end learns the address from the first handshake that arrives. Setting
+    # both anyway is what a working AmneziaWG deployment on this path does,
+    # and the reason is the path: a side that has to learn the address has
+    # nothing to send to until something arrives, and on a link where the
+    # first packets are the ones most likely to be dropped that is a tunnel
+    # that comes up only sometimes.
     if [ "$side" = iran ]; then
         endpoint="Endpoint = $(toml_get "$f" transport kharej):$port"
+    else
+        endpoint="Endpoint = $(toml_get "$f" transport iran):$port"
     fi
 
     mkdir -p "$AWG_DIR"
@@ -156,7 +164,7 @@ awg_conf() {
 PrivateKey = $my_key
 Address = $mine
 MTU = $(toml_get "$f" awg mtu)
-$([ "$side" = kharej ] && printf 'ListenPort = %s' "$port")
+ListenPort = $port
 Jc = $(toml_get "$f" awg jc)
 Jmin = $(toml_get "$f" awg jmin)
 Jmax = $(toml_get "$f" awg jmax)
@@ -169,7 +177,7 @@ H4 = $(toml_get "$f" awg h4)
 
 [Peer]
 PublicKey = $peer_pub
-AllowedIPs = ${peer_addr%%/*}/32
+AllowedIPs = ${peer_addr%.*}.0/24
 $endpoint
 PersistentKeepalive = 25
 CONF

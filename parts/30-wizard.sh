@@ -533,7 +533,7 @@ q_port() {
         blank
         dim "AmneziaWG listens on this. The same number on both servers."
         blank
-        ask T_AWG_PORT "port" "51820" v_port || return 1
+        ask T_AWG_PORT "port" "51820" v_awg_port || return 1
         return 0
         ;;
     esac
@@ -561,6 +561,22 @@ q_port() {
 # One question, not three. The old wizard asked for the octet and then re-asked
 # both addresses it had just derived from it, so a hand edit at the second
 # prompt walked straight past the checks that guarded the first.
+# AmneziaWG's own port, which both servers bind: they each have a ListenPort,
+# so something already holding it here is a link that will not come up at all.
+#
+# This check is the whole reason it is worth having. A leftover process on the
+# Iran server was holding udp/51820, awg-quick could not bind it, the interface
+# never appeared, and every screen above reported a tunnel whose far end had
+# never been seen - which was true, and said nothing about why.
+v_awg_port() {
+    v_port "$1" || return 1
+    if wiz_port_bound "$1" udp; then
+        echo "something here already listens on udp/$1; see: ss -lunp | grep :$1"
+        return 1
+    fi
+    return 0
+}
+
 # A path nobody scans for: six hex characters, from the kernel's own random
 # device where there is one and from the shell's when there is not.
 wiz_path() {
@@ -792,7 +808,7 @@ wiz_render() {
         printf 'name = "%s"\n' "$T_AWG_IFACE"
         printf 'iran = "10.%s.20.1/24"\n' "$T_OCTET"
         printf 'kharej = "10.%s.20.2/24"\n' "$T_OCTET"
-        printf 'mtu = 1360\n'
+        printf 'mtu = 1320\n'
         printf 'port = %s\n' "$T_AWG_PORT"
         printf 'iran_key = "%s"\n' "$T_AWG_IKEY"
         printf 'iran_pub = "%s"\n' "$T_AWG_IPUB"
@@ -1011,6 +1027,10 @@ wizard_new() {
     # unique on this host.
     if [ "$T_TRANSPORT" = awg ]; then
         T_PORT=$((20900 + T_OCTET))
+        # The tunnel rides inside the AmneziaWG link, so its packets have to
+        # fit in one of theirs: 1320 on the link, less 20 of IP, 8 of UDP and
+        # the twelve this core puts in front of a packet.
+        T_MTU=1280
         T_AWG_IFACE=$(awg_free_iface) || {
             bad "there is no free awg device left on this host"
             return 1
