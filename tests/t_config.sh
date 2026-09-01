@@ -125,7 +125,8 @@ if [ -x "$(command -v go)" ] && [ -f go.mod ]; then
         check_rc "the core accepts what the manager writes" 0 "$core" -c "$f" -check
 
         for bad_case in "tun mtu 100" "tun mtu 20000" "tuning profile extreme" \
-            "tuning queue_packets 50" "transport type gre"; do
+            "tuning queue_packets 50" "transport type carrier-pigeon" \
+            "transport dials sideways"; do
             set -- $bad_case
             write_sample "$f"
             toml_set "$f" "$1" "$2" "$3"

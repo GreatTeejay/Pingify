@@ -517,9 +517,9 @@ func (c *Config) check() error {
 		c.Transport.Type = "udp"
 	}
 	switch c.Transport.Type {
-	case "udp", "icmp", "tcp", "ws", "wss":
+	case "udp", "icmp", "tcp", "ws", "wss", "gre":
 	default:
-		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss and icmp are what exist so far",
+		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre and icmp are what exist so far",
 			c.Transport.Type)
 	}
 	switch c.Transport.Dials {
@@ -534,10 +534,15 @@ func (c *Config) check() error {
 	if c.Transport.Path != "" && !strings.HasPrefix(c.Transport.Path, "/") {
 		return fmt.Errorf("transport.path %q has to start with a slash", c.Transport.Path)
 	}
-	// ICMP has no ports. There is nothing to listen on and nothing to
-	// misconfigure, which is half of why it is the transport that survives.
-	if c.Transport.Type != "icmp" && (c.Transport.Port <= 0 || c.Transport.Port > 65535) {
-		return fmt.Errorf("transport.port %d is not a port", c.Transport.Port)
+	// Two of them have no ports at all: one rides in echo requests and the
+	// other is its own IP protocol. There is nothing to listen on and nothing
+	// to misconfigure, which is half of why they are the ones that survive.
+	switch c.Transport.Type {
+	case "icmp", "gre":
+	default:
+		if c.Transport.Port <= 0 || c.Transport.Port > 65535 {
+			return fmt.Errorf("transport.port %d is not a port", c.Transport.Port)
+		}
 	}
 	if c.Dials() && c.DialHost() == "" {
 		return fmt.Errorf("transport: the side that dials needs an address or a domain to dial")
