@@ -190,6 +190,24 @@ rep() {
 # the pieces a screen is made of
 # --------------------------------------------------------------------------
 
+# wipe clears the screen at the top of a screen, and only there.
+#
+# The rule the rest of the script follows is that nothing is thrown away: over
+# a link with a hundred milliseconds of delay and real loss, scrollback is
+# where you look when the connection stutters. So this moves the cursor home
+# and erases what is on the screen, and does not touch the scrollback buffer -
+# everything drawn before is still a page up. A screen opens clean; the
+# history it opened from is still there.
+#
+# Not between the wizard's questions. Those answers stay on the page above the
+# one being asked, which is what you want when you are copying the same
+# numbers onto a second server.
+wipe() {
+    [ -t 1 ] || return 0
+    [ "$UI_COLOR" = none ] && return 0
+    printf '\033[H\033[2J'
+}
+
 say() { printf '%s\n' "$*"; }
 blank() { printf '\n'; }
 dim() { printf '  %s%s%s\n' "$C_MUTE" "$*" "$C_OFF"; }

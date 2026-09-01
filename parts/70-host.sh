@@ -211,10 +211,15 @@ revert_tuning() {
 screen_host() {
     local key p n bbr cc qd
     while :; do
+        wipe
         blank
         rule "Host tuning"
-        dim "the kernel's own settings. The tunnel's queue profile is a different"
-        dim "thing with the same three names, and it lives on the tunnel screen."
+        dim "The kernel's own network settings, which apply to everything this"
+        dim "server does, not only to the tunnel. Every change is written to one"
+        dim "drop-in file and can be taken back from this screen."
+        blank
+        dim "A tunnel's queue profile is a different thing with the same three"
+        dim "names; it lives on that tunnel's screen."
         blank
         p=$(host_profile)
         bbr=$(host_bbr_state)
@@ -232,10 +237,11 @@ screen_host() {
         field "Open files" "$(ulimit -n) here, $([ -f "$HOST_LIMITS" ] && printf '1048576 at next login' || printf 'unchanged at login')"
         field "Drop-in" "$HOST_SYSCTL"
         blank
-        item2 "1" "Profile" "${p:-none}"
-        item2 "2" "BBR" "$bbr"
-        item2 "3" "Descriptor limits" "$([ -f "$HOST_LIMITS" ] && printf 'raised' || printf 'not raised')"
-        item "4" "Revert everything this screen did"
+        item2 "1" "Profile" "${p:-none applied}"
+        item2 "2" "BBR" "$bbr $G_DASH the congestion control the kernel uses"
+        item2 "3" "Descriptor limits" \
+            "$([ -f "$HOST_LIMITS" ] && printf 'raised to 1048576' || printf 'left at the distribution default')"
+        item "4" "Revert" "put every setting on this screen back"
         item "0" "Back"
         blank
         menu_key key || return 0
@@ -243,10 +249,13 @@ screen_host() {
         1)
             blank
             group "WHAT THIS MACHINE MOSTLY CARRIES"
-            item "1" "Gaming" "small queues; less waiting"
-            item "2" "Balanced" "pick this one if unsure"
-            item "3" "Download" "deep queues, for bulk"
+            item "1" "Gaming" "smaller socket buffers, so a reply waits less"
+            item "2" "Balanced" "the one to pick if the answer is everything"
+            item "3" "Download" "larger buffers, for long transfers"
             item "0" "Back"
+            blank
+            dim "This sets the kernel's socket buffer sizes and backlog. It is"
+            dim "written to $HOST_SYSCTL and applied at once."
             blank
             # menu_key rather than pick, because this screen was reached from
             # a menu and every one of those has a numeric way back out. pick
@@ -641,6 +650,7 @@ why_block_quic() {
 screen_firewall() {
     local key
     while :; do
+        wipe
         blank
         rule "Blocking"
         dim "state lives in $STATE_DIR. Every apply flushes our two chains and"

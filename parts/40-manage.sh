@@ -20,9 +20,19 @@
 # reads the log, because a log line is prose and prose gets reworded - the old
 # manager took the eighth field of an English sentence and broke the day
 # somebody improved the sentence.
+# The queue depth beside the profile's name. "balanced" on its own does not
+# say what it does, and the depth is the whole of what a profile changes.
+prof_queue_note() {
+    local f=$1 q
+    q=$(toml_get "$f" tuning queue_packets)
+    [ -n "$q" ] || q=$(wiz_queue "$(toml_get "$f" tuning profile)")
+    [ -n "$q" ] || return 0
+    printf ' %s %s packets' "$G_DASH" "$q"
+}
+
 tun_line() {
     local name=$1 state
-    TL_STATE=unknown TL_RATE= TL_PEER= TL_RTT= TL_TRANSPORT= TL_SIDE=
+    TL_STATE=unknown TL_RATE= TL_PEER= TL_RTT= TL_TRANSPORT= TL_SIDE= TL_UPTIME=
 
     local f
     f=$(cfg_file "$name")
@@ -47,7 +57,8 @@ tun_line() {
         else
             TL_STATE=idle
         fi
-        TL_RATE="$(round1 "$ST_IN")/$(round1 "$ST_OUT") Mbit/s"
+        TL_RATE="$(round1 "$ST_IN") in, $(round1 "$ST_OUT") out"
+        TL_UPTIME=$(human_secs "$ST_UPTIME")
     else
         # The unit is up but the endpoint does not answer. That is a real
         # state and it is not a failure to report in red: it happens for the
@@ -94,7 +105,11 @@ tun_rtt() {
     t=$(toml_get "$(cfg_file "$name")" transport type)
     [ "$t" = icmp ] && return 0
     have ping || return 0
-    out=$(ping -c 2 -W 2 -q "$(peer_addr "$name")" 2>/dev/null |
+    # Two packets a fifth of a second apart, and one second to wait. This is
+    # on the path of every redraw of the home screen: -c 2 -W 2 meant a tunnel
+    # whose far end had stopped answering cost four seconds of nothing before
+    # the menu appeared, once for every tunnel on the server.
+    out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
         awk -F'/' '/^rtt|^round-trip/ {printf "%.0f", $5}')
     printf '%s' "$out"
 }
@@ -109,6 +124,7 @@ screen_tunnel() {
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
 
     while :; do
+        wipe
         tun_line "$name"
         blank
         printf '  %s%s%s%s%s %s\n' "$C_B" "$name" "$C_OFF" \
@@ -125,35 +141,42 @@ screen_tunnel() {
         dev=$(toml_get "$f" tun name)
         prof=$(toml_get "$f" tuning profile)
 
+        # What this server is, in one line, said the way round that matters:
+        # which end dials and which end waits. The old line said "iran" and
+        # left the reader to remember which of the two does what.
         if [ "$side" = iran ]; then
             if [ "$transport" = icmp ]; then
-                field "Side" "IRAN, dials $kharej over icmp"
+                field "This end" "IRAN $G_DASH dials $kharej inside ping packets"
             else
-                field "Side" "IRAN, dials $kharej:$port/udp"
+                field "This end" "IRAN $G_DASH dials $kharej on udp/$port"
             fi
         else
             if [ "$transport" = icmp ]; then
-                field "Side" "KHAREJ, waits for echo"
+                field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
             else
-                field "Side" "KHAREJ, waits on udp/$port"
+                field "This end" "KHAREJ $G_DASH waits on udp/$port"
             fi
         fi
         field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
 
+        # One measurement to a line, each with the name of what it is. They
+        # were one line with two numbers on it and nothing saying which was
+        # which, five blank columns apart.
         if [ -n "$TL_RATE" ]; then
-            local rtt=$TL_RTT
-            if [ -n "$rtt" ]; then
-                field "Carrying" "$TL_RATE      $(rtt_colour "$rtt")$rtt ms$C_OFF"
-            else
-                field "Carrying" "$TL_RATE"
-            fi
+            field "Traffic" "$TL_RATE  Mbit/s"
         fi
+        if [ -n "$TL_RTT" ]; then
+            field "Round trip" "$(rtt_colour "$TL_RTT")$TL_RTT ms$C_OFF"
+        elif [ "$transport" = icmp ]; then
+            field "Round trip" "$C_MUTE""not measurable across an ICMP tunnel""$C_OFF"
+        fi
+        [ -n "${TL_UPTIME:-}" ] && field "Up for" "$TL_UPTIME"
 
         # Losses only when there are some. A line saying zero every time is a
         # line people stop reading, and then they do not see it change.
         if [ -n "${ST_LOST:-}" ] && [ "${ST_LOST:-0}" -gt 0 ]; then
             local per=$((ST_LOST / (ST_GAPS > 0 ? ST_GAPS : 1)))
-            field "Path took" "$ST_LOST packets in $ST_GAPS runs, about $per at a time"
+            field "Path lost" "$ST_LOST packets in $ST_GAPS gaps, about $per at a time"
         fi
 
         local fw
@@ -163,27 +186,27 @@ screen_tunnel() {
         blank
         group "RUN"
         case $TL_STATE in
-        stopped | disabled) item 1 "Start" ;;
-        *) item 1 "Restart" ;;
+        stopped | disabled) item 1 "Start" "and start it again at every boot" ;;
+        *) item 1 "Restart" "stop it and start it again" ;;
         esac
-        item 2 "Stop"
-        item 3 "Live view"
+        item 2 "Stop" "until you start it, or the server reboots"
+        item 3 "Live view" "the numbers above, once a second"
         blank
         group "CHECK"
-        item 4 "Health check" "what is wrong, and the fix"
-        item 5 "Log"
-        item 6 "Measure MTU"
-        item 7 "Speed test"
+        item 4 "Health check" "what is wrong, and what to do about it"
+        item 5 "Log" "the last forty lines the core wrote"
+        item 6 "Measure MTU" "the largest packet this path will carry"
+        item 7 "Speed test" "iperf3 across the tunnel, sixteen streams"
         blank
         group "CHANGE"
         if [ "$side" = iran ]; then
-            item2 8 "Ports" "${fw:-none}"
+            item2 8 "Ports" "${fw:-nothing is forwarded yet}"
         else
             item2 8 "Ports" "IRAN forwards them, not this side"
         fi
-        item2 9 "Profile" "$prof"
-        item 10 "Advanced" "mtu, log level, queues"
-        item 11 "Delete this tunnel"
+        item2 9 "Profile" "$prof$(prof_queue_note "$f")"
+        item 10 "Advanced" "mtu, log level, queue depth, the file itself"
+        item 11 "Delete this tunnel" "here only - the other server keeps its copy"
         item 0 "Back"
         blank
 
@@ -214,6 +237,7 @@ pause() {
 }
 
 show_log() {
+    wipe
     blank
     rule "Log $G_DASH $1"
     blank
@@ -233,17 +257,20 @@ edit_profile() {
     local name=$1 cur choice
     cur=$(toml_get "$(cfg_file "$name")" tuning profile)
 
+    wipe
     blank
     rule "What crosses this link"
     blank
-    printf '    %s%s%s\n' "$C_KEY" \
-        "$(pad_to '' 14)16 streams   one stream   under load" "$C_OFF"
-    profile_row 1 gaming "$cur" "397 Mbit/s" "167 Mbit/s" "84.5 / 92.5 ms"
-    profile_row 2 balanced "$cur" "448" "254" "93.3 / 106.5"
-    profile_row 3 download "$cur" "466" "253" "115.8 / 139.3"
+    profile_row 1 gaming "$cur" "600 packets - a small one waits behind less"
+    profile_row 2 balanced "$cur" "900 packets - the one to pick if unsure"
+    profile_row 3 download "$cur" "1500 packets - most on a long transfer"
     blank
-    dim "Balanced is not the middle: it carries one stream faster than either"
-    dim "of the others. Idle ping is 81 ms whichever you choose."
+    dim "A profile sets one number: how many packets may wait in the tunnel's"
+    dim "queue. A deeper queue carries more at once and holds a packet longer;"
+    dim "a shallower one answers sooner and gives up some throughput for it."
+    blank
+    dim "Both servers should be on the same one. Changing it restarts the"
+    dim "tunnel here, which costs a second of traffic and nothing else."
     blank
 
     local def=2
@@ -278,19 +305,25 @@ edit_profile() {
 
 _edit_profile() { toml_set "$1" tuning profile "$PROFILE_WANT"; }
 
+# One profile, with a mark against the one this tunnel is on now.
+#
+# It is item() with that mark written over the left margin rather than a line
+# of its own, so the three of them line up with every other menu in the script
+# and there is only one place that decides how a menu line looks.
 profile_row() {
-    local key=$1 name=$2 cur=$3 a=$4 b=$5 c=$6 mark=' '
-    [ "$name" = "$cur" ] && mark=$G_CUR
-    printf '  %s%s%s %s%s%s  %s%s%s%s\n' \
-        "$C_ACCENT" "$mark" "$C_OFF" \
-        "$C_ACCENT" "$key" "$C_OFF" \
-        "$(pad_to "${name^}" 11)" "$(pad_to "$a" 13)" "$(pad_to "$b" 13)" "$c"
+    local key=$1 name=$2 cur=$3 hint=$4 line mark=' '
+    # A dot, not the same arrow the line already has: two arrows on one line
+    # is a line where neither of them means anything.
+    [ "$name" = "$cur" ] && mark=$G_ON
+    line=$(item "$key" "${name^}" "$hint")
+    printf ' %s%s%s%s\n' "$C_OK" "$mark" "$C_OFF" "${line#  }"
 }
 
 screen_advanced() {
     local name=$1 f k q qs
     f=$(cfg_file "$name")
     while :; do
+        wipe
         # Two of these are not in the file until somebody sets them: the
         # profile carries the queue depth, and the core picks the number of
         # device queues. Reading the file alone drew "Queue depth  packets,
