@@ -495,8 +495,8 @@ q_transport() {
     dim "AmneziaWG is the only one here this core does not implement: the link"
     dim "is theirs, installed from their own repository, and the tunnel runs"
     dim "inside it - so it is encrypted, and it is the one with a handshake."
-    dim "It is UDP underneath, so where UDP dies it dies with it - the same"
-    dim "Tehran pair carries its handshake and then nothing."
+    dim "It is UDP underneath, so where UDP dies it dies with it: on a server"
+    dim "whose UDP flows stop after six packets, its handshake is the six."
     blank
     pick n "select" 1 7 || return 1
     case $n in
