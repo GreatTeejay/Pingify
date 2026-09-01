@@ -24,11 +24,23 @@ import (
 //	udp/8445    6 of 15 back   111111.........
 //	udp/8446    6 of 15 back   111111.........
 //
-// Six, and only ever six. A fresh destination port gets six, a fresh source
-// port gets six, waiting a minute gets six, forty packets fired back to back
-// get six. Captures on both ends at the same time say which direction: Germany
-// received every packet and answered every one, and six of the answers reached
-// Iran.
+// Six, and only ever six. Measured again, with an echo server on the far end
+// so that it is a conversation this side starts rather than an arrival nobody
+// asked for, and with the harness checked against itself first:
+//
+//	turkey to germany, no Iran in it     15 of 15
+//	iran to germany                       6 of 40
+//	iran to turkey                        6 of 40
+//	iran to germany, one packet per 2s    111111......
+//	three fresh flows, one after another  6, 6, 6
+//
+// So it is a counter on the flow and not a rate: the seventh packet of a flow
+// is dropped whether it comes a fifth of a second or two seconds after the
+// sixth, the destination makes no difference, and a new source port starts
+// the count again. That last part is why eight TCP connections carry what one
+// cannot, and why anything built on a single long-lived UDP flow - a
+// WireGuard, an AmneziaWG, this carrier - gets its handshake through and then
+// stops.
 //
 // So UDP is not a slow transport on this path. It is an unusable one, and no
 // amount of tuning here changes that - which is why ICMP is the transport
