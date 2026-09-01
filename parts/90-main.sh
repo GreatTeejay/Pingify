@@ -151,7 +151,6 @@ home_panels() {
     panel_field "Datacenter" "$SRV_ORG"
     panel_field "Side" "$side"
     panel_close
-    blank
 
     # A core that is installed but will not run - built for another
     # architecture, or truncated - returns 1 with nothing on stdout, and the
@@ -291,17 +290,17 @@ screen_home() {
 
     blank
     group "TUNNELS"
-    item 1 "New tunnel" "six questions, or one paste"
-    item 2 "Manage tunnels" "ports, profile, logs, remove"
-    item 3 "Health check" "every tunnel, and the fix"
+    item 1 "New tunnel" "set this server up, or finish the pair"
+    item 2 "Manage tunnels" "status, ports, profile, logs, remove"
+    item 3 "Health check" "every tunnel, and what to do about it"
     blank
     group "NETWORK"
-    item 4 "Host tuning" "$(host_summary)"
-    item 5 "Blocking" "ping, QUIC, speedtest sites"
+    item 4 "Host tuning" "kernel profile, BBR, descriptor limits"
+    item 5 "Blocking" "ping from outside, QUIC on udp 443, speedtest"
     blank
     group "MAINTENANCE"
-    item 6 "Update Pingify" "script and core together"
-    item 7 "Remove" "part of it, or all of it"
+    item 6 "Update Pingify" "script and core together, to the same version"
+    item 7 "Remove" "uninstall part of it, or all of it"
     blank
     item 0 "Exit"
     blank

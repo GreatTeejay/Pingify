@@ -43,7 +43,21 @@ PINGIFY_WIDTH=80 ui_detect
 # They were not: the rules were one column short of the rows.
 out=$(panel_open "t"; panel_row "x"; panel_close)
 widths=$(printf '%s\n' "$out" | awk '{ print length($0) }' | sort -u | tr '\n' ' ')
-check "a box is one width all the way down" "$widths" "80 "
+check "a box is one width all the way down" "$widths" "$UI_W "
+
+# The frames stop at 68 however wide the window is. A box pulled across a two
+# hundred column terminal cannot be read from one edge to the other, and this
+# is the width the tool has always had.
+for w in 80 100 120; do
+    PINGIFY_WIDTH=$w ui_detect
+    check "a $w column window still draws its frames at 68" "$UI_W" "68"
+done
+
+# And a narrow one is not widened past what it has.
+PINGIFY_WIDTH=50 ui_detect
+check "a narrow window is taken as it is" "$UI_W" "50"
+
+PINGIFY_WIDTH=80 ui_detect
 
 check "a value that fits is left alone" "$(trunc_to abcdef 10)" "abcdef"
 check "a value that does not fit is marked" "$(trunc_to abcdefghijkl 6)" "abcde~"
