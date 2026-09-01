@@ -43,7 +43,7 @@ type Full interface {
 // stops it dead.
 func noParity(kind string) bool {
 	switch kind {
-	case "tcp", "ws", "wss", "utls", "gre":
+	case "tcp", "ws", "wss", "utls", "fallback", "gre":
 		return true
 	}
 	return false
@@ -81,6 +81,8 @@ func open(cfg *config.Config) (Full, error) {
 		return newRawTCPCarrier(cfg)
 	case "utls":
 		return newUTLSCarrier(cfg)
+	case "fallback":
+		return newFallbackCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }

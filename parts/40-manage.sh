@@ -388,7 +388,7 @@ screen_advanced() {
         # cannot lose a packet, and GRE's payload has to stay a well formed IP
         # packet or the path drops every one of them.
         case $(toml_get "$f" transport type) in
-        tcp | ws | wss | utls | gre) ;;
+        tcp | ws | wss | utls | fallback | gre) ;;
         *) item2 7 "Parity" "$(fec_label "$f")" ;;
         esac
         item 8 "Show the config file"
@@ -437,7 +437,7 @@ screen_advanced() {
             ask v "path" "$(toml_get "$f" transport path)" v_path || continue
             PATH_WANT=$v; cfg_apply "$name" _edit_path yes; pause ;;
         7) case $(toml_get "$f" transport type) in
-            tcp | ws | wss | utls)
+            tcp | ws | wss | utls | fallback)
                 blank; warn "a stream transport cannot lose a packet, so there is nothing to repair"
                 pause; continue ;;
             esac

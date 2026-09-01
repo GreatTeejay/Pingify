@@ -610,13 +610,13 @@ func (c *Config) check() error {
 		c.Transport.Type = "udp"
 	}
 	switch c.Transport.Type {
-	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp", "utls":
+	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp", "utls", "fallback":
 	case "awg":
 		if c.AWG.Iran == "" || c.AWG.Kharej == "" {
 			return fmt.Errorf("awg.iran and awg.kharej are both needed, on both servers")
 		}
 	default:
-		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre, awg and icmp are what exist so far",
+		return fmt.Errorf("transport.type %q: udp, tcp, ws, wss, gre, awg, rawtcp, utls, fallback and icmp are what exist so far",
 			c.Transport.Type)
 	}
 	switch c.Transport.Dials {

@@ -282,7 +282,11 @@ home_cols() {
     # key and dot, name, transport, uptime, round trip, and the two rates.
     # The rates lose their unit to make room for the uptime; the heading over
     # the column carries it instead, which is where a unit belongs.
-    UI_COLS=(4 "$nw" 6 7 8 12)
+    #
+    # Eight for the transport, not six: FALLBACK is eight characters and the
+    # row at its widest is 63 of the 68 this screen is drawn at, so the room
+    # was already there.
+    UI_COLS=(4 "$nw" 8 7 8 12)
 }
 
 # The home screen: the name, the two panels, whatever is running, and a

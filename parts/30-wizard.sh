@@ -483,6 +483,7 @@ q_transport() {
     item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
     item "8" "Raw TCP" "packets inside TCP segments the kernel never sees"
     item "9" "TCP UTLS" "a TLS connection whose hello is Chrome's, not Go's"
+    item "10" "TLS FALLBACK" "the same, and a real website to anyone without the token"
     blank
     dim "sixteen streams, Tehran to Frankfurt:"
     dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
@@ -506,7 +507,13 @@ q_transport() {
     dim "the hello: Go's own says \"a Go program\" in the first packet. This one"
     dim "is Chrome's, from uTLS - the same thing fp=chrome selects elsewhere."
     blank
-    pick n "select" 1 9 || return 1
+    dim "TLS FALLBACK is that plus the other half: a censor that suspects an"
+    dim "address connects to it and looks, and this end answers a probe by"
+    dim "handing the whole connection to a real website. What comes back is"
+    dim "that site's own certificate and its own page, because it is that site"
+    dim "answering. Our own token rides where a browser puts a session ticket."
+    blank
+    pick n "select" 1 10 || return 1
     case $n in
     1) T_TRANSPORT=udp ;;
     2) T_TRANSPORT=tcp ;;
@@ -519,6 +526,7 @@ q_transport() {
        ;;
     8) T_TRANSPORT=rawtcp ;;
     9) T_TRANSPORT=utls ;;
+    10) T_TRANSPORT=fallback ;;
     esac
     return 0
 }
