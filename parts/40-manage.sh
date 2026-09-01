@@ -384,7 +384,11 @@ screen_advanced() {
         case $(toml_get "$f" transport type) in
         ws | wss) item2 6 "Web path" "$(toml_get "$f" transport path)" ;;
         esac
-        item 7 "Show the config file"
+        case $(toml_get "$f" transport type) in
+        tcp | ws | wss | utls) ;;
+        *) item2 7 "Parity" "$(fec_label "$f")" ;;
+        esac
+        item 8 "Show the config file"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -429,7 +433,24 @@ screen_advanced() {
             local v
             ask v "path" "$(toml_get "$f" transport path)" v_path || continue
             PATH_WANT=$v; cfg_apply "$name" _edit_path yes; pause ;;
-        7) blank; sed 's/^/    /' "$f"; pause ;;
+        7) case $(toml_get "$f" transport type) in
+            tcp | ws | wss | utls)
+                blank; warn "a stream transport cannot lose a packet, so there is nothing to repair"
+                pause; continue ;;
+            esac
+            blank
+            dim "One extra packet per N, made of the N before it. Lose any one"
+            dim "of them and this end rebuilds it at once, with nothing asked"
+            dim "for and no round trip; lose two of the same N and TCP does what"
+            dim "it would have done anyway."
+            blank
+            dim "It costs one packet in N of bandwidth. 10 is a good place to"
+            dim "start on a path that drops the odd packet; 0 turns it off."
+            blank
+            local v
+            ask v "one parity per (0 off, 4 to 32)" "$(toml_get "$f" tuning fec)" v_fec || continue
+            FEC_WANT=$v; cfg_apply "$name" _edit_fec yes; pause ;;
+        8) blank; sed 's/^/    /' "$f"; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -441,6 +462,26 @@ _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
 _edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
 _edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
+_edit_fec() { toml_set "$1" tuning fec "$FEC_WANT"; }
+
+# What the Advanced screen shows beside Parity, which is the setting and what
+# it costs rather than the number on its own.
+fec_label() {
+    local n
+    n=$(toml_get "$1" tuning fec)
+    case $n in
+    '' | 0) printf 'off' ;;
+    *) printf '1 per %s, about %d%% more traffic' "$n" $((100 / n)) ;;
+    esac
+}
+
+v_fec() {
+    case $1 in
+    0) return 0 ;;
+    '' | *[!0-9]*) echo "a number: 0 turns it off, otherwise 4 to 32"; return 1 ;;
+    esac
+    { [ "$1" -ge 4 ] && [ "$1" -le 32 ]; } || { echo "4 to 32, or 0 to turn it off"; return 1; }
+}
 
 v_path() {
     case $1 in
