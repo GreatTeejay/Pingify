@@ -11,6 +11,13 @@
 # end up describing something nobody asked for - which is what happens when a
 # tool adds and deletes single rules and one of the deletes quietly fails.
 #
+# The copy is in memory and nothing survives a reboot, so the premise needs a
+# path that makes the copy again at start-up. It has one now: nat_apply_all,
+# behind a oneshot unit. Without it the state files and the Ports screen went
+# on listing forwarded ports after every reboot and not one of them carried a
+# packet, which is the worst shape a fault can take - the machine agreeing
+# with you about what it is supposed to be doing.
+#
 # Two faults of the old script, both named where they are fixed below. A port
 # range in iptables is written with a colon, 8000:8010; the old code wrote a
 # hyphen and ran it under 2>/dev/null, so every range anyone ever entered was
@@ -25,6 +32,7 @@
 NAT_CHAIN=PINGIFY_NAT
 NAT_POST=PINGIFY_SNAT
 NAT_SYSCTL=/etc/sysctl.d/99-pingify-forward.conf
+NAT_UNIT=pingify-nat.service
 
 # Every iptables call goes through here so the lock wait cannot be forgotten.
 # systemd, docker and this script can all want xtables at the same moment, and
@@ -39,6 +47,11 @@ ipt() { iptables -w 2 "$@"; }
 # caller capturing those must not capture the complaints with them.
 fwd_no() { printf '  %s: %s\n' "$1" "$2" >&2; }
 
+# Where a tunnel's list is kept. This name is the file's own business: another
+# part that spells the path out for itself is a second definition, and the
+# health check had one - it read "$STATE_DIR/$1.ports", never found a file, and
+# reported "no ports are forwarded" about a tunnel forwarding six of them.
+# Read the list with forwards_of, or the parsed tuples with forward_specs_for.
 fwd_file() { printf '%s/%s.forwards' "$STATE_DIR" "$1"; }
 
 fwd_range() {
@@ -125,7 +138,7 @@ forward_specs() {
         # ten thousand ports on their behalf is not a favour.
         wide=$((hi - lo + 1))
         if [ "$wide" -gt 512 ]; then
-            fwd_no "$tok" "that is $wide ports, and more than 512 in one range is a mistake being made"
+            fwd_no "$tok" "that is $wide ports; the most in one range is 512"
             refused=$((refused + 1)); continue
         fi
 
@@ -145,7 +158,10 @@ forward_specs() {
             fi
             fwd_port_ok "$tok" "$dstp" || { refused=$((refused + 1)); continue; }
             if [ "$lo" != "$hi" ] && [ "$dstp" != "$lo" ]; then
-                fwd_no "$tok" "a range cannot go to one port - forward $lo-$hi as it stands, or the ports one at a time"
+                # Kept short on purpose. fwd_no prints with a bare printf and
+                # nothing on this path truncates, so a sentence of advice here
+                # wrapped past a hundred columns on a sixty column terminal.
+                fwd_no "$tok" "a range cannot go to one port"
                 refused=$((refused + 1)); continue
             fi
         fi
@@ -215,12 +231,45 @@ tun_dev_of() {
     printf '%s' "${d:-pfy0}"
 }
 
+# forward_specs_for is the parser bound to a tunnel: the same tuples, with the
+# `-` in the dsthost column already replaced by that tunnel's far end.
+#
+# It exists because the placeholder was escaping. forward_specs is handed
+# specs and not a tunnel, so it cannot resolve `-` itself and does not pretend
+# to; the health check took the tuples straight from it and probed the literal
+# host `-`, which cannot answer, so every plain `443` forward was reported as
+# a dead backend. Anything outside this file that wants a tunnel's tuples
+# wants these, and it should ask for them by tunnel name rather than spell out
+# where the state file lives.
+forward_specs_for() {
+    local name=$1 peer tuples proto lo hi dsth dstp
+    tuples=$(forward_specs "$(forwards_of "$name")") || return 1
+    [ -n "$tuples" ] || return 0
+    peer=$(peer_tun_addr "$name")
+    while read -r proto lo hi dsth dstp; do
+        [ -n "$proto" ] || continue
+        if [ "$dsth" = - ]; then
+            # No address for the far end and a token that needs one. Printing
+            # the tuple anyway would hand an empty host to whatever consumes
+            # it, and an empty host in a DNAT target is a rule iptables takes.
+            [ -n "$peer" ] || return 1
+            dsth=$peer
+        fi
+        printf '%s %s %s %s %s\n' "$proto" "$lo" "$hi" "$dsth" "$dstp"
+    done <<<"$tuples"
+}
+
 # fwd_listeners prints "proto port who" for everything bound on this host.
 #
 # Loopback-only listeners are left out on purpose: PREROUTING takes the packet
 # long before it reaches 127.0.0.1, so such a service never saw the outside
 # traffic and calling it a clash is a false alarm - and false alarms are how
 # people learn to ignore a collision check.
+#
+# The whole of 127.0.0.0/8 is loopback, not the one address. Matching only
+# 127.0.0.1 meant systemd-resolved on 127.0.0.53:53 was reported as a clash on
+# every Ubuntu host, which is precisely the false alarm this filter exists to
+# prevent.
 fwd_listeners() {
     have ss || return 0
     ss -lntup 2>/dev/null | awk '
@@ -229,7 +278,7 @@ fwd_listeners() {
             n = split(addr, p, ":")
             port = p[n]
             host = substr(addr, 1, length(addr) - length(port) - 1)
-            if (host == "127.0.0.1" || host == "[::1]") next
+            if (host ~ /^127\./ || host == "[::1]") next
             who = "something"
             i = index($0, "users:((\"")
             if (i > 0) {
@@ -260,6 +309,19 @@ forwards_clash() {
     tuples=$(forward_specs "$@") || return 1
     [ -n "$tuples" ] || return 0
     listeners=$(fwd_listeners)
+
+    # A tunnel whose stored list no longer parses contributes no tuples, and
+    # the parse ran under 2>/dev/null inside a process substitution, so both
+    # its complaint and its exit status went into the dark. The port it is
+    # holding was then handed out as free. Said once per tunnel, here, rather
+    # than once per port being checked.
+    while read -r other; do
+        [ -n "$other" ] || continue
+        [ "$other" = "$name" ] && continue
+        forward_specs "$(forwards_of "$other")" >/dev/null 2>&1 && continue
+        printf '%s: its list cannot be read\n' "$other"
+        hits=$((hits + 1))
+    done < <(cfg_list)
 
     while read -r proto lo hi dsth dstp; do
         [ -n "$proto" ] || continue
@@ -361,7 +423,7 @@ SYSCTL
         printf '1\n' >/proc/sys/net/ipv4/ip_forward 2>/dev/null
     now=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
     [ "$now" = 1 ] && return 0
-    bad "the kernel is not forwarding packets, so nothing would reach the other side"
+    bad "the kernel is not forwarding packets, so nothing arrives"
     fix "sysctl -w net.ipv4.ip_forward=1"
     return 1
 }
@@ -371,21 +433,21 @@ SYSCTL
 # than aborting the rebuild: the rebuild is doing the other tunnels' work too,
 # and one bad state file must not take their ports down with it.
 nat_rules_for() {
-    local name=$1 f side dev peer tuples proto lo hi dsth dstp dport target
+    local name=$1 f side dev tuples proto lo hi dsth dstp dport target
     f=$(cfg_file "$name")
     [ -f "$f" ] || return 0
     side=$(toml_get "$f" tunnel side)
     [ "$side" = iran ] || return 0
 
-    tuples=$(forward_specs "$(forwards_of "$name")") || return 1
+    # forward_specs_for resolves the `-` placeholder against this tunnel, so
+    # it also fails when a token needs the far end and the config names none.
+    tuples=$(forward_specs_for "$name") || return 1
     [ -n "$tuples" ] || return 0
     dev=$(tun_dev_of "$name")
-    peer=$(peer_tun_addr "$name")
-    [ -n "$dev" ] && [ -n "$peer" ] || return 1
+    [ -n "$dev" ] || return 1
 
     while read -r proto lo hi dsth dstp; do
         [ -n "$proto" ] || continue
-        [ "$dsth" = - ] && dsth=$peer
         if [ "$lo" = "$hi" ]; then
             dport=$lo target=$dsth:$dstp
         else
@@ -409,12 +471,19 @@ nat_rules_for() {
     nat_forward_hook add "$dev"
 }
 
-# nat_apply rebuilds everything from every tunnel's state, then reports on the
-# one it was called for. Everything, because the chains are shared: flushing
-# them to write one tunnel's rules and not writing the others back is how a
-# second tunnel silently loses its ports.
-nat_apply() {
-    local name=$1 t n peer word
+# nat_rebuild writes every tunnel's stored list into the freshly flushed
+# chains. Everything, because the chains are shared: flushing them to write one
+# tunnel's rules and not writing the others back is how a second tunnel
+# silently loses its ports.
+#
+# The argument is the tunnel the caller is about to report on, or empty to mean
+# every tunnel matters. It returns non-zero when that tunnel's rules did not go
+# in. This used to be inside nat_apply, which threw the result away: a DNAT the
+# kernel refused, or a config with no device or no far end, was warned about
+# and then reported as a success on the very next line, with a count read from
+# the state file rather than from what iptables had accepted.
+nat_rebuild() {
+    local want=$1 t dev rc=0
     have iptables || {
         warn "iptables is not installed, so nothing can be forwarded"
         fix "apt-get install -y iptables"
@@ -432,19 +501,91 @@ nat_apply() {
 
     while read -r t; do
         [ -n "$t" ] || continue
-        nat_rules_for "$t" || warn "$t: its stored ports could not be applied"
+        # A tunnel that has stopped forwarding kept its FORWARD accepts:
+        # nat_rules_for returns before it adds them and nothing ever took them
+        # away again, so `-o pfy0 -j ACCEPT` sat there permitting that device
+        # with no DNAT left behind it. The nat chains are flushed above; these
+        # two rules live in filter and have to be removed by name.
+        if [ -z "$(forwards_of "$t")" ]; then
+            dev=$(tun_dev_of "$t")
+            nat_forward_hook del "$dev"
+            continue
+        fi
+        nat_rules_for "$t" && continue
+        warn "$t: its stored ports could not be applied"
+        if [ -z "$want" ] || [ "$t" = "$want" ]; then rc=1; fi
     done < <(cfg_list)
+    return "$rc"
+}
+
+# nat_apply rebuilds everything, then reports on the one tunnel it was called
+# for. The report is the outcome, not a wish: it is only printed when the
+# rebuild said that tunnel's rules went in.
+nat_apply() {
+    local name=$1 n peer word
+    nat_rebuild "$name" || {
+        bad "$name: its ports are not forwarded"
+        fix "read the warnings above, then set the list again"
+        return 1
+    }
+    nat_unit_write || {
+        warn "the boot unit is not written, so a reboot loses these"
+        fix "check that $UNIT_DIR can be written"
+    }
 
     n=$(forwards_of "$name" | grep -c .) || n=0
     peer=$(peer_tun_addr "$name")
-    if [ "$n" -gt 0 ]; then
-        word=ports
-        [ "$n" = 1 ] && word=port
+    word=ports
+    [ "$n" = 1 ] && word=port
+    if [ "$n" = 0 ]; then
+        ok "$name forwards nothing now"
+    elif [ -n "$peer" ]; then
         ok "$name sends $n $word to $peer"
     else
-        ok "$name forwards nothing now"
+        # Every token named its own destination, so there is no far end to
+        # name here. The old line ended "to " with nothing after it.
+        ok "$name sends $n $word across the tunnel"
     fi
     return 0
+}
+
+# nat_apply_all is the boot path, and the reason the unit below exists.
+#
+# iptables keeps its rules in memory alone. Nothing replayed them at start-up,
+# so every forwarded port died at the first reboot while the state files and
+# the Ports screen went on saying the ports were forwarded - the one failure
+# with no symptom anywhere on the machine except that no packet arrives.
+nat_apply_all() {
+    [ "$(cfg_count)" -gt 0 ] || return 0
+    nat_rebuild "" || return 1
+    ok "the forwarded ports are back in the kernel"
+}
+
+# The unit re-enters this same script rather than repeating the rules, so the
+# boot path cannot drift from the interactive one. It sources the manager with
+# PINGIFY_NO_MAIN set, which is what stops a sourced copy opening the menu, and
+# calls the one function - there is no command line flag for this and adding
+# one would put a second entry point on the same work.
+nat_unit_write() {
+    mkdir -p "$UNIT_DIR" 2>/dev/null
+    # The write is checked. A unit that was never written is the reboot fault
+    # again, and it would be reported under the same green tick as before.
+    cat >"$UNIT_DIR/$NAT_UNIT" <<UNIT || return 1
+[Unit]
+Description=Pingify forwarded ports
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'PINGIFY_NO_MAIN=1 . $PINGIFY_BIN && nat_apply_all'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable "$NAT_UNIT" >/dev/null 2>&1 || true
 }
 
 # nat_drop removes one tunnel's forwarding. Call it before the config file is
@@ -453,7 +594,10 @@ nat_apply() {
 nat_drop() {
     local name=$1 dev t left=0
     rm -f "$(fwd_file "$name")"
-    have iptables || return 0
+    # The state file has gone either way, so say so. Returning in silence here
+    # left the menu item printing nothing at all after the confirmation, which
+    # reads as a key that did not work.
+    have iptables || { ok "$name forwards nothing now"; return 0; }
     dev=$(tun_dev_of "$name")
     nat_forward_hook del "$dev"
 
@@ -475,6 +619,13 @@ nat_drop() {
 # every run: a single -D would leave the duplicates pointing at a chain that
 # is about to be deleted.
 nat_teardown() {
+    # The boot unit goes first and always, iptables or not: a unit left behind
+    # would replay chains at the next reboot that nothing on this machine now
+    # asks for.
+    systemctl disable --now "$NAT_UNIT" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$NAT_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
     have iptables || return 0
     while ipt -t nat -C PREROUTING -j "$NAT_CHAIN" 2>/dev/null; do
         ipt -t nat -D PREROUTING -j "$NAT_CHAIN" || break
@@ -508,21 +659,23 @@ screen_ports() {
         rule "Ports $G_CUR $name"
         blank
         if [ "$side" != iran ]; then
-            warn "this is the KHAREJ side, and nothing is forwarded from here"
-            fix "run this on the IRAN server - that is the side users connect to"
+            warn "this is the KHAREJ side; nothing is forwarded here"
+            fix "run this on the IRAN server, where users connect"
             blank
             return 0
         fi
 
         peer=$(peer_tun_addr "$name")
-        dim "what arrives on these ports is handed to $peer, across the tunnel"
+        # Short because dim prints with a bare printf: the sentence this
+        # replaces came to 72 columns against a 60 column floor and wrapped.
+        dim "these ports go to $peer across the tunnel"
         blank
         cur=$(forwards_of "$name" | tr '\n' ' ')
         cur=${cur% }
         if [ -z "$cur" ]; then
             dim "nothing is forwarded yet"
         elif ! tuples=$(forward_specs "$cur"); then
-            warn "the stored list cannot be read, so this tunnel forwards nothing"
+            warn "the stored list cannot be read, so nothing is forwarded"
             fix "choose 1 and enter the ports again"
         else
             UI_COLS=(14 7 30)

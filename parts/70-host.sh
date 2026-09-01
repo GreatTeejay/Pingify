@@ -104,7 +104,11 @@ host_write_sysctl() {
         ;;
     esac
 
-    cat >"$HOST_SYSCTL" <<SYSCTL
+    # The write is checked. It used to be assumed, so a full disk or a
+    # read-only /etc left the old file in place, sysctl --system succeeded on
+    # what was already there, and the caller printed "host tuning applied" over
+    # settings nobody had changed.
+    cat >"$HOST_SYSCTL" <<SYSCTL || { bad "could not write $HOST_SYSCTL"; return 1; }
 # Written by Pingify $PINGIFY_VERSION. Delete this file, run "sysctl --system",
 # and the distribution's own settings are what is left.
 # profile: $profile
@@ -149,7 +153,7 @@ SYSCTL
     # this says - tuning.pace in the config does that - so this line is about
     # the host's other interfaces, not about the link.
     if [ "$bbr" = on ]; then
-        cat >>"$HOST_SYSCTL" <<'SYSCTL'
+        cat >>"$HOST_SYSCTL" <<'SYSCTL' || { bad "could not add the BBR lines"; return 1; }
 
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -169,7 +173,9 @@ SYSCTL
 # get their limit from the unit, and pingify@.service already carries
 # LimitNOFILE=1048576. This is for the shell you ssh in with.
 host_limits() {
-    cat >"$HOST_LIMITS" <<'LIMITS'
+    # Checked, because the success line below said the limit was raised whether
+    # or not a single byte reached the file.
+    cat >"$HOST_LIMITS" <<'LIMITS' || { bad "could not write $HOST_LIMITS"; return 1; }
 # Written by Pingify. Delete this file to undo it.
 *    soft  nofile  1048576
 *    hard  nofile  1048576
@@ -202,7 +208,7 @@ revert_tuning() {
     dim "the Blocking screen"
 }
 
-host_tuning_screen() {
+screen_host() {
     local key p n bbr cc qd
     while :; do
         blank
@@ -217,8 +223,12 @@ host_tuning_screen() {
         # and the file alone cannot show it.
         cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        # Two fields, not one sentence. field cuts its value to UI_W - 20, so
+        # at the 60-column floor the single line ran out at 40 columns and the
+        # qdisc - half of what the read-back is for - was what fell off.
         field "Profile" "${p:-not applied}"
-        field "BBR" "$bbr, and the kernel is running ${cc:-unknown} over ${qd:-unknown}"
+        field "BBR" "$bbr"
+        field "Kernel" "${cc:-unknown} over ${qd:-unknown}"
         field "Open files" "$(ulimit -n) here, $([ -f "$HOST_LIMITS" ] && printf '1048576 at next login' || printf 'unchanged at login')"
         field "Drop-in" "$HOST_SYSCTL"
         blank
@@ -249,8 +259,22 @@ host_tuning_screen() {
         2)
             blank
             if [ "$(host_bbr_state)" = on ]; then
-                host_write_sysctl "${p:-balanced}" off &&
-                    ok "back to $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+                # Taking the two lines out of the drop-in does not take BBR off
+                # the running kernel: sysctl --system only sets what a file
+                # names, and no file names a default. So this branch used to
+                # rewrite the file, read the live value back, and print "back
+                # to bbr". Set the values here, then report what is true.
+                if host_write_sysctl "${p:-balanced}" off; then
+                    sysctl -qw net.ipv4.tcp_congestion_control=cubic \
+                        net.core.default_qdisc=fq_codel >/dev/null 2>&1
+                    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+                    if [ "$cc" = bbr ]; then
+                        warn "the drop-in dropped BBR but the kernel is still on bbr"
+                        fix "a reboot clears it"
+                    else
+                        ok "back to ${cc:-the kernel default}"
+                    fi
+                fi
             elif ! host_bbr_available; then
                 bad "this kernel does not offer BBR"
                 fix "kernel $(uname -r) - 4.9 or newer with tcp_bbr is what has it"
@@ -276,17 +300,15 @@ host_tuning_screen() {
 # block_ipt is prefixed rather than called ipt, because the part that owns
 # forwarding hooks its own chains and the two must not end up sharing one
 # wrapper by accident and then disagreeing about which errors are quiet.
-block_ipt() { iptables "$@" 2>/dev/null; }
+#
+# -w 2, which was missing. Every one of these takes the xtables lock, and
+# without a wait iptables gives up the moment the forwarding part is applying
+# its own NAT rules. The error goes to /dev/null here, so those rules simply
+# were not installed and the screen said they were; the callers below now
+# check each one instead.
+block_ipt() { iptables -w 2 "$@" 2>/dev/null; }
 
 block_state() { [ -f "$STATE_DIR/block-$1" ] && printf 'on' || printf 'off'; }
-
-block_summary() {
-    local out= w
-    for w in icmp quic speedtest; do
-        [ "$(block_state "$w")" = on ] && out="$out$w "
-    done
-    [ -n "$out" ] && printf '%s' "${out% }" || printf 'none'
-}
 
 host_badge() {
     if [ "$1" = on ]; then printf '%s%s on%s' "$C_OK" "$G_ON" "$C_OFF"
@@ -327,6 +349,53 @@ block_icmp_tunnel() {
     return 1
 }
 
+# block_carrier_443 names a tunnel whose carrier is udp 443, which is the port
+# the QUIC switch takes away. The wizard lets the operator pick any port and
+# 443 is a common choice precisely because it looks like ordinary web traffic,
+# so this is not a corner case.
+block_carrier_443() {
+    local n f
+    while IFS= read -r n; do
+        f=$(cfg_file "$n")
+        [ "$(toml_get "$f" transport type)" = icmp ] && continue
+        [ "$(toml_get "$f" transport port)" = 443 ] || continue
+        printf '%s' "$n"
+        return 0
+    done < <(cfg_list)
+    return 1
+}
+
+# block_carrier_accept puts this server's own carrier out of reach of the
+# string match, and has to run before those rules go in.
+#
+# Nothing under internal/ encrypts the payload, so a customer's request for
+# speedtest.net travels through the tunnel with those bytes in clear and
+# -m string matches them inside the carrier's own packet. The rule aimed at a
+# browser then rejects the packet carrying it, and the whole link stutters for
+# a reason nothing on the screen explains.
+#
+# Both port directions, because the two ends are not symmetrical: IRAN dials
+# out, so its carrier packets carry the port as the destination, and KHAREJ
+# listens and answers from it as the source.
+block_carrier_accept() {
+    local n f t p rc=0 icmp_done=0
+    while IFS= read -r n; do
+        f=$(cfg_file "$n")
+        t=$(toml_get "$f" transport type)
+        if [ "$t" = icmp ]; then
+            [ "$icmp_done" = 1 ] && continue
+            icmp_done=1
+            block_ipt -A PINGIFY_OUT -p icmp -j ACCEPT || rc=1
+            continue
+        fi
+        p=$(toml_get "$f" transport port)
+        case $p in '' | *[!0-9]*) continue ;; esac
+        block_ipt -A PINGIFY_OUT -p udp --dport "$p" -j ACCEPT || rc=1
+        block_ipt -A PINGIFY_OUT -p udp --sport "$p" -j ACCEPT || rc=1
+    done < <(cfg_list)
+    return "$rc"
+}
+
 # The chains, hooked once at position 1 and rebuilt from empty on every apply.
 block_reset_chains() {
     local c
@@ -339,7 +408,7 @@ block_reset_chains() {
 }
 
 block_drop_chains() {
-    local c i
+    local c i rc=0
     # -D removes one match. An older script that inserted its hook twice leaves
     # the second behind, still sending every packet through a chain nothing
     # maintains, so take them off in a bounded loop rather than once.
@@ -348,8 +417,13 @@ block_drop_chains() {
     for c in PINGIFY_IN PINGIFY_OUT; do
         block_ipt -F "$c"
         block_ipt -X "$c"
+        # -X refuses while anything still jumps to the chain, and that refusal
+        # went to /dev/null, so a hook the loops above could not unpick left a
+        # live chain behind under a green "every blocking rule is gone". -S
+        # fails on a chain that is not there, which is the answer wanted.
+        block_ipt -S "$c" >/dev/null 2>&1 && rc=1
     done
-    return 0
+    return "$rc"
 }
 
 hosts_block_off() {
@@ -383,7 +457,10 @@ hosts_block_on() {
 # apply_blocking is the only thing that writes rules, and it writes all of them
 # every time from the state files. Nothing anywhere adds a single rule.
 apply_blocking() {
-    local quiet=${1:-} ifc h any
+    # rc is the honest answer. This function used to end with an unconditional
+    # ok and return 0, so a rule iptables refused - the lock, a missing module,
+    # a kernel without the match - was reported as a rule that went in.
+    local quiet=${1:-} ifc h any rc=0 carrier
     have iptables || {
         [ "$quiet" = quiet ] || warn "iptables is not installed, so nothing was applied"
         return 1
@@ -401,7 +478,7 @@ apply_blocking() {
         # Put the global drop above these and blocking pings from the internet
         # quietly takes away the only test the operator has.
         for ifc in $(block_tun_ifaces); do
-            block_ipt -A PINGIFY_IN -i "$ifc" -p icmp --icmp-type echo-request -j ACCEPT
+            block_ipt -A PINGIFY_IN -i "$ifc" -p icmp --icmp-type echo-request -j ACCEPT || rc=1
         done
 
         # And where a tunnel on this host uses the icmp transport, the global
@@ -424,20 +501,35 @@ apply_blocking() {
             [ "$quiet" = quiet ] ||
                 dim "core has already stopped this host answering pings"
         else
-            block_ipt -A PINGIFY_IN -p icmp --icmp-type echo-request -j DROP
+            block_ipt -A PINGIFY_IN -p icmp --icmp-type echo-request -j DROP || rc=1
         fi
     fi
 
     if [ "$(block_state quic)" = on ]; then
-        # Rejected on the way out, not dropped: a browser that gets a port
-        # unreachable falls back to TCP now, and one that gets silence waits
-        # for a timeout first, which is felt as the page hanging.
-        block_ipt -A PINGIFY_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
-        block_ipt -A PINGIFY_IN -p udp --dport 443 -j DROP
+        # A udp carrier on 443 is left alone, the same care the ICMP branch
+        # takes. These two rules match on the destination port only, which is
+        # the dialling side's carrier on the way out and the listening side's
+        # on the way in, so with the tunnel on 443 they made it deaf with every
+        # rule on the screen looking correct. Nothing on this host can tell one
+        # udp 443 datagram from another, so the choice is to leave them out.
+        if carrier=$(block_carrier_443); then
+            [ "$quiet" = quiet ] || dim "$carrier carries on udp 443"
+            [ "$quiet" = quiet ] ||
+                dim "so the QUIC rules are left out - nothing here can tell"
+            [ "$quiet" = quiet ] ||
+                dim "that carrier from a browser on the same port"
+        else
+            # Rejected on the way out, not dropped: a browser that gets a port
+            # unreachable falls back to TCP now, and one that gets silence waits
+            # for a timeout first, which is felt as the page hanging.
+            block_ipt -A PINGIFY_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable || rc=1
+            block_ipt -A PINGIFY_IN -p udp --dport 443 -j DROP || rc=1
+        fi
     fi
 
     if [ "$(block_state speedtest)" = on ]; then
         hosts_block_on
+        block_carrier_accept || rc=1
         any=0
         for h in $SPEEDTEST_HOSTS; do
             case $h in *[!a-zA-Z0-9.-]*) continue ;; esac
@@ -454,7 +546,12 @@ apply_blocking() {
         hosts_block_off
     fi
 
-    firewall_unit_write
+    firewall_unit_write || rc=1
+    if [ "$rc" != 0 ]; then
+        [ "$quiet" = quiet ] || bad "some of those rules would not go in"
+        [ "$quiet" = quiet ] || fix "iptables -S PINGIFY_OUT   shows what did"
+        return 1
+    fi
     [ "$quiet" = quiet ] || ok "blocking rules rebuilt from the state files"
     return 0
 }
@@ -463,7 +560,14 @@ apply_blocking() {
 # files. It calls back into this same script, which means there is one apply
 # path and the boot path cannot drift from the interactive one.
 firewall_unit_write() {
-    cat >"$UNIT_DIR/pingify-firewall.service" <<UNIT
+    local unit=$UNIT_DIR/pingify-firewall.service
+    # The unit used to run "$PINGIFY_BIN --apply-firewall", and argv in the
+    # main part has no such option: unknown flags print the usage and die, so
+    # every boot the unit failed, every rule stayed gone, and the Blocking
+    # screen still read "on". Source the script with PINGIFY_NO_MAIN instead
+    # and call the function directly, which is what the forwarding part's own
+    # boot unit does and what build.sh and the updater already use.
+    cat >"$unit" <<UNIT || { bad "could not write the boot unit"; fix "$unit"; return 1; }
 [Unit]
 Description=Pingify blocking rules
 After=network-online.target
@@ -472,7 +576,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$PINGIFY_BIN --apply-firewall
+ExecStart=/bin/bash -c 'PINGIFY_NO_MAIN=1 . $PINGIFY_BIN && apply_blocking quiet'
 
 [Install]
 WantedBy=multi-user.target
@@ -482,12 +586,20 @@ UNIT
 }
 
 remove_blocking() {
+    local rc=0
     rm -f "$STATE_DIR"/block-icmp "$STATE_DIR"/block-quic "$STATE_DIR"/block-speedtest
     hosts_block_off
-    have iptables && block_drop_chains
+    have iptables && { block_drop_chains || rc=1; }
     systemctl disable --now pingify-firewall.service >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/pingify-firewall.service"
     systemctl daemon-reload >/dev/null 2>&1 || true
+    # Uninstall calls this and prints its own success after it, so a chain that
+    # survived has to come back as a non-zero rather than as the line below.
+    if [ "$rc" != 0 ]; then
+        bad "the PINGIFY chains are still in the kernel"
+        fix "iptables -S PINGIFY_IN   shows what points at it"
+        return 1
+    fi
     ok "every blocking rule, state file and the boot unit are gone"
     dim "the tunnels themselves are untouched"
 }
@@ -518,7 +630,7 @@ why_block_quic() {
     dim "a site."
 }
 
-blocking_screen() {
+screen_firewall() {
     local key
     while :; do
         blank
@@ -550,10 +662,16 @@ blocking_screen() {
             if ! have iptables; then
                 warn "iptables is not installed"
             else
+                # Cut to the width like everything else on this screen. A
+                # string rule is about 127 columns as iptables prints it, so
+                # ten of them wrapped into each other at any width this UI
+                # supports and the list stopped being readable at all.
                 rule "PINGIFY_IN"
-                iptables -S PINGIFY_IN 2>/dev/null | grep -v '^-N ' | sed 's/^/    /'
+                iptables -S PINGIFY_IN 2>/dev/null | grep -v '^-N ' |
+                    sed 's/^/    /' | cut -c "1-$((UI_W - 3))"
                 rule "PINGIFY_OUT"
-                iptables -S PINGIFY_OUT 2>/dev/null | grep -v '^-N ' | sed 's/^/    /'
+                iptables -S PINGIFY_OUT 2>/dev/null | grep -v '^-N ' |
+                    sed 's/^/    /' | cut -c "1-$((UI_W - 3))"
             fi
             blank
             field "hosts file" "$(grep -qF "$HOSTS_MARK" /etc/hosts 2>/dev/null && printf 'our block is in it' || printf 'nothing of ours in it')"

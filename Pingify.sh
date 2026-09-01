@@ -4225,7 +4225,7 @@ ensure_go() {
     fi
     blank
     dim "This is the one step that wants the network. It would fetch:"
-    field "from" "$url"
+    dim "  $url"
     field "size" "about 80 MB, roughly 250 MB unpacked"
     field "into" "/usr/local/go, deleting whatever is there now"
     blank
@@ -4243,10 +4243,10 @@ ensure_go() {
 
     tmp=$(mktemp) || return 1
     if have curl; then
-        curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url" >/dev/null 2>&1 &
+        curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url"             >"$STATE_DIR/fetch.log" 2>&1 &
         pid=$!
     elif have wget; then
-        wget -q -O "$tmp" "$url" &
+        wget -O "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1 &
         pid=$!
     else
         rm -f "$tmp"
@@ -4260,19 +4260,35 @@ ensure_go() {
     if [ "$rc" != 0 ]; then
         rm -f "$tmp"
         bad "the download failed, exit $rc"
+        [ -s "$STATE_DIR/fetch.log" ] &&
+            tail -n 3 "$STATE_DIR/fetch.log" | sed 's/^/       /'
         fix "from a machine that can reach it:  curl -fLO $url"
         fix "copy it here, then:  tar -C /usr/local -xzf go$tar_ver.linux-$arch.tar.gz"
         return 1
     fi
 
-    rm -rf /usr/local/go
-    if ! tar -C /usr/local -xzf "$tmp"; then
+    # Unpack beside whatever is there and swap only when it worked. Deleting
+    # first is how a truncated download leaves a server with no compiler at
+    # all - including the too-old one it had a minute ago - and the advice
+    # printed after that failure needs the network that just failed.
+    rm -rf /usr/local/go.new
+    if ! tar -C /usr/local --one-top-level=go.new --strip-components=1 -xzf "$tmp"; then
+        rm -rf /usr/local/go.new
         rm -f "$tmp"
         bad "the tarball would not unpack - it is probably a truncated download"
         fix "run this again, or unpack it by hand into /usr/local"
         return 1
     fi
     rm -f "$tmp"
+    if [ ! -x /usr/local/go.new/bin/go ]; then
+        rm -rf /usr/local/go.new
+        bad "the tarball unpacked but there is no bin/go in it"
+        return 1
+    fi
+    rm -rf /usr/local/go.old
+    [ -d /usr/local/go ] && mv /usr/local/go /usr/local/go.old
+    mv /usr/local/go.new /usr/local/go
+    rm -rf /usr/local/go.old
 
     if [ ! -x /usr/local/go/bin/go ]; then
         bad "the tarball unpacked but there is no /usr/local/go/bin/go in it"
@@ -4338,7 +4354,23 @@ build_core() {
         bad "the core built but would not install to $CORE_BIN"
         return 1
     fi
-    ok "core $(core_version) is installed at $CORE_BIN"
+    # Ask the binary that just landed. `ok "core $(core_version) ..."` reads as
+    # a check and is not one: the substitution runs inside an argument, so a
+    # core that will not exec - wrong architecture, most likely - prints
+    # "core  is installed" in green and returns success, and every later run
+    # rebuilds it from scratch and says the same thing again.
+    local here
+    here=$(core_version)
+    if [ -z "$here" ]; then
+        bad "the core installed but will not run - is $(arch_go) really this machine?"
+        return 1
+    fi
+    if [ "$here" != "$PINGIFY_VERSION" ]; then
+        bad "the core says it is $here and this script is $PINGIFY_VERSION"
+        fix "they are built from the same file, so this means a stale copy somewhere"
+        return 1
+    fi
+    ok "core $here is installed at $CORE_BIN"
     return 0
 }
 
@@ -4397,8 +4429,11 @@ ensure_core() {
 # that were greps over the script's own source, and they pinned wording, broke
 # on renames, and passed happily on dead code.
 
-# The tunnel being edited may keep its own values. The wizard creates, so this
-# is empty here; the manage screens set it before calling the owner lookups.
+# The tunnel being edited may keep its own values - a screen that re-asks for a
+# port must not report the tunnel's own port as taken. The wizard creates, so
+# this stays empty here; every owner lookup below also takes the name as an
+# optional last argument, so a caller that has one need not set a global and
+# remember to put it back.
 WIZ_KEEP=
 
 # --------------------------------------------------------------------------
@@ -4431,7 +4466,7 @@ wiz_net_overlap() {
     # An octet that is not a number would become an arithmetic syntax error
     # below, and inside a validator that error is what the user gets told.
     case $oct in '' | *[!0-9]*) return 1 ;; esac
-    b=$(((10 << 24) + (oct << 16) + (10 << 8)))
+    b=$(((10 << 24) + ((10#$oct) << 16) + (10 << 8)))
     m=$plen
     [ "$m" -gt 24 ] && m=24
     # A /0 on an interface is not a claim on anything; treating it as one would
@@ -4443,13 +4478,13 @@ wiz_net_overlap() {
 # wiz_link_owner prints what owns 10.<octet>.10.0/24 here, or returns 1.
 wiz_link_owner() {
     local oct=$1 keep=${2:-$WIZ_KEEP} n a dev addr plen
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         a=$(toml_get "$(cfg_file "$n")" tun iran)
         case ${a%%/*} in
         10."$oct".*) printf 'the tunnel %s' "$n"; return 0 ;;
         esac
-    done
+    done < <(cfg_list)
     # Process substitution, not a pipe: a pipe puts the loop in a subshell and
     # the return below would leave only the subshell, so a clash on the host
     # would be found and then thrown away.
@@ -4468,11 +4503,11 @@ wiz_link_owner() {
 # wiz_device_owner prints what owns a tun device name here, or returns 1.
 wiz_device_owner() {
     local dev=$1 n keep=${2:-$WIZ_KEEP}
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         [ "$(toml_get "$(cfg_file "$n")" tun name)" = "$dev" ] &&
             { printf 'the tunnel %s' "$n"; return 0; }
-    done
+    done < <(cfg_list)
     # An interface with no config behind it is another tool's, or one of ours
     # left over from a crash. Either way the core cannot create it again.
     [ -e "/sys/class/net/$dev" ] && { printf 'an interface already on this host'; return 0; }
@@ -4481,14 +4516,14 @@ wiz_device_owner() {
 
 wiz_port_owner() {
     local p=$1 keep=${2:-$WIZ_KEEP} n f
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         f=$(cfg_file "$n")
         # ICMP has no port, so an icmp tunnel owns no number.
         [ "$(toml_get "$f" transport type)" = icmp ] && continue
         [ "$(toml_get "$f" transport port)" = "$p" ] &&
             { printf 'the tunnel %s' "$n"; return 0; }
-    done
+    done < <(cfg_list)
     return 1
 }
 
@@ -4567,19 +4602,24 @@ default_name() {
 # The status endpoint is one loopback port per tunnel. It is written into the
 # shared file, so the second server inherits the number; wizard_paste checks it
 # again there because the two servers do not have the same tunnels on them.
+#
+# Nothing free means nothing free. This used to fall out of the loop printing
+# $STATUS_BASE with status 0 - the one port it had just proved was taken - and
+# both callers wrote that number into the config without a word, so the new
+# core lost the race for the loopback port and the tunnel never came up.
 wiz_free_status_port() {
-    local i=0 p n taken
+    local keep=${1:-$WIZ_KEEP} i=0 p n taken
     while [ "$i" -lt 100 ]; do
         p=$((STATUS_BASE + i))
         taken=
-        for n in $(cfg_list); do
-            [ "$n" = "$WIZ_KEEP" ] && continue
+        while IFS= read -r n; do
+            [ "$n" = "$keep" ] && continue
             [ "$(toml_get "$(cfg_file "$n")" status port)" = "$p" ] && { taken=1; break; }
-        done
+        done < <(cfg_list)
         [ -z "$taken" ] && { printf '%s' "$p"; return 0; }
         i=$((i + 1))
     done
-    printf '%s' "$STATUS_BASE"
+    return 1
 }
 
 # --------------------------------------------------------------------------
@@ -4716,14 +4756,18 @@ q_port() {
     dim "KHAREJ waits on this port and IRAN dials it. The same"
     dim "number goes on both servers."
     blank
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
         dim "taken here:  $(toml_get "$(cfg_file "$n")" transport port)/udp   $n"
-    done
+    done < <(cfg_list)
+    # Leaving the last candidate is the point of the bare break. The scan used
+    # to end with def=8443, which is the number it had just proved was taken,
+    # so pressing Enter at the prompt handed v_wiz_port a port it was certain
+    # to refuse and the question asked itself again for no reason.
     while wiz_port_owner "$def" >/dev/null ||
         { [ "$T_SIDE" = kharej ] && wiz_port_bound "$def"; }; do
         def=$((def + 1))
-        [ "$def" -gt 8500 ] && { def=8443; break; }
+        [ "$def" -gt 8500 ] && break
     done
     ask T_PORT "port" "$def" v_wiz_port || return 1
     return 0
@@ -4738,10 +4782,10 @@ q_link() {
     blank
     dim "Two addresses nothing else uses. Pick the middle number."
     blank
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
         [ -n "$a" ] && dim "taken here:  ${a%%/*}/24  ($n)"
-    done
+    done < <(cfg_list)
     while read -r dev addr; do
         case ${addr%%/*} in
         10.*) dim "taken here:  $addr  ($dev)" ;;
@@ -4950,10 +4994,14 @@ tunnel_create() {
         return 1
     fi
     chmod 0600 "$f"
+    # A failed copy used to return 1 with nothing on the screen, and both
+    # wizards just passed that 1 up, so six answered questions ended in silence
+    # - the only failure in this file that never said what went wrong. A full
+    # disk and a read-only /etc both land here.
     if [ -n "$src" ]; then
-        cat "$src" >"$f" || { rm -f "$f"; return 1; }
+        cat "$src" >"$f" || { bad "could not write $f"; rm -f "$f"; return 1; }
     else
-        cat >"$f" || { rm -f "$f"; return 1; }
+        cat >"$f" || { bad "could not write $f"; rm -f "$f"; return 1; }
     fi
 
     if ! out=$("$CORE_BIN" -c "$f" -check 2>&1); then
@@ -5007,7 +5055,7 @@ token_decode() {
     *) echo "that is not a Pingify token - the line starts with PFY2." >&2; return 1 ;;
     esac
     raw=$(printf '%s' "${line#PFY2.}" | base64 -d 2>/dev/null) || {
-        echo "the token is damaged and will not decode - copy the whole line" >&2
+        echo "the token will not decode - copy the whole line" >&2
         return 1
     }
     # Split on the first pipe only: a hand-typed security token may contain
@@ -5015,7 +5063,7 @@ token_decode() {
     sum=${raw%%|*}
     body=${raw#*|}
     [ "$sum" != "$raw" ] || {
-        echo "the token is damaged and will not decode - copy the whole line" >&2
+        echo "the token will not decode - copy the whole line" >&2
         return 1
     }
     have=$(printf '%s\n' "$body" | wiz_sha256) || {
@@ -5057,7 +5105,14 @@ wizard_new() {
     q_profile || return 1
 
     T_NAME=$(default_name)
-    T_STATUS=$(wiz_free_status_port)
+    # Stop here rather than build a tunnel whose core cannot bind its status
+    # port: the home screen reads every number through that endpoint, so a
+    # tunnel without one is a tunnel nothing can report on.
+    if ! T_STATUS=$(wiz_free_status_port); then
+        bad "every status port from $STATUS_BASE is taken here"
+        fix "delete a tunnel, or set [status] port by hand"
+        return 1
+    fi
     if ! T_TOKEN=$(wiz_token); then
         warn "no random source here, so the token has to be typed"
         ask T_TOKEN "security token" "" v_wiz_token || return 1
@@ -5105,7 +5160,7 @@ wiz_handoff() {
 # --------------------------------------------------------------------------
 
 wizard_paste() {
-    local line f err a own n clash port
+    local line f err a own n clash moved
     WIZ_QUIT=0
     blank
     rule "Finish the pair"
@@ -5202,16 +5257,30 @@ wizard_paste() {
     # that may legitimately differ between the two files. It is checked again
     # here because this server does not have the same tunnels on it.
     T_STATUS=$(toml_get "$f" status port)
-    port=$(wiz_free_status_port)
-    for n in $(cfg_list); do
-        [ "$(toml_get "$(cfg_file "$n")" status port)" = "$T_STATUS" ] || continue
-        warn "status port $T_STATUS is taken here by $n"
-        dim "this file uses $port, so the two differ there too"
-        T_STATUS=
-        break
-    done
+    # Anything that is not a port counts as absent, and the empty string is the
+    # reason: a pasted file with no [status] port compared equal to every local
+    # tunnel that also had none, so the screen read "status port  is taken here
+    # by <n>" with a blank where the number belongs. An absent port is filled
+    # in below instead of being reported as a clash.
+    case $T_STATUS in '' | *[!0-9]*) T_STATUS= ;; esac
+    moved=0
+    if [ -n "$T_STATUS" ]; then
+        while IFS= read -r n; do
+            [ "$(toml_get "$(cfg_file "$n")" status port)" = "$T_STATUS" ] || continue
+            warn "status port $T_STATUS is taken here by $n"
+            T_STATUS=
+            moved=1
+            break
+        done < <(cfg_list)
+    fi
     if [ -z "$T_STATUS" ]; then
-        T_STATUS=$port
+        if ! T_STATUS=$(wiz_free_status_port); then
+            bad "every status port from $STATUS_BASE is taken here"
+            fix "delete a tunnel, or set [status] port by hand"
+            rm -f "$f"
+            return 1
+        fi
+        [ "$moved" = 1 ] && dim "this file uses $T_STATUS, so the two differ there too"
         toml_set "$f" status port "$T_STATUS"
     fi
 
@@ -5240,7 +5309,7 @@ wizard_paste() {
 # on purpose - a question with a numbered list of answers must not accept a
 # number that is not one of them. Navigation screens have a Back key; questions
 # do not.
-wizard_menu() {
+screen_new() {
     local k
     blank
     rule "New tunnel"
@@ -5623,6 +5692,13 @@ delete_tunnel() {
 # end up describing something nobody asked for - which is what happens when a
 # tool adds and deletes single rules and one of the deletes quietly fails.
 #
+# The copy is in memory and nothing survives a reboot, so the premise needs a
+# path that makes the copy again at start-up. It has one now: nat_apply_all,
+# behind a oneshot unit. Without it the state files and the Ports screen went
+# on listing forwarded ports after every reboot and not one of them carried a
+# packet, which is the worst shape a fault can take - the machine agreeing
+# with you about what it is supposed to be doing.
+#
 # Two faults of the old script, both named where they are fixed below. A port
 # range in iptables is written with a colon, 8000:8010; the old code wrote a
 # hyphen and ran it under 2>/dev/null, so every range anyone ever entered was
@@ -5637,6 +5713,7 @@ delete_tunnel() {
 NAT_CHAIN=PINGIFY_NAT
 NAT_POST=PINGIFY_SNAT
 NAT_SYSCTL=/etc/sysctl.d/99-pingify-forward.conf
+NAT_UNIT=pingify-nat.service
 
 # Every iptables call goes through here so the lock wait cannot be forgotten.
 # systemd, docker and this script can all want xtables at the same moment, and
@@ -5651,6 +5728,11 @@ ipt() { iptables -w 2 "$@"; }
 # caller capturing those must not capture the complaints with them.
 fwd_no() { printf '  %s: %s\n' "$1" "$2" >&2; }
 
+# Where a tunnel's list is kept. This name is the file's own business: another
+# part that spells the path out for itself is a second definition, and the
+# health check had one - it read "$STATE_DIR/$1.ports", never found a file, and
+# reported "no ports are forwarded" about a tunnel forwarding six of them.
+# Read the list with forwards_of, or the parsed tuples with forward_specs_for.
 fwd_file() { printf '%s/%s.forwards' "$STATE_DIR" "$1"; }
 
 fwd_range() {
@@ -5737,7 +5819,7 @@ forward_specs() {
         # ten thousand ports on their behalf is not a favour.
         wide=$((hi - lo + 1))
         if [ "$wide" -gt 512 ]; then
-            fwd_no "$tok" "that is $wide ports, and more than 512 in one range is a mistake being made"
+            fwd_no "$tok" "that is $wide ports; the most in one range is 512"
             refused=$((refused + 1)); continue
         fi
 
@@ -5757,7 +5839,10 @@ forward_specs() {
             fi
             fwd_port_ok "$tok" "$dstp" || { refused=$((refused + 1)); continue; }
             if [ "$lo" != "$hi" ] && [ "$dstp" != "$lo" ]; then
-                fwd_no "$tok" "a range cannot go to one port - forward $lo-$hi as it stands, or the ports one at a time"
+                # Kept short on purpose. fwd_no prints with a bare printf and
+                # nothing on this path truncates, so a sentence of advice here
+                # wrapped past a hundred columns on a sixty column terminal.
+                fwd_no "$tok" "a range cannot go to one port"
                 refused=$((refused + 1)); continue
             fi
         fi
@@ -5827,12 +5912,45 @@ tun_dev_of() {
     printf '%s' "${d:-pfy0}"
 }
 
+# forward_specs_for is the parser bound to a tunnel: the same tuples, with the
+# `-` in the dsthost column already replaced by that tunnel's far end.
+#
+# It exists because the placeholder was escaping. forward_specs is handed
+# specs and not a tunnel, so it cannot resolve `-` itself and does not pretend
+# to; the health check took the tuples straight from it and probed the literal
+# host `-`, which cannot answer, so every plain `443` forward was reported as
+# a dead backend. Anything outside this file that wants a tunnel's tuples
+# wants these, and it should ask for them by tunnel name rather than spell out
+# where the state file lives.
+forward_specs_for() {
+    local name=$1 peer tuples proto lo hi dsth dstp
+    tuples=$(forward_specs "$(forwards_of "$name")") || return 1
+    [ -n "$tuples" ] || return 0
+    peer=$(peer_tun_addr "$name")
+    while read -r proto lo hi dsth dstp; do
+        [ -n "$proto" ] || continue
+        if [ "$dsth" = - ]; then
+            # No address for the far end and a token that needs one. Printing
+            # the tuple anyway would hand an empty host to whatever consumes
+            # it, and an empty host in a DNAT target is a rule iptables takes.
+            [ -n "$peer" ] || return 1
+            dsth=$peer
+        fi
+        printf '%s %s %s %s %s\n' "$proto" "$lo" "$hi" "$dsth" "$dstp"
+    done <<<"$tuples"
+}
+
 # fwd_listeners prints "proto port who" for everything bound on this host.
 #
 # Loopback-only listeners are left out on purpose: PREROUTING takes the packet
 # long before it reaches 127.0.0.1, so such a service never saw the outside
 # traffic and calling it a clash is a false alarm - and false alarms are how
 # people learn to ignore a collision check.
+#
+# The whole of 127.0.0.0/8 is loopback, not the one address. Matching only
+# 127.0.0.1 meant systemd-resolved on 127.0.0.53:53 was reported as a clash on
+# every Ubuntu host, which is precisely the false alarm this filter exists to
+# prevent.
 fwd_listeners() {
     have ss || return 0
     ss -lntup 2>/dev/null | awk '
@@ -5841,7 +5959,7 @@ fwd_listeners() {
             n = split(addr, p, ":")
             port = p[n]
             host = substr(addr, 1, length(addr) - length(port) - 1)
-            if (host == "127.0.0.1" || host == "[::1]") next
+            if (host ~ /^127\./ || host == "[::1]") next
             who = "something"
             i = index($0, "users:((\"")
             if (i > 0) {
@@ -5872,6 +5990,19 @@ forwards_clash() {
     tuples=$(forward_specs "$@") || return 1
     [ -n "$tuples" ] || return 0
     listeners=$(fwd_listeners)
+
+    # A tunnel whose stored list no longer parses contributes no tuples, and
+    # the parse ran under 2>/dev/null inside a process substitution, so both
+    # its complaint and its exit status went into the dark. The port it is
+    # holding was then handed out as free. Said once per tunnel, here, rather
+    # than once per port being checked.
+    while read -r other; do
+        [ -n "$other" ] || continue
+        [ "$other" = "$name" ] && continue
+        forward_specs "$(forwards_of "$other")" >/dev/null 2>&1 && continue
+        printf '%s: its list cannot be read\n' "$other"
+        hits=$((hits + 1))
+    done < <(cfg_list)
 
     while read -r proto lo hi dsth dstp; do
         [ -n "$proto" ] || continue
@@ -5973,7 +6104,7 @@ SYSCTL
         printf '1\n' >/proc/sys/net/ipv4/ip_forward 2>/dev/null
     now=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
     [ "$now" = 1 ] && return 0
-    bad "the kernel is not forwarding packets, so nothing would reach the other side"
+    bad "the kernel is not forwarding packets, so nothing arrives"
     fix "sysctl -w net.ipv4.ip_forward=1"
     return 1
 }
@@ -5983,21 +6114,21 @@ SYSCTL
 # than aborting the rebuild: the rebuild is doing the other tunnels' work too,
 # and one bad state file must not take their ports down with it.
 nat_rules_for() {
-    local name=$1 f side dev peer tuples proto lo hi dsth dstp dport target
+    local name=$1 f side dev tuples proto lo hi dsth dstp dport target
     f=$(cfg_file "$name")
     [ -f "$f" ] || return 0
     side=$(toml_get "$f" tunnel side)
     [ "$side" = iran ] || return 0
 
-    tuples=$(forward_specs "$(forwards_of "$name")") || return 1
+    # forward_specs_for resolves the `-` placeholder against this tunnel, so
+    # it also fails when a token needs the far end and the config names none.
+    tuples=$(forward_specs_for "$name") || return 1
     [ -n "$tuples" ] || return 0
     dev=$(tun_dev_of "$name")
-    peer=$(peer_tun_addr "$name")
-    [ -n "$dev" ] && [ -n "$peer" ] || return 1
+    [ -n "$dev" ] || return 1
 
     while read -r proto lo hi dsth dstp; do
         [ -n "$proto" ] || continue
-        [ "$dsth" = - ] && dsth=$peer
         if [ "$lo" = "$hi" ]; then
             dport=$lo target=$dsth:$dstp
         else
@@ -6021,12 +6152,19 @@ nat_rules_for() {
     nat_forward_hook add "$dev"
 }
 
-# nat_apply rebuilds everything from every tunnel's state, then reports on the
-# one it was called for. Everything, because the chains are shared: flushing
-# them to write one tunnel's rules and not writing the others back is how a
-# second tunnel silently loses its ports.
-nat_apply() {
-    local name=$1 t n peer word
+# nat_rebuild writes every tunnel's stored list into the freshly flushed
+# chains. Everything, because the chains are shared: flushing them to write one
+# tunnel's rules and not writing the others back is how a second tunnel
+# silently loses its ports.
+#
+# The argument is the tunnel the caller is about to report on, or empty to mean
+# every tunnel matters. It returns non-zero when that tunnel's rules did not go
+# in. This used to be inside nat_apply, which threw the result away: a DNAT the
+# kernel refused, or a config with no device or no far end, was warned about
+# and then reported as a success on the very next line, with a count read from
+# the state file rather than from what iptables had accepted.
+nat_rebuild() {
+    local want=$1 t dev rc=0
     have iptables || {
         warn "iptables is not installed, so nothing can be forwarded"
         fix "apt-get install -y iptables"
@@ -6044,19 +6182,91 @@ nat_apply() {
 
     while read -r t; do
         [ -n "$t" ] || continue
-        nat_rules_for "$t" || warn "$t: its stored ports could not be applied"
+        # A tunnel that has stopped forwarding kept its FORWARD accepts:
+        # nat_rules_for returns before it adds them and nothing ever took them
+        # away again, so `-o pfy0 -j ACCEPT` sat there permitting that device
+        # with no DNAT left behind it. The nat chains are flushed above; these
+        # two rules live in filter and have to be removed by name.
+        if [ -z "$(forwards_of "$t")" ]; then
+            dev=$(tun_dev_of "$t")
+            nat_forward_hook del "$dev"
+            continue
+        fi
+        nat_rules_for "$t" && continue
+        warn "$t: its stored ports could not be applied"
+        if [ -z "$want" ] || [ "$t" = "$want" ]; then rc=1; fi
     done < <(cfg_list)
+    return "$rc"
+}
+
+# nat_apply rebuilds everything, then reports on the one tunnel it was called
+# for. The report is the outcome, not a wish: it is only printed when the
+# rebuild said that tunnel's rules went in.
+nat_apply() {
+    local name=$1 n peer word
+    nat_rebuild "$name" || {
+        bad "$name: its ports are not forwarded"
+        fix "read the warnings above, then set the list again"
+        return 1
+    }
+    nat_unit_write || {
+        warn "the boot unit is not written, so a reboot loses these"
+        fix "check that $UNIT_DIR can be written"
+    }
 
     n=$(forwards_of "$name" | grep -c .) || n=0
     peer=$(peer_tun_addr "$name")
-    if [ "$n" -gt 0 ]; then
-        word=ports
-        [ "$n" = 1 ] && word=port
+    word=ports
+    [ "$n" = 1 ] && word=port
+    if [ "$n" = 0 ]; then
+        ok "$name forwards nothing now"
+    elif [ -n "$peer" ]; then
         ok "$name sends $n $word to $peer"
     else
-        ok "$name forwards nothing now"
+        # Every token named its own destination, so there is no far end to
+        # name here. The old line ended "to " with nothing after it.
+        ok "$name sends $n $word across the tunnel"
     fi
     return 0
+}
+
+# nat_apply_all is the boot path, and the reason the unit below exists.
+#
+# iptables keeps its rules in memory alone. Nothing replayed them at start-up,
+# so every forwarded port died at the first reboot while the state files and
+# the Ports screen went on saying the ports were forwarded - the one failure
+# with no symptom anywhere on the machine except that no packet arrives.
+nat_apply_all() {
+    [ "$(cfg_count)" -gt 0 ] || return 0
+    nat_rebuild "" || return 1
+    ok "the forwarded ports are back in the kernel"
+}
+
+# The unit re-enters this same script rather than repeating the rules, so the
+# boot path cannot drift from the interactive one. It sources the manager with
+# PINGIFY_NO_MAIN set, which is what stops a sourced copy opening the menu, and
+# calls the one function - there is no command line flag for this and adding
+# one would put a second entry point on the same work.
+nat_unit_write() {
+    mkdir -p "$UNIT_DIR" 2>/dev/null
+    # The write is checked. A unit that was never written is the reboot fault
+    # again, and it would be reported under the same green tick as before.
+    cat >"$UNIT_DIR/$NAT_UNIT" <<UNIT || return 1
+[Unit]
+Description=Pingify forwarded ports
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c 'PINGIFY_NO_MAIN=1 . $PINGIFY_BIN && nat_apply_all'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable "$NAT_UNIT" >/dev/null 2>&1 || true
 }
 
 # nat_drop removes one tunnel's forwarding. Call it before the config file is
@@ -6065,7 +6275,10 @@ nat_apply() {
 nat_drop() {
     local name=$1 dev t left=0
     rm -f "$(fwd_file "$name")"
-    have iptables || return 0
+    # The state file has gone either way, so say so. Returning in silence here
+    # left the menu item printing nothing at all after the confirmation, which
+    # reads as a key that did not work.
+    have iptables || { ok "$name forwards nothing now"; return 0; }
     dev=$(tun_dev_of "$name")
     nat_forward_hook del "$dev"
 
@@ -6087,6 +6300,13 @@ nat_drop() {
 # every run: a single -D would leave the duplicates pointing at a chain that
 # is about to be deleted.
 nat_teardown() {
+    # The boot unit goes first and always, iptables or not: a unit left behind
+    # would replay chains at the next reboot that nothing on this machine now
+    # asks for.
+    systemctl disable --now "$NAT_UNIT" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/$NAT_UNIT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
     have iptables || return 0
     while ipt -t nat -C PREROUTING -j "$NAT_CHAIN" 2>/dev/null; do
         ipt -t nat -D PREROUTING -j "$NAT_CHAIN" || break
@@ -6120,21 +6340,23 @@ screen_ports() {
         rule "Ports $G_CUR $name"
         blank
         if [ "$side" != iran ]; then
-            warn "this is the KHAREJ side, and nothing is forwarded from here"
-            fix "run this on the IRAN server - that is the side users connect to"
+            warn "this is the KHAREJ side; nothing is forwarded here"
+            fix "run this on the IRAN server, where users connect"
             blank
             return 0
         fi
 
         peer=$(peer_tun_addr "$name")
-        dim "what arrives on these ports is handed to $peer, across the tunnel"
+        # Short because dim prints with a bare printf: the sentence this
+        # replaces came to 72 columns against a 60 column floor and wrapped.
+        dim "these ports go to $peer across the tunnel"
         blank
         cur=$(forwards_of "$name" | tr '\n' ' ')
         cur=${cur% }
         if [ -z "$cur" ]; then
             dim "nothing is forwarded yet"
         elif ! tuples=$(forward_specs "$cur"); then
-            warn "the stored list cannot be read, so this tunnel forwards nothing"
+            warn "the stored list cannot be read, so nothing is forwarded"
             fix "choose 1 and enter the ports again"
         else
             UI_COLS=(14 7 30)
@@ -6401,10 +6623,24 @@ tcp_reach() {
 # The forwarding part owns the port spec and where it is kept; this only reads
 # it. When forwarding was never set up the check says nothing about ports
 # rather than inventing a failure out of an absent file.
+#
+# The path comes from fwd_file rather than being spelled out a second time
+# here. It used to read $STATE_DIR/$1.ports, a name nothing has ever written -
+# the forwarding part writes $1.forwards - so the file was never found, section
+# 7 always took the absent-file branch, and a server forwarding six ports was
+# told in grey that it forwards none, with any dead backend behind them never
+# reported at all.
 chk_forward_spec() {
-    local f=$STATE_DIR/$1.ports
+    local f
+    declare -F fwd_file >/dev/null 2>&1 || return 1
+    f=$(fwd_file "$1")
     [ -f "$f" ] || return 1
-    tr -d '\r\n' <"$f"
+    # The tokens are stored one per line. Deleting the newlines glued 443 and
+    # 8080 into 4438080, forward_specs refused that as one impossible port, and
+    # the check told the user to set the list again about a list that was fine.
+    # fwd_tokens splits on newlines as readily as on commas, so the file is
+    # passed on as it stands.
+    cat "$f"
 }
 
 # --------------------------------------------------------------------------
@@ -6477,9 +6713,14 @@ health_check() {
         chk_add ok service "running since ${since:-a moment ago}"
         ;;
     stopped)
+        # The command goes on the fix line bare. The old "read why:  " prefix
+        # spent ten columns of a 46-column budget, so any tunnel name over ten
+        # characters wrapped, and fix() pads rather than cuts, so the wrapped
+        # half landed hard against the left margin and read as a line of its
+        # own.
         chk_add bad service "the service is enabled but not running" \
             "systemctl start pingify@$name" \
-            "read why:  journalctl -u pingify@$name -n 30"
+            "journalctl -u pingify@$name -n 30"
         ;;
     *)
         chk_add bad service "the service is neither running nor enabled" \
@@ -6521,8 +6762,15 @@ health_check() {
     # the link can be up, the config right and the service running with no
     # packet from over there having ever arrived.
     if tun_stats "$name"; then
+        # Only the word true. up is a Go bool in the core's report, so the
+        # value is true or false and never 1 or yes, and accepting those two
+        # here made this section disagree with the loss check and the speed
+        # test below, which both test for true alone. Had the core ever
+        # answered 1, this line would have said the far end was there while
+        # the loss check vanished and the speed test called the same tunnel
+        # unseen.
         case $ST_UP in
-        true | 1 | yes)
+        true)
             chk_add ok peer "the far end is there, up for $(human_secs "$ST_UPTIME")"
             ;;
         *)
@@ -6532,10 +6780,13 @@ health_check() {
                     "watch there:  tcpdump -ni any icmp" \
                     "if nothing arrives at all, use udp instead"
             else
+                # Bare again: the address on this line is a hostname somebody
+                # else chose, so the prefix is the only part of it there is
+                # room to give up.
                 chk_add bad peer "the far end has never been seen" \
                     "on KHAREJ:  systemctl status pingify@$name" \
                     "open it there:  ufw allow $CK_PORT/udp" \
-                    "from here:  nc -uzv $CK_KHAREJ $CK_PORT" \
+                    "nc -uzv $CK_KHAREJ $CK_PORT" \
                     "a token edited on one side only does this"
             fi
             ;;
@@ -6591,6 +6842,13 @@ health_check() {
             total=0 missing=0 unknown=0
             while read -r proto lo hi rhost rport; do
                 [ -n "$proto" ] || continue
+                # forward_specs writes - in the destination column when the
+                # token named no host, and it means "the far end of this
+                # tunnel"; nat_rules_for substitutes the peer address before it
+                # builds a rule. This did not, so a plain 443 forward probed
+                # the host called - , always failed, and every ordinary forward
+                # drew a warning telling the operator to listen on -:443.
+                [ "$rhost" = - ] && rhost=$CK_PEER
                 total=$((total + 1))
                 if [ "$proto" != tcp ]; then
                     # There is no way to ask a udp port whether anybody is
@@ -6635,12 +6893,18 @@ health_check() {
 # chk_finish picks the renderer. One place, so an early return in health_check
 # cannot forget the --json case and print a screen at a caller that wanted
 # something a machine could read.
+#
+# Both spellings of the mode word are matched, and that is not tidiness. main
+# calls health_check with the bare word json, while this tested only for
+# --json, so `pingify --check NAME --json` rendered the escape-coded human
+# screen into whatever script was parsing it and exited 0, 1 or 2 as though it
+# had answered. Taking either word means neither side can break it again by
+# settling on the other one.
 chk_finish() {
-    if [ "$2" = --json ]; then
-        chk_json "$1"
-    else
-        chk_render "$1"
-    fi
+    case ${2:-} in
+    json | --json) chk_json "$1" ;;
+    *) chk_render "$1" ;;
+    esac
 }
 
 # --------------------------------------------------------------------------
@@ -6836,7 +7100,12 @@ measure_mtu() {
         blank
         if [ "$CK_MTU" != 1280 ] && confirm "set the mtu to 1280?" n; then
             MTU_WANT=1280
-            cfg_apply "$name" mtu_editor restart &&
+            # yes, not restart. cfg_apply compares its third argument against
+            # the word yes, so the literal restart passed here read as "do not
+            # restart" - and cfg_apply still returned 0, so this printed a
+            # green line over a tunnel still running the old mtu until somebody
+            # happened to restart it by hand.
+            cfg_apply "$name" mtu_editor yes &&
                 ok "mtu 1280 - set the same number on KHAREJ"
         fi
         return 0
@@ -6889,7 +7158,9 @@ measure_mtu() {
     blank
     if confirm "set the mtu to $best?" y; then
         MTU_WANT=$best
-        if cfg_apply "$name" mtu_editor restart; then
+        # yes is the word cfg_apply tests for; restart quietly meant no, and
+        # the measured mtu sat in the file unused.
+        if cfg_apply "$name" mtu_editor yes; then
             ok "mtu $best"
             dim "Set the same on KHAREJ: the file is shared."
         fi
@@ -7103,7 +7374,11 @@ host_write_sysctl() {
         ;;
     esac
 
-    cat >"$HOST_SYSCTL" <<SYSCTL
+    # The write is checked. It used to be assumed, so a full disk or a
+    # read-only /etc left the old file in place, sysctl --system succeeded on
+    # what was already there, and the caller printed "host tuning applied" over
+    # settings nobody had changed.
+    cat >"$HOST_SYSCTL" <<SYSCTL || { bad "could not write $HOST_SYSCTL"; return 1; }
 # Written by Pingify $PINGIFY_VERSION. Delete this file, run "sysctl --system",
 # and the distribution's own settings are what is left.
 # profile: $profile
@@ -7148,7 +7423,7 @@ SYSCTL
     # this says - tuning.pace in the config does that - so this line is about
     # the host's other interfaces, not about the link.
     if [ "$bbr" = on ]; then
-        cat >>"$HOST_SYSCTL" <<'SYSCTL'
+        cat >>"$HOST_SYSCTL" <<'SYSCTL' || { bad "could not add the BBR lines"; return 1; }
 
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
@@ -7168,7 +7443,9 @@ SYSCTL
 # get their limit from the unit, and pingify@.service already carries
 # LimitNOFILE=1048576. This is for the shell you ssh in with.
 host_limits() {
-    cat >"$HOST_LIMITS" <<'LIMITS'
+    # Checked, because the success line below said the limit was raised whether
+    # or not a single byte reached the file.
+    cat >"$HOST_LIMITS" <<'LIMITS' || { bad "could not write $HOST_LIMITS"; return 1; }
 # Written by Pingify. Delete this file to undo it.
 *    soft  nofile  1048576
 *    hard  nofile  1048576
@@ -7201,7 +7478,7 @@ revert_tuning() {
     dim "the Blocking screen"
 }
 
-host_tuning_screen() {
+screen_host() {
     local key p n bbr cc qd
     while :; do
         blank
@@ -7216,8 +7493,12 @@ host_tuning_screen() {
         # and the file alone cannot show it.
         cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
         qd=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+        # Two fields, not one sentence. field cuts its value to UI_W - 20, so
+        # at the 60-column floor the single line ran out at 40 columns and the
+        # qdisc - half of what the read-back is for - was what fell off.
         field "Profile" "${p:-not applied}"
-        field "BBR" "$bbr, and the kernel is running ${cc:-unknown} over ${qd:-unknown}"
+        field "BBR" "$bbr"
+        field "Kernel" "${cc:-unknown} over ${qd:-unknown}"
         field "Open files" "$(ulimit -n) here, $([ -f "$HOST_LIMITS" ] && printf '1048576 at next login' || printf 'unchanged at login')"
         field "Drop-in" "$HOST_SYSCTL"
         blank
@@ -7248,8 +7529,22 @@ host_tuning_screen() {
         2)
             blank
             if [ "$(host_bbr_state)" = on ]; then
-                host_write_sysctl "${p:-balanced}" off &&
-                    ok "back to $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+                # Taking the two lines out of the drop-in does not take BBR off
+                # the running kernel: sysctl --system only sets what a file
+                # names, and no file names a default. So this branch used to
+                # rewrite the file, read the live value back, and print "back
+                # to bbr". Set the values here, then report what is true.
+                if host_write_sysctl "${p:-balanced}" off; then
+                    sysctl -qw net.ipv4.tcp_congestion_control=cubic \
+                        net.core.default_qdisc=fq_codel >/dev/null 2>&1
+                    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+                    if [ "$cc" = bbr ]; then
+                        warn "the drop-in dropped BBR but the kernel is still on bbr"
+                        fix "a reboot clears it"
+                    else
+                        ok "back to ${cc:-the kernel default}"
+                    fi
+                fi
             elif ! host_bbr_available; then
                 bad "this kernel does not offer BBR"
                 fix "kernel $(uname -r) - 4.9 or newer with tcp_bbr is what has it"
@@ -7275,17 +7570,15 @@ host_tuning_screen() {
 # block_ipt is prefixed rather than called ipt, because the part that owns
 # forwarding hooks its own chains and the two must not end up sharing one
 # wrapper by accident and then disagreeing about which errors are quiet.
-block_ipt() { iptables "$@" 2>/dev/null; }
+#
+# -w 2, which was missing. Every one of these takes the xtables lock, and
+# without a wait iptables gives up the moment the forwarding part is applying
+# its own NAT rules. The error goes to /dev/null here, so those rules simply
+# were not installed and the screen said they were; the callers below now
+# check each one instead.
+block_ipt() { iptables -w 2 "$@" 2>/dev/null; }
 
 block_state() { [ -f "$STATE_DIR/block-$1" ] && printf 'on' || printf 'off'; }
-
-block_summary() {
-    local out= w
-    for w in icmp quic speedtest; do
-        [ "$(block_state "$w")" = on ] && out="$out$w "
-    done
-    [ -n "$out" ] && printf '%s' "${out% }" || printf 'none'
-}
 
 host_badge() {
     if [ "$1" = on ]; then printf '%s%s on%s' "$C_OK" "$G_ON" "$C_OFF"
@@ -7326,6 +7619,53 @@ block_icmp_tunnel() {
     return 1
 }
 
+# block_carrier_443 names a tunnel whose carrier is udp 443, which is the port
+# the QUIC switch takes away. The wizard lets the operator pick any port and
+# 443 is a common choice precisely because it looks like ordinary web traffic,
+# so this is not a corner case.
+block_carrier_443() {
+    local n f
+    while IFS= read -r n; do
+        f=$(cfg_file "$n")
+        [ "$(toml_get "$f" transport type)" = icmp ] && continue
+        [ "$(toml_get "$f" transport port)" = 443 ] || continue
+        printf '%s' "$n"
+        return 0
+    done < <(cfg_list)
+    return 1
+}
+
+# block_carrier_accept puts this server's own carrier out of reach of the
+# string match, and has to run before those rules go in.
+#
+# Nothing under internal/ encrypts the payload, so a customer's request for
+# speedtest.net travels through the tunnel with those bytes in clear and
+# -m string matches them inside the carrier's own packet. The rule aimed at a
+# browser then rejects the packet carrying it, and the whole link stutters for
+# a reason nothing on the screen explains.
+#
+# Both port directions, because the two ends are not symmetrical: IRAN dials
+# out, so its carrier packets carry the port as the destination, and KHAREJ
+# listens and answers from it as the source.
+block_carrier_accept() {
+    local n f t p rc=0 icmp_done=0
+    while IFS= read -r n; do
+        f=$(cfg_file "$n")
+        t=$(toml_get "$f" transport type)
+        if [ "$t" = icmp ]; then
+            [ "$icmp_done" = 1 ] && continue
+            icmp_done=1
+            block_ipt -A PINGIFY_OUT -p icmp -j ACCEPT || rc=1
+            continue
+        fi
+        p=$(toml_get "$f" transport port)
+        case $p in '' | *[!0-9]*) continue ;; esac
+        block_ipt -A PINGIFY_OUT -p udp --dport "$p" -j ACCEPT || rc=1
+        block_ipt -A PINGIFY_OUT -p udp --sport "$p" -j ACCEPT || rc=1
+    done < <(cfg_list)
+    return "$rc"
+}
+
 # The chains, hooked once at position 1 and rebuilt from empty on every apply.
 block_reset_chains() {
     local c
@@ -7338,7 +7678,7 @@ block_reset_chains() {
 }
 
 block_drop_chains() {
-    local c i
+    local c i rc=0
     # -D removes one match. An older script that inserted its hook twice leaves
     # the second behind, still sending every packet through a chain nothing
     # maintains, so take them off in a bounded loop rather than once.
@@ -7347,8 +7687,13 @@ block_drop_chains() {
     for c in PINGIFY_IN PINGIFY_OUT; do
         block_ipt -F "$c"
         block_ipt -X "$c"
+        # -X refuses while anything still jumps to the chain, and that refusal
+        # went to /dev/null, so a hook the loops above could not unpick left a
+        # live chain behind under a green "every blocking rule is gone". -S
+        # fails on a chain that is not there, which is the answer wanted.
+        block_ipt -S "$c" >/dev/null 2>&1 && rc=1
     done
-    return 0
+    return "$rc"
 }
 
 hosts_block_off() {
@@ -7382,7 +7727,10 @@ hosts_block_on() {
 # apply_blocking is the only thing that writes rules, and it writes all of them
 # every time from the state files. Nothing anywhere adds a single rule.
 apply_blocking() {
-    local quiet=${1:-} ifc h any
+    # rc is the honest answer. This function used to end with an unconditional
+    # ok and return 0, so a rule iptables refused - the lock, a missing module,
+    # a kernel without the match - was reported as a rule that went in.
+    local quiet=${1:-} ifc h any rc=0 carrier
     have iptables || {
         [ "$quiet" = quiet ] || warn "iptables is not installed, so nothing was applied"
         return 1
@@ -7400,7 +7748,7 @@ apply_blocking() {
         # Put the global drop above these and blocking pings from the internet
         # quietly takes away the only test the operator has.
         for ifc in $(block_tun_ifaces); do
-            block_ipt -A PINGIFY_IN -i "$ifc" -p icmp --icmp-type echo-request -j ACCEPT
+            block_ipt -A PINGIFY_IN -i "$ifc" -p icmp --icmp-type echo-request -j ACCEPT || rc=1
         done
 
         # And where a tunnel on this host uses the icmp transport, the global
@@ -7423,20 +7771,35 @@ apply_blocking() {
             [ "$quiet" = quiet ] ||
                 dim "core has already stopped this host answering pings"
         else
-            block_ipt -A PINGIFY_IN -p icmp --icmp-type echo-request -j DROP
+            block_ipt -A PINGIFY_IN -p icmp --icmp-type echo-request -j DROP || rc=1
         fi
     fi
 
     if [ "$(block_state quic)" = on ]; then
-        # Rejected on the way out, not dropped: a browser that gets a port
-        # unreachable falls back to TCP now, and one that gets silence waits
-        # for a timeout first, which is felt as the page hanging.
-        block_ipt -A PINGIFY_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable
-        block_ipt -A PINGIFY_IN -p udp --dport 443 -j DROP
+        # A udp carrier on 443 is left alone, the same care the ICMP branch
+        # takes. These two rules match on the destination port only, which is
+        # the dialling side's carrier on the way out and the listening side's
+        # on the way in, so with the tunnel on 443 they made it deaf with every
+        # rule on the screen looking correct. Nothing on this host can tell one
+        # udp 443 datagram from another, so the choice is to leave them out.
+        if carrier=$(block_carrier_443); then
+            [ "$quiet" = quiet ] || dim "$carrier carries on udp 443"
+            [ "$quiet" = quiet ] ||
+                dim "so the QUIC rules are left out - nothing here can tell"
+            [ "$quiet" = quiet ] ||
+                dim "that carrier from a browser on the same port"
+        else
+            # Rejected on the way out, not dropped: a browser that gets a port
+            # unreachable falls back to TCP now, and one that gets silence waits
+            # for a timeout first, which is felt as the page hanging.
+            block_ipt -A PINGIFY_OUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable || rc=1
+            block_ipt -A PINGIFY_IN -p udp --dport 443 -j DROP || rc=1
+        fi
     fi
 
     if [ "$(block_state speedtest)" = on ]; then
         hosts_block_on
+        block_carrier_accept || rc=1
         any=0
         for h in $SPEEDTEST_HOSTS; do
             case $h in *[!a-zA-Z0-9.-]*) continue ;; esac
@@ -7453,7 +7816,12 @@ apply_blocking() {
         hosts_block_off
     fi
 
-    firewall_unit_write
+    firewall_unit_write || rc=1
+    if [ "$rc" != 0 ]; then
+        [ "$quiet" = quiet ] || bad "some of those rules would not go in"
+        [ "$quiet" = quiet ] || fix "iptables -S PINGIFY_OUT   shows what did"
+        return 1
+    fi
     [ "$quiet" = quiet ] || ok "blocking rules rebuilt from the state files"
     return 0
 }
@@ -7462,7 +7830,14 @@ apply_blocking() {
 # files. It calls back into this same script, which means there is one apply
 # path and the boot path cannot drift from the interactive one.
 firewall_unit_write() {
-    cat >"$UNIT_DIR/pingify-firewall.service" <<UNIT
+    local unit=$UNIT_DIR/pingify-firewall.service
+    # The unit used to run "$PINGIFY_BIN --apply-firewall", and argv in the
+    # main part has no such option: unknown flags print the usage and die, so
+    # every boot the unit failed, every rule stayed gone, and the Blocking
+    # screen still read "on". Source the script with PINGIFY_NO_MAIN instead
+    # and call the function directly, which is what the forwarding part's own
+    # boot unit does and what build.sh and the updater already use.
+    cat >"$unit" <<UNIT || { bad "could not write the boot unit"; fix "$unit"; return 1; }
 [Unit]
 Description=Pingify blocking rules
 After=network-online.target
@@ -7471,7 +7846,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=$PINGIFY_BIN --apply-firewall
+ExecStart=/bin/bash -c 'PINGIFY_NO_MAIN=1 . $PINGIFY_BIN && apply_blocking quiet'
 
 [Install]
 WantedBy=multi-user.target
@@ -7481,12 +7856,20 @@ UNIT
 }
 
 remove_blocking() {
+    local rc=0
     rm -f "$STATE_DIR"/block-icmp "$STATE_DIR"/block-quic "$STATE_DIR"/block-speedtest
     hosts_block_off
-    have iptables && block_drop_chains
+    have iptables && { block_drop_chains || rc=1; }
     systemctl disable --now pingify-firewall.service >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/pingify-firewall.service"
     systemctl daemon-reload >/dev/null 2>&1 || true
+    # Uninstall calls this and prints its own success after it, so a chain that
+    # survived has to come back as a non-zero rather than as the line below.
+    if [ "$rc" != 0 ]; then
+        bad "the PINGIFY chains are still in the kernel"
+        fix "iptables -S PINGIFY_IN   shows what points at it"
+        return 1
+    fi
     ok "every blocking rule, state file and the boot unit are gone"
     dim "the tunnels themselves are untouched"
 }
@@ -7517,7 +7900,7 @@ why_block_quic() {
     dim "a site."
 }
 
-blocking_screen() {
+screen_firewall() {
     local key
     while :; do
         blank
@@ -7549,10 +7932,16 @@ blocking_screen() {
             if ! have iptables; then
                 warn "iptables is not installed"
             else
+                # Cut to the width like everything else on this screen. A
+                # string rule is about 127 columns as iptables prints it, so
+                # ten of them wrapped into each other at any width this UI
+                # supports and the list stopped being readable at all.
                 rule "PINGIFY_IN"
-                iptables -S PINGIFY_IN 2>/dev/null | grep -v '^-N ' | sed 's/^/    /'
+                iptables -S PINGIFY_IN 2>/dev/null | grep -v '^-N ' |
+                    sed 's/^/    /' | cut -c "1-$((UI_W - 3))"
                 rule "PINGIFY_OUT"
-                iptables -S PINGIFY_OUT 2>/dev/null | grep -v '^-N ' | sed 's/^/    /'
+                iptables -S PINGIFY_OUT 2>/dev/null | grep -v '^-N ' |
+                    sed 's/^/    /' | cut -c "1-$((UI_W - 3))"
             fi
             blank
             field "hosts file" "$(grep -qF "$HOSTS_MARK" /etc/hosts 2>/dev/null && printf 'our block is in it' || printf 'nothing of ours in it')"
@@ -7617,10 +8006,21 @@ install_self() {
     # tunnel, so it is written here, once, and on a version change - which is
     # what stops it being rewritten four times whenever somebody adds a fifth
     # tunnel.
+    #
+    # The stamp is written only when the unit is really there. It used to be
+    # written whether or not unit_write had worked, so a run where $UNIT_DIR
+    # was unwritable left pingify@.service missing and never tried again - the
+    # stamp said this version had already done it. The file is the test rather
+    # than unit_write's status, because unit_write ends in a daemon-reload and
+    # so returns 0 even when its heredoc failed.
     stamp=$STATE_DIR/script.version
     if [ "$(cat "$stamp" 2>/dev/null)" != "$PINGIFY_VERSION" ]; then
-        unit_write
-        printf '%s\n' "$PINGIFY_VERSION" >"$stamp"
+        if unit_write && [ -s "$UNIT_DIR/pingify@.service" ]; then
+            printf '%s\n' "$PINGIFY_VERSION" >"$stamp"
+        else
+            warn "could not write $UNIT_DIR/pingify@.service"
+            return 1
+        fi
     fi
     return 0
 }
@@ -7643,7 +8043,15 @@ HOME_NAMES=()
 # this server's configs.
 home_subtitle() {
     local core=$G_DASH side= up= rest= first=
-    [ -x "$CORE_BIN" ] && core=$(core_version)
+    # A core that is installed but will not run - built for another
+    # architecture, or truncated - returns 1 with nothing on stdout, and the
+    # assignment used to keep that empty string: the banner then read
+    # "core   |  IRAN" with a hole where the version belongs. Put the dash
+    # back on either failure.
+    if [ -x "$CORE_BIN" ]; then
+        core=$(core_version) || core=$G_DASH
+        [ -n "$core" ] || core=$G_DASH
+    fi
 
     while IFS= read -r first; do break; done < <(cfg_list)
     [ -n "$first" ] && side=$(toml_get "$(cfg_file "$first")" tunnel side)
@@ -7707,7 +8115,10 @@ home_row() {
 # column across half the screen.
 home_cols() {
     local nw=$((UI_W - 46))
-    [ "$nw" -gt 26 ] && nw=26
+    # 24, not 26. v_name refuses a twenty-fifth character, so the two columns
+    # of slack above it could never hold anything and only pushed the numbers
+    # further from the name they belong to.
+    [ "$nw" -gt 24 ] && nw=24
     [ "$nw" -lt 8 ] && nw=8
     UI_COLS=(4 "$nw" 6 8 17)
 }
@@ -7796,6 +8207,7 @@ usage() {
     pingify --check NAME       health check; exits 0 clean, 1 warnings, 2 problems
     pingify --json             with --status or --check, machine readable
     pingify --version          the version of this script, and of the core
+    pingify --update           fetch a newer script and core
     pingify --uninstall        take Pingify off this server
     pingify --help             this
 
@@ -7816,11 +8228,21 @@ cmd_status() {
     else
         while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
     fi
-    [ "${#names[@]}" -gt 0 ] || { warn "no tunnels are configured"; return 1; }
+    # To stderr, because this is the one line on this path that is prose. On
+    # stdout it went into the --json stream, where a consumer parsing objects
+    # got "! no tunnels are configured" instead.
+    [ "${#names[@]}" -gt 0 ] || { warn "no tunnels are configured" >&2; return 1; }
 
     if [ -n "$ARG_JSON" ]; then
-        for n in "${names[@]}"; do status_json "$n"; done
-        return 0
+        # The same answer as the screen below gives. This loop used to return
+        # 0 whatever it found, so a monitoring script that asked for JSON -
+        # the only kind that reads the exit status without reading the output
+        # - was told every tunnel was fine while they were all stopped.
+        for n in "${names[@]}"; do
+            status_json "$n"
+            [ "$(svc_state "$n")" = active ] || rc=1
+        done
+        return "$rc"
     fi
 
     home_cols
@@ -7865,6 +8287,16 @@ argv() {
             ;;
         --json) ARG_JSON=1 ;;
         --new) ARG_MODE=new ;;
+        # The health check tells both operators to run `pingify --update` when
+        # the two ends disagree about a version. Until this case existed that
+        # advice fell through to the catch-all below and died with "--update is
+        # not an option this script has", which is a poor thing to read when
+        # the program itself sent you there.
+        --update) ARG_MODE=update ;;
+        # Not for people. update_pingify installs the new script and then execs
+        # it with this, because the script that did the fetching no longer
+        # knows what core the new one wants.
+        --rebuild-core) ARG_MODE=rebuild ;;
         --uninstall) ARG_MODE=uninstall ;;
         --version | -v) ARG_MODE=version ;;
         --help | -h) ARG_MODE=help ;;
@@ -7887,8 +8319,116 @@ argv() {
 # at a tun address that no longer exists does not error. It quietly swallows
 # every connection to that port, and whatever is installed on that port next
 # looks broken for a reason nothing on the machine explains.
+# update_pingify fetches a newer script and, if the version moved, a core to
+# match it.
+#
+# Two places are tried and the order is deliberate. A release asset is what a
+# version number points at, but a push to main updates the raw URL instantly
+# while the release carrying the matching core lands minutes later - so
+# somebody updating in that window from the release alone gets a script that
+# does not match the core beside it. Raw main is the fallback, not the first
+# choice, because it is whatever was pushed rather than whatever was released.
+#
+# Nothing is installed until it parses. A half-downloaded shell script is a
+# syntactically valid prefix of a working one, which is the worst possible
+# failure: it runs, and it stops in the middle.
+PINGIFY_REPO=${PINGIFY_REPO:-GreatTeejay/Pingify}
+
+update_pingify() {
+    local tmp rc=1 url
+    blank
+    rule "Update"
+    blank
+
+    have curl || have wget || {
+        bad "neither curl nor wget is here, so there is nothing to fetch with"
+        fix "apt install curl"
+        pause
+        return 1
+    }
+
+    tmp=$(mktemp) || return 1
+    for url in \
+        "https://github.com/$PINGIFY_REPO/releases/latest/download/Pingify.sh" \
+        "https://raw.githubusercontent.com/$PINGIFY_REPO/main/Pingify.sh"; do
+        dim "trying $url"
+        if have curl; then
+            curl -fsSL --connect-timeout 20 --retry 2 -o "$tmp" "$url" 2>/dev/null && rc=0
+        else
+            wget -qO "$tmp" "$url" 2>/dev/null && rc=0
+        fi
+        [ "$rc" = 0 ] && break
+    done
+
+    if [ "$rc" != 0 ]; then
+        rm -f "$tmp"
+        bad "nothing could be fetched from either place"
+        fix "check this server can reach github, or copy Pingify.sh over yourself"
+        pause
+        return 1
+    fi
+
+    # It must be a shell script, it must parse, and it must be ours. A captive
+    # portal answering every request with an HTML login page passes "the
+    # download worked" and fails all three of these.
+    if ! head -1 "$tmp" | grep -q '^#!.*bash'; then
+        rm -f "$tmp"
+        bad "what came back is not a shell script - something on the way answered instead"
+        pause
+        return 1
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        bad "what came back does not parse, so it arrived incomplete"
+        fix "try again - a truncated script is worse than an old one"
+        pause
+        return 1
+    fi
+
+    local newver
+    newver=$(PINGIFY_NO_MAIN=1 bash -c '. "$1"; printf "%s" "$PINGIFY_VERSION"' _ "$tmp" 2>/dev/null)
+    if [ -z "$newver" ]; then
+        rm -f "$tmp"
+        bad "that script would not tell us its version, so it is not one of ours"
+        pause
+        return 1
+    fi
+    if [ "$newver" = "$PINGIFY_VERSION" ]; then
+        rm -f "$tmp"
+        ok "already on $PINGIFY_VERSION - nothing to do"
+        pause
+        return 0
+    fi
+
+    blank
+    field "installed" "$PINGIFY_VERSION"
+    field "available" "$newver"
+    blank
+    dim "the core is rebuilt to match, and every running tunnel is restarted"
+    blank
+    confirm "update to $newver?" || { rm -f "$tmp"; return 1; }
+
+    install -m 0755 "$tmp" "$PINGIFY_BIN" || {
+        rm -f "$tmp"
+        bad "could not write $PINGIFY_BIN"
+        pause
+        return 1
+    }
+    rm -f "$tmp"
+    ok "the manager is now $newver"
+
+    # The core has to move with it: a script and a core from different versions
+    # is the one combination neither is built to work in. Hand over to the new
+    # script rather than doing it here, because this one no longer knows what
+    # the new core is supposed to be.
+    blank
+    dim "handing over to the new script to build its core"
+    blank
+    exec "$PINGIFY_BIN" --rebuild-core
+}
+
 uninstall_all() {
-    local names=() n keep=yes unit
+    local names=() n keep=yes unit rc=0 units=0
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
     blank
@@ -7902,7 +8442,12 @@ uninstall_all() {
     [ "${#names[@]}" -gt 0 ] && field "tunnels" "${names[*]}"
     field "configs" "$CFG_DIR - kept, unless you say so below"
     blank
-    confirm "remove all of that?" n || { dim "nothing was removed"; return 1; }
+    # 2, not 1. Saying no is a decision rather than a failure, and main turns
+    # this into an exit 0 so that `pingify --uninstall` does not report an
+    # error for a deliberate no. It cannot simply be 0 either: the menu's x key
+    # exits the program when this function succeeds, and a decline has to leave
+    # the operator on the screen they were looking at.
+    confirm "remove all of that?" n || { dim "nothing was removed"; return 2; }
     confirm "delete the configs in $CFG_DIR as well?" n && keep=no
     blank
 
@@ -7911,17 +8456,35 @@ uninstall_all() {
         svc_do stop "$n"
         svc_do disable "$n"
     done
-    nat_clear
-    block_clear
+    # Both of these ran with their status thrown away, under ok lines that
+    # printed regardless. An uninstall that could not reach iptables reported a
+    # clean removal with the PINGIFY_* chains still in the kernel, which is the
+    # worst way to leave them: whatever is installed on one of those ports next
+    # looks broken for a reason nothing on the machine explains.
+    # They are two separate cleanups and both run whatever the other did: a
+    # failed NAT teardown is no reason to leave the blocking rules behind too.
+    nat_teardown || rc=1
+    remove_blocking || rc=1
+    if [ "$rc" != 0 ]; then
+        bad "the firewall chains are still installed"
+        fix "run this again once iptables works"
+    fi
 
     for unit in "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-*.service \
         "$UNIT_DIR"/pingify-*.timer; do
         [ -e "$unit" ] || continue
         systemctl disable --now "${unit##*/}" >/dev/null 2>&1
         rm -f "$unit"
+        # rm -f says nothing about a file it could not remove, so the file
+        # itself is the test.
+        [ -e "$unit" ] && { units=1; rc=1; }
     done
     systemctl daemon-reload >/dev/null 2>&1
-    ok "services stopped and removed"
+    if [ "$units" = 0 ]; then
+        ok "services stopped and removed"
+    else
+        bad "some units are still in $UNIT_DIR"
+    fi
 
     rm -rf "$SRC_DIR" "$STATE_DIR"
     rm -f "$CORE_BIN"
@@ -7932,7 +8495,12 @@ uninstall_all() {
         ok "configs left in $CFG_DIR"
     fi
     rm -f "$PINGIFY_BIN"
-    ok "Pingify is removed"
+    # The closing line reports what happened rather than what was intended.
+    if [ "$rc" = 0 ]; then
+        ok "Pingify is removed"
+    else
+        bad "Pingify is off, but the lines above say what is left"
+    fi
 
     # The ICMP carrier sets net.ipv4.icmp_echo_ignore_all=1 and nothing puts
     # it back, this included: the sysctl is the core's, and a tunnel still
@@ -7944,12 +8512,13 @@ uninstall_all() {
         fix "sysctl -w net.ipv4.icmp_echo_ignore_all=0"
     fi
     blank
-    return 0
+    return "$rc"
 }
 
 # --------------------------------------------------------------------------
 
 main() {
+    local rc
     argv "$@"
 
     # Neither of these reads a config or writes anything, so neither needs to
@@ -7971,8 +8540,27 @@ main() {
     # out rather than being replaced by whatever the last printf returned.
     case $ARG_MODE in
     status) cmd_status; exit $? ;;
-    check) health_check "$ARG_NAME" "${ARG_JSON:+json}"; exit $? ;;
-    uninstall) uninstall_all; exit $? ;;
+    # The word matters. chk_finish tests for --json, and the bare "json" that
+    # was passed here never matched it, so `--check NAME --json` rendered the
+    # escape coded human screen into whatever was parsing it and exited as
+    # though it had answered the question that was asked.
+    check) health_check "$ARG_NAME" "${ARG_JSON:+--json}"; exit $? ;;
+    uninstall)
+        uninstall_all
+        rc=$?
+        # 2 is "you said no", which is not an error to report to a shell.
+        [ "$rc" = 2 ] && rc=0
+        exit "$rc"
+        ;;
+    esac
+
+    # Update comes before ensure_core on purpose. Building the core this
+    # version wants, moments before the next version asks for a different one,
+    # is a Go build on a slow server that nobody gets any use out of - and
+    # update_pingify installs the manager itself, so install_self has nothing
+    # to add either.
+    case $ARG_MODE in
+    update) update_pingify; exit $? ;;
     esac
 
     # Only the interactive paths reinstall the manager. A cron line calling
@@ -7988,6 +8576,23 @@ main() {
 
     case $ARG_MODE in
     new) screen_new ;;
+    rebuild)
+        require_root
+        ensure_dirs
+        unit_write
+        if ensure_core; then
+            local n
+            while IFS= read -r n; do
+                systemctl is-enabled --quiet "pingify@$n" 2>/dev/null &&
+                    svc_do restart "$n"
+            done < <(cfg_list)
+            ok "everything is on $PINGIFY_VERSION"
+        else
+            bad "the manager was updated but its core could not be built"
+            fix "run pingify and choose Update again once the reason is fixed"
+            exit 1
+        fi
+        ;;
     *) main_menu ;;
     esac
 }

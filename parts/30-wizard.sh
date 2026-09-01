@@ -21,8 +21,11 @@
 # that were greps over the script's own source, and they pinned wording, broke
 # on renames, and passed happily on dead code.
 
-# The tunnel being edited may keep its own values. The wizard creates, so this
-# is empty here; the manage screens set it before calling the owner lookups.
+# The tunnel being edited may keep its own values - a screen that re-asks for a
+# port must not report the tunnel's own port as taken. The wizard creates, so
+# this stays empty here; every owner lookup below also takes the name as an
+# optional last argument, so a caller that has one need not set a global and
+# remember to put it back.
 WIZ_KEEP=
 
 # --------------------------------------------------------------------------
@@ -55,7 +58,7 @@ wiz_net_overlap() {
     # An octet that is not a number would become an arithmetic syntax error
     # below, and inside a validator that error is what the user gets told.
     case $oct in '' | *[!0-9]*) return 1 ;; esac
-    b=$(((10 << 24) + (oct << 16) + (10 << 8)))
+    b=$(((10 << 24) + ((10#$oct) << 16) + (10 << 8)))
     m=$plen
     [ "$m" -gt 24 ] && m=24
     # A /0 on an interface is not a claim on anything; treating it as one would
@@ -67,13 +70,13 @@ wiz_net_overlap() {
 # wiz_link_owner prints what owns 10.<octet>.10.0/24 here, or returns 1.
 wiz_link_owner() {
     local oct=$1 keep=${2:-$WIZ_KEEP} n a dev addr plen
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         a=$(toml_get "$(cfg_file "$n")" tun iran)
         case ${a%%/*} in
         10."$oct".*) printf 'the tunnel %s' "$n"; return 0 ;;
         esac
-    done
+    done < <(cfg_list)
     # Process substitution, not a pipe: a pipe puts the loop in a subshell and
     # the return below would leave only the subshell, so a clash on the host
     # would be found and then thrown away.
@@ -92,11 +95,11 @@ wiz_link_owner() {
 # wiz_device_owner prints what owns a tun device name here, or returns 1.
 wiz_device_owner() {
     local dev=$1 n keep=${2:-$WIZ_KEEP}
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         [ "$(toml_get "$(cfg_file "$n")" tun name)" = "$dev" ] &&
             { printf 'the tunnel %s' "$n"; return 0; }
-    done
+    done < <(cfg_list)
     # An interface with no config behind it is another tool's, or one of ours
     # left over from a crash. Either way the core cannot create it again.
     [ -e "/sys/class/net/$dev" ] && { printf 'an interface already on this host'; return 0; }
@@ -105,14 +108,14 @@ wiz_device_owner() {
 
 wiz_port_owner() {
     local p=$1 keep=${2:-$WIZ_KEEP} n f
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$n" = "$keep" ] && continue
         f=$(cfg_file "$n")
         # ICMP has no port, so an icmp tunnel owns no number.
         [ "$(toml_get "$f" transport type)" = icmp ] && continue
         [ "$(toml_get "$f" transport port)" = "$p" ] &&
             { printf 'the tunnel %s' "$n"; return 0; }
-    done
+    done < <(cfg_list)
     return 1
 }
 
@@ -191,19 +194,24 @@ default_name() {
 # The status endpoint is one loopback port per tunnel. It is written into the
 # shared file, so the second server inherits the number; wizard_paste checks it
 # again there because the two servers do not have the same tunnels on them.
+#
+# Nothing free means nothing free. This used to fall out of the loop printing
+# $STATUS_BASE with status 0 - the one port it had just proved was taken - and
+# both callers wrote that number into the config without a word, so the new
+# core lost the race for the loopback port and the tunnel never came up.
 wiz_free_status_port() {
-    local i=0 p n taken
+    local keep=${1:-$WIZ_KEEP} i=0 p n taken
     while [ "$i" -lt 100 ]; do
         p=$((STATUS_BASE + i))
         taken=
-        for n in $(cfg_list); do
-            [ "$n" = "$WIZ_KEEP" ] && continue
+        while IFS= read -r n; do
+            [ "$n" = "$keep" ] && continue
             [ "$(toml_get "$(cfg_file "$n")" status port)" = "$p" ] && { taken=1; break; }
-        done
+        done < <(cfg_list)
         [ -z "$taken" ] && { printf '%s' "$p"; return 0; }
         i=$((i + 1))
     done
-    printf '%s' "$STATUS_BASE"
+    return 1
 }
 
 # --------------------------------------------------------------------------
@@ -340,14 +348,18 @@ q_port() {
     dim "KHAREJ waits on this port and IRAN dials it. The same"
     dim "number goes on both servers."
     blank
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         [ "$(toml_get "$(cfg_file "$n")" transport type)" = icmp ] && continue
         dim "taken here:  $(toml_get "$(cfg_file "$n")" transport port)/udp   $n"
-    done
+    done < <(cfg_list)
+    # Leaving the last candidate is the point of the bare break. The scan used
+    # to end with def=8443, which is the number it had just proved was taken,
+    # so pressing Enter at the prompt handed v_wiz_port a port it was certain
+    # to refuse and the question asked itself again for no reason.
     while wiz_port_owner "$def" >/dev/null ||
         { [ "$T_SIDE" = kharej ] && wiz_port_bound "$def"; }; do
         def=$((def + 1))
-        [ "$def" -gt 8500 ] && { def=8443; break; }
+        [ "$def" -gt 8500 ] && break
     done
     ask T_PORT "port" "$def" v_wiz_port || return 1
     return 0
@@ -362,10 +374,10 @@ q_link() {
     blank
     dim "Two addresses nothing else uses. Pick the middle number."
     blank
-    for n in $(cfg_list); do
+    while IFS= read -r n; do
         a=$(toml_get "$(cfg_file "$n")" tun iran)
         [ -n "$a" ] && dim "taken here:  ${a%%/*}/24  ($n)"
-    done
+    done < <(cfg_list)
     while read -r dev addr; do
         case ${addr%%/*} in
         10.*) dim "taken here:  $addr  ($dev)" ;;
@@ -574,10 +586,14 @@ tunnel_create() {
         return 1
     fi
     chmod 0600 "$f"
+    # A failed copy used to return 1 with nothing on the screen, and both
+    # wizards just passed that 1 up, so six answered questions ended in silence
+    # - the only failure in this file that never said what went wrong. A full
+    # disk and a read-only /etc both land here.
     if [ -n "$src" ]; then
-        cat "$src" >"$f" || { rm -f "$f"; return 1; }
+        cat "$src" >"$f" || { bad "could not write $f"; rm -f "$f"; return 1; }
     else
-        cat >"$f" || { rm -f "$f"; return 1; }
+        cat >"$f" || { bad "could not write $f"; rm -f "$f"; return 1; }
     fi
 
     if ! out=$("$CORE_BIN" -c "$f" -check 2>&1); then
@@ -631,7 +647,7 @@ token_decode() {
     *) echo "that is not a Pingify token - the line starts with PFY2." >&2; return 1 ;;
     esac
     raw=$(printf '%s' "${line#PFY2.}" | base64 -d 2>/dev/null) || {
-        echo "the token is damaged and will not decode - copy the whole line" >&2
+        echo "the token will not decode - copy the whole line" >&2
         return 1
     }
     # Split on the first pipe only: a hand-typed security token may contain
@@ -639,7 +655,7 @@ token_decode() {
     sum=${raw%%|*}
     body=${raw#*|}
     [ "$sum" != "$raw" ] || {
-        echo "the token is damaged and will not decode - copy the whole line" >&2
+        echo "the token will not decode - copy the whole line" >&2
         return 1
     }
     have=$(printf '%s\n' "$body" | wiz_sha256) || {
@@ -681,7 +697,14 @@ wizard_new() {
     q_profile || return 1
 
     T_NAME=$(default_name)
-    T_STATUS=$(wiz_free_status_port)
+    # Stop here rather than build a tunnel whose core cannot bind its status
+    # port: the home screen reads every number through that endpoint, so a
+    # tunnel without one is a tunnel nothing can report on.
+    if ! T_STATUS=$(wiz_free_status_port); then
+        bad "every status port from $STATUS_BASE is taken here"
+        fix "delete a tunnel, or set [status] port by hand"
+        return 1
+    fi
     if ! T_TOKEN=$(wiz_token); then
         warn "no random source here, so the token has to be typed"
         ask T_TOKEN "security token" "" v_wiz_token || return 1
@@ -729,7 +752,7 @@ wiz_handoff() {
 # --------------------------------------------------------------------------
 
 wizard_paste() {
-    local line f err a own n clash port
+    local line f err a own n clash moved
     WIZ_QUIT=0
     blank
     rule "Finish the pair"
@@ -826,16 +849,30 @@ wizard_paste() {
     # that may legitimately differ between the two files. It is checked again
     # here because this server does not have the same tunnels on it.
     T_STATUS=$(toml_get "$f" status port)
-    port=$(wiz_free_status_port)
-    for n in $(cfg_list); do
-        [ "$(toml_get "$(cfg_file "$n")" status port)" = "$T_STATUS" ] || continue
-        warn "status port $T_STATUS is taken here by $n"
-        dim "this file uses $port, so the two differ there too"
-        T_STATUS=
-        break
-    done
+    # Anything that is not a port counts as absent, and the empty string is the
+    # reason: a pasted file with no [status] port compared equal to every local
+    # tunnel that also had none, so the screen read "status port  is taken here
+    # by <n>" with a blank where the number belongs. An absent port is filled
+    # in below instead of being reported as a clash.
+    case $T_STATUS in '' | *[!0-9]*) T_STATUS= ;; esac
+    moved=0
+    if [ -n "$T_STATUS" ]; then
+        while IFS= read -r n; do
+            [ "$(toml_get "$(cfg_file "$n")" status port)" = "$T_STATUS" ] || continue
+            warn "status port $T_STATUS is taken here by $n"
+            T_STATUS=
+            moved=1
+            break
+        done < <(cfg_list)
+    fi
     if [ -z "$T_STATUS" ]; then
-        T_STATUS=$port
+        if ! T_STATUS=$(wiz_free_status_port); then
+            bad "every status port from $STATUS_BASE is taken here"
+            fix "delete a tunnel, or set [status] port by hand"
+            rm -f "$f"
+            return 1
+        fi
+        [ "$moved" = 1 ] && dim "this file uses $T_STATUS, so the two differ there too"
         toml_set "$f" status port "$T_STATUS"
     fi
 
@@ -864,7 +901,7 @@ wizard_paste() {
 # on purpose - a question with a numbered list of answers must not accept a
 # number that is not one of them. Navigation screens have a Back key; questions
 # do not.
-wizard_menu() {
+screen_new() {
     local k
     blank
     rule "New tunnel"

@@ -50,10 +50,21 @@ install_self() {
     # tunnel, so it is written here, once, and on a version change - which is
     # what stops it being rewritten four times whenever somebody adds a fifth
     # tunnel.
+    #
+    # The stamp is written only when the unit is really there. It used to be
+    # written whether or not unit_write had worked, so a run where $UNIT_DIR
+    # was unwritable left pingify@.service missing and never tried again - the
+    # stamp said this version had already done it. The file is the test rather
+    # than unit_write's status, because unit_write ends in a daemon-reload and
+    # so returns 0 even when its heredoc failed.
     stamp=$STATE_DIR/script.version
     if [ "$(cat "$stamp" 2>/dev/null)" != "$PINGIFY_VERSION" ]; then
-        unit_write
-        printf '%s\n' "$PINGIFY_VERSION" >"$stamp"
+        if unit_write && [ -s "$UNIT_DIR/pingify@.service" ]; then
+            printf '%s\n' "$PINGIFY_VERSION" >"$stamp"
+        else
+            warn "could not write $UNIT_DIR/pingify@.service"
+            return 1
+        fi
     fi
     return 0
 }
@@ -76,7 +87,15 @@ HOME_NAMES=()
 # this server's configs.
 home_subtitle() {
     local core=$G_DASH side= up= rest= first=
-    [ -x "$CORE_BIN" ] && core=$(core_version)
+    # A core that is installed but will not run - built for another
+    # architecture, or truncated - returns 1 with nothing on stdout, and the
+    # assignment used to keep that empty string: the banner then read
+    # "core   |  IRAN" with a hole where the version belongs. Put the dash
+    # back on either failure.
+    if [ -x "$CORE_BIN" ]; then
+        core=$(core_version) || core=$G_DASH
+        [ -n "$core" ] || core=$G_DASH
+    fi
 
     while IFS= read -r first; do break; done < <(cfg_list)
     [ -n "$first" ] && side=$(toml_get "$(cfg_file "$first")" tunnel side)
@@ -140,7 +159,10 @@ home_row() {
 # column across half the screen.
 home_cols() {
     local nw=$((UI_W - 46))
-    [ "$nw" -gt 26 ] && nw=26
+    # 24, not 26. v_name refuses a twenty-fifth character, so the two columns
+    # of slack above it could never hold anything and only pushed the numbers
+    # further from the name they belong to.
+    [ "$nw" -gt 24 ] && nw=24
     [ "$nw" -lt 8 ] && nw=8
     UI_COLS=(4 "$nw" 6 8 17)
 }
@@ -229,6 +251,7 @@ usage() {
     pingify --check NAME       health check; exits 0 clean, 1 warnings, 2 problems
     pingify --json             with --status or --check, machine readable
     pingify --version          the version of this script, and of the core
+    pingify --update           fetch a newer script and core
     pingify --uninstall        take Pingify off this server
     pingify --help             this
 
@@ -249,11 +272,21 @@ cmd_status() {
     else
         while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
     fi
-    [ "${#names[@]}" -gt 0 ] || { warn "no tunnels are configured"; return 1; }
+    # To stderr, because this is the one line on this path that is prose. On
+    # stdout it went into the --json stream, where a consumer parsing objects
+    # got "! no tunnels are configured" instead.
+    [ "${#names[@]}" -gt 0 ] || { warn "no tunnels are configured" >&2; return 1; }
 
     if [ -n "$ARG_JSON" ]; then
-        for n in "${names[@]}"; do status_json "$n"; done
-        return 0
+        # The same answer as the screen below gives. This loop used to return
+        # 0 whatever it found, so a monitoring script that asked for JSON -
+        # the only kind that reads the exit status without reading the output
+        # - was told every tunnel was fine while they were all stopped.
+        for n in "${names[@]}"; do
+            status_json "$n"
+            [ "$(svc_state "$n")" = active ] || rc=1
+        done
+        return "$rc"
     fi
 
     home_cols
@@ -298,6 +331,16 @@ argv() {
             ;;
         --json) ARG_JSON=1 ;;
         --new) ARG_MODE=new ;;
+        # The health check tells both operators to run `pingify --update` when
+        # the two ends disagree about a version. Until this case existed that
+        # advice fell through to the catch-all below and died with "--update is
+        # not an option this script has", which is a poor thing to read when
+        # the program itself sent you there.
+        --update) ARG_MODE=update ;;
+        # Not for people. update_pingify installs the new script and then execs
+        # it with this, because the script that did the fetching no longer
+        # knows what core the new one wants.
+        --rebuild-core) ARG_MODE=rebuild ;;
         --uninstall) ARG_MODE=uninstall ;;
         --version | -v) ARG_MODE=version ;;
         --help | -h) ARG_MODE=help ;;
@@ -320,8 +363,116 @@ argv() {
 # at a tun address that no longer exists does not error. It quietly swallows
 # every connection to that port, and whatever is installed on that port next
 # looks broken for a reason nothing on the machine explains.
+# update_pingify fetches a newer script and, if the version moved, a core to
+# match it.
+#
+# Two places are tried and the order is deliberate. A release asset is what a
+# version number points at, but a push to main updates the raw URL instantly
+# while the release carrying the matching core lands minutes later - so
+# somebody updating in that window from the release alone gets a script that
+# does not match the core beside it. Raw main is the fallback, not the first
+# choice, because it is whatever was pushed rather than whatever was released.
+#
+# Nothing is installed until it parses. A half-downloaded shell script is a
+# syntactically valid prefix of a working one, which is the worst possible
+# failure: it runs, and it stops in the middle.
+PINGIFY_REPO=${PINGIFY_REPO:-GreatTeejay/Pingify}
+
+update_pingify() {
+    local tmp rc=1 url
+    blank
+    rule "Update"
+    blank
+
+    have curl || have wget || {
+        bad "neither curl nor wget is here, so there is nothing to fetch with"
+        fix "apt install curl"
+        pause
+        return 1
+    }
+
+    tmp=$(mktemp) || return 1
+    for url in \
+        "https://github.com/$PINGIFY_REPO/releases/latest/download/Pingify.sh" \
+        "https://raw.githubusercontent.com/$PINGIFY_REPO/main/Pingify.sh"; do
+        dim "trying $url"
+        if have curl; then
+            curl -fsSL --connect-timeout 20 --retry 2 -o "$tmp" "$url" 2>/dev/null && rc=0
+        else
+            wget -qO "$tmp" "$url" 2>/dev/null && rc=0
+        fi
+        [ "$rc" = 0 ] && break
+    done
+
+    if [ "$rc" != 0 ]; then
+        rm -f "$tmp"
+        bad "nothing could be fetched from either place"
+        fix "check this server can reach github, or copy Pingify.sh over yourself"
+        pause
+        return 1
+    fi
+
+    # It must be a shell script, it must parse, and it must be ours. A captive
+    # portal answering every request with an HTML login page passes "the
+    # download worked" and fails all three of these.
+    if ! head -1 "$tmp" | grep -q '^#!.*bash'; then
+        rm -f "$tmp"
+        bad "what came back is not a shell script - something on the way answered instead"
+        pause
+        return 1
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        bad "what came back does not parse, so it arrived incomplete"
+        fix "try again - a truncated script is worse than an old one"
+        pause
+        return 1
+    fi
+
+    local newver
+    newver=$(PINGIFY_NO_MAIN=1 bash -c '. "$1"; printf "%s" "$PINGIFY_VERSION"' _ "$tmp" 2>/dev/null)
+    if [ -z "$newver" ]; then
+        rm -f "$tmp"
+        bad "that script would not tell us its version, so it is not one of ours"
+        pause
+        return 1
+    fi
+    if [ "$newver" = "$PINGIFY_VERSION" ]; then
+        rm -f "$tmp"
+        ok "already on $PINGIFY_VERSION - nothing to do"
+        pause
+        return 0
+    fi
+
+    blank
+    field "installed" "$PINGIFY_VERSION"
+    field "available" "$newver"
+    blank
+    dim "the core is rebuilt to match, and every running tunnel is restarted"
+    blank
+    confirm "update to $newver?" || { rm -f "$tmp"; return 1; }
+
+    install -m 0755 "$tmp" "$PINGIFY_BIN" || {
+        rm -f "$tmp"
+        bad "could not write $PINGIFY_BIN"
+        pause
+        return 1
+    }
+    rm -f "$tmp"
+    ok "the manager is now $newver"
+
+    # The core has to move with it: a script and a core from different versions
+    # is the one combination neither is built to work in. Hand over to the new
+    # script rather than doing it here, because this one no longer knows what
+    # the new core is supposed to be.
+    blank
+    dim "handing over to the new script to build its core"
+    blank
+    exec "$PINGIFY_BIN" --rebuild-core
+}
+
 uninstall_all() {
-    local names=() n keep=yes unit
+    local names=() n keep=yes unit rc=0 units=0
     while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
 
     blank
@@ -335,7 +486,12 @@ uninstall_all() {
     [ "${#names[@]}" -gt 0 ] && field "tunnels" "${names[*]}"
     field "configs" "$CFG_DIR - kept, unless you say so below"
     blank
-    confirm "remove all of that?" n || { dim "nothing was removed"; return 1; }
+    # 2, not 1. Saying no is a decision rather than a failure, and main turns
+    # this into an exit 0 so that `pingify --uninstall` does not report an
+    # error for a deliberate no. It cannot simply be 0 either: the menu's x key
+    # exits the program when this function succeeds, and a decline has to leave
+    # the operator on the screen they were looking at.
+    confirm "remove all of that?" n || { dim "nothing was removed"; return 2; }
     confirm "delete the configs in $CFG_DIR as well?" n && keep=no
     blank
 
@@ -344,17 +500,35 @@ uninstall_all() {
         svc_do stop "$n"
         svc_do disable "$n"
     done
-    nat_clear
-    block_clear
+    # Both of these ran with their status thrown away, under ok lines that
+    # printed regardless. An uninstall that could not reach iptables reported a
+    # clean removal with the PINGIFY_* chains still in the kernel, which is the
+    # worst way to leave them: whatever is installed on one of those ports next
+    # looks broken for a reason nothing on the machine explains.
+    # They are two separate cleanups and both run whatever the other did: a
+    # failed NAT teardown is no reason to leave the blocking rules behind too.
+    nat_teardown || rc=1
+    remove_blocking || rc=1
+    if [ "$rc" != 0 ]; then
+        bad "the firewall chains are still installed"
+        fix "run this again once iptables works"
+    fi
 
     for unit in "$UNIT_DIR"/pingify@.service "$UNIT_DIR"/pingify-*.service \
         "$UNIT_DIR"/pingify-*.timer; do
         [ -e "$unit" ] || continue
         systemctl disable --now "${unit##*/}" >/dev/null 2>&1
         rm -f "$unit"
+        # rm -f says nothing about a file it could not remove, so the file
+        # itself is the test.
+        [ -e "$unit" ] && { units=1; rc=1; }
     done
     systemctl daemon-reload >/dev/null 2>&1
-    ok "services stopped and removed"
+    if [ "$units" = 0 ]; then
+        ok "services stopped and removed"
+    else
+        bad "some units are still in $UNIT_DIR"
+    fi
 
     rm -rf "$SRC_DIR" "$STATE_DIR"
     rm -f "$CORE_BIN"
@@ -365,7 +539,12 @@ uninstall_all() {
         ok "configs left in $CFG_DIR"
     fi
     rm -f "$PINGIFY_BIN"
-    ok "Pingify is removed"
+    # The closing line reports what happened rather than what was intended.
+    if [ "$rc" = 0 ]; then
+        ok "Pingify is removed"
+    else
+        bad "Pingify is off, but the lines above say what is left"
+    fi
 
     # The ICMP carrier sets net.ipv4.icmp_echo_ignore_all=1 and nothing puts
     # it back, this included: the sysctl is the core's, and a tunnel still
@@ -377,12 +556,13 @@ uninstall_all() {
         fix "sysctl -w net.ipv4.icmp_echo_ignore_all=0"
     fi
     blank
-    return 0
+    return "$rc"
 }
 
 # --------------------------------------------------------------------------
 
 main() {
+    local rc
     argv "$@"
 
     # Neither of these reads a config or writes anything, so neither needs to
@@ -404,8 +584,27 @@ main() {
     # out rather than being replaced by whatever the last printf returned.
     case $ARG_MODE in
     status) cmd_status; exit $? ;;
-    check) health_check "$ARG_NAME" "${ARG_JSON:+json}"; exit $? ;;
-    uninstall) uninstall_all; exit $? ;;
+    # The word matters. chk_finish tests for --json, and the bare "json" that
+    # was passed here never matched it, so `--check NAME --json` rendered the
+    # escape coded human screen into whatever was parsing it and exited as
+    # though it had answered the question that was asked.
+    check) health_check "$ARG_NAME" "${ARG_JSON:+--json}"; exit $? ;;
+    uninstall)
+        uninstall_all
+        rc=$?
+        # 2 is "you said no", which is not an error to report to a shell.
+        [ "$rc" = 2 ] && rc=0
+        exit "$rc"
+        ;;
+    esac
+
+    # Update comes before ensure_core on purpose. Building the core this
+    # version wants, moments before the next version asks for a different one,
+    # is a Go build on a slow server that nobody gets any use out of - and
+    # update_pingify installs the manager itself, so install_self has nothing
+    # to add either.
+    case $ARG_MODE in
+    update) update_pingify; exit $? ;;
     esac
 
     # Only the interactive paths reinstall the manager. A cron line calling
@@ -421,6 +620,23 @@ main() {
 
     case $ARG_MODE in
     new) screen_new ;;
+    rebuild)
+        require_root
+        ensure_dirs
+        unit_write
+        if ensure_core; then
+            local n
+            while IFS= read -r n; do
+                systemctl is-enabled --quiet "pingify@$n" 2>/dev/null &&
+                    svc_do restart "$n"
+            done < <(cfg_list)
+            ok "everything is on $PINGIFY_VERSION"
+        else
+            bad "the manager was updated but its core could not be built"
+            fix "run pingify and choose Update again once the reason is fixed"
+            exit 1
+        fi
+        ;;
     *) main_menu ;;
     esac
 }
