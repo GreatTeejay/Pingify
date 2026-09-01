@@ -492,7 +492,11 @@ wiz_review() {
     panel_field "This server" "${T_SIDE^^}"
     panel_field "Abroad" "$T_KHAREJ"
     panel_field "Transport" "$trans"
-    panel_field "Private link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
+    # "Link", not "Private link": it is the widest key any panel in the script
+    # has, and one key a column wider than the rest puts one value out of line
+    # with every other value in the box. The tunnel screen already calls it
+    # this, so the two screens now agree as well.
+    panel_field "Link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
     panel_field "Profile" "${prof^}   queue $(wiz_queue "$prof") packets"
     panel_field "Token" "${T_TOKEN:0:8}$G_CUT  (fingerprint $(wiz_fingerprint "$T_TOKEN"))"
     panel_close

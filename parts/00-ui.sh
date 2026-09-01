@@ -61,10 +61,22 @@ ui_detect() {
     esac
     [ -n "${PINGIFY_ASCII:-}" ] && UI_GLYPH=ascii
 
-    UI_W=${PINGIFY_WIDTH:-$(tput cols 2>/dev/null || echo 80)}
-    case "$UI_W" in '' | *[!0-9]*) UI_W=80 ;; esac
-    [ "$UI_W" -gt 100 ] && UI_W=100
-    [ "$UI_W" -lt 60 ] && UI_W=60
+    # Two widths, and they are not the same measurement.
+    #
+    # The frames are drawn at 68 columns whatever the window is. A box pulled
+    # across a two hundred column terminal is a box the eye cannot follow from
+    # one edge to the other, and 68 is the width this tool has always had.
+    #
+    # The menu lines get the whole window. Their last column is a sentence
+    # saying what the key does, and cutting that short on a wide screen buys
+    # nothing - so they are allowed to run past the right edge of the frames
+    # above them, which is exactly how they have always looked.
+    UI_TERM=${PINGIFY_WIDTH:-$(tput cols 2>/dev/null || echo 80)}
+    case "$UI_TERM" in '' | *[!0-9]*) UI_TERM=80 ;; esac
+    [ "$UI_TERM" -gt 120 ] && UI_TERM=120
+    [ "$UI_TERM" -lt 40 ] && UI_TERM=40
+    UI_W=$UI_TERM
+    [ "$UI_W" -gt 68 ] && UI_W=68
 
     ui_palette
     ui_glyphs
@@ -97,7 +109,7 @@ ui_glyphs() {
         G_H='─' G_V='│' G_TL='╭' G_TR='╮' G_BL='╰' G_BR='╯'
         G_CUR='▸' G_ON='●' G_OFF='○' G_OK='✓' G_BAD='✗' G_WARN='!'
         G_ARROW='→' G_BOTH='⇄' G_CUT='…' G_DASH='—'
-        G_ITEM='►' G_DOT='·'
+        G_ITEM='▸' G_DOT='·'
     else
         G_H='-' G_V='|' G_TL='+' G_TR='+' G_BL='+' G_BR='+'
         G_CUR='>' G_ON='*' G_OFF='o' G_OK='+' G_BAD='x' G_WARN='!'
@@ -222,7 +234,9 @@ rule() {
 
 # field is one key and one value, aligned. The key column is fixed so that
 # every screen lines up with every other screen.
-UI_KEYW=12
+# The same eleven the panels use, so a value on a plain screen stands in the
+# same column as a value inside a box.
+UI_KEYW=11
 field() {
     printf '    %s%s%s  %s\n' \
         "$C_KEY" "$(pad_to "$1" "$UI_KEYW")" "$C_OFF" \
@@ -230,21 +244,23 @@ field() {
 }
 
 # item is one line of a menu: the number you type, what it does, and - where it
-# needs one - what that means in three or four words.
+# needs one - the sentence saying what that means.
 #
 # The hint is its own argument rather than spaces inside the label. Five of
 # these had the hint padded into the label by hand, and every one of them went
 # crooked the moment somebody renamed the thing beside it; the width here is
 # measured, once, from the label that is actually being drawn.
-# Twenty columns for the label. It is the width at which the longest label in
-# the script still leaves room for a hint on a sixty column terminal, which is
-# the narrowest this UI draws at.
-UI_ITEMW=20
+#
+# Twenty-four columns for the label, and the key right aligned in two, so that
+# the tenth item on a screen starts its label in the same column as the first.
+# The hint is measured against the window rather than the frames, because it
+# is the last thing on the line and has nothing to push out of place.
+UI_ITEMW=24
 item() {
     local w=$UI_ITEMW n hint=${3:-} hw
     n=$(vislen "$2")
     [ "$n" -ge "$w" ] && w=$((n + 2))
-    hw=$((UI_W - w - 10))
+    hw=$((UI_TERM - w - 9))
     # A hint with four columns left for it is not a hint, it is a cut mark.
     # Below that the label takes the whole line and the note is dropped.
     if [ -n "$hint" ] && [ "$hw" -ge 6 ]; then
@@ -254,7 +270,7 @@ item() {
     else
         printf '   %s%2s%s %s%s%s %s\n' \
             "$C_ACCENT$C_B" "$1" "$C_OFF" "$C_MUTE" "$G_ITEM" "$C_OFF" \
-            "$(trunc_to "$2" $((UI_W - 8)))"
+            "$(trunc_to "$2" $((UI_TERM - 9)))"
     fi
 }
 
@@ -296,8 +312,11 @@ panel_row() {
         "$C_RULE" "$G_V" "$C_OFF" "$(pad_to "$1" "$inner")" \
         "$C_RULE" "$G_V" "$C_OFF"
 }
+# Eleven, which is the longest key any panel in the script uses. A wider one
+# only pushes every value further from the word it belongs to.
+UI_PANELW=11
 panel_field() {
-    panel_row "$(printf '%s%s%s  %s' "$C_KEY" "$(pad_to "$1" 14)" "$C_OFF" "$2")"
+    panel_row "$(printf '%s%s%s  %s' "$C_KEY" "$(pad_to "$1" "$UI_PANELW")" "$C_OFF" "$2")"
 }
 panel_close() {
     printf '%s\n' "$(fill_to "  $C_RULE$G_BL" "$G_H" "$G_BR")"
