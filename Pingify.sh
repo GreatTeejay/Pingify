@@ -7225,6 +7225,18 @@ const (
 
 	hdrLen = 5
 
+	// How many records may wait for one carrier connection. It was four
+	// thousand, which is eight megabytes of records in front of every packet
+	// queued behind them: measured, the tunnel's own ping came back 1.2
+	// seconds late while a transfer ran, and a tunnel that answers in a
+	// second under load is no good to anyone watching a video on it.
+	//
+	// Sixty-four is about a tenth of a millisecond of a fast path and still
+	// far more than the writer needs to stay busy. What does not fit here
+	// pushes back on the stream that made it, which is where the waiting
+	// belongs.
+	outDepth = 64
+
 	udpIDBit  = 0x80000000
 	udpIdle   = 90 * time.Second
 	pingEvery = 10 * time.Second
@@ -7309,7 +7321,7 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 	}
 	f.out = make([]chan outRec, n)
 	for i := range f.out {
-		f.out[i] = make(chan outRec, 4096)
+		f.out[i] = make(chan outRec, outDepth)
 	}
 	car.OnPacket(f.onRecord)
 	return f, nil
