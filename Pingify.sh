@@ -1486,10 +1486,25 @@ const (
 	replayWords = ReplayDepth / 64
 )
 
+// restartRun is how many authenticated packets from before the window it
+// takes to be believed as a restart rather than a replay.
+//
+// Two, and not more, because of the end that waits. It sends nothing on its
+// own but a keepalive every ten seconds, so after it restarts the other end
+// sees one old packet every ten seconds until a run this long has arrived:
+// eight of them was over a minute of dead tunnel, measured. Two is the second
+// keepalive. What a path actually duplicates is a recent packet, once, and
+// that is inside the window and handled there; nothing on a path replays two
+// packets from four thousand ago back to back.
+const restartRun = 2
+
 type ReplayWindow struct {
 	top   uint32 // the highest counter seen
 	bits  [replayWords]uint64
 	empty bool
+
+	// Packets from before the window, counted in a row. See Fresh.
+	ancient uint32
 
 	// What the far end sent that we did not get, and what arrived behind
 	// something newer. The counter is consecutive at the sender, so a number
@@ -1534,17 +1549,41 @@ func (w *ReplayWindow) Fresh(seq uint32) bool {
 		w.shift(seq - w.top)
 		w.top = seq
 		w.set(0)
+		w.ancient = 0
 		return true
 	default:
-		w.late++
 		back := w.top - seq
 		if back >= ReplayDepth {
-			return false // older than the window remembers; treat as replay
+			// Older than the window remembers. One of these is a replay. A
+			// run of them is the far end having restarted: its counter went
+			// back to nought while this window still stands at the top of
+			// the old one, and every packet it now sends is "already seen".
+			//
+			// Measured on the real pair: restart one end of an ICMP tunnel
+			// and the other end drops everything from it - the log counts
+			// "2084 already seen" and nothing arrives - until that end is
+			// restarted as well. A watchdog restart, a crash, a setting
+			// changed on one server: each one blackholed the tunnel. So a run
+			// of authenticated packets from before the window is taken as a
+			// new beginning, and the window moves to it. The tag is what
+			// makes this safe to do: nobody without the token can make one
+			// such packet, let alone a run of them.
+			w.ancient++
+			if w.ancient < restartRun {
+				return false
+			}
+			w.ancient = 0
+			w.top = seq
+			w.bits = [replayWords]uint64{}
+			w.set(0)
+			return true
 		}
+		w.late++
 		if w.get(back) {
 			return false
 		}
 		w.set(back)
+		w.ancient = 0
 		// It was counted as missing when the packet after it arrived first,
 		// and here it is. Reordering was being reported as loss and as
 		// reordering at the same time, which on any path that reorders made
