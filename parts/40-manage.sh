@@ -162,23 +162,26 @@ screen_tunnel() {
         prof=$(toml_get "$f" tuning profile)
 
         # What this server is, in one line, said the way round that matters:
-        # which end dials and which end waits. The old line said "iran" and
-        # left the reader to remember which of the two does what.
-        if [ "$side" = iran ]; then
-            if [ "$transport" = icmp ]; then
-                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") inside ping packets"
-            else
-                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") on $transport/$port"
-            fi
+        # which end dials and which end waits. It used to read that off the
+        # side alone - IRAN dials, KHAREJ waits - and that was true only while
+        # Iran was the end that dialled. It comes from transport.dials now, so
+        # the line says what this server actually does.
+        local dials far how
+        dials=$(toml_get "$f" transport dials)
+        [ -n "$dials" ] || dials=kharej
+        if [ "$side" = iran ]; then far=$kharej; else far=$(toml_get "$f" transport iran); fi
+        local waiting
+        case $transport in
+        icmp) how="inside ping packets"; waiting="waits for ping packets" ;;
+        gre) how="as ip protocol 47"; waiting="waits for ip protocol 47" ;;
+        awg) how="inside the AmneziaWG link"; waiting="waits inside the AmneziaWG link" ;;
+        *) how="on $transport/$port"; waiting="waits on $transport/$port" ;;
+        esac
+        if [ "$side" = "$dials" ]; then
+            field "This end" "${side^^} $G_DASH dials $(addr_text "$far") $how"
         else
-            local iran_addr
-            iran_addr=$(toml_get "$f" transport iran)
-            if [ "$transport" = icmp ]; then
-                field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
-            else
-                field "This end" "KHAREJ $G_DASH waits on $transport/$port"
-            fi
-            [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
+            field "This end" "${side^^} $G_DASH $waiting"
+            [ -n "$far" ] && field "Dialled by" "$(addr_text "$far")"
         fi
         # The name and the path, for the transports that have one. It is the
         # one thing about a WebSocket tunnel that is not in the line above,

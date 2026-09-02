@@ -148,6 +148,33 @@ section "parity is not offered where the core ignores it"
 check_contains "the Advanced screen leaves gre out of Parity"     "$(grep -A5 'Parity is not offered' parts/40-manage.sh)" "utls | fallback | gre"
 check_contains "and the check does not advise it on gre"     "$(grep -B4 'turn on Parity' parts/60-check.sh)" "utls | fallback | gre"
 
+section "the machine gets its pings back, and not a moment sooner"
+
+# The core mutes echo replies while an ICMP tunnel runs, and has to. Giving
+# them back is the manager's job, and doing it while a second ICMP tunnel is
+# still running would double that tunnel's traffic on the path.
+_sd=$(mktemp -d)
+printf '[transport]
+type = "icmp"
+' >"$_sd/one.toml"
+cfg_list() { printf 'one
+'; }
+cfg_file() { printf '%s' "$_sd/one.toml"; }
+sysctl() { printf 'SYSCTL %s
+' "$*"; }
+svc_state() { printf 'active'; }
+out=$(icmp_echo_restore 2>&1)
+check_missing "an icmp tunnel still running keeps the kernel quiet" "$out" "SYSCTL"
+svc_state() { printf 'stopped'; }
+out=$(icmp_echo_restore 2>&1)
+if [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
+    check_contains "with the last one stopped, the pings come back" "$out" "SYSCTL"
+else
+    skip "nothing is muted on this machine, so there is nothing to restore"
+fi
+unset -f cfg_list cfg_file sysctl svc_state
+rm -rf "$_sd"
+
 section "the guard that lets this file be sourced at all"
 
 # build.sh and every test here source the script. Without the guard on the

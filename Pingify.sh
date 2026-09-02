@@ -379,6 +379,20 @@ rtt_colour() {
     esac
 }
 
+# rate_colour is the same idea for megabits, with one difference that matters:
+# a tunnel carrying nothing is not a slow tunnel. Nobody is using it. So below
+# a megabit this is grey - the state the dot beside it already describes - and
+# the three colours only start once there is traffic to have an opinion about.
+rate_colour() {
+    case $1 in
+    '' | *[!0-9.]*) printf '%s' "$C_MUTE" ;;
+    *) if [ "${1%%.*}" -lt 1 ]; then printf '%s' "$C_MUTE"
+       elif [ "${1%%.*}" -ge 100 ]; then printf '%s' "$C_OK"
+       elif [ "${1%%.*}" -ge 10 ]; then printf '%s' "$C_WARN"
+       else printf '%s' "$C_BAD"; fi ;;
+    esac
+}
+
 # The name, drawn large, in a frame it fills. It is the first thing on the
 # screen and the only decoration in the whole script.
 #
@@ -987,6 +1001,33 @@ svc_state() {
 # svc_do never swallows the result. The old service_enable_start returned the
 # exit status of a `systemctl daemon-reload` that always succeeds, so the caller
 # printed a green "is running" over a unit that had failed to start.
+# The machine gets its pings back when the last ICMP tunnel stops.
+#
+# The core sets net.ipv4.icmp_echo_ignore_all while it runs, and it has to:
+# both ends of an ICMP tunnel send echo requests, so without it every packet
+# is answered twice - once by the far tunnel and once by the far kernel, which
+# has no idea it is in the middle of anything - and the traffic on the path
+# doubles. It is the same setting flagtun asks you to put in a sysctl.d file
+# by hand, set at start instead, so a reboot needs nothing.
+#
+# What it did not do was give it back. A server whose ICMP tunnel had been
+# stopped went on answering no pings at all, which looks exactly like a dead
+# server, and every other tunnel on it lost its round trip measurement as
+# well. This is the other half, and it counts the remaining ICMP tunnels
+# first: two of them, one stopped, must not unmute the one still running.
+icmp_echo_restore() {
+    local n t
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        t=$(toml_get "$(cfg_file "$n")" transport type)
+        [ "$t" = icmp ] || continue
+        [ "$(svc_state "$n")" = active ] && return 0
+    done < <(cfg_list)
+    [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ] || return 0
+    sysctl -qw net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 &&
+        ok "this server answers pings again"
+}
+
 svc_do() {
     local what=$1 name=$2
     case $what in
@@ -1009,7 +1050,7 @@ svc_do() {
         # "disableped" out of disable - on the uninstall screen, where every
         # other line is plain English.
         case $what in
-        stop) ok "$name stopped" ;;
+        stop) ok "$name stopped"; icmp_echo_restore ;;
         *) ok "$name will not start at boot" ;;
         esac
         ;;
@@ -21446,23 +21487,26 @@ screen_tunnel() {
         prof=$(toml_get "$f" tuning profile)
 
         # What this server is, in one line, said the way round that matters:
-        # which end dials and which end waits. The old line said "iran" and
-        # left the reader to remember which of the two does what.
-        if [ "$side" = iran ]; then
-            if [ "$transport" = icmp ]; then
-                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") inside ping packets"
-            else
-                field "This end" "IRAN $G_DASH dials $(addr_text "$kharej") on $transport/$port"
-            fi
+        # which end dials and which end waits. It used to read that off the
+        # side alone - IRAN dials, KHAREJ waits - and that was true only while
+        # Iran was the end that dialled. It comes from transport.dials now, so
+        # the line says what this server actually does.
+        local dials far how
+        dials=$(toml_get "$f" transport dials)
+        [ -n "$dials" ] || dials=kharej
+        if [ "$side" = iran ]; then far=$kharej; else far=$(toml_get "$f" transport iran); fi
+        local waiting
+        case $transport in
+        icmp) how="inside ping packets"; waiting="waits for ping packets" ;;
+        gre) how="as ip protocol 47"; waiting="waits for ip protocol 47" ;;
+        awg) how="inside the AmneziaWG link"; waiting="waits inside the AmneziaWG link" ;;
+        *) how="on $transport/$port"; waiting="waits on $transport/$port" ;;
+        esac
+        if [ "$side" = "$dials" ]; then
+            field "This end" "${side^^} $G_DASH dials $(addr_text "$far") $how"
         else
-            local iran_addr
-            iran_addr=$(toml_get "$f" transport iran)
-            if [ "$transport" = icmp ]; then
-                field "This end" "KHAREJ $G_DASH waits for ping packets from IRAN"
-            else
-                field "This end" "KHAREJ $G_DASH waits on $transport/$port"
-            fi
-            [ -n "$iran_addr" ] && field "IRAN is" "$(addr_text "$iran_addr")"
+            field "This end" "${side^^} $G_DASH $waiting"
+            [ -n "$far" ] && field "Dialled by" "$(addr_text "$far")"
         fi
         # The name and the path, for the transports that have one. It is the
         # one thing about a WebSocket tunnel that is not in the line above,
@@ -23923,16 +23967,40 @@ screen_host() {
         field "Open files" "$(ulimit -n) here, $([ -f "$HOST_LIMITS" ] && printf '1048576 at next login' || printf 'unchanged at login')"
         field "Drop-in" "$HOST_SYSCTL"
         blank
-        item2 "1" "Profile" "${p:-none applied}"
-        item2 "2" "BBR" "$bbr $G_DASH the congestion control the kernel uses"
-        item2 "3" "Descriptor limits" \
+        item "1" "Optimize this server" "all three below, the way a tunnel wants them"
+        item2 "2" "Profile" "${p:-none applied}"
+        item2 "3" "BBR" "$bbr $G_DASH the congestion control the kernel uses"
+        item2 "4" "Descriptor limits" \
             "$([ -f "$HOST_LIMITS" ] && printf 'raised to 1048576' || printf 'left at the distribution default')"
-        item "4" "Revert" "put every setting on this screen back"
+        item "5" "Revert" "put every setting on this screen back"
         item "0" "Back"
         blank
         menu_key key || return 0
         case $key in
+        # Everything below, in the order it has to be done in. Three switches
+        # is three decisions to make about a machine somebody just rented, and
+        # the answer is the same on almost all of them.
         1)
+            blank
+            dim "Balanced socket buffers, BBR over fq, and a million open"
+            dim "files. It is the three settings below, set the way a tunnel"
+            dim "server wants them, in one go."
+            blank
+            confirm "apply all three?" y || continue
+            blank
+            local want=off
+            host_bbr_available && want=on
+            if host_write_sysctl balanced "$want"; then
+                if [ "$want" = on ]; then
+                    ok "balanced buffers, BBR over fq"
+                else
+                    ok "balanced buffers"
+                    warn "this kernel does not offer BBR, so cubic stays"
+                fi
+            fi
+            host_limits
+            ;;
+        2)
             blank
             group "WHAT THIS MACHINE MOSTLY CARRIES"
             item "1" "Gaming" "smaller socket buffers, so a reply waits less"
@@ -23959,7 +24027,7 @@ screen_host() {
             blank
             host_write_sysctl "$p" "$(host_bbr_state)" && ok "$p host tuning applied"
             ;;
-        2)
+        3)
             blank
             if [ "$(host_bbr_state)" = on ]; then
                 # Taking the two lines out of the drop-in does not take BBR off
@@ -23986,8 +24054,8 @@ screen_host() {
                     ok "BBR is on, with fq underneath it"
             fi
             ;;
-        3) blank; host_limits ;;
-        4)
+        4) blank; host_limits ;;
+        5)
             blank
             confirm "remove the drop-in and the limits file?" n && { blank; revert_tuning; }
             ;;
@@ -24339,12 +24407,15 @@ screen_firewall() {
         screen_top
         blank
         rule "Blocking"
+        dim "on means it is being blocked, off means it is not. The name of"
+        dim "each line is what the switch does, not what it is about."
+        blank
         dim "state lives in $STATE_DIR. Every apply flushes our two chains and"
         dim "builds them again, so your own rules are never in the way of it."
         blank
-        item2 "1" "Ping from outside" "$(host_badge "$(block_state icmp)")"
-        item2 "2" "QUIC, udp 443" "$(host_badge "$(block_state quic)")"
-        item2 "3" "Speedtest sites" "$(host_badge "$(block_state speedtest)")"
+        item2 "1" "Blocking outside ping" "$(host_badge "$(block_state icmp)")"
+        item2 "2" "Blocking QUIC, udp 443" "$(host_badge "$(block_state quic)")"
+        item2 "3" "Blocking speedtest sites" "$(host_badge "$(block_state speedtest)")"
         blank
         item "4" "Show the rules that are in place"
         item "5" "Clear everything, including the boot unit"
@@ -24621,7 +24692,12 @@ home_row() {
             # for running-and-alone, which is what the dot has always meant.
             [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ] && dot=running
             [ -n "$ST_TRANSPORT" ] && transport=$ST_TRANSPORT
-            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
+            # Coloured by the busier of the two directions: a tunnel pulling
+            # 400 down and 8 up is not an amber tunnel.
+            local hi
+            hi=$ST_IN
+            awk -v a="$ST_OUT" -v b="$ST_IN" 'BEGIN{exit !(a+0>b+0)}' && hi=$ST_OUT
+            rate="$(rate_colour "$(round1 "$hi")")$(round1 "$ST_IN")/$(round1 "$ST_OUT")$C_OFF"
         else
             rate="no answer"
         fi
@@ -24683,28 +24759,23 @@ home_cols() {
     UI_COLS=(4 "$nw" 8 7 8 12)
 }
 
-# The home screen: the name, the two panels, whatever is running, and a
-# numbered list of everything that can be done from here.
+# The home screen: the name, the two panels, and a numbered list of everything
+# that can be done from here.
+#
+# What is not here any more is the list of running tunnels. Every line of it
+# cost a systemctl, a request to the tunnel's own status port and a ping across
+# the link - and the ping is up to a second on its own when the far end has
+# stopped answering, which is exactly when somebody is opening this screen. On
+# a server with three tunnels the menu took seconds to appear, every time, for
+# a table that Manage tunnels draws anyway.
 #
 # The numbers are fixed, and that is the point of them. They were letters, and
 # the tunnels themselves were keys on this screen, so the key for Uninstall
 # moved down the alphabet every time somebody added a tunnel. Nothing here
 # moves now: 7 is Remove on a server with no tunnels and on a server with ten.
 screen_home() {
-    local n names=()
-    while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
-
     screen_top
     home_panels
-
-    if [ "${#names[@]}" -gt 0 ]; then
-        blank
-        group "RUNNING NOW"
-        home_cols
-        home_head
-        for n in "${names[@]}"; do home_row "$n" " "; done
-    fi
-
     blank
     group "TUNNELS"
     item 1 "New tunnel" "set this server up, or finish the pair"
@@ -24712,8 +24783,8 @@ screen_home() {
     item 3 "Health check" "every tunnel, and what to do about it"
     blank
     group "NETWORK"
-    item 4 "Host tuning" "kernel profile, BBR, descriptor limits"
-    item 5 "Blocking" "ping from outside, QUIC on udp 443, speedtest"
+    item 4 "Host tuning" "one key for all of it, or each on its own"
+    item 5 "Blocking" "outside ping, QUIC on udp 443, speedtest sites"
     blank
     group "MAINTENANCE"
     item 6 "Update Pingify" "script and core together, to the same version"
@@ -24761,6 +24832,10 @@ screen_tunnels() {
             i=$((i + 1))
         done
         blank
+        # The key after the last tunnel, so it can never collide with one of
+        # them however many there are. From the old script, where it was the
+        # one thing on this screen that could not be done from a tunnel's own.
+        item "$((${#names[@]} + 1))" "Restart every tunnel"
         item 0 "Back"
         blank
 
@@ -24769,7 +24844,11 @@ screen_tunnels() {
         0 | '') return 0 ;;
         *[!0-9]*) blank; warn "there is nothing on $k" ;;
         *)
-            if [ "$k" -ge 1 ] && [ "$k" -le "${#names[@]}" ]; then
+            if [ "$k" -eq $((${#names[@]} + 1)) ]; then
+                blank
+                for n in "${names[@]}"; do svc_do restart "$n"; done
+                pause
+            elif [ "$k" -ge 1 ] && [ "$k" -le "${#names[@]}" ]; then
                 screen_tunnel "${names[k - 1]}"
                 names=()
                 while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
