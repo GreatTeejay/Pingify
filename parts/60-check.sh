@@ -183,6 +183,22 @@ chk_load() {
         CK_THEIRS=$(toml_get "$CK_FILE" tun iran)
     fi
     CK_PEER=${CK_THEIRS%%/*}
+
+    # Which end waits, and what to call the other one. Every piece of advice
+    # below turns on this: a port has to be open on the end that waits and
+    # nowhere else, and only the end that dials can test the other from
+    # outside. All of it said KHAREJ, from when Iran was the end that dialled,
+    # so half of it was addressed to the wrong server.
+    CK_DIALS=$(toml_get "$CK_FILE" transport dials)
+    [ -n "$CK_DIALS" ] || CK_DIALS=kharej
+    if [ "$CK_DIALS" = iran ]; then
+        CK_WAITS=KHAREJ
+        CK_WAIT_ADDR=$CK_KHAREJ
+    else
+        CK_WAITS=IRAN
+        CK_WAIT_ADDR=$(toml_get "$CK_FILE" transport iran)
+    fi
+    if [ "$CK_SIDE" = iran ]; then CK_FAR=KHAREJ; else CK_FAR=IRAN; fi
     return 0
 }
 
@@ -397,7 +413,7 @@ health_check() {
             case $CK_TRANSPORT in
             icmp)
                 chk_add bad peer "the far end has never been seen" \
-                    "on KHAREJ:  systemctl status pingify@$name" \
+                    "on $CK_FAR:  systemctl status pingify@$name" \
                     "watch there:  tcpdump -ni any icmp" \
                     "if nothing arrives at all, try tcp or udp"
                 ;;
@@ -408,19 +424,26 @@ health_check() {
                 chk_add bad peer "the far end has never been seen inside the link" \
                     "the line below says whether the link itself is up" \
                     "if it handshook, the path is dropping udp once it flows" \
-                    "on KHAREJ:  systemctl status pingify@$name"
+                    "on $CK_FAR:  systemctl status pingify@$name"
                 ;;
             gre)
                 chk_add bad peer "the far end has never been seen" \
-                    "on KHAREJ:  systemctl status pingify@$name" \
+                    "on $CK_FAR:  systemctl status pingify@$name" \
                     "watch there:  tcpdump -ni any proto gre" \
                     "some networks drop ip protocol 47 outright; try tcp or ws"
                 ;;
             tcp)
                 # TCP is the one transport whose far end can be tested from
-                # here without the tunnel: a connection either opens or it
-                # does not, and which of the two it is decides where to look.
-                if [ "$CK_SIDE" = iran ] && tcp_reach "$CK_KHAREJ" "$CK_PORT"; then
+                # here without the tunnel - but only from the end that dials.
+                # On the end that waits there is nothing out there to open a
+                # connection to, and the socket worth looking at is this one.
+                if [ "${CK_SIDE^^}" = "$CK_WAITS" ]; then
+                    chk_add bad peer "the far end has never been seen" \
+                        "this end is the one that waits, so start with it:" \
+                        "ss -ltn | grep :$CK_PORT" \
+                        "open it here:  ufw allow $CK_PORT/tcp" \
+                        "on $CK_FAR:  systemctl status pingify@$name"
+                elif tcp_reach "$CK_WAIT_ADDR" "$CK_PORT"; then
                     chk_add bad peer \
                         "tcp/$CK_PORT is open there, but nothing pingify sent has come back" \
                         "the token differs between the two servers" \
@@ -428,9 +451,9 @@ health_check() {
                         "or something else is answering on that port there"
                 else
                     chk_add bad peer "the far end has never been seen" \
-                        "on KHAREJ:  systemctl status pingify@$name" \
+                        "on $CK_FAR:  systemctl status pingify@$name" \
                         "open it there:  ufw allow $CK_PORT/tcp" \
-                        "from here:  nc -zv $CK_KHAREJ $CK_PORT"
+                        "from here:  nc -zv $CK_WAIT_ADDR $CK_PORT"
                 fi
                 ;;
             *)
@@ -438,9 +461,9 @@ health_check() {
                 # else chose, so the prefix is the only part of it there is
                 # room to give up.
                 chk_add bad peer "the far end has never been seen" \
-                    "on KHAREJ:  systemctl status pingify@$name" \
-                    "open it there:  ufw allow $CK_PORT/udp" \
-                    "nc -uzv $CK_KHAREJ $CK_PORT" \
+                    "on $CK_FAR:  systemctl status pingify@$name" \
+                    "udp/$CK_PORT has to be open on $CK_WAITS" \
+                    "nc -uzv $CK_WAIT_ADDR $CK_PORT" \
                     "a token edited on one side only does this"
                 ;;
             esac
@@ -469,7 +492,7 @@ health_check() {
             else
                 chk_add bad awg "AmneziaWG on $iface has never handshaken" \
                     "the two servers have not agreed on keys" \
-                    "open udp/$(toml_get "$CK_FILE" awg port) on KHAREJ" \
+                    "open udp/$(toml_get "$CK_FILE" awg port) on both servers" \
                     "awg show $iface"
             fi
         fi
@@ -864,7 +887,7 @@ measure_mtu() {
             # green line over a tunnel still running the old mtu until somebody
             # happened to restart it by hand.
             cfg_apply "$name" mtu_editor yes &&
-                ok "mtu 1280 - set the same number on KHAREJ"
+                ok "mtu 1280 - set the same number on $CK_FAR"
         fi
         return 0
     fi
@@ -920,7 +943,7 @@ measure_mtu() {
         # the measured mtu sat in the file unused.
         if cfg_apply "$name" mtu_editor yes; then
             ok "mtu $best"
-            dim "Set the same on KHAREJ: the file is shared."
+            dim "Set the same on $CK_FAR: the file is shared."
         fi
     fi
     return 1
@@ -977,7 +1000,7 @@ speed_test() {
         return 1
     fi
 
-    dim "This needs a listener there. On KHAREJ, run:"
+    dim "This needs a listener there. On $CK_FAR, run:"
     say "       iperf3 -s"
     blank
     confirm "is it running there?" y || {

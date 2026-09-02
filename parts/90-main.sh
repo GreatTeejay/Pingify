@@ -273,7 +273,11 @@ home_head() {
 # characters v_name allows and no further. A wide window should not stretch one
 # column across half the screen.
 home_cols() {
-    local nw=$((UI_W - 50))
+    # 52, not 50: the transport column took two characters for FALLBACK, and
+    # the name column gives both back. One more than this and the row runs a
+    # character past the sixty-eight the screen is drawn at, which costs the
+    # whole right hand end of every line to an ellipsis.
+    local nw=$((UI_W - 52))
     # 24, not 26. v_name refuses a twenty-fifth character, so the two columns
     # of slack above it could never hold anything and only pushed the numbers
     # further from the name they belong to.
