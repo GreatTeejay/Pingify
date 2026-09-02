@@ -79,6 +79,7 @@ type icmpCarrier struct {
 
 	batched bool
 	burst   int
+	readers int // goroutines reading the socket, one per core up to four
 
 	// Whether the kernel handed us the IP header. It does on a raw socket, and
 	// Go takes it off again in ReadFromIP but not in recvmmsg - so it is looked
@@ -141,8 +142,9 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 	if canBatch {
 		if rc, err := pc.SyscallConn(); err == nil {
 			c.rc, c.batched = rc, true
-			logging.Info("packet i/o: up to %d in and %d out per crossing into the kernel",
-				recvBatch, sendBatch)
+			c.readers = readerCount()
+			logging.Info("packet i/o: up to %d in and %d out per crossing into the kernel, %d reading",
+				recvBatch, sendBatch, c.readers)
 		} else {
 			logging.Warn("no raw access to the socket (%v): one call per packet", err)
 		}
@@ -271,7 +273,26 @@ func (s *plainSender) Send(bps []*[]byte) {
 
 func (c *icmpCarrier) Run() {
 	if c.batched {
-		c.runBatched()
+		// One reader per core, up to four, on the one socket. recvmmsg
+		// hands each caller its own datagrams, so nothing is read twice, and
+		// what each one does after - the tag, the window, the write into the
+		// device - runs on its own core.
+		//
+		// Measured with one reader on the two core server abroad: 94% of a
+		// core, 330 Mbit/s over sixteen streams, and the kernel dropping
+		// eleven percent of what arrived on the socket because the reader
+		// could not take it off fast enough. A bigger socket buffer moved
+		// the queue rather than draining it: no drops, the same rate, and
+		// fifty milliseconds more on the tail. The reader was the limit.
+		var wg sync.WaitGroup
+		for i := 0; i < c.readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c.runBatched()
+			}()
+		}
+		wg.Wait()
 		return
 	}
 	c.runPlain()
