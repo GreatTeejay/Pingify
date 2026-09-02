@@ -104,6 +104,18 @@ tun_rtt() {
     local name=$1 t out hp peer
     t=$(toml_get "$(cfg_file "$name")" transport type)
 
+    # A forward tunnel has no address to ping and no health port to connect
+    # to; it measures itself, with a ping record every ten seconds, and the
+    # status endpoint says what it found.
+    if [ "$(toml_get "$(cfg_file "$name")" tunnel mode)" = forward ]; then
+        tun_stats "$name" || return 0
+        case $ST_FAR_RTT in
+        '' | 0 | *[!0-9.]*) return 0 ;;
+        esac
+        LC_ALL=C awk -v t="$ST_FAR_RTT" 'BEGIN { printf "%.0f", t }'
+        return 0
+    fi
+
     # An ICMP tunnel cannot be pinged. The carrier stops both kernels
     # answering echo - it has to, or every packet it sends is answered twice -
     # so the ping goes out and is deliberately ignored, and for a long time
@@ -191,7 +203,13 @@ screen_tunnel() {
         if [ -n "$dom" ]; then
             field "Address" "$(addr_text "$dom")$(toml_get "$f" transport path)"
         fi
-        field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
+        if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
+            local plist
+            plist=$(toml_get "$f" forward ports | tr -d '[]"' | sed 's/, */  /g')
+            field "Ports" "${plist:-none yet - set them on the Ports screen}"
+        else
+            field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
+        fi
 
         # One measurement to a line, each with the name of what it is. They
         # were one line with two numbers on it and nothing saying which was

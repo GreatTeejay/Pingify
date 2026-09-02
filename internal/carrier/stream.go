@@ -252,6 +252,23 @@ func (c *streamCarrier) Send(bp *[]byte) error {
 	return c.sendOn(l, bp)
 }
 
+// SendFlow puts a datagram on the connection its flow number picks, every
+// time. A forward tunnel's streams are ordered only because every record of
+// one stream takes the same connection, and this is what promises that.
+func (c *streamCarrier) SendFlow(flow uint32, bp *[]byte) error {
+	b := *bp
+	if len(b) < c.Headroom() {
+		buf.Put(bp)
+		return nil
+	}
+	l := c.pick(flow)
+	if l == nil {
+		buf.Put(bp)
+		return ErrNoPeer
+	}
+	return c.sendOn(l, bp)
+}
+
 func (c *streamCarrier) sendOn(l *streamLink, bp *[]byte) error {
 	b := *bp
 	// The framing owns the bytes in front of the tag, and the tag covers

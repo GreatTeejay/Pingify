@@ -438,14 +438,15 @@ q_addresses() {
     local -a addrs=()
     [ "$T_SIDE" = kharej ] && other=IRAN
 
-    wiz_ask "Endpoints"
+    wiz_ask "Servers"
     blank
     # A name rather than an address is the whole of the CDN arrangement, and
     # it is one word rather than a question: an edge answers on the name and
     # connects inward to the origin behind it, which is the Iran server, which
     # is the end that waits. Naming it is all that is needed - which end dials
     # was never in question.
-    dim "an address, or a domain - a domain is what puts a CDN in front of it"
+    dim "The public IP of each server. A domain instead of IRAN's IP means a CDN"
+    dim "sits in front of it."
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
@@ -479,65 +480,83 @@ q_addresses() {
     return 0
 }
 
+# Two kinds of tunnel, and the transport decides which.
+#
+# A TCP tunnel forwards ports: users connect to IRAN, each connection crosses
+# as a stream of its own, KHAREJ dials the real service. No device, no
+# addresses, no NAT - the Ports screen is the whole of its setup.
+#
+# A [TUN] tunnel is a private network between the two servers, for the
+# transports that carry packets rather than streams. Ports are forwarded over
+# it with NAT, and it needs the address pair the next step asks for.
 q_transport() {
     local n
     wiz_ask "Transport"
     blank
-    item "1" "UDP" "a packet in, a packet out, nothing in the way"
-    item "2" "TCP" "one open port, where a network carries only TCP"
-    item "3" "WS" "an ordinary WebSocket - goes where HTTP goes"
-    item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
-    item "5" "ICMP" "inside ping packets - no open port at all"
-    item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
-    item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
-    item "8" "Raw TCP" "packets inside TCP segments the kernel never sees"
-    item "9" "TCP UTLS" "a TLS connection whose hello is Chrome's, not Go's"
-    item "10" "TLS FALLBACK" "the same, and a real website to anyone without the token"
+    group "TCP TUNNEL   port forwarding, no device"
+    item "1" "TCP" "plain TCP on one port"
+    item "2" "WS" "WebSocket - HTTP, so a CDN can front it"
+    item "3" "WSS" "WebSocket over TLS - a domain, or Cloudflare"
+    item "4" "TCP UTLS" "TLS with Chrome's fingerprint"
+    item "5" "TLS FALLBACK" "TCP UTLS, and a real website to any probe"
     blank
-    dim "sixteen streams, Tehran to Frankfurt:"
-    dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
-    dim "and on a path with no such limits, Istanbul to Frankfurt:"
-    dim "  UDP 332   AmneziaWG 194"
+    group "[TUN] LINK   a private network between the servers"
+    item "6" "[TUN] ICMP" "inside echo requests - no port"
+    item "7" "[TUN] GRE" "IP protocol 47 - no port"
+    item "8" "[TUN] UDP" "plain UDP on one port"
+    item "9" "[TUN] Raw TCP" "TCP segments without a handshake"
+    item "10" "[TUN] AmneziaWG" "obfuscated WireGuard, encrypted"
     blank
-    dim "WS and WSS go behind a CDN, which makes them the ones to try when a"
-    dim "port is blocked rather than slow. ICMP and GRE need no open port at"
-    dim "all; while an ICMP tunnel runs, neither server answers a ping."
+    dim "TCP UTLS hides from a filter that watches: its ClientHello is"
+    dim "Chrome's. TLS FALLBACK also hides from one that connects: without"
+    dim "the token it is handed a real website, certificate and all."
     blank
-    dim "UDP and AmneziaWG are the two that some Iranian networks stop: a UDP"
-    dim "flow there can be cut after a handful of packets whatever is inside"
-    dim "it, which is a limit no setting on either can get around. Where UDP"
-    dim "lives, both are good - AmneziaWG is also the only encrypted one here."
-    blank
-    dim "Raw TCP looks like TCP on the wire and behaves like UDP above it: no"
-    dim "handshake, no retransmit, and none of the head-of-line waiting a real"
-    dim "TCP tunnel pays for. It needs iptables, and root."
-    blank
-    dim "TCP UTLS is a plain TLS connection, and what a filter reads of one is"
-    dim "the hello: Go's own says \"a Go program\" in the first packet. This one"
-    dim "is Chrome's, from uTLS - the same thing fp=chrome selects elsewhere."
-    blank
-    dim "TLS FALLBACK is that plus the other half: a censor that suspects an"
-    dim "address connects to it and looks, and this end answers a probe by"
-    dim "handing the whole connection to a real website. What comes back is"
-    dim "that site's own certificate and its own page, because it is that site"
-    dim "answering. Our own token rides where a browser puts a session ticket."
+    dim "Tehran to Frankfurt, 16 streams:  WS 447  TCP 372  ICMP 371  GRE 303"
+    dim "UDP and AmneziaWG do not work from Iran: inbound UDP stops at 6 packets."
     blank
     pick n "select" 1 10 || return 1
     case $n in
-    1) T_TRANSPORT=udp ;;
-    2) T_TRANSPORT=tcp ;;
-    3) T_TRANSPORT=ws ;;
-    4) T_TRANSPORT=wss ;;
-    5) T_TRANSPORT=icmp ;;
-    6) T_TRANSPORT=gre ;;
-    7) T_TRANSPORT=awg
-       awg_install || return 1
-       ;;
-    8) T_TRANSPORT=rawtcp ;;
-    9) T_TRANSPORT=utls ;;
-    10) T_TRANSPORT=fallback ;;
+    1) T_TRANSPORT=tcp ;;
+    2) T_TRANSPORT=ws ;;
+    3) T_TRANSPORT=wss ;;
+    4) T_TRANSPORT=utls ;;
+    5) T_TRANSPORT=fallback ;;
+    6) T_TRANSPORT=icmp ;;
+    7) T_TRANSPORT=gre ;;
+    8) T_TRANSPORT=udp ;;
+    9) T_TRANSPORT=rawtcp ;;
+    10) T_TRANSPORT=awg
+        awg_install || return 1
+        ;;
     esac
+    T_MODE=$(mode_of "$T_TRANSPORT")
     return 0
+}
+
+# mode_of is the kind a transport makes: streams forward ports, packets need
+# a link. The core refuses the other pairing, so this is the one place that
+# decides it.
+mode_of() {
+    case $1 in
+    tcp | ws | wss | utls | fallback) printf 'forward' ;;
+    *) printf 'tun' ;;
+    esac
+}
+
+# kind_label is how a transport is written wherever it is named: the [TUN]
+# ones wear the label, so nobody has to remember which is which.
+kind_label() {
+    local t=${1^^}
+    case $1 in
+    rawtcp) t="Raw TCP" ;;
+    utls) t="TCP UTLS" ;;
+    fallback) t="TLS FALLBACK" ;;
+    awg) t="AmneziaWG" ;;
+    esac
+    case $(mode_of "$1") in
+    tun) printf '[TUN] %s' "$t" ;;
+    *) printf '%s' "$t" ;;
+    esac
 }
 
 # Skipped whole for icmp, which has no ports: there is nothing to listen on and
@@ -648,6 +667,48 @@ q_link() {
     return 0
 }
 
+# The ports a TCP tunnel forwards, asked once here in the Ports screen's own
+# spelling and checked by the same code, so the wizard and that screen cannot
+# disagree about what a port list is. It can be left empty and set later.
+q_forward_ports() {
+    local answer clashes
+    wiz_ask "Ports"
+    blank
+    dim "The ports users connect to on IRAN, and where each goes on KHAREJ."
+    dim "one port  443     a range  8000-8010     udp  udp:500"
+    dim "somewhere else  443=8443  or  443=10.99.10.5:443"
+    blank
+    while :; do
+        ask answer "ports, comma separated (Enter for none yet)" "" v_forwards_or_none || return 1
+        [ -n "$answer" ] || { T_PORTS=; return 0; }
+        if [ "$T_SIDE" = iran ] && ! clashes=$(forwards_clash "" "$answer"); then
+            blank
+            bad "something else already has one of those:"
+            printf '%s\n' "$clashes" | sed 's/^/       /'
+            fix "pick other ports, or stop what is holding these"
+            blank
+            continue
+        fi
+        T_PORTS=$(fwd_tokens "$answer")
+        return 0
+    done
+}
+
+v_forwards_or_none() {
+    [ -z "$1" ] && return 0
+    v_forwards "$1"
+}
+
+# fwd_toml_list renders forward specs as the TOML array the core reads.
+fwd_toml_list() {
+    local first=1 t
+    for t in "$@"; do
+        [ "$first" = 1 ] || printf ', '
+        printf '"%s"' "$t"
+        first=0
+    done
+}
+
 # The screen that justifies the tool. Every number here was measured on the
 # real path, restarted fresh at each queue depth, and the profile moves exactly
 # one setting - tuning.queue_packets. Showing a bare number instead of what it
@@ -718,7 +779,7 @@ wiz_fingerprint() {
 wiz_review() {
     local trans prof f
     f=$(cfg_file "$T_NAME")
-    trans=${T_TRANSPORT^^}
+    trans=$(kind_label "$T_TRANSPORT")
     # For AmneziaWG the number worth showing is its own listening port, which
     # is the one somebody has to open. The carrier's port is inside the link
     # and nobody has to know it.
@@ -758,7 +819,11 @@ wiz_review() {
     # has, and one key a column wider than the rest puts one value out of line
     # with every other value in the box. The tunnel screen already calls it
     # this, so the two screens now agree as well.
-    panel_field "Link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
+    if [ "$T_MODE" = forward ]; then
+        panel_field "Ports" "${T_PORTS:-none yet - set them on the Ports screen}"
+    else
+        panel_field "Link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
+    fi
     panel_field "Profile" "${prof^}   queue $(wiz_queue "$prof") packets"
     panel_field "Token" "${T_TOKEN:0:8}$G_CUT  (fingerprint $(wiz_fingerprint "$T_TOKEN"))"
     panel_close
@@ -809,7 +874,7 @@ wiz_render() {
     printf '\n[tunnel]\n'
     printf 'name = "%s"\n' "$T_NAME"
     printf 'side = "%s"\n' "$T_SIDE"
-    printf 'mode = "tun"\n'
+    printf 'mode = "%s"\n' "${T_MODE:-$(mode_of "$T_TRANSPORT")}"
     printf '\n[transport]\n'
     printf 'type = "%s"\n' "$T_TRANSPORT"
     printf 'kharej = "%s"\n' "$T_KHAREJ"
@@ -856,13 +921,21 @@ wiz_render() {
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
     printf 'profile = "%s"\n' "$T_PROFILE"
-    printf '\n[tun]\n'
-    printf 'name = "%s"\n' "$T_DEV"
-    printf 'iran = "10.%s.10.1/24"\n' "$T_OCTET"
-    printf 'kharej = "10.%s.10.2/24"\n' "$T_OCTET"
-    # Not asked. 1320 works on every path we have measured, and Measure MTU on
-    # the tunnel screen finds the real number properly.
-    printf 'mtu = %s\n' "${T_MTU:-1320}"
+    if [ "${T_MODE:-$(mode_of "$T_TRANSPORT")}" = forward ]; then
+        # The ports, in the Ports screen's spelling, one list for both
+        # servers: IRAN binds them, KHAREJ reads them to know what it will be
+        # asked to dial.
+        printf '\n[forward]\n'
+        printf 'ports = [%s]\n' "$(fwd_toml_list $T_PORTS)"
+    else
+        printf '\n[tun]\n'
+        printf 'name = "%s"\n' "$T_DEV"
+        printf 'iran = "10.%s.10.1/24"\n' "$T_OCTET"
+        printf 'kharej = "10.%s.10.2/24"\n' "$T_OCTET"
+        # Not asked. 1320 works on every path we have measured, and Measure
+        # MTU on the tunnel screen finds the real number properly.
+        printf 'mtu = %s\n' "${T_MTU:-1320}"
+    fi
     printf '\n[logging]\n'
     printf 'level = "info"\n'
     printf '\n[status]\n'
@@ -1018,6 +1091,7 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_DIALS= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
+    T_MODE= T_PORTS=
     T_PATH= T_AWG_PORT= T_AWG_IFACE=
     T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
     T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
@@ -1057,7 +1131,13 @@ wizard_new() {
     blank
     q_port || return 1
     blank
-    q_link || return 1
+    # A TCP tunnel has no link to make; it has ports to forward. A [TUN] one
+    # has a link and forwards its ports over it, later, from its own screen.
+    if [ "$T_MODE" = forward ]; then
+        q_forward_ports || return 1
+    else
+        q_link || return 1
+    fi
     blank
     q_profile || return 1
 
@@ -1179,6 +1259,8 @@ wizard_paste() {
     # it - the port check, the summary - has to see the pasted value and not
     # the default.
     T_DIALS=$(toml_get "$f" transport dials)
+    T_MODE=$(toml_get "$f" tunnel mode)
+    [ -n "$T_MODE" ] || T_MODE=tun
     T_TRANSPORT=$(toml_get "$f" transport type)
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
@@ -1196,9 +1278,12 @@ wizard_paste() {
     # Pingify config. Everything below indexes on these four, so they are
     # checked here rather than found missing halfway through the collision
     # checks with an arithmetic error for a message.
-    if ! v_name "$T_NAME" >/dev/null 2>&1 ||
-        ! v_octet "$T_OCTET" >/dev/null 2>&1 ||
-        [ -z "$T_DEV" ] || [ -z "$T_TRANSPORT" ]; then
+    # A forward tunnel has no link and no device, so those two are only
+    # required of a [TUN] one - refusing every TCP tunnel's token as "not a
+    # Pingify config" was the first thing this check did.
+    if ! v_name "$T_NAME" >/dev/null 2>&1 || [ -z "$T_TRANSPORT" ] ||
+        { [ "$T_MODE" != forward ] &&
+            { ! v_octet "$T_OCTET" >/dev/null 2>&1 || [ -z "$T_DEV" ]; }; }; then
         bad "that token decoded, but it is not a Pingify config"
         fix "paste the line the other server printed"
         rm -f "$f"
@@ -1229,12 +1314,12 @@ wizard_paste() {
         fix "delete that one first, or use a different octet"
         clash=1
     fi
-    if own=$(wiz_link_owner "$T_OCTET"); then
+    if [ "$T_MODE" != forward ] && own=$(wiz_link_owner "$T_OCTET"); then
         bad "10.$T_OCTET.10.0/24 is in use here by $own"
         fix "change the range on both servers, and paste again"
         clash=1
     fi
-    if own=$(wiz_device_owner "$T_DEV"); then
+    if [ "$T_MODE" != forward ] && own=$(wiz_device_owner "$T_DEV"); then
         bad "the device $T_DEV is in use here by $own"
         fix "the device is in the shared file - change both"
         clash=1
