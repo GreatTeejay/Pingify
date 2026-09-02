@@ -1084,7 +1084,7 @@ svc_do() {
 tun_stats() {
     local name=$1 json
     ST_UP= ST_IN= ST_OUT= ST_LOST= ST_GAPS= ST_LATE= ST_UPTIME= ST_DROPPED=
-    ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB=
+    ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB= ST_MODE= ST_FAR_RTT= ST_FAR_SEEN=
 
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
@@ -1106,6 +1106,11 @@ tun_stats() {
     ST_TRANSPORT=$(json_field "$json" transport)
     ST_PROFILE=$(json_field "$json" profile)
     ST_SIDE=$(json_field "$json" side)
+    # A forward tunnel measures its own far end; a private link is measured
+    # from outside. These are empty on a link.
+    ST_MODE=$(json_field "$json" mode)
+    ST_FAR_RTT=$(json_field "$json" far_rtt_ms)
+    ST_FAR_SEEN=$(json_field "$json" far_seen_sec)
     return 0
 }
 
@@ -1183,7 +1188,7 @@ GO_DL_BASE=https://go.dev/dl
 write_core_sources() {
     local d=$1
     mkdir -p "$d"
-    mkdir -p "$d/cmd/pingify" "$d/internal/buf" "$d/internal/carrier" "$d/internal/config" "$d/internal/link" "$d/internal/logging" "$d/internal/status"
+    mkdir -p "$d/cmd/pingify" "$d/internal/buf" "$d/internal/carrier" "$d/internal/config" "$d/internal/forward" "$d/internal/link" "$d/internal/logging" "$d/internal/status"
     cat > "$d/go.mod" <<'PINGIFY_GO_SOURCE_EOF'
 module pingify
 
@@ -1223,6 +1228,7 @@ import (
 
 	"pingify/internal/carrier"
 	"pingify/internal/config"
+	"pingify/internal/forward"
 	"pingify/internal/link"
 	"pingify/internal/logging"
 	"pingify/internal/status"
@@ -1313,13 +1319,31 @@ func main() {
 		logging.Die("carrier: %v", err)
 	}
 
-	l, err := link.New(cfg, car)
-	if err != nil {
-		car.Close()
-		logging.Die("private link: %v", err)
+	// Two kinds of tunnel, and the file says which. A private link is a tun
+	// device with an address at each end; a forward tunnel has no device at
+	// all - the IRAN side answers on ports and each connection crosses as a
+	// stream of its own.
+	var l tunnel
+	if cfg.Mode == "forward" {
+		f, err := forward.New(cfg, car)
+		if err != nil {
+			car.Close()
+			logging.Die("forward: %v", err)
+		}
+		if err := f.Start(); err != nil {
+			car.Close()
+			logging.Die("forward: %v", err)
+		}
+		l = f
+	} else {
+		pl, err := link.New(cfg, car)
+		if err != nil {
+			car.Close()
+			logging.Die("private link: %v", err)
+		}
+		pl.Start()
+		l = pl
 	}
-
-	l.Start()
 	go car.Run()
 	if cfg.Dials() {
 		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
@@ -1343,6 +1367,15 @@ func main() {
 // doing something. A line every thirty seconds saying nothing happened fills
 // a log with the absence of news, and the one line that matters is then in the
 // middle of a thousand that do not.
+// tunnel is what main needs from either kind: the status server's two
+// counters, a close, and a line for the log on the way out.
+type tunnel interface {
+	Dropped() uint64
+	Packets() (toWire, toDevice uint64)
+	Close() error
+	String() string
+}
+
 func max64(a, b uint64) uint64 {
 	if a > b {
 		return a
@@ -1358,7 +1391,7 @@ func since(now, then uint64) uint64 {
 	return now - then
 }
 
-func reportEvery(every time.Duration, c carrier.Full, l *link.Link) {
+func reportEvery(every time.Duration, c carrier.Full, l tunnel) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	var lastRx, lastTx uint64
@@ -5115,6 +5148,23 @@ func (c *streamCarrier) Send(bp *[]byte) error {
 	return c.sendOn(l, bp)
 }
 
+// SendFlow puts a datagram on the connection its flow number picks, every
+// time. A forward tunnel's streams are ordered only because every record of
+// one stream takes the same connection, and this is what promises that.
+func (c *streamCarrier) SendFlow(flow uint32, bp *[]byte) error {
+	b := *bp
+	if len(b) < c.Headroom() {
+		buf.Put(bp)
+		return nil
+	}
+	l := c.pick(flow)
+	if l == nil {
+		buf.Put(bp)
+		return ErrNoPeer
+	}
+	return c.sendOn(l, bp)
+}
+
 func (c *streamCarrier) sendOn(l *streamLink, bp *[]byte) error {
 	b := *bp
 	// The framing owns the bytes in front of the tag, and the tag covers
@@ -6346,6 +6396,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -6421,7 +6472,17 @@ const (
 type Config struct {
 	Name string
 	Side string // iran | kharej
-	Mode string // tun
+	Mode string // tun | forward
+
+	// Forward mode: the ports this server answers on and where each one goes,
+	// in the Ports screen's spelling ("443", "udp:500", "443=10.9.0.5:443").
+	// Only the IRAN side binds anything; the allow list is the KHAREJ side's
+	// say over what it will dial.
+	Forward struct {
+		Ports    []string
+		BindAddr string
+		Allow    []string
+	}
 
 	Transport struct {
 		Type   string // udp
@@ -6708,6 +6769,27 @@ func parseTOML(text string, c *Config) error {
 func assign(c *Config, table, key, raw string) error {
 	str := func() (string, error) { return unquote(raw) }
 	num := func() (int, error) { return strconv.Atoi(strings.Trim(raw, `"' `)) }
+	// A TOML array of strings: ["443", "udp:500"]. One line, quoted items,
+	// which is every array this file has.
+	list := func() ([]string, error) {
+		s := strings.TrimSpace(raw)
+		if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+			return nil, fmt.Errorf("%s.%s wants a list like [\"443\", \"udp:500\"]", table, key)
+		}
+		var out []string
+		for _, item := range strings.Split(s[1:len(s)-1], ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			v, err := unquote(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v)
+		}
+		return out, nil
+	}
 
 	var err error
 	switch table + "." + key {
@@ -6815,6 +6897,13 @@ func assign(c *Config, table, key, raw string) error {
 		c.AWG.H3, err = num()
 	case "awg.h4":
 		c.AWG.H4, err = num()
+
+	case "forward.ports":
+		c.Forward.Ports, err = list()
+	case "forward.bind_addr":
+		c.Forward.BindAddr, err = str()
+	case "forward.allow":
+		c.Forward.Allow, err = list()
 
 	case "status.port":
 		c.StatusPort, err = num()
@@ -6943,11 +7032,28 @@ func (c *Config) check() error {
 	if c.Mode == "" {
 		c.Mode = "tun"
 	}
-	if c.Mode != "tun" {
-		return fmt.Errorf("tunnel.mode %q: only \"tun\" is built so far", c.Mode)
+	if c.Mode != "tun" && c.Mode != "forward" {
+		return fmt.Errorf("tunnel.mode %q: \"tun\" is a private link, \"forward\" carries ports", c.Mode)
 	}
 	if c.Transport.Type == "" {
 		c.Transport.Type = "udp"
+	}
+	// A forward tunnel rides streams, so it needs a carrier that cannot lose
+	// or reorder one. The datagram transports keep the private link, which
+	// is what they are for.
+	if c.Mode == "forward" {
+		switch c.Transport.Type {
+		case "tcp", "ws", "wss", "utls", "fallback":
+		default:
+			return fmt.Errorf("tunnel.mode forward needs tcp, ws, wss, utls or fallback; %s is a [TUN] transport",
+				c.Transport.Type)
+		}
+		if c.Forward.BindAddr == "" {
+			c.Forward.BindAddr = "0.0.0.0"
+		}
+		if net.ParseIP(c.Forward.BindAddr) == nil {
+			return fmt.Errorf("forward.bind_addr %q is not an address", c.Forward.BindAddr)
+		}
 	}
 	switch c.Transport.Type {
 	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp", "utls", "fallback":
@@ -6999,7 +7105,7 @@ func (c *Config) check() error {
 	if c.TUN.Name == "" {
 		c.TUN.Name = "pfy0"
 	}
-	if c.TUN.Iran == "" || c.TUN.Kharej == "" {
+	if c.Mode == "tun" && (c.TUN.Iran == "" || c.TUN.Kharej == "") {
 		return fmt.Errorf("tun.iran and tun.kharej are both needed, on both servers")
 	}
 	if c.TUN.MTU == 0 {
@@ -7060,6 +7166,913 @@ func (c *Config) check() error {
 		return fmt.Errorf("tuning.send_batch %d is outside 0..%d", c.Tuning.SendBatch, MaxSendBatch)
 	}
 	return nil
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/forward/forward.go" <<'PINGIFY_GO_SOURCE_EOF'
+// Package forward is the tunnel without a private link: the IRAN server owns
+// the user-facing ports, the KHAREJ server owns the real services, and every
+// connection between them rides the carrier as a stream of its own.
+//
+// This is the kind of tunnel a port forwarder makes, and the kind the old
+// core called TCP: there is no tun device, no address pair, no route and no
+// NAT. A user connects to IRAN on 443, this end opens a stream to the far
+// end naming 127.0.0.1:443, the far end dials it, and the bytes go across in
+// records inside the carrier's datagrams. UDP goes the same way, one session
+// per client address.
+//
+// It needs a carrier that cannot lose or reorder a datagram, which is every
+// stream carrier - TCP, WS, WSS, TCP UTLS, TLS FALLBACK - and none of the
+// datagram ones. Those keep the private link, which is what they need.
+//
+// On the wire, inside one carrier datagram:
+//
+//	0      1            5
+//	+------+------------+-------------------------------+
+//	| cmd  |  stream id |  body                         |
+//	+------+------------+-------------------------------+
+//
+// A stream lives on one carrier connection from its first record to its
+// last. The carrier picks the connection from the flow number, and the flow
+// number is the stream id, so nothing arrives out of order.
+package forward
+
+import (
+	"encoding/binary"
+	"fmt"
+	"net"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"pingify/internal/buf"
+	"pingify/internal/carrier"
+	"pingify/internal/config"
+	"pingify/internal/logging"
+)
+
+const (
+	cmdData = 1 // stream payload
+	cmdSYN  = 2 // open a TCP stream; body is the target "host:port"
+	cmdFIN  = 3 // no more data from this side
+	cmdRST  = 4 // the stream is gone; body says why
+	_       = 5 // was a credit record; flow control is the carrier's TCP now
+	cmdPing = 6 // body is a stamp, echoed back as is
+	cmdPong = 7
+	cmdUSYN = 8  // open a UDP session; body is the target
+	cmdUDP  = 9  // one datagram
+	cmdUFIN = 10 // the session is gone
+
+	hdrLen = 5
+
+	udpIDBit  = 0x80000000
+	udpIdle   = 90 * time.Second
+	pingEvery = 10 * time.Second
+	dialWait  = 10 * time.Second
+)
+
+// FlowSender is the one thing a carrier has to offer for this: sending a
+// datagram on the connection its flow number picks, every time.
+type FlowSender interface {
+	SendFlow(flow uint32, bp *[]byte) error
+}
+
+type Forwarder struct {
+	cfg  *config.Config
+	car  carrier.Full
+	send FlowSender
+	edge bool // the IRAN side: binds the ports
+
+	listeners []net.Listener
+	packets   []net.PacketConn
+	rules     []Rule
+	allow     map[string]bool
+
+	mu      sync.Mutex
+	streams map[uint32]*stream
+	udp     map[uint32]*udpSess
+	udpEdge map[string]*udpSess // "port|client" -> session, on the edge
+	nextID  uint32
+	udpSeq  uint32
+
+	toWire, fromWire, dropped, refused uint64
+	farSeen                            int64 // unix nanos of the last record in
+	rtt                                int64 // nanos, from the last pong
+
+	// Records on their way out, one queue per carrier connection, each drained
+	// by a goroutine of its own. The receive path never writes to the carrier
+	// directly: it hands a pong or a refusal to these queues without blocking
+	// (recordNB), so a read goroutine is never stuck in a write while the far
+	// end waits to be read. Bulk data blocks here, and that block is the back
+	// pressure a fast local end should feel.
+	out []chan outRec
+
+	closing chan struct{}
+	once    sync.Once
+}
+
+type outRec struct {
+	id uint32
+	bp *[]byte
+}
+
+func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
+	fs, ok := car.(FlowSender)
+	if !ok {
+		return nil, fmt.Errorf("%s cannot carry streams; a forward tunnel needs tcp, ws, wss, utls or fallback",
+			cfg.Transport.Type)
+	}
+	f := &Forwarder{
+		cfg: cfg, car: car, send: fs,
+		edge:    cfg.Side == config.SideIran,
+		streams: map[uint32]*stream{},
+		udp:     map[uint32]*udpSess{},
+		udpEdge: map[string]*udpSess{},
+		closing: make(chan struct{}),
+	}
+	if f.edge {
+		rules, err := ParseAll(cfg.Forward.Ports)
+		if err != nil {
+			return nil, err
+		}
+		f.rules = rules
+	}
+	if len(cfg.Forward.Allow) > 0 {
+		f.allow = map[string]bool{}
+		for _, a := range cfg.Forward.Allow {
+			f.allow[a] = true
+		}
+	}
+	n := cfg.Transport.Connections
+	if n < 1 {
+		n = 1
+	}
+	f.out = make([]chan outRec, n)
+	for i := range f.out {
+		f.out[i] = make(chan outRec, 4096)
+	}
+	car.OnPacket(f.onRecord)
+	return f, nil
+}
+
+// writer drains one outbound queue onto the carrier. One per connection,
+// so a stream's records leave in the order they were queued.
+func (f *Forwarder) writer(q chan outRec) {
+	for {
+		select {
+		case <-f.closing:
+			return
+		case r := <-q:
+			if err := f.send.SendFlow(r.id, r.bp); err != nil {
+				atomic.AddUint64(&f.dropped, 1)
+				continue
+			}
+			atomic.AddUint64(&f.toWire, 1)
+		}
+	}
+}
+
+// Start binds the ports on the edge and starts the pinger on both.
+func (f *Forwarder) Start() error {
+	if f.edge {
+		for _, r := range f.rules {
+			if err := f.bind(r); err != nil {
+				f.Close()
+				return err
+			}
+		}
+		if len(f.rules) == 0 {
+			logging.Warn("no ports to forward yet: add them on the Ports screen")
+		}
+	}
+	for _, q := range f.out {
+		go f.writer(q)
+	}
+	go f.pinger()
+	go f.reapUDP()
+	return nil
+}
+
+func (f *Forwarder) Close() error {
+	f.once.Do(func() {
+		close(f.closing)
+		for _, ln := range f.listeners {
+			_ = ln.Close()
+		}
+		for _, pc := range f.packets {
+			_ = pc.Close()
+		}
+		// Collect first, kill outside the lock: kill -> forget wants this same
+		// lock, so killing while holding it deadlocks the shutdown, and the
+		// core hangs until systemd loses patience and sends SIGKILL.
+		f.mu.Lock()
+		streams := make([]*stream, 0, len(f.streams))
+		for _, s := range f.streams {
+			streams = append(streams, s)
+		}
+		f.mu.Unlock()
+		for _, s := range streams {
+			s.kill()
+		}
+	})
+	return nil
+}
+
+// --- what the status server asks ------------------------------------------
+
+func (f *Forwarder) Dropped() uint64 { return atomic.LoadUint64(&f.dropped) }
+func (f *Forwarder) Packets() (toWire, toDevice uint64) {
+	return atomic.LoadUint64(&f.toWire), atomic.LoadUint64(&f.fromWire)
+}
+
+// FarSeen is when the far end last said anything, and RTT the last measured
+// round trip - the two things a forward tunnel can say about its health,
+// having no address to be pinged on.
+func (f *Forwarder) FarSeen() time.Time {
+	n := atomic.LoadInt64(&f.farSeen)
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+func (f *Forwarder) RTT() time.Duration { return time.Duration(atomic.LoadInt64(&f.rtt)) }
+
+func (f *Forwarder) String() string {
+	return fmt.Sprintf("forward: %d records to the wire, %d from it, %d dropped, %d refused",
+		atomic.LoadUint64(&f.toWire), atomic.LoadUint64(&f.fromWire),
+		atomic.LoadUint64(&f.dropped), atomic.LoadUint64(&f.refused))
+}
+
+// --- records ----------------------------------------------------------------
+
+func (f *Forwarder) maxBody() int { return f.car.MaxPayload() - hdrLen }
+
+// record puts one record on the wire, on the connection the stream id picks.
+func (f *Forwarder) record(cmd byte, id uint32, body []byte) bool {
+	head := f.car.Headroom()
+	bp := buf.Take(head, hdrLen+len(body))
+	b := (*bp)[head:]
+	b[0] = cmd
+	binary.BigEndian.PutUint32(b[1:5], id)
+	copy(b[hdrLen:], body)
+	// Queued for the connection this id lives on, never written from here:
+	// see the note on Forwarder.out. A pump goroutine blocking on a full
+	// queue is the back pressure it should feel.
+	select {
+	case f.out[id%uint32(len(f.out))] <- outRec{id, bp}:
+		return true
+	case <-f.closing:
+		buf.Put(bp)
+		return false
+	}
+}
+
+// recordNB is record for the one caller that must never block: the carrier's
+// own read goroutine, in onRecord. If it blocked there - on a full out queue,
+// which drains onto the very connection the peer is trying to read - both ends
+// wedge, each read goroutine stuck sending while the other waits to be read.
+// Measured before this: an upload stopped dead at 8088 bytes, every time.
+//
+// What it sends is a pong or a refusal, and both are safe to drop when the
+// queue is full: a missed pong costs one round-trip sample, a missed refusal
+// is a session the reaper collects anyway. Bulk data never comes this way.
+func (f *Forwarder) recordNB(cmd byte, id uint32, body []byte) {
+	head := f.car.Headroom()
+	bp := buf.Take(head, hdrLen+len(body))
+	b := (*bp)[head:]
+	b[0] = cmd
+	binary.BigEndian.PutUint32(b[1:5], id)
+	copy(b[hdrLen:], body)
+	select {
+	case f.out[id%uint32(len(f.out))] <- outRec{id, bp}:
+	default:
+		buf.Put(bp)
+	}
+}
+
+func (f *Forwarder) onRecord(b []byte) {
+	if len(b) < hdrLen {
+		return
+	}
+	atomic.AddUint64(&f.fromWire, 1)
+	atomic.StoreInt64(&f.farSeen, time.Now().UnixNano())
+	cmd, id, body := b[0], binary.BigEndian.Uint32(b[1:5]), b[hdrLen:]
+	switch cmd {
+	case cmdPing:
+		f.recordNB(cmdPong, id, body)
+	case cmdPong:
+		if len(body) == 8 {
+			sent := int64(binary.BigEndian.Uint64(body))
+			atomic.StoreInt64(&f.rtt, time.Now().UnixNano()-sent)
+		}
+	case cmdSYN:
+		if f.edge {
+			return // the edge opens streams; it does not take them
+		}
+		f.accept(id, string(body))
+	case cmdData:
+		if s := f.stream(id); s != nil {
+			s.deliver(body)
+		}
+	case cmdFIN:
+		if s := f.stream(id); s != nil {
+			s.deliverEOF()
+		}
+	case cmdRST:
+		if s := f.stream(id); s != nil {
+			s.kill()
+		}
+	case cmdUSYN:
+		if !f.edge {
+			f.openUDP(id, string(body))
+		}
+	case cmdUDP:
+		f.mu.Lock()
+		s := f.udp[id]
+		f.mu.Unlock()
+		if s != nil {
+			s.deliver(body)
+		}
+	case cmdUFIN:
+		f.mu.Lock()
+		s := f.udp[id]
+		f.mu.Unlock()
+		if s != nil {
+			f.dropUDP(s, false)
+		}
+	}
+}
+
+func (f *Forwarder) stream(id uint32) *stream {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.streams[id]
+}
+
+func (f *Forwarder) forget(id uint32) {
+	f.mu.Lock()
+	delete(f.streams, id)
+	f.mu.Unlock()
+}
+
+func (f *Forwarder) pinger() {
+	tk := time.NewTicker(pingEvery)
+	defer tk.Stop()
+	for {
+		select {
+		case <-f.closing:
+			return
+		case <-tk.C:
+			if !f.car.Up() {
+				continue
+			}
+			var stamp [8]byte
+			binary.BigEndian.PutUint64(stamp[:], uint64(time.Now().UnixNano()))
+			f.record(cmdPing, 0, stamp[:])
+		}
+	}
+}
+
+// --- TCP streams --------------------------------------------------------------
+
+// A stream is one TCP connection carried across: the local socket at this
+// end, the records to and from the other. Credit is what keeps a fast sender
+// from burying a slow reader: this end may have `win` bytes in flight, and
+// the far end hands bytes back as it writes them out.
+type stream struct {
+	id    uint32
+	f     *Forwarder
+	local net.Conn
+
+	// Records from the wire, in order, waiting for the local socket to take
+	// them. A bounded channel, and that bound is the whole of this stream's
+	// flow control: when the local end cannot keep up, this fills, deliver
+	// blocks the carrier's read goroutine, that goroutine stops reading its
+	// connection, the connection's window closes, and the far end's write
+	// blocks - end to end, over the carrier's own TCP, with no credit scheme
+	// of our own on top of it.
+	//
+	// An earlier version did have one - a per-stream byte credit sent back as
+	// records. It deadlocked over a real path every time: the sender filled
+	// its window and waited for credit that was itself stuck behind the data
+	// it was meant to clear. TCP already does this correctly; doing it again
+	// above TCP only invents a way to get it wrong.
+	in     chan []byte
+	inEOF  chan struct{}
+	inOnce sync.Once
+
+	done     chan struct{}
+	doneOnce sync.Once
+}
+
+// inDepth is how many records a stream may hold before the carrier read
+// goroutine is made to wait on it. Deep enough that a stream on an idle path
+// never stalls on it, shallow enough that a slow local end pushes back before
+// megabytes pile up: a few hundred records is a few hundred kilobytes.
+const inDepth = 256
+
+func (f *Forwarder) newStream(id uint32, local net.Conn) *stream {
+	s := &stream{
+		id: id, f: f, local: local,
+		in:    make(chan []byte, inDepth),
+		inEOF: make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	f.mu.Lock()
+	f.streams[id] = s
+	f.mu.Unlock()
+	return s
+}
+
+// deliver is a record from the wire. The copy is not optional: the carrier
+// owns the buffer it handed us and reuses it the moment this returns. The
+// send blocks when the stream is backed up, which is the flow control - see
+// the note on stream.in.
+func (s *stream) deliver(b []byte) {
+	c := make([]byte, len(b))
+	copy(c, b)
+	select {
+	case s.in <- c:
+	case <-s.done:
+	case <-s.f.closing:
+	}
+}
+
+func (s *stream) deliverEOF() { s.inOnce.Do(func() { close(s.inEOF) }) }
+
+func (s *stream) kill() {
+	s.doneOnce.Do(func() {
+		close(s.done)
+		if s.local != nil {
+			_ = s.local.Close()
+		}
+		s.f.forget(s.id)
+	})
+}
+
+// pumpOut reads the local socket and sends it across. record blocks when the
+// carrier is backed up, so a fast local end cannot outrun the wire. It ends
+// with a FIN, the local side having nothing more to say.
+func (s *stream) pumpOut() {
+	defer s.f.record(cmdFIN, s.id, nil)
+	b := make([]byte, s.f.maxBody())
+	for {
+		n, err := s.local.Read(b)
+		if n > 0 {
+			if !s.f.record(cmdData, s.id, b[:n]) {
+				s.kill()
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// pumpIn writes what arrived into the local socket, in order, until the far
+// end half-closes or the stream ends.
+func (s *stream) pumpIn() {
+	writeOne := func(b []byte) bool {
+		if _, err := s.local.Write(b); err != nil {
+			s.f.record(cmdRST, s.id, []byte("local write failed"))
+			s.kill()
+			return false
+		}
+		return true
+	}
+	for {
+		select {
+		case b := <-s.in:
+			if !writeOne(b) {
+				return
+			}
+		case <-s.inEOF:
+			// Whatever is still queued is ordered before the FIN it follows.
+			for {
+				select {
+				case b := <-s.in:
+					if !writeOne(b) {
+						return
+					}
+					continue
+				default:
+				}
+				break
+			}
+			if cw, ok := s.local.(interface{ CloseWrite() error }); ok {
+				_ = cw.CloseWrite()
+			} else {
+				s.kill()
+			}
+			return
+		case <-s.done:
+			return
+		case <-s.f.closing:
+			return
+		}
+	}
+}
+
+// run pumps both ways and takes the stream down when both are done.
+func (s *stream) run() {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); s.pumpOut() }()
+	go func() { defer wg.Done(); s.pumpIn() }()
+	wg.Wait()
+	s.kill()
+}
+
+// bind takes one rule on the edge.
+func (f *Forwarder) bind(r Rule) error {
+	addr := net.JoinHostPort(f.cfg.Forward.BindAddr, strconv.Itoa(r.Port))
+	if r.Proto == "udp" {
+		pc, err := net.ListenPacket("udp", addr)
+		if err != nil {
+			return fmt.Errorf("udp/%d: %v", r.Port, err)
+		}
+		f.packets = append(f.packets, pc)
+		go f.serveUDP(pc, r)
+		logging.Info("forward udp/%d -> %s", r.Port, r.Target)
+		return nil
+	}
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("tcp/%d: %v", r.Port, err)
+	}
+	f.listeners = append(f.listeners, ln)
+	go f.serveTCP(ln, r)
+	logging.Info("forward tcp/%d -> %s", r.Port, r.Target)
+	return nil
+}
+
+func (f *Forwarder) serveTCP(ln net.Listener, r Rule) {
+	for {
+		c, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-f.closing:
+			default:
+				logging.Warn("tcp/%d: %v", r.Port, err)
+			}
+			return
+		}
+		go f.open(c, r)
+	}
+}
+
+// open is a user's connection on the edge becoming a stream.
+func (f *Forwarder) open(c net.Conn, r Rule) {
+	if !f.car.Up() {
+		atomic.AddUint64(&f.dropped, 1)
+		_ = c.Close()
+		return
+	}
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetNoDelay(true)
+	}
+	id := atomic.AddUint32(&f.nextID, 1) & 0x7fffffff
+	s := f.newStream(id, c)
+	if !f.record(cmdSYN, id, []byte(r.Target)) {
+		s.kill()
+		return
+	}
+	s.run()
+}
+
+// accept is a SYN arriving at the origin: dial the service it names.
+func (f *Forwarder) accept(id uint32, target string) {
+	if f.allow != nil && !f.allow[target] {
+		atomic.AddUint64(&f.refused, 1)
+		f.recordNB(cmdRST, id, []byte(target+": not in the allow list"))
+		return
+	}
+	// The stream exists before the dial, not after it. The edge sends data
+	// on the heels of its SYN, and anything that arrives while the service is
+	// still being dialled has to queue on the stream - registered late, the
+	// first fifty kilobytes of every connection were thrown away as records
+	// for a stream nobody had heard of.
+	s := f.newStream(id, nil)
+	go func() {
+		c, err := net.DialTimeout("tcp", target, dialWait)
+		if err != nil {
+			atomic.AddUint64(&f.refused, 1)
+			f.record(cmdRST, id, []byte(target+": "+err.Error()))
+			s.kill()
+			return
+		}
+		select {
+		case <-s.done:
+			_ = c.Close()
+			return
+		default:
+		}
+		if tc, ok := c.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+		s.local = c
+		s.run()
+	}()
+}
+
+// --- UDP sessions -------------------------------------------------------------
+
+type udpSess struct {
+	id  uint32
+	f   *Forwarder
+	pc  net.PacketConn // edge: the bound port, to answer the user on
+	cli net.Addr       // edge: the user
+	key string
+
+	mu      sync.Mutex
+	uc      *net.UDPConn // origin: the socket to the service
+	pending [][]byte
+	last    int64
+}
+
+func (f *Forwarder) serveUDP(pc net.PacketConn, r Rule) {
+	b := make([]byte, 64*1024)
+	for {
+		n, addr, err := pc.ReadFrom(b)
+		if err != nil {
+			select {
+			case <-f.closing:
+			default:
+				logging.Warn("udp/%d: %v", r.Port, err)
+			}
+			return
+		}
+		if n > f.maxBody() {
+			atomic.AddUint64(&f.dropped, 1)
+			continue
+		}
+		key := strconv.Itoa(r.Port) + "|" + addr.String()
+		f.mu.Lock()
+		s := f.udpEdge[key]
+		if s == nil {
+			id := (atomic.AddUint32(&f.udpSeq, 1) & 0x7fffffff) | udpIDBit
+			s = &udpSess{id: id, f: f, pc: pc, cli: addr, key: key}
+			f.udpEdge[key] = s
+			f.udp[id] = s
+			f.mu.Unlock()
+			f.record(cmdUSYN, id, []byte(r.Target))
+		} else {
+			f.mu.Unlock()
+		}
+		atomic.StoreInt64(&s.last, time.Now().UnixNano())
+		f.record(cmdUDP, s.id, b[:n])
+	}
+}
+
+func (f *Forwarder) openUDP(id uint32, target string) {
+	if f.allow != nil && !f.allow[target] {
+		atomic.AddUint64(&f.refused, 1)
+		f.recordNB(cmdUFIN, id, nil) // read path: must not block
+		return
+	}
+	s := &udpSess{id: id, f: f}
+	atomic.StoreInt64(&s.last, time.Now().UnixNano())
+	f.mu.Lock()
+	if f.udp[id] != nil {
+		f.mu.Unlock()
+		return
+	}
+	f.udp[id] = s
+	f.mu.Unlock()
+	go func() {
+		ua, err := net.ResolveUDPAddr("udp", target)
+		if err != nil {
+			f.dropUDP(s, true)
+			return
+		}
+		uc, err := net.DialUDP("udp", nil, ua)
+		if err != nil {
+			f.dropUDP(s, true)
+			return
+		}
+		s.ready(uc)
+		b := make([]byte, 64*1024)
+		for {
+			_ = uc.SetReadDeadline(time.Now().Add(udpIdle))
+			n, err := uc.Read(b)
+			if n > 0 && n <= f.maxBody() {
+				atomic.StoreInt64(&s.last, time.Now().UnixNano())
+				f.record(cmdUDP, id, b[:n])
+			}
+			if err != nil {
+				f.dropUDP(s, true)
+				return
+			}
+		}
+	}()
+}
+
+// deliver is a datagram from the wire: to the user on the edge, to the
+// service at the origin - queued, briefly, while the service is being dialled,
+// because losing the first datagram of an exchange is usually losing the
+// exchange.
+func (s *udpSess) deliver(b []byte) {
+	atomic.StoreInt64(&s.last, time.Now().UnixNano())
+	if s.pc != nil {
+		_, _ = s.pc.WriteTo(b, s.cli)
+		return
+	}
+	s.mu.Lock()
+	if s.uc == nil {
+		if len(s.pending) < 8 {
+			c := make([]byte, len(b))
+			copy(c, b)
+			s.pending = append(s.pending, c)
+		}
+		s.mu.Unlock()
+		return
+	}
+	uc := s.uc
+	s.mu.Unlock()
+	_, _ = uc.Write(b)
+}
+
+func (s *udpSess) ready(uc *net.UDPConn) {
+	s.mu.Lock()
+	s.uc = uc
+	p := s.pending
+	s.pending = nil
+	s.mu.Unlock()
+	for _, b := range p {
+		_, _ = uc.Write(b)
+	}
+}
+
+func (f *Forwarder) dropUDP(s *udpSess, tell bool) {
+	f.mu.Lock()
+	delete(f.udp, s.id)
+	if s.key != "" {
+		delete(f.udpEdge, s.key)
+	}
+	f.mu.Unlock()
+	s.mu.Lock()
+	if s.uc != nil {
+		_ = s.uc.Close()
+	}
+	s.mu.Unlock()
+	if tell {
+		f.record(cmdUFIN, s.id, nil)
+	}
+}
+
+func (f *Forwarder) reapUDP() {
+	tk := time.NewTicker(udpIdle / 3)
+	defer tk.Stop()
+	for {
+		select {
+		case <-f.closing:
+			return
+		case <-tk.C:
+			cut := time.Now().Add(-udpIdle).UnixNano()
+			var old []*udpSess
+			f.mu.Lock()
+			for _, s := range f.udp {
+				if atomic.LoadInt64(&s.last) < cut {
+					old = append(old, s)
+				}
+			}
+			f.mu.Unlock()
+			for _, s := range old {
+				f.dropUDP(s, true)
+			}
+		}
+	}
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/forward/rules.go" <<'PINGIFY_GO_SOURCE_EOF'
+package forward
+
+import (
+	"fmt"
+	"net"
+	"strconv"
+	"strings"
+)
+
+// One user-facing port on the IRAN server, and where on the KHAREJ server it
+// goes. The spelling is the one the Ports screen has always taken:
+//
+//	443                  tcp 443 here to 127.0.0.1:443 there
+//	8000-8010            a range, port for port
+//	udp:500              the same for udp
+//	443=8443             a different port there
+//	443=10.99.10.5:443   a different host there
+type Rule struct {
+	Proto  string // tcp | udp
+	Port   int    // the port bound here
+	Target string // host:port dialled there
+}
+
+// Parse turns one spec into its rules - one per port of a range.
+func Parse(spec string) ([]Rule, error) {
+	s := strings.TrimSpace(spec)
+	if s == "" {
+		return nil, fmt.Errorf("an empty forward")
+	}
+	proto := "tcp"
+	if i := strings.Index(s, ":"); i >= 0 {
+		switch strings.ToLower(s[:i]) {
+		case "tcp":
+			proto, s = "tcp", s[i+1:]
+		case "udp":
+			proto, s = "udp", s[i+1:]
+		}
+	}
+	local, remote := s, ""
+	if i := strings.Index(s, "="); i >= 0 {
+		local, remote = s[:i], s[i+1:]
+		if strings.TrimSpace(remote) == "" {
+			return nil, fmt.Errorf("%q: there is nothing after the =", spec)
+		}
+	}
+	lo, hi, err := portRange(local)
+	if err != nil {
+		return nil, fmt.Errorf("%q: %v", spec, err)
+	}
+	host, base := "127.0.0.1", 0
+	if remote != "" {
+		rp := remote
+		if i := strings.LastIndex(remote, ":"); i >= 0 {
+			host, rp = remote[:i], remote[i+1:]
+			if host == "" {
+				host = "127.0.0.1"
+			}
+		}
+		if rp != "" {
+			if base, err = strconv.Atoi(rp); err != nil || base < 1 || base > 65535 {
+				return nil, fmt.Errorf("%q: %q is not a port", spec, rp)
+			}
+		}
+		if net.ParseIP(host) == nil && !validHost(host) {
+			return nil, fmt.Errorf("%q: %q is not an address", spec, host)
+		}
+	}
+	var out []Rule
+	for p := lo; p <= hi; p++ {
+		t := p
+		if base > 0 {
+			t = base + (p - lo)
+			if t > 65535 {
+				return nil, fmt.Errorf("%q: the far ports run past 65535", spec)
+			}
+		}
+		out = append(out, Rule{Proto: proto, Port: p, Target: net.JoinHostPort(host, strconv.Itoa(t))})
+	}
+	return out, nil
+}
+
+// ParseAll is Parse over every spec in a config, with the first fault named.
+func ParseAll(specs []string) ([]Rule, error) {
+	var out []Rule
+	for _, s := range specs {
+		r, err := Parse(s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r...)
+	}
+	return out, nil
+}
+
+func portRange(s string) (int, int, error) {
+	if i := strings.Index(s, "-"); i >= 0 {
+		lo, e1 := strconv.Atoi(strings.TrimSpace(s[:i]))
+		hi, e2 := strconv.Atoi(strings.TrimSpace(s[i+1:]))
+		if e1 != nil || e2 != nil || lo < 1 || hi > 65535 || lo > hi {
+			return 0, 0, fmt.Errorf("not a port range")
+		}
+		if hi-lo > 512 {
+			return 0, 0, fmt.Errorf("a range wider than 512 ports")
+		}
+		return lo, hi, nil
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil || p < 1 || p > 65535 {
+		return 0, 0, fmt.Errorf("not a port")
+	}
+	return p, p, nil
+}
+
+func validHost(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-' || c == '.' || c == '_':
+		default:
+			return false
+		}
+	}
+	return true
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/link/link.go" <<'PINGIFY_GO_SOURCE_EOF'
@@ -7626,6 +8639,12 @@ type Report struct {
 	// the one number that says whether the parity is earning its bandwidth,
 	// and it is absent on a transport that has none.
 	Repaired uint64 `json:"fec_repaired"`
+
+	// A forward tunnel has no private address to be pinged on, so it
+	// measures its own round trip with a ping record every ten seconds and
+	// says when the far end last spoke. Absent on a private link.
+	FarRTTms   float64 `json:"far_rtt_ms,omitempty"`
+	FarSeenSec float64 `json:"far_seen_sec,omitempty"`
 }
 
 type Server struct {
@@ -7765,6 +8784,8 @@ func (s *Server) Report() Report {
 		ToDevice:      toDevice,
 		Dropped:       s.link.Dropped(),
 		Repaired:      s.repaired(),
+		FarRTTms:      s.farRTT(),
+		FarSeenSec:    s.farSeen(),
 	}
 }
 
@@ -7843,6 +8864,29 @@ func max(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+// A forward tunnel measures the far end itself; a private link is measured
+// from outside, on its address. Asked for rather than required.
+type farEnd interface {
+	RTT() time.Duration
+	FarSeen() time.Time
+}
+
+func (s *Server) farRTT() float64 {
+	if f, ok := s.link.(farEnd); ok {
+		return float64(f.RTT().Microseconds()) / 1000
+	}
+	return 0
+}
+
+func (s *Server) farSeen() float64 {
+	if f, ok := s.link.(farEnd); ok {
+		if t := f.FarSeen(); !t.IsZero() {
+			return time.Since(t).Seconds()
+		}
+	}
+	return 0
 }
 
 // repaired is what the carrier put back together from parity, or zero when it
@@ -20598,14 +21642,15 @@ q_addresses() {
     local -a addrs=()
     [ "$T_SIDE" = kharej ] && other=IRAN
 
-    wiz_ask "Endpoints"
+    wiz_ask "Servers"
     blank
     # A name rather than an address is the whole of the CDN arrangement, and
     # it is one word rather than a question: an edge answers on the name and
     # connects inward to the origin behind it, which is the Iran server, which
     # is the end that waits. Naming it is all that is needed - which end dials
     # was never in question.
-    dim "an address, or a domain - a domain is what puts a CDN in front of it"
+    dim "The public IP of each server. A domain instead of IRAN's IP means a CDN"
+    dim "sits in front of it."
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
@@ -20639,65 +21684,83 @@ q_addresses() {
     return 0
 }
 
+# Two kinds of tunnel, and the transport decides which.
+#
+# A TCP tunnel forwards ports: users connect to IRAN, each connection crosses
+# as a stream of its own, KHAREJ dials the real service. No device, no
+# addresses, no NAT - the Ports screen is the whole of its setup.
+#
+# A [TUN] tunnel is a private network between the two servers, for the
+# transports that carry packets rather than streams. Ports are forwarded over
+# it with NAT, and it needs the address pair the next step asks for.
 q_transport() {
     local n
     wiz_ask "Transport"
     blank
-    item "1" "UDP" "a packet in, a packet out, nothing in the way"
-    item "2" "TCP" "one open port, where a network carries only TCP"
-    item "3" "WS" "an ordinary WebSocket - goes where HTTP goes"
-    item "4" "WSS" "the same inside TLS - a domain, or a CDN in front"
-    item "5" "ICMP" "inside ping packets - no open port at all"
-    item "6" "GRE" "ip protocol 47 - no port to open, and no handshake"
-    item "7" "AmneziaWG" "obfuscated WireGuard, encrypted, from their packages"
-    item "8" "Raw TCP" "packets inside TCP segments the kernel never sees"
-    item "9" "TCP UTLS" "a TLS connection whose hello is Chrome's, not Go's"
-    item "10" "TLS FALLBACK" "the same, and a real website to anyone without the token"
+    group "TCP TUNNEL   port forwarding, no device"
+    item "1" "TCP" "plain TCP on one port"
+    item "2" "WS" "WebSocket - HTTP, so a CDN can front it"
+    item "3" "WSS" "WebSocket over TLS - a domain, or Cloudflare"
+    item "4" "TCP UTLS" "TLS with Chrome's fingerprint"
+    item "5" "TLS FALLBACK" "TCP UTLS, and a real website to any probe"
     blank
-    dim "sixteen streams, Tehran to Frankfurt:"
-    dim "  WS 427   WSS 405   ICMP 371   TCP 342   GRE 317"
-    dim "and on a path with no such limits, Istanbul to Frankfurt:"
-    dim "  UDP 332   AmneziaWG 194"
+    group "[TUN] LINK   a private network between the servers"
+    item "6" "[TUN] ICMP" "inside echo requests - no port"
+    item "7" "[TUN] GRE" "IP protocol 47 - no port"
+    item "8" "[TUN] UDP" "plain UDP on one port"
+    item "9" "[TUN] Raw TCP" "TCP segments without a handshake"
+    item "10" "[TUN] AmneziaWG" "obfuscated WireGuard, encrypted"
     blank
-    dim "WS and WSS go behind a CDN, which makes them the ones to try when a"
-    dim "port is blocked rather than slow. ICMP and GRE need no open port at"
-    dim "all; while an ICMP tunnel runs, neither server answers a ping."
+    dim "TCP UTLS hides from a filter that watches: its ClientHello is"
+    dim "Chrome's. TLS FALLBACK also hides from one that connects: without"
+    dim "the token it is handed a real website, certificate and all."
     blank
-    dim "UDP and AmneziaWG are the two that some Iranian networks stop: a UDP"
-    dim "flow there can be cut after a handful of packets whatever is inside"
-    dim "it, which is a limit no setting on either can get around. Where UDP"
-    dim "lives, both are good - AmneziaWG is also the only encrypted one here."
-    blank
-    dim "Raw TCP looks like TCP on the wire and behaves like UDP above it: no"
-    dim "handshake, no retransmit, and none of the head-of-line waiting a real"
-    dim "TCP tunnel pays for. It needs iptables, and root."
-    blank
-    dim "TCP UTLS is a plain TLS connection, and what a filter reads of one is"
-    dim "the hello: Go's own says \"a Go program\" in the first packet. This one"
-    dim "is Chrome's, from uTLS - the same thing fp=chrome selects elsewhere."
-    blank
-    dim "TLS FALLBACK is that plus the other half: a censor that suspects an"
-    dim "address connects to it and looks, and this end answers a probe by"
-    dim "handing the whole connection to a real website. What comes back is"
-    dim "that site's own certificate and its own page, because it is that site"
-    dim "answering. Our own token rides where a browser puts a session ticket."
+    dim "Tehran to Frankfurt, 16 streams:  WS 447  TCP 372  ICMP 371  GRE 303"
+    dim "UDP and AmneziaWG do not work from Iran: inbound UDP stops at 6 packets."
     blank
     pick n "select" 1 10 || return 1
     case $n in
-    1) T_TRANSPORT=udp ;;
-    2) T_TRANSPORT=tcp ;;
-    3) T_TRANSPORT=ws ;;
-    4) T_TRANSPORT=wss ;;
-    5) T_TRANSPORT=icmp ;;
-    6) T_TRANSPORT=gre ;;
-    7) T_TRANSPORT=awg
-       awg_install || return 1
-       ;;
-    8) T_TRANSPORT=rawtcp ;;
-    9) T_TRANSPORT=utls ;;
-    10) T_TRANSPORT=fallback ;;
+    1) T_TRANSPORT=tcp ;;
+    2) T_TRANSPORT=ws ;;
+    3) T_TRANSPORT=wss ;;
+    4) T_TRANSPORT=utls ;;
+    5) T_TRANSPORT=fallback ;;
+    6) T_TRANSPORT=icmp ;;
+    7) T_TRANSPORT=gre ;;
+    8) T_TRANSPORT=udp ;;
+    9) T_TRANSPORT=rawtcp ;;
+    10) T_TRANSPORT=awg
+        awg_install || return 1
+        ;;
     esac
+    T_MODE=$(mode_of "$T_TRANSPORT")
     return 0
+}
+
+# mode_of is the kind a transport makes: streams forward ports, packets need
+# a link. The core refuses the other pairing, so this is the one place that
+# decides it.
+mode_of() {
+    case $1 in
+    tcp | ws | wss | utls | fallback) printf 'forward' ;;
+    *) printf 'tun' ;;
+    esac
+}
+
+# kind_label is how a transport is written wherever it is named: the [TUN]
+# ones wear the label, so nobody has to remember which is which.
+kind_label() {
+    local t=${1^^}
+    case $1 in
+    rawtcp) t="Raw TCP" ;;
+    utls) t="TCP UTLS" ;;
+    fallback) t="TLS FALLBACK" ;;
+    awg) t="AmneziaWG" ;;
+    esac
+    case $(mode_of "$1") in
+    tun) printf '[TUN] %s' "$t" ;;
+    *) printf '%s' "$t" ;;
+    esac
 }
 
 # Skipped whole for icmp, which has no ports: there is nothing to listen on and
@@ -20808,6 +21871,48 @@ q_link() {
     return 0
 }
 
+# The ports a TCP tunnel forwards, asked once here in the Ports screen's own
+# spelling and checked by the same code, so the wizard and that screen cannot
+# disagree about what a port list is. It can be left empty and set later.
+q_forward_ports() {
+    local answer clashes
+    wiz_ask "Ports"
+    blank
+    dim "The ports users connect to on IRAN, and where each goes on KHAREJ."
+    dim "one port  443     a range  8000-8010     udp  udp:500"
+    dim "somewhere else  443=8443  or  443=10.99.10.5:443"
+    blank
+    while :; do
+        ask answer "ports, comma separated (Enter for none yet)" "" v_forwards_or_none || return 1
+        [ -n "$answer" ] || { T_PORTS=; return 0; }
+        if [ "$T_SIDE" = iran ] && ! clashes=$(forwards_clash "" "$answer"); then
+            blank
+            bad "something else already has one of those:"
+            printf '%s\n' "$clashes" | sed 's/^/       /'
+            fix "pick other ports, or stop what is holding these"
+            blank
+            continue
+        fi
+        T_PORTS=$(fwd_tokens "$answer")
+        return 0
+    done
+}
+
+v_forwards_or_none() {
+    [ -z "$1" ] && return 0
+    v_forwards "$1"
+}
+
+# fwd_toml_list renders forward specs as the TOML array the core reads.
+fwd_toml_list() {
+    local first=1 t
+    for t in "$@"; do
+        [ "$first" = 1 ] || printf ', '
+        printf '"%s"' "$t"
+        first=0
+    done
+}
+
 # The screen that justifies the tool. Every number here was measured on the
 # real path, restarted fresh at each queue depth, and the profile moves exactly
 # one setting - tuning.queue_packets. Showing a bare number instead of what it
@@ -20878,7 +21983,7 @@ wiz_fingerprint() {
 wiz_review() {
     local trans prof f
     f=$(cfg_file "$T_NAME")
-    trans=${T_TRANSPORT^^}
+    trans=$(kind_label "$T_TRANSPORT")
     # For AmneziaWG the number worth showing is its own listening port, which
     # is the one somebody has to open. The carrier's port is inside the link
     # and nobody has to know it.
@@ -20918,7 +22023,11 @@ wiz_review() {
     # has, and one key a column wider than the rest puts one value out of line
     # with every other value in the box. The tunnel screen already calls it
     # this, so the two screens now agree as well.
-    panel_field "Link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
+    if [ "$T_MODE" = forward ]; then
+        panel_field "Ports" "${T_PORTS:-none yet - set them on the Ports screen}"
+    else
+        panel_field "Link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
+    fi
     panel_field "Profile" "${prof^}   queue $(wiz_queue "$prof") packets"
     panel_field "Token" "${T_TOKEN:0:8}$G_CUT  (fingerprint $(wiz_fingerprint "$T_TOKEN"))"
     panel_close
@@ -20969,7 +22078,7 @@ wiz_render() {
     printf '\n[tunnel]\n'
     printf 'name = "%s"\n' "$T_NAME"
     printf 'side = "%s"\n' "$T_SIDE"
-    printf 'mode = "tun"\n'
+    printf 'mode = "%s"\n' "${T_MODE:-$(mode_of "$T_TRANSPORT")}"
     printf '\n[transport]\n'
     printf 'type = "%s"\n' "$T_TRANSPORT"
     printf 'kharej = "%s"\n' "$T_KHAREJ"
@@ -21016,13 +22125,21 @@ wiz_render() {
     printf 'token = "%s"\n' "$T_TOKEN"
     printf '\n[tuning]\n'
     printf 'profile = "%s"\n' "$T_PROFILE"
-    printf '\n[tun]\n'
-    printf 'name = "%s"\n' "$T_DEV"
-    printf 'iran = "10.%s.10.1/24"\n' "$T_OCTET"
-    printf 'kharej = "10.%s.10.2/24"\n' "$T_OCTET"
-    # Not asked. 1320 works on every path we have measured, and Measure MTU on
-    # the tunnel screen finds the real number properly.
-    printf 'mtu = %s\n' "${T_MTU:-1320}"
+    if [ "${T_MODE:-$(mode_of "$T_TRANSPORT")}" = forward ]; then
+        # The ports, in the Ports screen's spelling, one list for both
+        # servers: IRAN binds them, KHAREJ reads them to know what it will be
+        # asked to dial.
+        printf '\n[forward]\n'
+        printf 'ports = [%s]\n' "$(fwd_toml_list $T_PORTS)"
+    else
+        printf '\n[tun]\n'
+        printf 'name = "%s"\n' "$T_DEV"
+        printf 'iran = "10.%s.10.1/24"\n' "$T_OCTET"
+        printf 'kharej = "10.%s.10.2/24"\n' "$T_OCTET"
+        # Not asked. 1320 works on every path we have measured, and Measure
+        # MTU on the tunnel screen finds the real number properly.
+        printf 'mtu = %s\n' "${T_MTU:-1320}"
+    fi
     printf '\n[logging]\n'
     printf 'level = "info"\n'
     printf '\n[status]\n'
@@ -21178,6 +22295,7 @@ wizard_new() {
     local f other
     WIZ_QUIT=0
     T_SIDE= T_DIALS= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
+    T_MODE= T_PORTS=
     T_PATH= T_AWG_PORT= T_AWG_IFACE=
     T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
     T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
@@ -21217,7 +22335,13 @@ wizard_new() {
     blank
     q_port || return 1
     blank
-    q_link || return 1
+    # A TCP tunnel has no link to make; it has ports to forward. A [TUN] one
+    # has a link and forwards its ports over it, later, from its own screen.
+    if [ "$T_MODE" = forward ]; then
+        q_forward_ports || return 1
+    else
+        q_link || return 1
+    fi
     blank
     q_profile || return 1
 
@@ -21339,6 +22463,8 @@ wizard_paste() {
     # it - the port check, the summary - has to see the pasted value and not
     # the default.
     T_DIALS=$(toml_get "$f" transport dials)
+    T_MODE=$(toml_get "$f" tunnel mode)
+    [ -n "$T_MODE" ] || T_MODE=tun
     T_TRANSPORT=$(toml_get "$f" transport type)
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
@@ -21356,9 +22482,12 @@ wizard_paste() {
     # Pingify config. Everything below indexes on these four, so they are
     # checked here rather than found missing halfway through the collision
     # checks with an arithmetic error for a message.
-    if ! v_name "$T_NAME" >/dev/null 2>&1 ||
-        ! v_octet "$T_OCTET" >/dev/null 2>&1 ||
-        [ -z "$T_DEV" ] || [ -z "$T_TRANSPORT" ]; then
+    # A forward tunnel has no link and no device, so those two are only
+    # required of a [TUN] one - refusing every TCP tunnel's token as "not a
+    # Pingify config" was the first thing this check did.
+    if ! v_name "$T_NAME" >/dev/null 2>&1 || [ -z "$T_TRANSPORT" ] ||
+        { [ "$T_MODE" != forward ] &&
+            { ! v_octet "$T_OCTET" >/dev/null 2>&1 || [ -z "$T_DEV" ]; }; }; then
         bad "that token decoded, but it is not a Pingify config"
         fix "paste the line the other server printed"
         rm -f "$f"
@@ -21389,12 +22518,12 @@ wizard_paste() {
         fix "delete that one first, or use a different octet"
         clash=1
     fi
-    if own=$(wiz_link_owner "$T_OCTET"); then
+    if [ "$T_MODE" != forward ] && own=$(wiz_link_owner "$T_OCTET"); then
         bad "10.$T_OCTET.10.0/24 is in use here by $own"
         fix "change the range on both servers, and paste again"
         clash=1
     fi
-    if own=$(wiz_device_owner "$T_DEV"); then
+    if [ "$T_MODE" != forward ] && own=$(wiz_device_owner "$T_DEV"); then
         bad "the device $T_DEV is in use here by $own"
         fix "the device is in the shared file - change both"
         clash=1
@@ -21606,6 +22735,18 @@ tun_rtt() {
     local name=$1 t out hp peer
     t=$(toml_get "$(cfg_file "$name")" transport type)
 
+    # A forward tunnel has no address to ping and no health port to connect
+    # to; it measures itself, with a ping record every ten seconds, and the
+    # status endpoint says what it found.
+    if [ "$(toml_get "$(cfg_file "$name")" tunnel mode)" = forward ]; then
+        tun_stats "$name" || return 0
+        case $ST_FAR_RTT in
+        '' | 0 | *[!0-9.]*) return 0 ;;
+        esac
+        LC_ALL=C awk -v t="$ST_FAR_RTT" 'BEGIN { printf "%.0f", t }'
+        return 0
+    fi
+
     # An ICMP tunnel cannot be pinged. The carrier stops both kernels
     # answering echo - it has to, or every packet it sends is answered twice -
     # so the ping goes out and is deliberately ignored, and for a long time
@@ -21693,7 +22834,13 @@ screen_tunnel() {
         if [ -n "$dom" ]; then
             field "Address" "$(addr_text "$dom")$(toml_get "$f" transport path)"
         fi
-        field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
+        if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
+            local plist
+            plist=$(toml_get "$f" forward ports | tr -d '[]"' | sed 's/, */  /g')
+            field "Ports" "${plist:-none yet - set them on the Ports screen}"
+        else
+            field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
+        fi
 
         # One measurement to a line, each with the name of what it is. They
         # were one line with two numbers on it and nothing saying which was
@@ -22795,7 +23942,11 @@ screen_ports() {
         peer=$(peer_tun_addr "$name")
         # Short because dim prints with a bare printf: the sentence this
         # replaces came to 72 columns against a 60 column floor and wrapped.
-        dim "these ports go to $peer across the tunnel"
+        if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
+            dim "users connect here; each port goes to the service it names on KHAREJ"
+        else
+            dim "these ports go to $peer across the tunnel"
+        fi
         blank
         cur=$(forwards_of "$name" | tr '\n' ' ')
         cur=${cur% }
@@ -22852,7 +24003,34 @@ screen_ports_set() {
         blank
     done
     forwards_set "$name" "$answer" || return 1
-    nat_apply "$name"
+    # A forward tunnel carries its ports itself: the list goes into the file
+    # both servers share and the core binds them. A [TUN] tunnel forwards
+    # them over its link with NAT, as it always has.
+    if [ "$(toml_get "$(cfg_file "$name")" tunnel mode)" = forward ]; then
+        fwd_apply_forward "$name"
+    else
+        nat_apply "$name"
+    fi
+}
+
+# fwd_apply_forward writes the stored list into [forward] ports and restarts
+# the tunnel, which is how the core learns it. The other server gets the same
+# list the next time the file is shared, and does not need it to work: only
+# IRAN binds anything.
+fwd_apply_forward() {
+    local name=$1 f list t first=1
+    f=$(cfg_file "$name")
+    for t in $(forwards_of "$name"); do
+        [ "$first" = 1 ] || list="$list, "
+        list="$list\"$t\""
+        first=0
+    done
+    grep -q '^\[forward\]' "$f" || printf '\n[forward]\n' >>"$f"
+    toml_set "$f" forward ports "[$list]" no || {
+        bad "could not write the port list into $f"
+        return 1
+    }
+    svc_do restart "$name"
 }
 #!/usr/bin/env bash
 #
@@ -23022,6 +24200,8 @@ chk_load() {
     [ -f "$CK_FILE" ] || return 1
     CK_SIDE=$(toml_get "$CK_FILE" tunnel side)
     CK_TRANSPORT=$(toml_get "$CK_FILE" transport type)
+    CK_MODE=$(toml_get "$CK_FILE" tunnel mode)
+    [ -n "$CK_MODE" ] || CK_MODE=tun
     CK_PORT=$(toml_get "$CK_FILE" transport port)
     CK_KHAREJ=$(toml_get "$CK_FILE" transport kharej)
     CK_DEV=$(toml_get "$CK_FILE" tun name)
@@ -23193,7 +24373,18 @@ health_check() {
     # 4. the private link. operstate on a tun device reads "unknown" even when
     # it is carrying perfectly - the driver has no carrier to report - so the
     # flags word is the thing to look at. Bit 0 of it is IFF_UP.
-    if [ ! -d "/sys/class/net/$CK_DEV" ]; then
+    if [ "$CK_MODE" = forward ]; then
+        # A forward tunnel has no device to look at. What it has is a list of
+        # ports and its own word on the far end, further down.
+        local nports
+        nports=$(toml_get "$CK_FILE" forward ports | tr ',' '\n' | grep -c '"')
+        if [ "$CK_SIDE" = iran ] && [ "${nports:-0}" = 0 ]; then
+            chk_add warn ports "no ports are forwarded yet" \
+                "tunnel screen, Ports: add the ones users connect to"
+        else
+            chk_add ok link "forward tunnel, ${nports:-0} port$(plural_s "${nports:-0}") on IRAN"
+        fi
+    elif [ ! -d "/sys/class/net/$CK_DEV" ]; then
         chk_add bad link "the private link $CK_DEV does not exist" \
             "the core makes it at start, so it never started" \
             "journalctl -u pingify@$name -n 30"

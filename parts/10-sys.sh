@@ -457,7 +457,7 @@ svc_do() {
 tun_stats() {
     local name=$1 json
     ST_UP= ST_IN= ST_OUT= ST_LOST= ST_GAPS= ST_LATE= ST_UPTIME= ST_DROPPED=
-    ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB=
+    ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB= ST_MODE= ST_FAR_RTT= ST_FAR_SEEN=
 
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
@@ -479,6 +479,11 @@ tun_stats() {
     ST_TRANSPORT=$(json_field "$json" transport)
     ST_PROFILE=$(json_field "$json" profile)
     ST_SIDE=$(json_field "$json" side)
+    # A forward tunnel measures its own far end; a private link is measured
+    # from outside. These are empty on a link.
+    ST_MODE=$(json_field "$json" mode)
+    ST_FAR_RTT=$(json_field "$json" far_rtt_ms)
+    ST_FAR_SEEN=$(json_field "$json" far_seen_sec)
     return 0
 }
 

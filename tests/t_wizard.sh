@@ -39,7 +39,8 @@ section "seven questions on the first server"
 if [ -z "$CORE" ]; then
     skip "the wizard end to end" "no core could be built"
 else
-    out=$(answers 1 185.31.8.129 46.247.109.83 1 8443 99 2 y | wizard_new 2>&1)
+    # 8 is [TUN] UDP: the link kind, with the address pair the octet derives.
+    out=$(answers 1 185.31.8.129 46.247.109.83 8 8443 99 2 y | wizard_new 2>&1)
     rc=$?
     check "the wizard finished" "$rc" "0"
 
@@ -229,5 +230,44 @@ check_rc "on iran, the end that waits, a bound port is refused" 1 v_wiz_port 844
 T_SIDE=kharej
 check_rc "on kharej, the end that dials, the same port is fine" 0 v_wiz_port 8443
 unset -f wiz_port_owner wiz_port_bound
+
+
+section "two kinds of tunnel, and the transport decides which"
+
+# Streams forward ports and packets need a link; the core refuses the other
+# pairing, so the wizard has to get it right every time.
+for t in tcp ws wss utls fallback; do
+    check_contains "$t forwards ports" "$(mode_of $t)" "forward"
+done
+for t in icmp gre udp rawtcp awg; do
+    check_contains "$t is a [TUN] link" "$(mode_of $t)" "tun"
+done
+check_contains "a [TUN] transport wears the label" "$(kind_label icmp)" "[TUN] ICMP"
+check_contains "and Raw TCP keeps its name under it" "$(kind_label rawtcp)" "[TUN] Raw TCP"
+check_missing "a TCP tunnel does not" "$(kind_label fallback)" "[TUN]"
+check_contains "the port list renders as a TOML array" "$(fwd_toml_list 443 udp:500 8000-8010=9000)" '"443", "udp:500", "8000-8010=9000"'
+
+
+section "a TCP tunnel: ports instead of a link"
+
+if [ -z "$CORE" ]; then
+    skip "the forward wizard end to end" "no core could be built"
+else
+    out=$(answers 1 185.31.8.129 46.247.109.83 1 8443 "443,udp:500" 2 y | wizard_new 2>&1)
+    check "the wizard finished" "$?" "0"
+    f=$CFG_DIR/iran-tcp-8443.toml
+    if [ ! -f "$f" ]; then
+        FAIL=$((FAIL + 1))
+        printf '    [31mx[0m no config was written
+'
+        printf '%s
+' "$out" | tail -12 | sed 's/^/        /'
+    else
+        check "it is a forward tunnel" "$(toml_get "$f" tunnel mode)" "forward"
+        check_contains "the ports went into the file, both of them" "$(toml_get "$f" forward ports)" '"443", "udp:500"'
+        check_missing "and there is no private link in it" "$(cat "$f")" "[tun]"
+        check "the core accepts it"             "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+    fi
+fi
 
 report

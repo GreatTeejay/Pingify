@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -78,7 +79,17 @@ const (
 type Config struct {
 	Name string
 	Side string // iran | kharej
-	Mode string // tun
+	Mode string // tun | forward
+
+	// Forward mode: the ports this server answers on and where each one goes,
+	// in the Ports screen's spelling ("443", "udp:500", "443=10.9.0.5:443").
+	// Only the IRAN side binds anything; the allow list is the KHAREJ side's
+	// say over what it will dial.
+	Forward struct {
+		Ports    []string
+		BindAddr string
+		Allow    []string
+	}
 
 	Transport struct {
 		Type   string // udp
@@ -365,6 +376,27 @@ func parseTOML(text string, c *Config) error {
 func assign(c *Config, table, key, raw string) error {
 	str := func() (string, error) { return unquote(raw) }
 	num := func() (int, error) { return strconv.Atoi(strings.Trim(raw, `"' `)) }
+	// A TOML array of strings: ["443", "udp:500"]. One line, quoted items,
+	// which is every array this file has.
+	list := func() ([]string, error) {
+		s := strings.TrimSpace(raw)
+		if !strings.HasPrefix(s, "[") || !strings.HasSuffix(s, "]") {
+			return nil, fmt.Errorf("%s.%s wants a list like [\"443\", \"udp:500\"]", table, key)
+		}
+		var out []string
+		for _, item := range strings.Split(s[1:len(s)-1], ",") {
+			item = strings.TrimSpace(item)
+			if item == "" {
+				continue
+			}
+			v, err := unquote(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, v)
+		}
+		return out, nil
+	}
 
 	var err error
 	switch table + "." + key {
@@ -472,6 +504,13 @@ func assign(c *Config, table, key, raw string) error {
 		c.AWG.H3, err = num()
 	case "awg.h4":
 		c.AWG.H4, err = num()
+
+	case "forward.ports":
+		c.Forward.Ports, err = list()
+	case "forward.bind_addr":
+		c.Forward.BindAddr, err = str()
+	case "forward.allow":
+		c.Forward.Allow, err = list()
 
 	case "status.port":
 		c.StatusPort, err = num()
@@ -600,11 +639,28 @@ func (c *Config) check() error {
 	if c.Mode == "" {
 		c.Mode = "tun"
 	}
-	if c.Mode != "tun" {
-		return fmt.Errorf("tunnel.mode %q: only \"tun\" is built so far", c.Mode)
+	if c.Mode != "tun" && c.Mode != "forward" {
+		return fmt.Errorf("tunnel.mode %q: \"tun\" is a private link, \"forward\" carries ports", c.Mode)
 	}
 	if c.Transport.Type == "" {
 		c.Transport.Type = "udp"
+	}
+	// A forward tunnel rides streams, so it needs a carrier that cannot lose
+	// or reorder one. The datagram transports keep the private link, which
+	// is what they are for.
+	if c.Mode == "forward" {
+		switch c.Transport.Type {
+		case "tcp", "ws", "wss", "utls", "fallback":
+		default:
+			return fmt.Errorf("tunnel.mode forward needs tcp, ws, wss, utls or fallback; %s is a [TUN] transport",
+				c.Transport.Type)
+		}
+		if c.Forward.BindAddr == "" {
+			c.Forward.BindAddr = "0.0.0.0"
+		}
+		if net.ParseIP(c.Forward.BindAddr) == nil {
+			return fmt.Errorf("forward.bind_addr %q is not an address", c.Forward.BindAddr)
+		}
 	}
 	switch c.Transport.Type {
 	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp", "utls", "fallback":
@@ -656,7 +712,7 @@ func (c *Config) check() error {
 	if c.TUN.Name == "" {
 		c.TUN.Name = "pfy0"
 	}
-	if c.TUN.Iran == "" || c.TUN.Kharej == "" {
+	if c.Mode == "tun" && (c.TUN.Iran == "" || c.TUN.Kharej == "") {
 		return fmt.Errorf("tun.iran and tun.kharej are both needed, on both servers")
 	}
 	if c.TUN.MTU == 0 {

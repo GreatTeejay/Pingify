@@ -166,6 +166,8 @@ chk_load() {
     [ -f "$CK_FILE" ] || return 1
     CK_SIDE=$(toml_get "$CK_FILE" tunnel side)
     CK_TRANSPORT=$(toml_get "$CK_FILE" transport type)
+    CK_MODE=$(toml_get "$CK_FILE" tunnel mode)
+    [ -n "$CK_MODE" ] || CK_MODE=tun
     CK_PORT=$(toml_get "$CK_FILE" transport port)
     CK_KHAREJ=$(toml_get "$CK_FILE" transport kharej)
     CK_DEV=$(toml_get "$CK_FILE" tun name)
@@ -337,7 +339,18 @@ health_check() {
     # 4. the private link. operstate on a tun device reads "unknown" even when
     # it is carrying perfectly - the driver has no carrier to report - so the
     # flags word is the thing to look at. Bit 0 of it is IFF_UP.
-    if [ ! -d "/sys/class/net/$CK_DEV" ]; then
+    if [ "$CK_MODE" = forward ]; then
+        # A forward tunnel has no device to look at. What it has is a list of
+        # ports and its own word on the far end, further down.
+        local nports
+        nports=$(toml_get "$CK_FILE" forward ports | tr ',' '\n' | grep -c '"')
+        if [ "$CK_SIDE" = iran ] && [ "${nports:-0}" = 0 ]; then
+            chk_add warn ports "no ports are forwarded yet" \
+                "tunnel screen, Ports: add the ones users connect to"
+        else
+            chk_add ok link "forward tunnel, ${nports:-0} port$(plural_s "${nports:-0}") on IRAN"
+        fi
+    elif [ ! -d "/sys/class/net/$CK_DEV" ]; then
         chk_add bad link "the private link $CK_DEV does not exist" \
             "the core makes it at start, so it never started" \
             "journalctl -u pingify@$name -n 30"

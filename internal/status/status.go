@@ -79,6 +79,12 @@ type Report struct {
 	// the one number that says whether the parity is earning its bandwidth,
 	// and it is absent on a transport that has none.
 	Repaired uint64 `json:"fec_repaired"`
+
+	// A forward tunnel has no private address to be pinged on, so it
+	// measures its own round trip with a ping record every ten seconds and
+	// says when the far end last spoke. Absent on a private link.
+	FarRTTms   float64 `json:"far_rtt_ms,omitempty"`
+	FarSeenSec float64 `json:"far_seen_sec,omitempty"`
 }
 
 type Server struct {
@@ -218,6 +224,8 @@ func (s *Server) Report() Report {
 		ToDevice:      toDevice,
 		Dropped:       s.link.Dropped(),
 		Repaired:      s.repaired(),
+		FarRTTms:      s.farRTT(),
+		FarSeenSec:    s.farSeen(),
 	}
 }
 
@@ -296,6 +304,29 @@ func max(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+// A forward tunnel measures the far end itself; a private link is measured
+// from outside, on its address. Asked for rather than required.
+type farEnd interface {
+	RTT() time.Duration
+	FarSeen() time.Time
+}
+
+func (s *Server) farRTT() float64 {
+	if f, ok := s.link.(farEnd); ok {
+		return float64(f.RTT().Microseconds()) / 1000
+	}
+	return 0
+}
+
+func (s *Server) farSeen() float64 {
+	if f, ok := s.link.(farEnd); ok {
+		if t := f.FarSeen(); !t.IsZero() {
+			return time.Since(t).Seconds()
+		}
+	}
+	return 0
 }
 
 // repaired is what the carrier put back together from parity, or zero when it

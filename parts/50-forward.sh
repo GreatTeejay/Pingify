@@ -702,7 +702,11 @@ screen_ports() {
         peer=$(peer_tun_addr "$name")
         # Short because dim prints with a bare printf: the sentence this
         # replaces came to 72 columns against a 60 column floor and wrapped.
-        dim "these ports go to $peer across the tunnel"
+        if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
+            dim "users connect here; each port goes to the service it names on KHAREJ"
+        else
+            dim "these ports go to $peer across the tunnel"
+        fi
         blank
         cur=$(forwards_of "$name" | tr '\n' ' ')
         cur=${cur% }
@@ -759,5 +763,32 @@ screen_ports_set() {
         blank
     done
     forwards_set "$name" "$answer" || return 1
-    nat_apply "$name"
+    # A forward tunnel carries its ports itself: the list goes into the file
+    # both servers share and the core binds them. A [TUN] tunnel forwards
+    # them over its link with NAT, as it always has.
+    if [ "$(toml_get "$(cfg_file "$name")" tunnel mode)" = forward ]; then
+        fwd_apply_forward "$name"
+    else
+        nat_apply "$name"
+    fi
+}
+
+# fwd_apply_forward writes the stored list into [forward] ports and restarts
+# the tunnel, which is how the core learns it. The other server gets the same
+# list the next time the file is shared, and does not need it to work: only
+# IRAN binds anything.
+fwd_apply_forward() {
+    local name=$1 f list t first=1
+    f=$(cfg_file "$name")
+    for t in $(forwards_of "$name"); do
+        [ "$first" = 1 ] || list="$list, "
+        list="$list\"$t\""
+        first=0
+    done
+    grep -q '^\[forward\]' "$f" || printf '\n[forward]\n' >>"$f"
+    toml_set "$f" forward ports "[$list]" no || {
+        bad "could not write the port list into $f"
+        return 1
+    }
+    svc_do restart "$name"
 }

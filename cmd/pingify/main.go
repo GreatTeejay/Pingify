@@ -10,6 +10,7 @@ import (
 
 	"pingify/internal/carrier"
 	"pingify/internal/config"
+	"pingify/internal/forward"
 	"pingify/internal/link"
 	"pingify/internal/logging"
 	"pingify/internal/status"
@@ -100,13 +101,31 @@ func main() {
 		logging.Die("carrier: %v", err)
 	}
 
-	l, err := link.New(cfg, car)
-	if err != nil {
-		car.Close()
-		logging.Die("private link: %v", err)
+	// Two kinds of tunnel, and the file says which. A private link is a tun
+	// device with an address at each end; a forward tunnel has no device at
+	// all - the IRAN side answers on ports and each connection crosses as a
+	// stream of its own.
+	var l tunnel
+	if cfg.Mode == "forward" {
+		f, err := forward.New(cfg, car)
+		if err != nil {
+			car.Close()
+			logging.Die("forward: %v", err)
+		}
+		if err := f.Start(); err != nil {
+			car.Close()
+			logging.Die("forward: %v", err)
+		}
+		l = f
+	} else {
+		pl, err := link.New(cfg, car)
+		if err != nil {
+			car.Close()
+			logging.Die("private link: %v", err)
+		}
+		pl.Start()
+		l = pl
 	}
-
-	l.Start()
 	go car.Run()
 	if cfg.Dials() {
 		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
@@ -130,6 +149,15 @@ func main() {
 // doing something. A line every thirty seconds saying nothing happened fills
 // a log with the absence of news, and the one line that matters is then in the
 // middle of a thousand that do not.
+// tunnel is what main needs from either kind: the status server's two
+// counters, a close, and a line for the log on the way out.
+type tunnel interface {
+	Dropped() uint64
+	Packets() (toWire, toDevice uint64)
+	Close() error
+	String() string
+}
+
 func max64(a, b uint64) uint64 {
 	if a > b {
 		return a
@@ -145,7 +173,7 @@ func since(now, then uint64) uint64 {
 	return now - then
 }
 
-func reportEvery(every time.Duration, c carrier.Full, l *link.Link) {
+func reportEvery(every time.Duration, c carrier.Full, l tunnel) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	var lastRx, lastTx uint64
