@@ -231,7 +231,12 @@ home_row() {
             # for running-and-alone, which is what the dot has always meant.
             [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ] && dot=running
             [ -n "$ST_TRANSPORT" ] && transport=$ST_TRANSPORT
-            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
+            # Coloured by the busier of the two directions: a tunnel pulling
+            # 400 down and 8 up is not an amber tunnel.
+            local hi
+            hi=$ST_IN
+            awk -v a="$ST_OUT" -v b="$ST_IN" 'BEGIN{exit !(a+0>b+0)}' && hi=$ST_OUT
+            rate="$(rate_colour "$(round1 "$hi")")$(round1 "$ST_IN")/$(round1 "$ST_OUT")$C_OFF"
         else
             rate="no answer"
         fi
@@ -293,28 +298,23 @@ home_cols() {
     UI_COLS=(4 "$nw" 8 7 8 12)
 }
 
-# The home screen: the name, the two panels, whatever is running, and a
-# numbered list of everything that can be done from here.
+# The home screen: the name, the two panels, and a numbered list of everything
+# that can be done from here.
+#
+# What is not here any more is the list of running tunnels. Every line of it
+# cost a systemctl, a request to the tunnel's own status port and a ping across
+# the link - and the ping is up to a second on its own when the far end has
+# stopped answering, which is exactly when somebody is opening this screen. On
+# a server with three tunnels the menu took seconds to appear, every time, for
+# a table that Manage tunnels draws anyway.
 #
 # The numbers are fixed, and that is the point of them. They were letters, and
 # the tunnels themselves were keys on this screen, so the key for Uninstall
 # moved down the alphabet every time somebody added a tunnel. Nothing here
 # moves now: 7 is Remove on a server with no tunnels and on a server with ten.
 screen_home() {
-    local n names=()
-    while IFS= read -r n; do names+=("$n"); done < <(cfg_list)
-
     screen_top
     home_panels
-
-    if [ "${#names[@]}" -gt 0 ]; then
-        blank
-        group "RUNNING NOW"
-        home_cols
-        home_head
-        for n in "${names[@]}"; do home_row "$n" " "; done
-    fi
-
     blank
     group "TUNNELS"
     item 1 "New tunnel" "set this server up, or finish the pair"
@@ -322,8 +322,8 @@ screen_home() {
     item 3 "Health check" "every tunnel, and what to do about it"
     blank
     group "NETWORK"
-    item 4 "Host tuning" "kernel profile, BBR, descriptor limits"
-    item 5 "Blocking" "ping from outside, QUIC on udp 443, speedtest"
+    item 4 "Host tuning" "one key for all of it, or each on its own"
+    item 5 "Blocking" "outside ping, QUIC on udp 443, speedtest sites"
     blank
     group "MAINTENANCE"
     item 6 "Update Pingify" "script and core together, to the same version"
@@ -371,6 +371,10 @@ screen_tunnels() {
             i=$((i + 1))
         done
         blank
+        # The key after the last tunnel, so it can never collide with one of
+        # them however many there are. From the old script, where it was the
+        # one thing on this screen that could not be done from a tunnel's own.
+        item "$((${#names[@]} + 1))" "Restart every tunnel"
         item 0 "Back"
         blank
 
@@ -379,7 +383,11 @@ screen_tunnels() {
         0 | '') return 0 ;;
         *[!0-9]*) blank; warn "there is nothing on $k" ;;
         *)
-            if [ "$k" -ge 1 ] && [ "$k" -le "${#names[@]}" ]; then
+            if [ "$k" -eq $((${#names[@]} + 1)) ]; then
+                blank
+                for n in "${names[@]}"; do svc_do restart "$n"; done
+                pause
+            elif [ "$k" -ge 1 ] && [ "$k" -le "${#names[@]}" ]; then
                 screen_tunnel "${names[k - 1]}"
                 names=()
                 while IFS= read -r n; do names+=("$n"); done < <(cfg_list)

@@ -379,6 +379,20 @@ rtt_colour() {
     esac
 }
 
+# rate_colour is the same idea for megabits, with one difference that matters:
+# a tunnel carrying nothing is not a slow tunnel. Nobody is using it. So below
+# a megabit this is grey - the state the dot beside it already describes - and
+# the three colours only start once there is traffic to have an opinion about.
+rate_colour() {
+    case $1 in
+    '' | *[!0-9.]*) printf '%s' "$C_MUTE" ;;
+    *) if [ "${1%%.*}" -lt 1 ]; then printf '%s' "$C_MUTE"
+       elif [ "${1%%.*}" -ge 100 ]; then printf '%s' "$C_OK"
+       elif [ "${1%%.*}" -ge 10 ]; then printf '%s' "$C_WARN"
+       else printf '%s' "$C_BAD"; fi ;;
+    esac
+}
+
 # The name, drawn large, in a frame it fills. It is the first thing on the
 # screen and the only decoration in the whole script.
 #

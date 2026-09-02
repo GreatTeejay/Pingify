@@ -237,16 +237,40 @@ screen_host() {
         field "Open files" "$(ulimit -n) here, $([ -f "$HOST_LIMITS" ] && printf '1048576 at next login' || printf 'unchanged at login')"
         field "Drop-in" "$HOST_SYSCTL"
         blank
-        item2 "1" "Profile" "${p:-none applied}"
-        item2 "2" "BBR" "$bbr $G_DASH the congestion control the kernel uses"
-        item2 "3" "Descriptor limits" \
+        item "1" "Optimize this server" "all three below, the way a tunnel wants them"
+        item2 "2" "Profile" "${p:-none applied}"
+        item2 "3" "BBR" "$bbr $G_DASH the congestion control the kernel uses"
+        item2 "4" "Descriptor limits" \
             "$([ -f "$HOST_LIMITS" ] && printf 'raised to 1048576' || printf 'left at the distribution default')"
-        item "4" "Revert" "put every setting on this screen back"
+        item "5" "Revert" "put every setting on this screen back"
         item "0" "Back"
         blank
         menu_key key || return 0
         case $key in
+        # Everything below, in the order it has to be done in. Three switches
+        # is three decisions to make about a machine somebody just rented, and
+        # the answer is the same on almost all of them.
         1)
+            blank
+            dim "Balanced socket buffers, BBR over fq, and a million open"
+            dim "files. It is the three settings below, set the way a tunnel"
+            dim "server wants them, in one go."
+            blank
+            confirm "apply all three?" y || continue
+            blank
+            local want=off
+            host_bbr_available && want=on
+            if host_write_sysctl balanced "$want"; then
+                if [ "$want" = on ]; then
+                    ok "balanced buffers, BBR over fq"
+                else
+                    ok "balanced buffers"
+                    warn "this kernel does not offer BBR, so cubic stays"
+                fi
+            fi
+            host_limits
+            ;;
+        2)
             blank
             group "WHAT THIS MACHINE MOSTLY CARRIES"
             item "1" "Gaming" "smaller socket buffers, so a reply waits less"
@@ -273,7 +297,7 @@ screen_host() {
             blank
             host_write_sysctl "$p" "$(host_bbr_state)" && ok "$p host tuning applied"
             ;;
-        2)
+        3)
             blank
             if [ "$(host_bbr_state)" = on ]; then
                 # Taking the two lines out of the drop-in does not take BBR off
@@ -300,8 +324,8 @@ screen_host() {
                     ok "BBR is on, with fq underneath it"
             fi
             ;;
-        3) blank; host_limits ;;
-        4)
+        4) blank; host_limits ;;
+        5)
             blank
             confirm "remove the drop-in and the limits file?" n && { blank; revert_tuning; }
             ;;
@@ -653,12 +677,15 @@ screen_firewall() {
         screen_top
         blank
         rule "Blocking"
+        dim "on means it is being blocked, off means it is not. The name of"
+        dim "each line is what the switch does, not what it is about."
+        blank
         dim "state lives in $STATE_DIR. Every apply flushes our two chains and"
         dim "builds them again, so your own rules are never in the way of it."
         blank
-        item2 "1" "Ping from outside" "$(host_badge "$(block_state icmp)")"
-        item2 "2" "QUIC, udp 443" "$(host_badge "$(block_state quic)")"
-        item2 "3" "Speedtest sites" "$(host_badge "$(block_state speedtest)")"
+        item2 "1" "Blocking outside ping" "$(host_badge "$(block_state icmp)")"
+        item2 "2" "Blocking QUIC, udp 443" "$(host_badge "$(block_state quic)")"
+        item2 "3" "Blocking speedtest sites" "$(host_badge "$(block_state speedtest)")"
         blank
         item "4" "Show the rules that are in place"
         item "5" "Clear everything, including the boot unit"

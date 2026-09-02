@@ -374,6 +374,33 @@ svc_state() {
 # svc_do never swallows the result. The old service_enable_start returned the
 # exit status of a `systemctl daemon-reload` that always succeeds, so the caller
 # printed a green "is running" over a unit that had failed to start.
+# The machine gets its pings back when the last ICMP tunnel stops.
+#
+# The core sets net.ipv4.icmp_echo_ignore_all while it runs, and it has to:
+# both ends of an ICMP tunnel send echo requests, so without it every packet
+# is answered twice - once by the far tunnel and once by the far kernel, which
+# has no idea it is in the middle of anything - and the traffic on the path
+# doubles. It is the same setting flagtun asks you to put in a sysctl.d file
+# by hand, set at start instead, so a reboot needs nothing.
+#
+# What it did not do was give it back. A server whose ICMP tunnel had been
+# stopped went on answering no pings at all, which looks exactly like a dead
+# server, and every other tunnel on it lost its round trip measurement as
+# well. This is the other half, and it counts the remaining ICMP tunnels
+# first: two of them, one stopped, must not unmute the one still running.
+icmp_echo_restore() {
+    local n t
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        t=$(toml_get "$(cfg_file "$n")" transport type)
+        [ "$t" = icmp ] || continue
+        [ "$(svc_state "$n")" = active ] && return 0
+    done < <(cfg_list)
+    [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ] || return 0
+    sysctl -qw net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 &&
+        ok "this server answers pings again"
+}
+
 svc_do() {
     local what=$1 name=$2
     case $what in
@@ -396,7 +423,7 @@ svc_do() {
         # "disableped" out of disable - on the uninstall screen, where every
         # other line is plain English.
         case $what in
-        stop) ok "$name stopped" ;;
+        stop) ok "$name stopped"; icmp_echo_restore ;;
         *) ok "$name will not start at boot" ;;
         esac
         ;;
