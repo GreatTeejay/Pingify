@@ -5161,7 +5161,11 @@ func newTCPCarrier(cfg *config.Config) (*streamCarrier, error) {
 	if err != nil {
 		return nil, err
 	}
-	addr := net.JoinHostPort(cfg.Transport.Kharej, fmt.Sprint(cfg.Transport.Port))
+	// DialHost, not the kharej address. This named one side directly, from
+	// when Iran was the end that dialled, and it went on naming it after the
+	// direction was settled the other way: the server abroad reached in by
+	// dialling itself, and the tunnel sat there refusing its own connection.
+	addr := net.JoinHostPort(cfg.DialHost(), fmt.Sprint(cfg.Transport.Port))
 	c.dial = func() (net.Conn, framing, error) {
 		nc, err := net.DialTimeout("tcp4", addr, streamDialWait)
 		if err != nil {
@@ -6326,25 +6330,22 @@ type Config struct {
 // dials the edge. transport.dials says so when that is the arrangement.
 func (c *Config) Dials() bool { return c.Side == c.DialSide() }
 
-// DialSide is worked out from the two addresses rather than asked for.
+// DialSide is which end opens the connection, and it is never asked.
 //
-// Iran dials out, and that is the default because connections into the Iran
-// server are blackholed after about six exchanges - measured, repeatedly.
+// KHAREJ dials IRAN. That is what a reverse tunnel is: the server abroad
+// reaches in, and the Iran server is the one that waits, because the Iran
+// server is the one users connect to and the one that owns the forwarded
+// ports. Both halves belong on the same machine - the ports and the socket
+// that answers them - and this is the half that decides it.
 //
-// The exception is a name. A CDN answers on a name and connects *inward* to
-// the origin it was given, so a name can only ever front the side that waits:
-// if the Iran server is named and the one abroad is an address, then Iran is
-// the origin behind the edge, and the server abroad is the one that dials it.
-// There is nothing to ask - the two addresses already say which it is.
+// transport.dials overrides it, which is there for the path that will not
+// carry a connection inward and for nothing else. Nothing sets it by itself.
 func (c *Config) DialSide() string {
 	switch c.Transport.Dials {
 	case SideIran, SideKharej:
 		return c.Transport.Dials
 	}
-	if isName(c.Transport.Iran) && !isName(c.Transport.Kharej) {
-		return SideKharej
-	}
-	return SideIran
+	return SideKharej
 }
 
 // isName is "this is a domain and not an address", which is the whole of what
@@ -6361,9 +6362,9 @@ func isName(s string) bool {
 // DialHost is what the side that dials connects to, which is the other
 // server's address - and that address is the domain when somebody typed one.
 //
-// Over AmneziaWG it is neither: the carrier runs inside that link, so the
-// far end is its address on the link and the public addresses are the
-// business of awg-quick rather than of this.
+// Over AmneziaWG it is neither: the carrier runs inside that link, so the far
+// end is its address on the link and the public addresses are the business of
+// awg-quick rather than of this.
 func (c *Config) DialHost() string {
 	if c.Transport.Type == "awg" {
 		if c.DialSide() == SideIran {
@@ -20362,10 +20363,10 @@ q_addresses() {
     wiz_ask "Endpoints"
     blank
     # A name rather than an address is the whole of the CDN arrangement, and
-    # it is one word rather than a question: a name can only ever front the
-    # side that waits, because an edge answers on the name and connects
-    # inward to the origin behind it. So a name here is what decides which
-    # side dials, and nothing else needs asking.
+    # it is one word rather than a question: an edge answers on the name and
+    # connects inward to the origin behind it, which is the Iran server, which
+    # is the end that waits. Naming it is all that is needed - which end dials
+    # was never in question.
     dim "an address, or a domain - a domain is what puts a CDN in front of it"
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
@@ -20733,10 +20734,10 @@ wiz_render() {
     printf '\n[transport]\n'
     printf 'type = "%s"\n' "$T_TRANSPORT"
     printf 'kharej = "%s"\n' "$T_KHAREJ"
-    # Recorded, not dialled. KHAREJ never dials anything, so nothing uses this
-    # - but both files carry it, so the operator of either server can see
-    # which pair a tunnel belongs to without logging into the other one.
-    [ -n "$T_IRAN" ] && printf 'iran = "%s"\n' "$T_IRAN"
+    # This is the address KHAREJ dials, so it is not optional on either file:
+    # one file describes the whole tunnel, and the end that reaches in has
+    # nothing to reach without it.
+    printf 'iran = "%s"\n' "$T_IRAN"
     # No port key at all for icmp. Writing port = 0 would pass the core's check
     # and then sit in the file looking like a setting somebody chose.
     [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"
@@ -21646,6 +21647,7 @@ screen_advanced() {
         *) item2 7 "Parity" "$(fec_label "$f")" ;;
         esac
         item 8 "Show the config file"
+        item2 9 "Dial direction" "$(dials_label "$f")"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -21708,6 +21710,22 @@ screen_advanced() {
             ask v "one parity per (0 off, 4 to 32)" "$(toml_get "$f" tuning fec)" v_fec || continue
             FEC_WANT=$v; cfg_apply "$name" _edit_fec yes; pause ;;
         8) blank; sed 's/^/    /' "$f"; pause ;;
+        9) blank
+            dim "A reverse tunnel has the server abroad reach in, and Iran is"
+            dim "the end that waits, because Iran is where the ports are."
+            blank
+            dim "Some Iranian networks take that connection and then carry"
+            dim "nothing on it. Measured on one server: 0 bit/s inbound on 80,"
+            dim "443, 2053 and 8080, against 713 Mbit/s outward on the same"
+            dim "wire - and 521 Mbit/s back into Iran once the connection was"
+            dim "opened from Iran instead. The traffic still flows inward; it"
+            dim "is only the connection that has to start on the other side."
+            blank
+            dim "Set the same value on both servers."
+            blank
+            local v
+            ask v "which end opens it (kharej or iran)" "$(dials_now "$f")" v_dials || continue
+            DIALS_WANT=$v; cfg_apply "$name" _edit_dials yes; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -21720,6 +21738,31 @@ _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
 _edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
 _edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
 _edit_fec() { toml_set "$1" tuning fec "$FEC_WANT"; }
+_edit_dials() { toml_set "$1" transport dials "$DIALS_WANT"; }
+
+# Which end opens the connection. Empty means the default, and the default is
+# what a reverse tunnel is: the server abroad reaches in.
+dials_now() {
+    local d
+    d=$(toml_get "$1" transport dials)
+    [ -n "$d" ] || d=kharej
+    printf '%s' "$d"
+}
+
+dials_label() {
+    case $(dials_now "$1") in
+    iran) printf 'iran opens it, outward' ;;
+    *) printf 'kharej reaches in' ;;
+    esac
+}
+
+v_dials() {
+    case $1 in
+    iran | kharej) return 0 ;;
+    esac
+    echo "kharej or iran"
+    return 1
+}
 
 # What the Advanced screen shows beside Parity, which is the setting and what
 # it costs rather than the number on its own.
@@ -22946,6 +22989,17 @@ health_check() {
             fi
             ;;
         *)
+            # Connected and silent is a different fault from never connected.
+            # The carriers are up, so the path took the connection and then
+            # carried nothing on it - measured on one Iranian server as 0 bit/s
+            # inbound on 80, 443, 2053 and 8080 against 713 Mbit/s outward, and
+            # 521 Mbit/s inward again once the connection was opened from Iran.
+            if [ "$ST_UP" = true ]; then
+                chk_add bad dial "the carriers connected and then carried nothing" \
+                    "some networks take a connection from outside and carry" \
+                    "nothing on it - switch which end opens the connection:" \
+                    "tunnel screen, Advanced, 9, on both servers"
+            fi
             case $CK_TRANSPORT in
             icmp)
                 chk_add bad peer "the far end has never been seen" \
@@ -23058,6 +23112,8 @@ health_check() {
                 chk_add warn link-end "the far end does not answer on the private link" \
                     "the carrier is up, so this is the link and not the path" \
                     "on the other server:  pingify --status" \
+                    "if packets arrived and then stopped, switch which end" \
+                    "opens it: tunnel screen, Advanced, 9, on both servers" \
                     "a core older than $PINGIFY_VERSION has no health port"
             fi
         fi

@@ -432,10 +432,10 @@ q_addresses() {
     wiz_ask "Endpoints"
     blank
     # A name rather than an address is the whole of the CDN arrangement, and
-    # it is one word rather than a question: a name can only ever front the
-    # side that waits, because an edge answers on the name and connects
-    # inward to the origin behind it. So a name here is what decides which
-    # side dials, and nothing else needs asking.
+    # it is one word rather than a question: an edge answers on the name and
+    # connects inward to the origin behind it, which is the Iran server, which
+    # is the end that waits. Naming it is all that is needed - which end dials
+    # was never in question.
     dim "an address, or a domain - a domain is what puts a CDN in front of it"
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
@@ -803,10 +803,10 @@ wiz_render() {
     printf '\n[transport]\n'
     printf 'type = "%s"\n' "$T_TRANSPORT"
     printf 'kharej = "%s"\n' "$T_KHAREJ"
-    # Recorded, not dialled. KHAREJ never dials anything, so nothing uses this
-    # - but both files carry it, so the operator of either server can see
-    # which pair a tunnel belongs to without logging into the other one.
-    [ -n "$T_IRAN" ] && printf 'iran = "%s"\n' "$T_IRAN"
+    # This is the address KHAREJ dials, so it is not optional on either file:
+    # one file describes the whole tunnel, and the end that reaches in has
+    # nothing to reach without it.
+    printf 'iran = "%s"\n' "$T_IRAN"
     # No port key at all for icmp. Writing port = 0 would pass the core's check
     # and then sit in the file looking like a setting somebody chose.
     [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"

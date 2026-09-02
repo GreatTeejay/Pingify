@@ -383,6 +383,17 @@ health_check() {
             fi
             ;;
         *)
+            # Connected and silent is a different fault from never connected.
+            # The carriers are up, so the path took the connection and then
+            # carried nothing on it - measured on one Iranian server as 0 bit/s
+            # inbound on 80, 443, 2053 and 8080 against 713 Mbit/s outward, and
+            # 521 Mbit/s inward again once the connection was opened from Iran.
+            if [ "$ST_UP" = true ]; then
+                chk_add bad dial "the carriers connected and then carried nothing" \
+                    "some networks take a connection from outside and carry" \
+                    "nothing on it - switch which end opens the connection:" \
+                    "tunnel screen, Advanced, 9, on both servers"
+            fi
             case $CK_TRANSPORT in
             icmp)
                 chk_add bad peer "the far end has never been seen" \
@@ -495,6 +506,8 @@ health_check() {
                 chk_add warn link-end "the far end does not answer on the private link" \
                     "the carrier is up, so this is the link and not the path" \
                     "on the other server:  pingify --status" \
+                    "if packets arrived and then stopped, switch which end" \
+                    "opens it: tunnel screen, Advanced, 9, on both servers" \
                     "a core older than $PINGIFY_VERSION has no health port"
             fi
         fi

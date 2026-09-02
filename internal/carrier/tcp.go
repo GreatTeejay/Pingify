@@ -26,7 +26,11 @@ func newTCPCarrier(cfg *config.Config) (*streamCarrier, error) {
 	if err != nil {
 		return nil, err
 	}
-	addr := net.JoinHostPort(cfg.Transport.Kharej, fmt.Sprint(cfg.Transport.Port))
+	// DialHost, not the kharej address. This named one side directly, from
+	// when Iran was the end that dialled, and it went on naming it after the
+	// direction was settled the other way: the server abroad reached in by
+	// dialling itself, and the tunnel sat there refusing its own connection.
+	addr := net.JoinHostPort(cfg.DialHost(), fmt.Sprint(cfg.Transport.Port))
 	c.dial = func() (net.Conn, framing, error) {
 		nc, err := net.DialTimeout("tcp4", addr, streamDialWait)
 		if err != nil {
