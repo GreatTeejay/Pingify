@@ -277,7 +277,10 @@ func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64)
 			if !setPacingRate(pc, int(want)) {
 				return // the kernel will not have it; stop asking
 			}
-			if applied == 0 {
+			if applied == 0 && want == paceFloorBps {
+				logging.Info("pacing at its floor of %d Mbit/s; the path has carried %d so far",
+					want*8/1e6, peak*8/1e6)
+			} else if applied == 0 {
 				logging.Info("pacing follows the path: %d Mbit/s, from the %d it carried",
 					want*8/1e6, peak*8/1e6)
 			} else {

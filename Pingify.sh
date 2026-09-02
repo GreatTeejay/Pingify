@@ -2164,7 +2164,16 @@ func (f *fallback) splice(nc net.Conn, hello []byte, sni string) {
 	if sni == "" {
 		sni = f.sni
 	}
-	up, err := net.DialTimeout("tcp", net.JoinHostPort(sni, "443"), 8*time.Second)
+	// The name was written by whoever is probing, and this server is about
+	// to open a connection to it on their behalf. A public address is what
+	// an SNI proxy does all day; a private one is a way into whatever this
+	// machine can reach and the internet cannot, so those get the same answer
+	// as a bad hello - nothing.
+	ip := publicAddressOf(sni)
+	if ip == nil {
+		return
+	}
+	up, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "443"), 8*time.Second)
 	if err != nil {
 		// There is nothing useful to say to a prober. Closing is what a
 		// server with nothing on that port does.
@@ -2195,35 +2204,56 @@ func halfClose(c net.Conn) {
 
 // A nonce is good once. Without this, a recording of one valid hello opens a
 // connection here for as long as the window lasts - which is exactly the probe
-// this transport exists to survive.
+// this transport exists to survive: the replay cannot finish the handshake,
+// but it does not need to. It only needs to see this server answer with its
+// own certificate instead of Microsoft's.
+//
+// Three generations, not two. A hello is accepted from a window either side of
+// now, so one made by a clock half a minute ahead is still valid two windows
+// after it was first seen - and with two generations its nonce had been
+// forgotten by then. Recorded, replayed a minute later, accepted.
+const nonceGens = 3
+
 type nonceSet struct {
 	mu   sync.Mutex
 	gen  int64
-	now  map[[16]byte]struct{}
-	prev map[[16]byte]struct{}
+	gens [nonceGens]map[[16]byte]struct{} // [0] is this window, [1] the last, and so on
 }
 
 func newNonceSet() *nonceSet {
-	return &nonceSet{now: map[[16]byte]struct{}{}, prev: map[[16]byte]struct{}{}}
+	s := &nonceSet{}
+	for i := range s.gens {
+		s.gens[i] = map[[16]byte]struct{}{}
+	}
+	return s
 }
 
-// accept remembers a nonce and reports whether it was new. Two generations are
-// kept rather than one, because a hello made in the last window is still valid
-// in this one and its nonce has to still be remembered.
+// accept remembers a nonce and reports whether it was new.
 func (s *nonceSet) accept(n [16]byte, at time.Time) bool {
 	g := at.Unix() / int64(fallbackWindow/time.Second)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if g != s.gen {
-		s.gen, s.prev, s.now = g, s.now, map[[16]byte]struct{}{}
+	if d := g - s.gen; d != 0 {
+		if d < 0 || d >= nonceGens {
+			// The clock went backwards, or so long passed that nothing
+			// remembered can still be valid. Start clean either way.
+			for i := range s.gens {
+				s.gens[i] = map[[16]byte]struct{}{}
+			}
+		} else {
+			for ; d > 0; d-- {
+				copy(s.gens[1:], s.gens[:nonceGens-1])
+				s.gens[0] = map[[16]byte]struct{}{}
+			}
+		}
+		s.gen = g
 	}
-	if _, ok := s.now[n]; ok {
-		return false
+	for i := range s.gens {
+		if _, ok := s.gens[i][n]; ok {
+			return false
+		}
 	}
-	if _, ok := s.prev[n]; ok {
-		return false
-	}
-	s.now[n] = struct{}{}
+	s.gens[0][n] = struct{}{}
 	return true
 }
 
@@ -2349,6 +2379,36 @@ func parseSNI(b []byte) string {
 		b = b[3+ln:]
 	}
 	return ""
+}
+
+// publicAddressOf resolves a name a prober asked for and hands back one public
+// address of it, or nil. The address is what gets dialled, rather than the
+// name a second time, so what was checked is what is connected to.
+func publicAddressOf(host string) net.IP {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil && publicIP(ip4) {
+			return ip4
+		}
+	}
+	return nil
+}
+
+// publicIP is "an address the whole internet could have reached by itself":
+// not loopback, not the private ranges, not link local, not the carrier grade
+// block, not multicast.
+func publicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64 {
+		return false // 100.64.0.0/10
+	}
+	return true
 }
 
 // validHostname keeps a forged SNI from turning this server into an open relay
@@ -4109,7 +4169,10 @@ func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64)
 			if !setPacingRate(pc, int(want)) {
 				return // the kernel will not have it; stop asking
 			}
-			if applied == 0 {
+			if applied == 0 && want == paceFloorBps {
+				logging.Info("pacing at its floor of %d Mbit/s; the path has carried %d so far",
+					want*8/1e6, peak*8/1e6)
+			} else if applied == 0 {
 				logging.Info("pacing follows the path: %d Mbit/s, from the %d it carried",
 					want*8/1e6, peak*8/1e6)
 			} else {
@@ -20317,14 +20380,23 @@ v_wiz_port() {
         echo "port $1 already belongs to $who"
         return 1
     fi
-    # A bound port only matters on the side that waits. IRAN dials out, so a
-    # local listener on the same number there is not a conflict, and refusing
-    # it would be a refusal with no action behind it.
-    if [ "$T_SIDE" = kharej ] && wiz_port_bound "$1"; then
+    # A bound port only matters on the side that waits. On the end that dials
+    # a local listener on the same number is not a conflict, and refusing it
+    # would be a refusal with no action behind it.
+    if [ "$T_SIDE" = "$(wiz_waits)" ] && wiz_port_bound "$1"; then
         echo "$T_TRANSPORT/$1 is in use here; see: ss -lnp | grep :$1"
         return 1
     fi
     return 0
+}
+
+# wiz_waits is the side that listens, which is the side a bound port matters
+# on. KHAREJ dials IRAN unless the file says otherwise, and T_DIALS is what
+# the file said when this run started from a pasted token. This read the side
+# directly - "kharej" - from when Iran was the end that dialled, so the check
+# ran on the end with no socket and skipped the end with one.
+wiz_waits() {
+    if [ "${T_DIALS:-kharej}" = iran ]; then printf 'kharej'; else printf 'iran'; fi
 }
 
 # Two characters are refused, and both were found by writing one and reading it
@@ -20569,7 +20641,7 @@ q_port() {
     # so pressing Enter at the prompt handed v_wiz_port a port it was certain
     # to refuse and the question asked itself again for no reason.
     while wiz_port_owner "$def" >/dev/null ||
-        { [ "$T_SIDE" = kharej ] && wiz_port_bound "$def"; }; do
+        { [ "$T_SIDE" = "$(wiz_waits)" ] && wiz_port_bound "$def"; }; do
         def=$((def + 1))
         [ "$def" -gt 8500 ] && break
     done
@@ -20732,12 +20804,13 @@ wiz_review() {
         panel_field "IRAN" "$(addr_text "$T_IRAN")"
     fi
     panel_field "Transport" "$trans"
-    # Which end dials, said out loud, because for a WebSocket tunnel it is
-    # worked out from the addresses rather than chosen - and the one thing a
-    # person should be able to check on this screen is that it came out the
-    # way they meant.
-    local dialer=iran
-    case $T_IRAN in *[a-zA-Z]*) case $T_KHAREJ in *[a-zA-Z]*) ;; *) dialer=kharej ;; esac ;; esac
+    # Which end dials, said out loud, so the one thing a person can check on
+    # this screen is that it came out the way they meant. KHAREJ dials IRAN
+    # unless the file says otherwise - this used to work it out from whether
+    # the Iran address was a name, which was the old core's rule, and went on
+    # printing "IRAN dials out" after the direction had been settled the other
+    # way round.
+    local dialer=${T_DIALS:-kharej}
     local target=$T_KHAREJ
     [ "$dialer" = kharej ] && target=$T_IRAN
     if [ "$T_SIDE" = "$dialer" ]; then
@@ -21008,7 +21081,7 @@ token_decode() {
 wizard_new() {
     local f other
     WIZ_QUIT=0
-    T_SIDE= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
+    T_SIDE= T_DIALS= T_KHAREJ= T_IRAN= T_HERE= T_THERE= T_TRANSPORT= T_PORT= T_OCTET= T_PROFILE= T_HEALTH=
     T_PATH= T_AWG_PORT= T_AWG_IFACE=
     T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
     T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
@@ -21166,6 +21239,10 @@ wizard_paste() {
 
     T_NAME=$(toml_get "$f" tunnel name)
     T_SIDE=$(toml_get "$f" tunnel side)
+    # Which end dials travels with the token, and everything that depends on
+    # it - the port check, the summary - has to see the pasted value and not
+    # the default.
+    T_DIALS=$(toml_get "$f" transport dials)
     T_TRANSPORT=$(toml_get "$f" transport type)
     T_KHAREJ=$(toml_get "$f" transport kharej)
     T_IRAN=$(toml_get "$f" transport iran)
@@ -21238,7 +21315,11 @@ wizard_paste() {
         fix "to fix it, set status.health_port to a free number on both servers"
     fi
 
-    if [ "$T_SIDE" = kharej ] && [ "$T_TRANSPORT" != icmp ]; then
+    # The file is the authority on who waits by now: a pasted token carries
+    # transport.dials with it, and the check has to run on the end that will
+    # actually bind the port.
+    T_DIALS=$(toml_get "$f" transport dials)
+    if [ "$T_SIDE" = "$(wiz_waits)" ] && [ "$T_TRANSPORT" != icmp ] && [ "$T_TRANSPORT" != gre ]; then
         if own=$(wiz_port_owner "$T_PORT"); then
             bad "port $T_PORT already belongs to $own"
             fix "change the port on both servers, and paste again"

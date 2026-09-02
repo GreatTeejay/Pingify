@@ -162,3 +162,51 @@ func TestAForgedServerNameCannotPointAnywhere(t *testing.T) {
 		}
 	}
 }
+
+// A hello made by a clock half a minute ahead is valid for two windows after
+// it is first seen. Its nonce has to be remembered for all of them: with two
+// generations it was forgotten after one, and a recording of that hello,
+// played back a minute later, opened a connection - which is the probe this
+// whole transport exists to survive.
+func TestAReplayedHelloIsRefusedForAsLongAsItIsValid(t *testing.T) {
+	s := newNonceSet()
+	n := [16]byte{1, 2, 3}
+	w := fallbackWindow
+	t0 := time.Unix(1_700_000_000, 0)
+	if !s.accept(n, t0) {
+		t.Fatal("a new nonce was refused")
+	}
+	for _, later := range []time.Duration{0, w, 2 * w} {
+		if s.accept(n, t0.Add(later)) {
+			t.Fatalf("the same nonce was accepted again %v later", later)
+		}
+	}
+	// Three windows on it can no longer be valid, and the set must not grow
+	// for ever: a fresh nonce is fine and the old one is finally forgotten.
+	if !s.accept([16]byte{9}, t0.Add(3*w)) {
+		t.Fatal("a fresh nonce was refused three windows later")
+	}
+	if !s.accept(n, t0.Add(4*w)) {
+		t.Fatal("a nonce from four windows ago is still remembered; the set never forgets")
+	}
+	// A clock that jumps backwards must not leave the set confused either.
+	if !s.accept([16]byte{7}, t0) {
+		t.Fatal("a nonce after a clock jump backwards was refused")
+	}
+}
+
+// What a prober names in the SNI is what this server connects to, so the
+// private ranges - and the machine itself - are never on the table.
+func TestASpliceNeverReachesAPrivateAddress(t *testing.T) {
+	for _, a := range []string{"127.0.0.1", "10.1.2.3", "192.168.1.1", "172.16.0.9",
+		"169.254.169.254", "100.64.0.1", "100.127.255.254", "0.0.0.0", "224.0.0.1"} {
+		if publicIP(net.ParseIP(a)) {
+			t.Errorf("%s was taken for a public address", a)
+		}
+	}
+	for _, a := range []string{"8.8.8.8", "20.70.246.20", "100.128.0.1", "172.32.0.1"} {
+		if !publicIP(net.ParseIP(a)) {
+			t.Errorf("%s was refused as private", a)
+		}
+	}
+}

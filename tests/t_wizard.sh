@@ -209,4 +209,25 @@ check "the next free octet skips what is taken" \
 o=$(free_octet)
 check_rc "and what it offers is genuinely free" 0 test -z "$(wiz_link_owner "$o")"
 
+
+section "a bound port is checked on the end that waits"
+
+# KHAREJ dials IRAN, so the port has to be free on IRAN. The check used to
+# run on kharej - from when Iran was the end that dialled - which was the end
+# with no socket, and skipped the end with one.
+T_DIALS=
+check_contains "by default the end that waits is iran" "$(wiz_waits)" "iran"
+T_DIALS=iran
+check_contains "with transport.dials = iran it is kharej" "$(wiz_waits)" "kharej"
+T_DIALS=
+
+wiz_port_owner() { return 1; }
+wiz_port_bound() { return 0; } # everything is taken, as far as the kernel says
+T_TRANSPORT=tcp
+T_SIDE=iran
+check_rc "on iran, the end that waits, a bound port is refused" 1 v_wiz_port 8443
+T_SIDE=kharej
+check_rc "on kharej, the end that dials, the same port is fine" 0 v_wiz_port 8443
+unset -f wiz_port_owner wiz_port_bound
+
 report
