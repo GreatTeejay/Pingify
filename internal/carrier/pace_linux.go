@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"pingify/internal/config"
 	"pingify/internal/logging"
@@ -45,6 +44,13 @@ import (
 // 253.8 here where 200 throttled us to 181 - so it is offered and not assumed.
 // fq on its own needs no number and cannot be set too low.
 const soMaxPacingRate = 47
+
+// fqFlowFactor turns the profile's queue depth into fq's per-flow limit. The
+// profile is written for one tunnel's queue; fq counts one flow, and the whole
+// tunnel is that one flow. Ten times over is past anything measured here and
+// still a bounded queue - at the balanced profile it is nine thousand packets,
+// about twelve megabytes, which the tunnel never reaches.
+const fqFlowFactor = 10
 
 // egressInterface is the one the default route leaves by, read from the
 // kernel rather than guessed at from a name.
@@ -102,31 +108,31 @@ func smoothTheWire(cfg *config.Config) {
 		logging.Debug("could not read the queue on %s", dev)
 		return
 	}
-	limit := strconv.Itoa(cfg.Tuning.QueuePkts)
+	// The whole tunnel is one flow to fq: a datagram carrier sends every
+	// packet from one address to one address, and ICMP and GRE have no ports
+	// to tell them apart. So flow_limit is not a fairness knob here, it is a
+	// hard cap on the tunnel's own queue, and everything past it is dropped
+	// before it leaves this machine.
+	//
+	// It was the profile's queue depth - nine hundred - and the tunnel was
+	// sitting on it. Counted on the real pair during one transfer: 8799
+	// packets dropped by our own qdisc going out, and 5754 of a download's
+	// "path loss" was this, not the path. With a queue deep enough not to
+	// drop, the same transfer lost 156. The throughput was the same either
+	// way, so the nine hundred was buying nothing and lying about it: the
+	// health check told the operator the path was losing packets that this
+	// machine had thrown away itself.
+	//
+	// The profile still sets how deep, and it is deep enough now that the
+	// tunnel does not hit it.
+	limit := strconv.Itoa(cfg.Tuning.QueuePkts * fqFlowFactor)
 	if strings.Contains(was, "qdisc fq ") && strings.Contains(was, "flow_limit "+limit+"p") {
 		logging.Info("%s already spaces packets the way this wants", dev)
 		return
 	}
 
-	// flow_limit is how many packets one flow may have waiting, and both ends
-	// of the range are wrong. The default of a hundred is the size of the
-	// burst this exists to smooth, so it would drop exactly what we came to
-	// space out. Twenty thousand - which is what this asked for first - is a
-	// quarter of a second of queue at four hundred megabits, and it behaves
-	// like one: when the rate cap sits briefly under what is being offered,
-	// the queue fills and every packet behind it waits.
-	//
-	//	  flow_limit   ping under load   16 streams    one stream
-	//	     20000       102.8 ms         456.4         246.9 Mbit/s
-	//	      2000       104.5            449.9         240.7
-	//	       600        88.9            337.4         247.7
-	//	       200        82.1            232.1          75.8
-	//
-	// Measured once at twenty thousand, with the cap still catching up: p50
-	// 302 ms and a tail at 1174.
-	//
-	// Between the floor and that, it is one straight trade and there is no
-	// setting on it that is free. Restarted fresh at each depth:
+	// What the depth is worth, measured at the profile's own numbers when
+	// this was the flow limit directly and the tunnel was hitting it:
 	//
 	//	  queue    16 streams   one stream   under load
 	//	   600      327.1        193.1        84.6 / 91.5 ms
@@ -134,14 +140,8 @@ func smoothTheWire(cfg *config.Config) {
 	//	  1200      461.6        251.0       104.2 / 127.7
 	//	  1500      451.5        254.3       111.6 / 127.3
 	//
-	// Nine hundred is where the two stop fighting. It carries more than any
-	// other depth measured - more than flagtun on the same path - keeps a
-	// single stream within a few percent of the best it ever manages, and
-	// still answers under load faster than flagtun does. Six hundred buys
-	// fifteen milliseconds more and pays a third of the throughput for them,
-	// which is the wrong side of the trade for a link people watch video over.
-	//
-	// tuning.queue_packets moves it, and the table says what that costs.
+	// tuning.queue_packets still moves it, ten times over, and the profile
+	// still means what that table says about latency against throughput.
 	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", limit}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 		logging.Warn("could not put fq on %s (%v: %s) - packets will leave in bursts"+
@@ -151,144 +151,6 @@ func smoothTheWire(cfg *config.Config) {
 	logging.Info("%s now spaces packets with fq, %s packets deep (%s), so a burst"+
 		" leaves as a stream (this changes the queue for everything on %s)",
 		dev, limit, cfg.Tuning.Profile, dev)
-}
-
-// Choosing the rate without being told it.
-//
-// Half the link speed was the obvious answer and it is not available: every
-// server this runs on is a virtual machine, and virtio_net reports its speed
-// as -1. Both of ours do. A number in the config is no better - nobody can
-// compute what the path between Tehran and Frankfurt will carry, and a wrong
-// one either throttles the tunnel or does nothing.
-//
-// So it is measured. The tunnel knows exactly how many bytes it put on the
-// wire, so once a second it works out the rate, keeps the highest it has ever
-// managed, and holds the cap half again above that.
-//
-// The peak only ever rises, which is what makes this safe: the cap cannot fall
-// below a rate already achieved, so it can never throttle the tunnel to less
-// than it was doing. And it cannot run away either - the peak only grows when
-// the path actually carried more, so on a path that stops at 275 Mbit/s the
-// cap settles at about 410 and stays there.
-//
-// Half again is where the measurements pointed. On this path, which carries
-// about 275, the sweep was flat between 350 and 700:
-//
-//	cap      one stream
-//	200      181.0 Mbit/s   throttled
-//	280      235.0
-//	400      253.8
-//	600      245.3
-//	1000     237.2
-//	none     229.7          bursts get through and the path drops runs
-const (
-	paceHeadroom = 3       // over 2: the cap is one and a half times the peak
-	paceIdleBps  = 1 << 20 // below this a second, nothing is being carried
-	paceLearnFor = 3       // seconds of real traffic before clamping anything
-
-	// No cap below this, whatever the peak says. Measured, and the reason
-	// this constant exists: a tunnel carrying a download is carrying nothing
-	// but acknowledgements in the other direction, and the end sending them
-	// learns its peak from those. Frankfurt, while Tehran uploaded at 452
-	// Mbit/s, logged
-	//
-	//	  pacing follows the path: 21 Mbit/s, from the 14 it carried
-	//
-	// and then the download started, and 21 Mbit/s is what it got: 15.7
-	// measured, against 348 on GRE over the same wire in the same minute. The
-	// cap it had learned from its own silence was now the only thing in the
-	// way, and a cap can only be escaped a second and a half at a time.
-	//
-	// A hundred was tried as the floor first and was still a cap: the same
-	// download came back at 82.9 Mbit/s against 397 with pacing switched off
-	// altogether, because a cap can only be escaped one and a half times a
-	// second and ten seconds is not enough.
-	//
-	// So the floor is four hundred, which is the number this file's own sweep
-	// already pointed at: on a path that carries about 275, a cap of 400 gave
-	// the best single stream it measured, and everything from 350 to 700 was
-	// flat. Below that the cap is doing nothing except waiting to trap a
-	// direction that has been quiet. Above it, the peak still grows the cap
-	// when a path shows it can carry more.
-	paceFloorBps = 400 * 1000 * 1000 / 8
-)
-
-// paceAdaptively keeps the socket's pacing rate a little above the fastest
-// this tunnel has been seen to go.
-//
-// It starts with no cap at all, and that is not an oversight. A cap chosen
-// before anything has been measured is a cap chosen at random, and the first
-// attempt here proved it: starting at a floor of 25 Mbit/s throttled the TCP
-// inside from the first second, so the rate never grew, so the cap never grew.
-// It sat at 23 Mbit/s for three runs in a row. A loop that learns from what it
-// limits has to be allowed to see the thing unlimited first.
-//
-// So it watches for a few seconds, takes the best second it saw, and holds the
-// cap half again above it. The peak only ever rises, which is what makes this
-// safe: the cap can never fall below a rate already achieved, so it cannot
-// throttle the tunnel to less than it was doing. It cannot run away either -
-// the peak only grows when the path actually carried more - so on a path that
-// stops at 275 Mbit/s it settles around 410 and stays there.
-func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64) {
-	tk := time.NewTicker(time.Second)
-	defer tk.Stop()
-	var last, peak, applied uint64
-	var busy int
-	for {
-		select {
-		case <-done:
-			return
-		case <-tk.C:
-			now := sent()
-			rate := now - last
-			last = now
-			if rate < paceIdleBps {
-				continue // idle, and an idle second says nothing about the path
-			}
-			busy++
-
-			// The peak follows what the tunnel is doing now, not the best it
-			// ever did. Sixteen streams push it far above what one stream can
-			// use, and a cap set from that is no cap at all: measured, after a
-			// sixteen-stream run the cap sat at 793 Mbit/s and a single stream
-			// fell back to 228 from the 255 it manages when the cap suits it.
-			//
-			// So a busy second that is slower than the peak lets the peak down
-			// by a sixty-fourth, which halves it in about forty seconds, and it
-			// can never fall below the rate actually being carried. An idle
-			// second does nothing at all - it is not evidence about the path.
-			if rate > peak {
-				peak = rate
-			} else if peak -= peak / 64; rate > peak {
-				peak = rate
-			}
-			if busy < paceLearnFor {
-				continue
-			}
-			want := peak * paceHeadroom / 2
-			if want < paceFloorBps {
-				want = paceFloorBps
-			}
-			// A little hysteresis, so the cap is not rewritten every second
-			// for a percent either way.
-			if applied > 0 && want < applied+applied/16 && want > applied-applied/16 {
-				continue
-			}
-			if !setPacingRate(pc, int(want)) {
-				return // the kernel will not have it; stop asking
-			}
-			if applied == 0 && want == paceFloorBps {
-				logging.Info("pacing at its floor of %d Mbit/s; the path has carried %d so far",
-					want*8/1e6, peak*8/1e6)
-			} else if applied == 0 {
-				logging.Info("pacing follows the path: %d Mbit/s, from the %d it carried",
-					want*8/1e6, peak*8/1e6)
-			} else {
-				logging.Debug("pacing now %d Mbit/s", want*8/1e6)
-			}
-			applied = want
-		}
-	}
 }
 
 // setPacingRate asks the kernel to spread this socket's packets over time, and
@@ -314,19 +176,27 @@ func setPacingRate(pc net.PacketConn, bytesPerSecond int) bool {
 	return ok
 }
 
-// pace spaces this socket's packets out. With a rate in the config that rate
-// is used and nothing changes it; without one, it follows the path. Either way
-// it does nothing at all unless the interface uses fq, which is why
-// smoothTheWire runs first.
+// pace caps this socket's rate, and by default it does not.
+//
+// The cap used to be worked out from what the tunnel had carried, raised and
+// lowered a second at a time. That is gone. Measured against itself on the
+// Tehran to Frankfurt pair, with the interface's queue deep enough not to drop
+// (see smoothTheWire), it lost on every count:
+//
+//	                download   upload   ping p50/p90   path lost
+//	cap applied       342       383       76 / 302        175
+//	no cap            404       393       75 / 225        182
+//
+// More throughput, a better tail, and the same loss - the cap was buying
+// nothing and charging a third of the download for it. fq on its own does the
+// smoothing that mattered, and costs nothing.
+//
+// A number in the config still means what it says.
 func pace(pc net.PacketConn, cfg *config.Config, done <-chan struct{}, sent func() uint64) {
-	if !cfg.Tuning.Pace {
+	if !cfg.Tuning.Pace || !cfg.Tuning.PaceMbitSet {
 		return
 	}
-	if cfg.Tuning.PaceMbitSet {
-		if cfg.Tuning.PaceMbit > 0 && setPacingRate(pc, cfg.Tuning.PaceMbit*1000*1000/8) {
-			logging.Info("packets are paced at %d Mbit/s, as the config asks", cfg.Tuning.PaceMbit)
-		}
-		return
+	if cfg.Tuning.PaceMbit > 0 && setPacingRate(pc, cfg.Tuning.PaceMbit*1000*1000/8) {
+		logging.Info("packets are paced at %d Mbit/s, as the config asks", cfg.Tuning.PaceMbit)
 	}
-	go paceAdaptively(pc, done, sent)
 }
