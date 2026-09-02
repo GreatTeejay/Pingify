@@ -185,6 +185,32 @@ const (
 	paceHeadroom = 3       // over 2: the cap is one and a half times the peak
 	paceIdleBps  = 1 << 20 // below this a second, nothing is being carried
 	paceLearnFor = 3       // seconds of real traffic before clamping anything
+
+	// No cap below this, whatever the peak says. Measured, and the reason
+	// this constant exists: a tunnel carrying a download is carrying nothing
+	// but acknowledgements in the other direction, and the end sending them
+	// learns its peak from those. Frankfurt, while Tehran uploaded at 452
+	// Mbit/s, logged
+	//
+	//	  pacing follows the path: 21 Mbit/s, from the 14 it carried
+	//
+	// and then the download started, and 21 Mbit/s is what it got: 15.7
+	// measured, against 348 on GRE over the same wire in the same minute. The
+	// cap it had learned from its own silence was now the only thing in the
+	// way, and a cap can only be escaped a second and a half at a time.
+	//
+	// A hundred was tried as the floor first and was still a cap: the same
+	// download came back at 82.9 Mbit/s against 397 with pacing switched off
+	// altogether, because a cap can only be escaped one and a half times a
+	// second and ten seconds is not enough.
+	//
+	// So the floor is four hundred, which is the number this file's own sweep
+	// already pointed at: on a path that carries about 275, a cap of 400 gave
+	// the best single stream it measured, and everything from 350 to 700 was
+	// flat. Below that the cap is doing nothing except waiting to trap a
+	// direction that has been quiet. Above it, the peak still grows the cap
+	// when a path shows it can carry more.
+	paceFloorBps = 400 * 1000 * 1000 / 8
 )
 
 // paceAdaptively keeps the socket's pacing rate a little above the fastest
@@ -240,6 +266,9 @@ func paceAdaptively(pc net.PacketConn, done <-chan struct{}, sent func() uint64)
 				continue
 			}
 			want := peak * paceHeadroom / 2
+			if want < paceFloorBps {
+				want = paceFloorBps
+			}
 			// A little hysteresis, so the cap is not rewritten every second
 			// for a percent either way.
 			if applied > 0 && want < applied+applied/16 && want > applied-applied/16 {
