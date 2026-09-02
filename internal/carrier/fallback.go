@@ -228,7 +228,16 @@ func (f *fallback) splice(nc net.Conn, hello []byte, sni string) {
 	if sni == "" {
 		sni = f.sni
 	}
-	up, err := net.DialTimeout("tcp", net.JoinHostPort(sni, "443"), 8*time.Second)
+	// The name was written by whoever is probing, and this server is about
+	// to open a connection to it on their behalf. A public address is what
+	// an SNI proxy does all day; a private one is a way into whatever this
+	// machine can reach and the internet cannot, so those get the same answer
+	// as a bad hello - nothing.
+	ip := publicAddressOf(sni)
+	if ip == nil {
+		return
+	}
+	up, err := net.DialTimeout("tcp", net.JoinHostPort(ip.String(), "443"), 8*time.Second)
 	if err != nil {
 		// There is nothing useful to say to a prober. Closing is what a
 		// server with nothing on that port does.
@@ -259,35 +268,56 @@ func halfClose(c net.Conn) {
 
 // A nonce is good once. Without this, a recording of one valid hello opens a
 // connection here for as long as the window lasts - which is exactly the probe
-// this transport exists to survive.
+// this transport exists to survive: the replay cannot finish the handshake,
+// but it does not need to. It only needs to see this server answer with its
+// own certificate instead of Microsoft's.
+//
+// Three generations, not two. A hello is accepted from a window either side of
+// now, so one made by a clock half a minute ahead is still valid two windows
+// after it was first seen - and with two generations its nonce had been
+// forgotten by then. Recorded, replayed a minute later, accepted.
+const nonceGens = 3
+
 type nonceSet struct {
 	mu   sync.Mutex
 	gen  int64
-	now  map[[16]byte]struct{}
-	prev map[[16]byte]struct{}
+	gens [nonceGens]map[[16]byte]struct{} // [0] is this window, [1] the last, and so on
 }
 
 func newNonceSet() *nonceSet {
-	return &nonceSet{now: map[[16]byte]struct{}{}, prev: map[[16]byte]struct{}{}}
+	s := &nonceSet{}
+	for i := range s.gens {
+		s.gens[i] = map[[16]byte]struct{}{}
+	}
+	return s
 }
 
-// accept remembers a nonce and reports whether it was new. Two generations are
-// kept rather than one, because a hello made in the last window is still valid
-// in this one and its nonce has to still be remembered.
+// accept remembers a nonce and reports whether it was new.
 func (s *nonceSet) accept(n [16]byte, at time.Time) bool {
 	g := at.Unix() / int64(fallbackWindow/time.Second)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if g != s.gen {
-		s.gen, s.prev, s.now = g, s.now, map[[16]byte]struct{}{}
+	if d := g - s.gen; d != 0 {
+		if d < 0 || d >= nonceGens {
+			// The clock went backwards, or so long passed that nothing
+			// remembered can still be valid. Start clean either way.
+			for i := range s.gens {
+				s.gens[i] = map[[16]byte]struct{}{}
+			}
+		} else {
+			for ; d > 0; d-- {
+				copy(s.gens[1:], s.gens[:nonceGens-1])
+				s.gens[0] = map[[16]byte]struct{}{}
+			}
+		}
+		s.gen = g
 	}
-	if _, ok := s.now[n]; ok {
-		return false
+	for i := range s.gens {
+		if _, ok := s.gens[i][n]; ok {
+			return false
+		}
 	}
-	if _, ok := s.prev[n]; ok {
-		return false
-	}
-	s.now[n] = struct{}{}
+	s.gens[0][n] = struct{}{}
 	return true
 }
 
@@ -413,6 +443,36 @@ func parseSNI(b []byte) string {
 		b = b[3+ln:]
 	}
 	return ""
+}
+
+// publicAddressOf resolves a name a prober asked for and hands back one public
+// address of it, or nil. The address is what gets dialled, rather than the
+// name a second time, so what was checked is what is connected to.
+func publicAddressOf(host string) net.IP {
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return nil
+	}
+	for _, ip := range ips {
+		if ip4 := ip.To4(); ip4 != nil && publicIP(ip4) {
+			return ip4
+		}
+	}
+	return nil
+}
+
+// publicIP is "an address the whole internet could have reached by itself":
+// not loopback, not the private ranges, not link local, not the carrier grade
+// block, not multicast.
+func publicIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1]&0xc0 == 64 {
+		return false // 100.64.0.0/10
+	}
+	return true
 }
 
 // validHostname keeps a forged SNI from turning this server into an open relay
