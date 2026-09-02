@@ -23,6 +23,7 @@ const head = `
 side = "iran"
 [transport]
 type = "icmp"
+iran = "198.51.100.7"
 kharej = "203.0.113.9"
 [security]
 token = "a token typed on both servers"
@@ -101,7 +102,52 @@ func TestTheTwoServersDifferByOneLine(t *testing.T) {
 		t.Fatalf("the two ends disagree about who is where: %s/%s against %s/%s",
 			mineIR, theirsIR, mineKH, theirsKH)
 	}
-	if !ir.Dials() || kh.Dials() {
-		t.Fatal("iran dials out and kharej waits; this got it the wrong way round")
+	// A reverse tunnel: the server abroad reaches in, and Iran waits, because
+	// Iran is where the ports are and where users connect.
+	if ir.Dials() || !kh.Dials() {
+		t.Fatal("kharej dials iran and iran waits; this got it the wrong way round")
+	}
+	if kh.DialHost() != "198.51.100.7" {
+		t.Fatalf("kharej dialled %q, not the iran address", kh.DialHost())
+	}
+}
+
+// Every carrier that dials must ask DialHost for the address. tcp.go named
+// cfg.Transport.Kharej directly, so once the direction settled the other way
+// the server abroad reached in by dialling itself.
+//
+// DialHost belongs to the tunnel, not to the side asking: both files work it
+// out the same way, which is what lets the two ends agree on a name without
+// being told one.
+func TestTheDialledAddressIsTheEndThatWaits(t *testing.T) {
+	var hosts []string
+	for _, side := range []string{SideIran, SideKharej} {
+		c := &Config{}
+		if err := parseTOML(head, c); err != nil {
+			t.Fatal(err)
+		}
+		c.Side = side
+		if err := c.check(); err != nil {
+			t.Fatal(err)
+		}
+		if c.DialHost() != c.Transport.Iran {
+			t.Fatalf("the %s file dials %q, not the iran address it waits on",
+				side, c.DialHost())
+		}
+		hosts = append(hosts, c.DialHost())
+	}
+	if hosts[0] != hosts[1] {
+		t.Fatalf("the two files disagree about what is dialled: %q and %q",
+			hosts[0], hosts[1])
+	}
+
+	// And with the switch thrown, the other way round.
+	c := &Config{}
+	if err := parseTOML(head+"", c); err != nil {
+		t.Fatal(err)
+	}
+	c.Transport.Dials = SideIran
+	if c.DialHost() != c.Transport.Kharej {
+		t.Fatalf("dials = iran dialled %q, not the kharej address", c.DialHost())
 	}
 }

@@ -216,25 +216,22 @@ type Config struct {
 // dials the edge. transport.dials says so when that is the arrangement.
 func (c *Config) Dials() bool { return c.Side == c.DialSide() }
 
-// DialSide is worked out from the two addresses rather than asked for.
+// DialSide is which end opens the connection, and it is never asked.
 //
-// Iran dials out, and that is the default because connections into the Iran
-// server are blackholed after about six exchanges - measured, repeatedly.
+// KHAREJ dials IRAN. That is what a reverse tunnel is: the server abroad
+// reaches in, and the Iran server is the one that waits, because the Iran
+// server is the one users connect to and the one that owns the forwarded
+// ports. Both halves belong on the same machine - the ports and the socket
+// that answers them - and this is the half that decides it.
 //
-// The exception is a name. A CDN answers on a name and connects *inward* to
-// the origin it was given, so a name can only ever front the side that waits:
-// if the Iran server is named and the one abroad is an address, then Iran is
-// the origin behind the edge, and the server abroad is the one that dials it.
-// There is nothing to ask - the two addresses already say which it is.
+// transport.dials overrides it, which is there for the path that will not
+// carry a connection inward and for nothing else. Nothing sets it by itself.
 func (c *Config) DialSide() string {
 	switch c.Transport.Dials {
 	case SideIran, SideKharej:
 		return c.Transport.Dials
 	}
-	if isName(c.Transport.Iran) && !isName(c.Transport.Kharej) {
-		return SideKharej
-	}
-	return SideIran
+	return SideKharej
 }
 
 // isName is "this is a domain and not an address", which is the whole of what
@@ -251,9 +248,9 @@ func isName(s string) bool {
 // DialHost is what the side that dials connects to, which is the other
 // server's address - and that address is the domain when somebody typed one.
 //
-// Over AmneziaWG it is neither: the carrier runs inside that link, so the
-// far end is its address on the link and the public addresses are the
-// business of awg-quick rather than of this.
+// Over AmneziaWG it is neither: the carrier runs inside that link, so the far
+// end is its address on the link and the public addresses are the business of
+// awg-quick rather than of this.
 func (c *Config) DialHost() string {
 	if c.Transport.Type == "awg" {
 		if c.DialSide() == SideIran {

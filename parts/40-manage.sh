@@ -392,6 +392,7 @@ screen_advanced() {
         *) item2 7 "Parity" "$(fec_label "$f")" ;;
         esac
         item 8 "Show the config file"
+        item2 9 "Dial direction" "$(dials_label "$f")"
         item 0 "Back"
         blank
         menu_key k || return 0
@@ -454,6 +455,22 @@ screen_advanced() {
             ask v "one parity per (0 off, 4 to 32)" "$(toml_get "$f" tuning fec)" v_fec || continue
             FEC_WANT=$v; cfg_apply "$name" _edit_fec yes; pause ;;
         8) blank; sed 's/^/    /' "$f"; pause ;;
+        9) blank
+            dim "A reverse tunnel has the server abroad reach in, and Iran is"
+            dim "the end that waits, because Iran is where the ports are."
+            blank
+            dim "Some Iranian networks take that connection and then carry"
+            dim "nothing on it. Measured on one server: 0 bit/s inbound on 80,"
+            dim "443, 2053 and 8080, against 713 Mbit/s outward on the same"
+            dim "wire - and 521 Mbit/s back into Iran once the connection was"
+            dim "opened from Iran instead. The traffic still flows inward; it"
+            dim "is only the connection that has to start on the other side."
+            blank
+            dim "Set the same value on both servers."
+            blank
+            local v
+            ask v "which end opens it (kharej or iran)" "$(dials_now "$f")" v_dials || continue
+            DIALS_WANT=$v; cfg_apply "$name" _edit_dials yes; pause ;;
         0 | '') return 0 ;;
         esac
     done
@@ -466,6 +483,31 @@ _edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
 _edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
 _edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
 _edit_fec() { toml_set "$1" tuning fec "$FEC_WANT"; }
+_edit_dials() { toml_set "$1" transport dials "$DIALS_WANT"; }
+
+# Which end opens the connection. Empty means the default, and the default is
+# what a reverse tunnel is: the server abroad reaches in.
+dials_now() {
+    local d
+    d=$(toml_get "$1" transport dials)
+    [ -n "$d" ] || d=kharej
+    printf '%s' "$d"
+}
+
+dials_label() {
+    case $(dials_now "$1") in
+    iran) printf 'iran opens it, outward' ;;
+    *) printf 'kharej reaches in' ;;
+    esac
+}
+
+v_dials() {
+    case $1 in
+    iran | kharej) return 0 ;;
+    esac
+    echo "kharej or iran"
+    return 1
+}
 
 # What the Advanced screen shows beside Parity, which is the setting and what
 # it costs rather than the number on its own.

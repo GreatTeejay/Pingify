@@ -134,11 +134,36 @@ existed precisely so that it would not.
 Not a map swept once per packet. O(1) for a packet that arrives in order,
 which is nearly all of them.
 
-## 14. Iran dials out
+## 14. KHAREJ dials IRAN, and one server would not carry it
 
-Connections *into* the Iran server are blackholed after about six exchanges.
-The side that owns the ports is not the side that dials. Settled; do not
-revisit.
+The tunnel is reverse: IRAN owns the forwarded ports because users connect to
+IRAN, and the server abroad reaches in. That is the arrangement Backhaul and
+the rathole scripts use, and it is the default here.
+
+One server this was tested on carries nothing on a connection opened from
+outside. iperf3, no tunnel involved, four streams:
+
+	  kharej -> iran   tcp/443     0.00 bit/s
+	  kharej -> iran   tcp/80      0.00 bit/s
+	  kharej -> iran   tcp/8080    0.00 bit/s
+	  kharej -> iran   tcp/2053    0.00 bit/s
+	  kharej -> iran   tcp/9911   21.4 Kbit/s
+	  iran   -> kharej            713   Mbit/s
+
+The connections themselves open - all eight carriers came up and fourteen
+packets reached the device - and then the path stops carrying. It is the
+data, not the handshake.
+
+The traffic still has to flow *into* Iran, and it does, at full speed, as long
+as the connection was opened from Iran. Through one TCP tunnel on that path:
+
+	  iran   -> kharej   422 Mbit/s
+	  kharej -> iran     475 Mbit/s   (this is what a user downloads)
+
+So `transport.dials = "iran"` exists for that server and for others like it,
+the Advanced screen offers it as Dial direction, and the check names it when a
+tunnel is heard from and then goes quiet. The default stays what a reverse
+tunnel is.
 
 ## 15. UDP into Iran stops after six packets
 
