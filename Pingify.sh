@@ -2877,6 +2877,12 @@ type framer struct {
 	// packets lost. The path cannot lose one without the connection ending.
 	reliable bool
 
+	// The window is a plain bitmap, and a datagram carrier may now read
+	// from more than one goroutine - see icmpCarrier.Run. One lock, taken
+	// per packet for a few dozen nanoseconds, against a receive path that
+	// was pinned to a single core at 330 Mbit/s.
+	mu sync.Mutex
+
 	badTag, replayed uint64
 }
 
@@ -2888,6 +2894,8 @@ func (f *framer) lost() (missing, late, gaps uint64) {
 	if f.reliable {
 		return 0, 0, 0
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.seen.Lost()
 }
 
@@ -2962,7 +2970,10 @@ func (f *framer) open(b []byte) ([]byte, bool) {
 	if f.reliable {
 		return b[frameLen:], true
 	}
-	if !f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen])) {
+	f.mu.Lock()
+	fresh := f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen]))
+	f.mu.Unlock()
+	if !fresh {
 		atomic.AddUint64(&f.replayed, 1)
 		return nil, false
 	}
@@ -3409,6 +3420,7 @@ type icmpCarrier struct {
 
 	batched bool
 	burst   int
+	readers int // goroutines reading the socket, one per core up to four
 
 	// Whether the kernel handed us the IP header. It does on a raw socket, and
 	// Go takes it off again in ReadFromIP but not in recvmmsg - so it is looked
@@ -3471,8 +3483,9 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 	if canBatch {
 		if rc, err := pc.SyscallConn(); err == nil {
 			c.rc, c.batched = rc, true
-			logging.Info("packet i/o: up to %d in and %d out per crossing into the kernel",
-				recvBatch, sendBatch)
+			c.readers = readerCount()
+			logging.Info("packet i/o: up to %d in and %d out per crossing into the kernel, %d reading",
+				recvBatch, sendBatch, c.readers)
 		} else {
 			logging.Warn("no raw access to the socket (%v): one call per packet", err)
 		}
@@ -3601,7 +3614,26 @@ func (s *plainSender) Send(bps []*[]byte) {
 
 func (c *icmpCarrier) Run() {
 	if c.batched {
-		c.runBatched()
+		// One reader per core, up to four, on the one socket. recvmmsg
+		// hands each caller its own datagrams, so nothing is read twice, and
+		// what each one does after - the tag, the window, the write into the
+		// device - runs on its own core.
+		//
+		// Measured with one reader on the two core server abroad: 94% of a
+		// core, 330 Mbit/s over sixteen streams, and the kernel dropping
+		// eleven percent of what arrived on the socket because the reader
+		// could not take it off fast enough. A bigger socket buffer moved
+		// the queue rather than draining it: no drops, the same rate, and
+		// fifty milliseconds more on the tail. The reader was the limit.
+		var wg sync.WaitGroup
+		for i := 0; i < c.readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c.runBatched()
+			}()
+		}
+		wg.Wait()
 		return
 	}
 	c.runPlain()
@@ -4688,6 +4720,31 @@ func (c *rawTCPCarrier) Counters() (rx, tx, bad, replay, errs uint64) {
 	return atomic.LoadUint64(&c.rxBytes), atomic.LoadUint64(&c.txBytes),
 		bad + atomic.LoadUint64(&c.notOurs), replay,
 		atomic.LoadUint64(&c.sendErrs)
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/readers.go" <<'PINGIFY_GO_SOURCE_EOF'
+package carrier
+
+import "runtime"
+
+// readerCount is how many goroutines read a datagram socket: one per core,
+// and never more than four.
+//
+// One was the number, and on a two core server it was the ceiling: the
+// reader alone at 94% of a core, sixteen streams stopping at 330 Mbit/s, and
+// the kernel dropping a tenth of what reached the socket because it was not
+// being taken off. A single core server gets one reader still - there is
+// nothing to be gained by two goroutines sharing one core - and above four
+// the lock on the replay window would be the thing they queue for instead.
+func readerCount() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	if n > 4 {
+		return 4
+	}
+	return n
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/sockopt_linux.go" <<'PINGIFY_GO_SOURCE_EOF'

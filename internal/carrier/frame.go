@@ -58,6 +58,12 @@ type framer struct {
 	// packets lost. The path cannot lose one without the connection ending.
 	reliable bool
 
+	// The window is a plain bitmap, and a datagram carrier may now read
+	// from more than one goroutine - see icmpCarrier.Run. One lock, taken
+	// per packet for a few dozen nanoseconds, against a receive path that
+	// was pinned to a single core at 330 Mbit/s.
+	mu sync.Mutex
+
 	badTag, replayed uint64
 }
 
@@ -69,6 +75,8 @@ func (f *framer) lost() (missing, late, gaps uint64) {
 	if f.reliable {
 		return 0, 0, 0
 	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.seen.Lost()
 }
 
@@ -143,7 +151,10 @@ func (f *framer) open(b []byte) ([]byte, bool) {
 	if f.reliable {
 		return b[frameLen:], true
 	}
-	if !f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen])) {
+	f.mu.Lock()
+	fresh := f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen]))
+	f.mu.Unlock()
+	if !fresh {
 		atomic.AddUint64(&f.replayed, 1)
 		return nil, false
 	}
