@@ -95,12 +95,28 @@ func configureDevice(name, addr string, mtu int) error {
 	//	     500          47, 1167, 2320         116, 116, 98 Mbit/s
 	//	   10000              0, 0, 0            117, 140, 137 Mbit/s
 	//
-	// Ten thousand is not a deep queue in time. At four hundred megabits it is
-	// about thirty milliseconds, and it only ever fills when the reader is
-	// behind - which, unlike a queue on the wire, is a burst rather than a
-	// standing backlog.
+	// So it was ten thousand, with a note saying that was "about thirty
+	// milliseconds" at four hundred megabits. The arithmetic was wrong: ten
+	// thousand packets of 1320 bytes is 105 megabits, which at four hundred
+	// megabits a second is 264 milliseconds, and it was not a burst that
+	// drained - it was a standing backlog with every reply queued behind it.
+	// It was the whole of this tunnel's latency under load. Measured on the
+	// Tehran to Frankfurt pair, eight streams downloading, the round trip
+	// taken through the tunnel while it ran:
+	//
+	//	  txqueuelen    download        p50 / p90
+	//	   10000        409 Mbit/s      75 / 234 ms
+	//	    2000        357             76 / 119
+	//	    1000        409             75 / 109
+	//	     500        378             75 /  84
+	//
+	// A thousand carries exactly what ten thousand carried and answers in
+	// less than half the time; one stream on its own went up rather than
+	// down, 381 to 432. The device drops more - that is the point of a queue
+	// with an end to it, and the TCP inside reads a drop as the signal it is
+	// for, which is what keeps the queue short.
 	if err := run("link", "set", "dev", name, "mtu", fmt.Sprint(mtu),
-		"txqueuelen", "10000", "up"); err != nil {
+		"txqueuelen", "1000", "up"); err != nil {
 		return err
 	}
 	return run("addr", "add", addr, "dev", name)
