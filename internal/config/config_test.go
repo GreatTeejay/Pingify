@@ -47,6 +47,30 @@ func TestEachProfileMovesTheQueue(t *testing.T) {
 	}
 }
 
+func TestOnlyTheDownloadProfileKeepsADeepReceiveQueue(t *testing.T) {
+	// Three megabytes on the receiving socket is fifty milliseconds at the
+	// rate this carries, and everything arriving waits behind it. That is the
+	// trade the download profile exists to make and the other two do not.
+	for _, c := range []struct {
+		profile string
+		rcv     int
+	}{{"gaming", 256}, {"balanced", 256}, {"download", 3072}} {
+		got := load(t, "[tuning]\nprofile = \""+c.profile+"\"\n")
+		if got.Tuning.RcvBufKB != c.rcv {
+			t.Errorf("%s asked for %d KB of receive queue, got %d",
+				c.profile, c.rcv, got.Tuning.RcvBufKB)
+		}
+	}
+}
+
+func TestAReceiveQueueOfYourOwnBeatsTheProfile(t *testing.T) {
+	got := load(t, "[tuning]\nprofile = \"gaming\"\nrcvbuf_kb = 2048\n")
+	if got.Tuning.RcvBufKB != 2048 {
+		t.Fatalf("an explicit receive queue was overruled by the profile: got %d",
+			got.Tuning.RcvBufKB)
+	}
+}
+
 func TestSayingNothingIsBalanced(t *testing.T) {
 	got := load(t, "")
 	if got.Tuning.Profile != ProfileBalanced || got.Tuning.QueuePkts != 900 {
