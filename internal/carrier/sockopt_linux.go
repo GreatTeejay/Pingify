@@ -5,6 +5,7 @@ package carrier
 import (
 	"net"
 	"syscall"
+	"time"
 
 	"pingify/internal/config"
 	"pingify/internal/logging"
@@ -103,4 +104,20 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {
 			" raise net.core.rmem_max, or packets will be dropped before we see them",
 			rcv/1024, gotRcv/1024)
 	}
+}
+
+// setUserTimeout is TCP_USER_TIMEOUT: how long transmitted data may go
+// unacknowledged before the kernel gives the connection up with an error,
+// instead of retransmitting into a route that has stopped answering for as
+// long as it otherwise would - which is about fifteen minutes.
+func setUserTimeout(tc *net.TCPConn, d time.Duration) {
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	const tcpUserTimeout = 18 // TCP_USER_TIMEOUT, in milliseconds
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeout,
+			int(d/time.Millisecond))
+	})
 }

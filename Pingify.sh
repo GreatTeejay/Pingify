@@ -4676,6 +4676,7 @@ package carrier
 import (
 	"net"
 	"syscall"
+	"time"
 
 	"pingify/internal/config"
 	"pingify/internal/logging"
@@ -4775,6 +4776,22 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {
 			rcv/1024, gotRcv/1024)
 	}
 }
+
+// setUserTimeout is TCP_USER_TIMEOUT: how long transmitted data may go
+// unacknowledged before the kernel gives the connection up with an error,
+// instead of retransmitting into a route that has stopped answering for as
+// long as it otherwise would - which is about fifteen minutes.
+func setUserTimeout(tc *net.TCPConn, d time.Duration) {
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	const tcpUserTimeout = 18 // TCP_USER_TIMEOUT, in milliseconds
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeout,
+			int(d/time.Millisecond))
+	})
+}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/sockopt_other.go" <<'PINGIFY_GO_SOURCE_EOF'
 //go:build !linux
@@ -4783,6 +4800,7 @@ package carrier
 
 import (
 	"net"
+	"time"
 
 	"pingify/internal/config"
 )
@@ -4794,6 +4812,8 @@ import (
 func tuneSocket(pc net.PacketConn, cfg *config.Config) {}
 
 func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
+
+func setUserTimeout(tc *net.TCPConn, d time.Duration) {}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/stream.go" <<'PINGIFY_GO_SOURCE_EOF'
 package carrier
@@ -4839,7 +4859,61 @@ const (
 	streamRedialMin = 500 * time.Millisecond
 	streamRedialMax = 8 * time.Second
 	streamDialWait  = 15 * time.Second
+
+	// How long the side that waits gives a new connection to say something
+	// it can check. A dialler of this version says so at once; one of the
+	// version before says nothing until it has a packet or a keepalive to
+	// send, and the keepalive is ten seconds by default. Thirty covers that.
+	streamHelloWait = 30 * time.Second
+
+	// How long a connection may go without the far end acknowledging what
+	// was sent on it before the kernel gives it up. The default is about
+	// fifteen minutes, and a connection the route has quietly stopped
+	// carrying holds its slot for the whole of that.
+	streamUserTimeout = 20 * time.Second
+
+	helloLen = 4
 )
+
+// The first frame a dialler sends says which slot it is filling.
+//
+// It is there because of what happened without it, watched on the abroad
+// server on 2026-09-04 while eight streams downloaded through eight
+// connections. Something at 66.132.195.49 connected to the carrier port -
+// port scanners do, several times an hour on any public address - and was
+// given a slot the moment the TCP handshake finished, before it had sent a
+// byte. Every slot was full, so the oldest live connection to Iran was closed
+// to make room. Iran redialled; the redial arrived at a table with no free
+// slot, because the scanner's socket was still sitting in one; so the next
+// live connection was closed for it. Within eight seconds the log read
+//
+//	connection 1 from 66.132.195.49:53916
+//	connection 2 from 66.132.195.49:53918
+//	18245 bytes announced on the stream, which is not one of ours
+//	connection 0 from 185.31.8.129:36106   ... 36112 ... 36132 ... 36122
+//
+// and the tunnel carried nothing until the storm happened to settle. That was
+// the collapse to zero under load: not the load, and not the number eight -
+// a scan landing while every slot was in use.
+//
+// So now a connection has no slot until its first frame opens with our tag,
+// and that frame names the slot. A scanner never gets one. A redial replaces
+// exactly the connection it is replacing, and never a neighbour that was
+// carrying traffic. The body is four bytes, which a core of the version before
+// takes for a datagram too short to be anything and drops without comment.
+var helloMark = [2]byte{0xA5, 0x5A}
+
+func helloOf(slot int) []byte {
+	return []byte{helloMark[0], helloMark[1], byte(slot >> 8), byte(slot)}
+}
+
+// helloSlot says whether a payload is a hello, and which slot it names.
+func helloSlot(b []byte) (int, bool) {
+	if len(b) != helloLen || b[0] != helloMark[0] || b[1] != helloMark[1] {
+		return 0, false
+	}
+	return int(b[2])<<8 | int(b[3]), true
+}
 
 // framing is how whole datagrams are marked out on a stream. One per
 // connection, because a WebSocket client keeps a mask key per connection.
@@ -4961,6 +5035,13 @@ func prepStream(c net.Conn) {
 	_ = tc.SetNoDelay(true)
 	_ = tc.SetKeepAlive(true)
 	_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	// A connection the route has stopped carrying looks, from here, like one
+	// that is merely slow: the writes go into the kernel and nothing comes
+	// back. Left alone the kernel keeps trying for a quarter of an hour, and
+	// on the side that waits the dead connection holds its slot for all of
+	// it. Twenty seconds without an acknowledgement is long past anything
+	// this path does when it is working.
+	setUserTimeout(tc, streamUserTimeout)
 }
 
 func (c *streamCarrier) Headroom() int   { return c.head + c.fr.headroom() }
@@ -5139,6 +5220,14 @@ func (c *streamCarrier) dialForever(slot int) {
 		wait = streamRedialMin
 
 		l := &streamLink{c: nc, fm: fm, seq: uint64(slot)}
+		// Say which slot this is before anything else can be written on it:
+		// the link is not in the table yet, so nothing else can be.
+		bp := buf.Take(c.Headroom(), helloLen)
+		copy((*bp)[c.Headroom():], helloOf(slot))
+		if err := c.sendOn(l, bp); err != nil {
+			_ = nc.Close()
+			continue
+		}
 		c.links[slot].Store(l)
 		if slot == 0 {
 			logging.Info("carrier: connected over %s", c.kind)
@@ -5186,22 +5275,49 @@ func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 		_ = nc.Close()
 		return
 	}
+	// Nothing has a slot until it has sent one frame that opens with our
+	// tag. See helloMark for what handing slots out any earlier cost.
+	r := bufio.NewReaderSize(up, 256*1024)
+	body := make([]byte, streamMaxFrame)
+	_ = nc.SetDeadline(time.Now().Add(streamHelloWait))
+	n, err := fm.next(r, body)
+	if err != nil {
+		logging.Debug("carrier: %s said nothing we could check: %v", nc.RemoteAddr(), err)
+		_ = up.Close()
+		return
+	}
 	_ = nc.SetDeadline(time.Time{})
+	first, ok := c.fr.open(body[:n])
+	if !ok {
+		logging.Debug("carrier: %s did not authenticate; no slot for it", nc.RemoteAddr())
+		_ = up.Close()
+		return
+	}
 
 	l := &streamLink{c: up, fm: fm, seq: seq}
-	slot := -1
-	for i := range c.links {
-		if c.links[i].Load() == nil {
-			slot = i
-			break
-		}
+	slot, named := helloSlot(first)
+	if named && slot >= len(c.links) {
+		logging.Debug("carrier: %s asked for slot %d of %d", nc.RemoteAddr(), slot, len(c.links))
+		named = false
 	}
-	if slot < 0 {
-		oldest := ^uint64(0)
-		slot = 0
+	if !named {
+		// A dialler of the version before, which never says. First free
+		// slot, else the oldest - which can only ever cost a connection of
+		// its own kind now, and never a scanner's.
+		slot = -1
 		for i := range c.links {
-			if p := c.links[i].Load(); p != nil && p.seq < oldest {
-				oldest, slot = p.seq, i
+			if c.links[i].Load() == nil {
+				slot = i
+				break
+			}
+		}
+		if slot < 0 {
+			oldest := ^uint64(0)
+			slot = 0
+			for i := range c.links {
+				if p := c.links[i].Load(); p != nil && p.seq < oldest {
+					oldest, slot = p.seq, i
+				}
 			}
 		}
 	}
@@ -5212,8 +5328,11 @@ func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 		logging.Info("carrier: the far end is at %s", nc.RemoteAddr())
 	}
 	logging.Debug("carrier: connection %d from %s", slot, nc.RemoteAddr())
+	if !named {
+		c.handle(body[:n]) // it was a real frame, and it is not to be lost
+	}
 
-	c.read(l)
+	c.readFrom(l, r, body)
 	c.links[slot].CompareAndSwap(l, nil)
 	_ = up.Close()
 }
@@ -5224,9 +5343,12 @@ func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 // length would be its own read syscall, which on a four hundred megabit
 // stream is a syscall for every eight hundred bytes carried.
 func (c *streamCarrier) read(l *streamLink) {
-	r := bufio.NewReaderSize(l.c, 256*1024)
-	body := make([]byte, streamMaxFrame)
+	c.readFrom(l, bufio.NewReaderSize(l.c, 256*1024), make([]byte, streamMaxFrame))
+}
 
+// readFrom is read with the reader handed in, for the side that has already
+// taken one frame off it and must not lose what the reader buffered after.
+func (c *streamCarrier) readFrom(l *streamLink, r *bufio.Reader, body []byte) {
 	for {
 		n, err := l.fm.next(r, body)
 		if err != nil {
@@ -5258,6 +5380,9 @@ func (c *streamCarrier) handle(b []byte) {
 	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
 	if len(body) == 0 {
 		return // a keepalive, which has done its whole job by arriving
+	}
+	if _, isHello := helloSlot(body); isHello {
+		return // a slot announcement, which take has already acted on
 	}
 	if f := c.onPacket.Load(); f != nil {
 		(*f)(body)
