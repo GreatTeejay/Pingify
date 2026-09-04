@@ -21,7 +21,8 @@
 # manager took the eighth field of an English sentence and broke the day
 # somebody improved the sentence.
 # The queue depth beside the profile's name. "balanced" on its own does not
-# say what it does, and the depth is the whole of what a profile changes.
+# say what it does; the depth is the half of what a profile changes that a
+# person can picture (the other half is the receiving socket's queue).
 prof_queue_note() {
     local f=$1 q
     q=$(toml_get "$f" tuning queue_packets)

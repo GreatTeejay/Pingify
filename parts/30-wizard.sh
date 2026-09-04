@@ -440,13 +440,27 @@ q_addresses() {
 
     wiz_ask "Servers"
     blank
-    # A name rather than an address is the whole of the CDN arrangement, and
-    # it is one word rather than a question: an edge answers on the name and
-    # connects inward to the origin behind it, which is the Iran server, which
-    # is the end that waits. Naming it is all that is needed - which end dials
-    # was never in question.
-    dim "The public IP of each server. A domain instead of IRAN's IP means a CDN"
-    dim "sits in front of it."
+    # What is said here follows the transport chosen a step ago. A name rather
+    # than an address is the whole of the CDN arrangement and it belongs to WS
+    # and WSS alone: an edge answers on the name and connects inward to the
+    # origin behind it, which is the Iran server, which is the end that waits.
+    # Naming it is all that is needed - which end dials was never in question.
+    # For the two transports with no port there is nothing to open anywhere,
+    # and saying so here is what stops the firewall question being asked of
+    # the wrong person later.
+    case $T_TRANSPORT in
+    ws | wss)
+        dim "The public IP of each server. A domain instead of IRAN's IP puts a CDN"
+        dim "in front of it: the edge answers on the name and connects in to IRAN."
+        ;;
+    icmp | gre)
+        dim "The public IP of each server. This transport has no port, so there is"
+        dim "nothing to open on either firewall."
+        ;;
+    *)
+        dim "The public IP of each server."
+        ;;
+    esac
     blank
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
 
@@ -496,12 +510,12 @@ q_transport() {
     group "TCP TUNNEL   port forwarding, no device"
     item "1" "TCP" "plain TCP on one port"
     item "2" "WS" "WebSocket - HTTP, so a CDN can front it"
-    item "3" "WSS" "WebSocket over TLS - a domain, or Cloudflare"
-    item "4" "TCP UTLS" "TLS with Chrome's fingerprint"
+    item "3" "WSS" "WebSocket over TLS - behind Cloudflare, the fastest measured"
+    item "4" "TCP UTLS" "TLS with Chrome's fingerprint - the pick for a direct pair"
     item "5" "TLS FALLBACK" "TCP UTLS, and a real website to any probe"
     blank
     group "[TUN] LINK   a private network between the servers"
-    item "6" "[TUN] ICMP" "inside echo requests - no port"
+    item "6" "[TUN] ICMP" "inside echo requests - no port; where TCP is shaped"
     item "7" "[TUN] GRE" "IP protocol 47 - no port"
     item "8" "[TUN] UDP" "plain UDP on one port"
     item "9" "[TUN] Raw TCP" "TCP segments without a handshake"
@@ -511,8 +525,12 @@ q_transport() {
     dim "Chrome's. TLS FALLBACK also hides from one that connects: without"
     dim "the token it is handed a real website, certificate and all."
     blank
-    dim "Tehran to Frankfurt, 16 streams:  WS 447  TCP 372  ICMP 371  GRE 303"
-    dim "UDP and AmneziaWG do not work from Iran: inbound UDP stops at 6 packets."
+    dim "Tehran to Frankfurt, one connection, down/up, on a wire that carries 746/694:"
+    dim "UTLS 732/654   WSS via Cloudflare 824/759   TCP 594/671   FALLBACK 598/679"
+    dim "ICMP 516/393   GRE 515/401   Raw TCP 532/364"
+    dim "UDP does not work from Iran - inbound UDP stops at 6 packets - and"
+    dim "AmneziaWG rides on UDP. ICMP depends on the route: 516 to Frankfurt,"
+    dim "nothing at all to Istanbul. The health check says which yours is."
     blank
     pick n "select" 1 10 || return 1
     case $n in
@@ -709,20 +727,23 @@ fwd_toml_list() {
     done
 }
 
-# The screen that justifies the tool. Every number here was measured on the
-# real path, restarted fresh at each queue depth, and the profile moves exactly
-# one setting - tuning.queue_packets. Showing a bare number instead of what it
-# buys is how the old tuning menu came to be scrolled past.
+# A profile moves two things, and both are queues: how deep the tunnel's own
+# queue may get, and how much the receiving socket may hold. Deeper carries
+# more when many streams run at once and answers slower while they do; the
+# download profile keeps the deep receive queue and the other two do not.
+# Measured on the real path the three sit close together, which is said here
+# so that nobody picks one expecting a different tunnel.
 q_profile() {
     local n
     wiz_ask "Profile"
     blank
-    item "1" "Gaming" "600 packets - a small one waits behind less"
-    item "2" "Balanced" "900 packets - the one to pick if unsure"
-    item "3" "Download" "1500 packets - most on a long transfer"
+    item "1" "Gaming" "shallow queues - a small packet waits behind the least"
+    item "2" "Balanced" "the one to pick if unsure"
+    item "3" "Download" "deep receive queue - most when many streams pull at once"
     blank
-    dim "How many packets may wait in the tunnel's queue. Changeable later, on"
-    dim "either server, without rebuilding anything."
+    dim "How much may wait in the tunnel's queues. Measured on the real path the"
+    dim "three are close; balanced is right for nearly everyone. Changeable later,"
+    dim "on either server, without rebuilding anything."
     blank
     pick n "select" 2 3 || return 1
     case $n in
@@ -1113,6 +1134,14 @@ wizard_new() {
         return $?
     fi
     blank
+    # The transport before the servers. What the servers screen asks depends
+    # on it - a domain is an answer for WS and WSS and nothing else, and ICMP
+    # and GRE have no port to open - and the path a WebSocket carrier uses is
+    # made from the transport, which was empty when this ran the other way
+    # round. It is also the order a person thinks in: what kind of tunnel,
+    # then between which two machines.
+    q_transport || return 1
+    blank
     q_addresses || return 1
 
     # Which of the two answers is which key. The file names both ends, and it
@@ -1126,8 +1155,6 @@ wizard_new() {
         T_IRAN=$T_THERE
     fi
 
-    blank
-    q_transport || return 1
     blank
     q_port || return 1
     blank
