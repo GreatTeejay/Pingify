@@ -162,6 +162,12 @@ type Config struct {
 		Kharej string
 		MTU    int
 		Queues int // 0 means choose one
+
+		// How many goroutines put arriving packets into the device. Zero
+		// means one per core; a negative number means the goroutine that
+		// read the packet off the socket carries it there itself, which is
+		// what this did before there was a choice.
+		WriteWorkers int
 	}
 
 	Level string
@@ -462,6 +468,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.TUN.Kharej, err = str()
 	case "tun.mtu":
 		c.TUN.MTU, err = num()
+	case "tun.write_workers":
+		c.TUN.WriteWorkers, err = num()
 	case "tun.queues":
 		c.TUN.Queues, err = num()
 
@@ -750,6 +758,9 @@ func (c *Config) check() error {
 	}
 	if c.TUN.MTU < 576 || c.TUN.MTU > 9000 {
 		return fmt.Errorf("tun.mtu %d is outside anything that works", c.TUN.MTU)
+	}
+	if c.TUN.WriteWorkers < -1 || c.TUN.WriteWorkers > 8 {
+		return fmt.Errorf("tun.write_workers %d is outside -1..8", c.TUN.WriteWorkers)
 	}
 	if c.TUN.Queues < 0 || c.TUN.Queues > 16 {
 		return fmt.Errorf("tun.queues %d is not a number of queues", c.TUN.Queues)

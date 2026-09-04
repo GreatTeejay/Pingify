@@ -3,6 +3,7 @@ package link
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -42,6 +43,10 @@ type Link struct {
 	short            uint64
 
 	burst int // how many packets may go on the wire in one crossing
+
+	// Where a packet off the wire goes on its way to the device, when the
+	// goroutine that read it does not carry it there itself. See writeQueue.
+	writers []chan *[]byte
 }
 
 func New(cfg *config.Config, car carrier.Carrier) (*Link, error) {
@@ -74,6 +79,7 @@ func New(cfg *config.Config, car carrier.Carrier) (*Link, error) {
 // start puts the link to work: one reader per queue taking packets to the
 // wire, and the carrier bringing them back the other way.
 func (l *Link) Start() {
+	l.startWriters()
 	l.car.OnPacket(l.fromWire)
 	for i := range l.dev {
 		l.wg.Add(1)
@@ -81,6 +87,64 @@ func (l *Link) Start() {
 			defer l.wg.Done()
 			l.readQueue(f, q)
 		}(l.dev[i], i)
+	}
+}
+
+// startWriters puts the write into the device on its own goroutines, if the
+// config asked for that.
+//
+// The goroutine that takes a datagram off the socket used to carry it all the
+// way into the device, and the device write is a system call: while it is in
+// one, it is not reading the socket. A batch of a hundred and twenty eight
+// datagrams is a hundred and twenty eight of them in a row, and what arrives
+// meanwhile goes into the socket's queue - which is where this tunnel's
+// packets were being lost, tens of thousands in a transfer, at every buffer
+// size tried.
+//
+// So the read and the write are separated: the reader hands the packet over
+// and goes back to the socket, and a writer goroutine puts it in the device.
+// The handover is per flow, by the same hash the device queues use, because
+// two goroutines writing one flow would deliver it out of order and the TCP
+// inside reads that as loss.
+//
+// A queue that is full is a packet dropped here rather than by the kernel,
+// which is the same signal arriving in the same place, counted honestly.
+func (l *Link) startWriters() {
+	n := l.cfg.TUN.WriteWorkers
+	if n == 0 {
+		n = defaultWriteWorkers()
+	}
+	if n < 0 {
+		return // tun.write_workers = -1, the old behaviour, for comparing
+	}
+	depth := writeQueueDepth
+	l.writers = make([]chan *[]byte, n)
+	for i := range l.writers {
+		l.writers[i] = make(chan *[]byte, depth)
+		l.wg.Add(1)
+		go func(q chan *[]byte) {
+			defer l.wg.Done()
+			l.writeQueue(q)
+		}(l.writers[i])
+	}
+	logging.Info("%s: %d goroutines put packets into the device, %d deep,"+
+		" so reading the wire never waits on a device write", l.name, n, depth)
+}
+
+// writeQueueDepth is how many packets may wait for one writer: one batch of
+// the largest recvmmsg takes, so a reader emptying the socket in one call
+// never has to wait, and no deeper, because a queue here is latency here.
+const writeQueueDepth = 128
+
+func (l *Link) writeQueue(q chan *[]byte) {
+	for {
+		select {
+		case bp := <-q:
+			l.toDevice1(*bp)
+			buf.Put(bp)
+		case <-l.closing:
+			return
+		}
 	}
 }
 
@@ -147,15 +211,36 @@ func (l *Link) readQueue(f *os.File, q int) {
 	}
 }
 
-// fromWire writes one packet that arrived on the carrier to the device.
+// fromWire takes one packet that arrived on the carrier to the device, either
+// itself or by handing it to a writer - see startWriters.
 //
-// It runs on the goroutine that read the datagram off the socket, and writes
-// from there. See udpCarrier.run for why there is nothing in between.
+// It runs on the goroutine that read the datagram off the socket. See
+// udpCarrier.run for why there is nothing in between.
 func (l *Link) fromWire(b []byte) {
 	if len(b) < 20 {
 		atomic.AddUint64(&l.short, 1)
 		return
 	}
+	if len(l.writers) == 0 {
+		l.toDevice1(b)
+		return
+	}
+	// The buffer belongs to the reader and is reused the moment this returns,
+	// so what is handed over is a copy.
+	q := l.writers[flowHash(b)%uint32(len(l.writers))]
+	bp := buf.Take(0, len(b))
+	*bp = (*bp)[:len(b)]
+	copy(*bp, b)
+	select {
+	case q <- bp:
+	default:
+		buf.Put(bp)
+		atomic.AddUint64(&l.dropped, 1)
+	}
+}
+
+// toDevice1 puts one packet into the device.
+func (l *Link) toDevice1(b []byte) {
 	f := l.dev[flowHash(b)%uint32(len(l.dev))]
 	if _, err := f.Write(b); err != nil {
 		select {
@@ -201,6 +286,45 @@ func flowHash(p []byte) uint32 {
 // defaultQueues is how many device queues to open when the config does not
 // say. See the note on reordering in readQueue for why more is not better.
 func defaultQueues() int { return 1 }
+
+// defaultWriteWorkers is one per core, up to four - the same rule the carrier
+// uses for how many goroutines read the socket, and for the same reason: a
+// writer is what a reader hands to, so one each means no reader ever waits.
+//
+// It is the machine's number and not a profile's, because the two ends of one
+// tunnel are usually not the same machine. Measured on the Tehran to Frankfurt
+// pair, four rounds at each setting, every end set the same:
+//
+//	writers   download   upload   one stream down   p90 down / up   socket lost
+//	   0        457        412        569 Mbit/s      106 / 94        5500
+//	   1        572        388        578             108 / 82         160
+//	   2        532        438        595             107 / 103        830
+//
+// One is best where the download arrives, which is the Iran server with one
+// core; two is best where the upload arrives, which is Frankfurt with two.
+// Both are the receiving end, and each wanted as many writers as it has cores,
+// which is what this returns.
+//
+// Against flagtun's ICMP with that rule in place, both tunnels up at once on
+// the same wire, six interleaved rounds, medians:
+//
+//	           download   one stream   upload   p90 under download / upload
+//	pingify      528         614         436         106 / 89 ms
+//	flagtun      563         523         436         124 / 106
+//
+// Before this the same six rounds were 467, 566, 388, 110/93 - so it is worth
+// sixty megabits on the download, fifty on a single stream, and the whole of
+// what the upload was behind by.
+func defaultWriteWorkers() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	if n > 4 {
+		return 4
+	}
+	return n
+}
 
 // Dropped is how many packets the link could not put on the wire, and Packets
 // is how many crossed it each way. The three of them are what a report is made
