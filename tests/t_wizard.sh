@@ -40,7 +40,7 @@ if [ -z "$CORE" ]; then
     skip "the wizard end to end" "no core could be built"
 else
     # 8 is [TUN] UDP: the link kind, with the address pair the octet derives.
-    out=$(answers 1 185.31.8.129 46.247.109.83 8 8443 99 2 y | wizard_new 2>&1)
+    out=$(answers 1 8 185.31.8.129 46.247.109.83 8443 99 2 y | wizard_new 2>&1)
     rc=$?
     check "the wizard finished" "$rc" "0"
 
@@ -253,7 +253,7 @@ section "a TCP tunnel: ports instead of a link"
 if [ -z "$CORE" ]; then
     skip "the forward wizard end to end" "no core could be built"
 else
-    out=$(answers 1 185.31.8.129 46.247.109.83 1 8443 "443,udp:500" 2 y | wizard_new 2>&1)
+    out=$(answers 1 1 185.31.8.129 46.247.109.83 8443 "443,udp:500" 2 y | wizard_new 2>&1)
     check "the wizard finished" "$?" "0"
     f=$CFG_DIR/iran-tcp-8443.toml
     if [ ! -f "$f" ]; then
