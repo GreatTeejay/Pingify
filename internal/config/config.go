@@ -558,20 +558,50 @@ const (
 )
 
 func (c *Config) profile() error {
-	depth := 0
+	depth, rcv := 0, 0
 	switch strings.ToLower(strings.TrimSpace(c.Tuning.Profile)) {
 	case "":
 		c.Tuning.Profile = ProfileBalanced
-		depth = 900
+		depth, rcv = 900, 256
 	case ProfileGaming:
-		depth = 600
+		depth, rcv = 600, 256
 	case ProfileBalanced:
-		depth = 900
+		depth, rcv = 900, 256
 	case ProfileDownload:
-		depth = 1500
+		depth, rcv = 1500, 3072
 	default:
 		return fmt.Errorf("tuning.profile %q: it is %q, %q or %q",
 			c.Tuning.Profile, ProfileGaming, ProfileBalanced, ProfileDownload)
+	}
+
+	// The second thing a profile moves: how much the receiving socket may
+	// hold. It was three megabytes for every profile, on the grounds that the
+	// socket buffer had one right answer - and it does not. Three megabytes at
+	// four hundred and fifty megabits is fifty milliseconds, and a packet that
+	// arrives while the queue is full waits behind all of it, the handshake of
+	// a new connection included.
+	//
+	// Measured on the Tehran to Frankfurt pair, both ends set the same, three
+	// rounds each, with the round trip taken through the tunnel while it ran
+	// and the same handshake taken straight down the public path alongside so
+	// the route's own share could be subtracted:
+	//
+	//	  receive queue   upload   download   one stream down   p90 up / down
+	//	    3072 KB        458       552         602 Mbit/s      125 / 156 ms
+	//	     256 KB        432       475         610              93 / 106
+	//
+	// The tail is a third to a half better and a single stream does not move,
+	// which is what one person downloading actually has. What it costs is the
+	// aggregate of many streams at once, and that is the whole of what the
+	// download profile is for - so that profile keeps the deep queue and the
+	// other two do not. tuning.rcvbuf_kb still overrides either way.
+	//
+	// The socket drops more this way, and those drops are the point: they are
+	// the congestion signal arriving on time instead of a queue hiding it and
+	// charging fifty milliseconds for the favour. See tuneSocket for why the
+	// old reading of that counter no longer holds.
+	if c.Tuning.RcvBufKB == 0 {
+		c.Tuning.RcvBufKB = rcv
 	}
 
 	// An explicit depth wins. The profiles are three points on a line, and
@@ -744,13 +774,6 @@ func (c *Config) check() error {
 		c.HealthPort = 0
 	case c.HealthPort > 65535:
 		return fmt.Errorf("status.health_port %d is not a port", c.HealthPort)
-	}
-	// Measured on the real path, sweeping the receive buffer against latency
-	// and throughput: below about two megabytes the kernel drops packets the
-	// process never sees, and above about six the queue is deep enough to be
-	// felt as lag. Three is where both were good.
-	if c.Tuning.RcvBufKB == 0 {
-		c.Tuning.RcvBufKB = 3072
 	}
 	if c.Tuning.SndBufKB == 0 {
 		c.Tuning.SndBufKB = 16384
