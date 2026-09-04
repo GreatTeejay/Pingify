@@ -29,6 +29,20 @@ import (
 // of them read by the TCP inside the tunnel as congestion. That is what held a
 // single stream to a quarter of what the pair could carry.
 //
+// That was true when one goroutine took one packet off the socket at a time.
+// It is not true now: the socket is read by recvmmsg, a hundred and twenty
+// eight datagrams to the call, by one goroutine per core - so the queue is
+// drained faster than it fills, and its depth stopped being the difference
+// between carrying a stream and not. What its depth still decides is how long
+// a packet waits when the link is busy, and three megabytes at four hundred
+// and fifty megabits is fifty milliseconds of waiting. The profile now sets
+// it, and sets it shallow unless the profile is the one about aggregate
+// throughput; see Config.profile for the measurement.
+//
+// So the drop counter below no longer reads the way it did. A socket that
+// drops nothing is a socket deep enough to hide the congestion rather than
+// report it, and the loss it hides costs more than the loss it prevents.
+//
 // SO_RCVBUFFORCE and SO_SNDBUFFORCE are the same request without the clamp,
 // and a process with CAP_NET_ADMIN may make it - which this one has, because a
 // raw socket needs the same privilege. Where it is refused the ordinary call
