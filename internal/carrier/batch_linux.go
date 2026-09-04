@@ -34,30 +34,48 @@ const (
 	sendBatch = 64  // the most a sender will ever be asked for
 
 	// How many packets go on the wire in one crossing unless the config says
-	// otherwise. One - which is to say, none.
+	// otherwise.
 	//
-	// This is not a throughput knob. It is a burst knob, and the path cares
-	// about bursts far more than it cares about syscalls. Measured at Germany
-	// by counting gaps in our own sequence numbers, one stream pushing:
+	// This was one, and one was measured. Draining the device and firing
+	// sixty-four packets into the wire at line rate undid the pacing the TCP
+	// inside had carefully applied, and something on the way policed the burst
+	// by dropping a run of it - a hundred and seventy-three packets in a row,
+	// twice in fifteen seconds. Counted at Germany by the gaps in our own
+	// sequence numbers, one stream pushing:
 	//
 	//	  send_batch    packets the path lost    one stream
 	//	      64             2.870%               129.8 Mbit/s
-	//	      16             0.728%               144.1
-	//	       4             1.145%               157.0
 	//	       1             0.000%               170.6
 	//
-	// flagtun on the same path in the same minute lost nothing at all, which
-	// is what said the loss was ours and not the route's. Draining the device
-	// and firing sixty-four packets into the wire at line rate undoes the
-	// pacing the TCP inside had carefully applied, and something on the way
-	// polices the burst by dropping a run of it - a hundred and seventy-three
-	// packets in a row, twice in fifteen seconds.
+	// That measurement was taken before fq went on the way out. fq spaces a
+	// socket's packets for us, so a batch of thirty-two is no longer thirty-two
+	// packets at line rate - it is thirty-two packets handed to a queue that
+	// releases them evenly. The burst the path was policing does not reach the
+	// path any more, and what a batch of one was buying is gone with it.
 	//
-	// Batching cost nothing to give up. Sixteen streams carried 442.7 Mbit/s
-	// at a batch of one against 443.2 at sixty-four, because with sixteen
-	// streams the packets are already there when we look; it is the single
-	// stream, the one that arrives paced, that a batch can only damage.
-	defaultSendBatch = 1
+	// What it was costing was the download. A batch of one is one read from the
+	// device and one sendmmsg of a single packet, thirty-five thousand times a
+	// second, and the goroutine doing it is one goroutine: it ran out before
+	// either server did. On the Tehran to Frankfurt pair, neither end above 65%
+	// of its cores, three passes each:
+	//
+	//	  send_batch   download   one stream down   upload   path lost
+	//	       1        377 Mbit    435 Mbit         447      none
+	//	      16        365         593              455      none
+	//	      32        557         522              444      none
+	//
+	// Half as much again on the download and a fifth on a single stream, for
+	// nothing on the upload and no loss at all. The upload does not move
+	// because the Iran end has one core and was never syscall-bound; the
+	// download does, because the end doing the reading has two and was.
+	//
+	// Thirty-two rather than sixty-four: sixty-four measured slightly lower
+	// (511, 561) and is a bigger burst to hand a path that has been seen to
+	// police them. Eight was asked three more passes on a worse day and came
+	// out level - 390 against 437 on eight streams, 551 against 544 on one -
+	// so anything from eight up is the same answer, and the number that
+	// matters is that it is not one.
+	defaultSendBatch = 32
 )
 
 // mmsghdr is the kernel's struct mmsghdr: a msghdr and the length that call
