@@ -201,8 +201,8 @@ enable_forwarding() {
 }
 
 revert_tuning() {
-    rm -f "$HOST_SYSCTL" "$HOST_LIMITS" /etc/sysctl.d/98-pingify-bbr.conf /etc/modules-load.d/pingify.conf \
-        /etc/sysctl.d/97-pingify-forward.conf
+    rm -f "$HOST_SYSCTL" "$HOST_LIMITS" "$NAT_SYSCTL" /etc/sysctl.d/98-pingify-bbr.conf \
+        /etc/modules-load.d/pingify.conf /etc/sysctl.d/97-pingify-forward.conf
     sysctl --system >/dev/null 2>&1 || true
     ok "Pingify's tuning and limits files are gone; the distribution defaults are back"
     dim "a value we raised stays raised until this machine reboots, because nothing"

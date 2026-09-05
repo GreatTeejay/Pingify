@@ -55,6 +55,11 @@ run_health_check() {
             far_report "$n" >/dev/null 2>&1 || strike=1
         fi
 
+        # Only a tunnel that has heard from the other server is restarted for
+        # losing it. One that has never heard from it gains nothing from a
+        # restart every ninety seconds - the core keeps trying by itself -
+        # and the health log would say nothing but that.
+        [ "${ST_INB:-0}" != 0 ] || strike=0
         if [ "$strike" = 0 ]; then
             echo 0 >"$STATE_DIR/$n.fail"
             continue
@@ -600,6 +605,9 @@ live_dashboard() {
         say "  ${C_DIM}watchdog: $(watchdog_state)   $(uptime 2>/dev/null | sed 's/^ *//')${C_OFF}"
         blank
         dim "refreshing every 2s - enter or q to go back"
+        # Nobody at a keyboard means one frame, not a loop that redraws for
+        # ever into a pipe.
+        [ -t 0 ] || return 0
         if read -rsn1 -t 2 key; then
             case $key in q | Q | 0 | "") return ;; esac
         fi
