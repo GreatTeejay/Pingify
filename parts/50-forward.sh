@@ -1,4 +1,5 @@
-# --------------------------------------------------------------------------
+#!/usr/bin/env bash
+#
 # Ports, from the IRAN server to whatever is listening abroad.
 #
 # The core does not forward anything any more: it carries a private /24 and
@@ -418,6 +419,7 @@ nat_hook() {
 # outside, from the far end being down.
 nat_forward_hook() {
     local how=$1 dev=$2
+    # shellcheck disable=SC2054
     local -a back=(-i "$dev" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT)
     [ -n "$dev" ] || return 0
     case $how in
