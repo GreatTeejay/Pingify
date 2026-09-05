@@ -229,7 +229,12 @@ toml_set() {
             if (cur == t && !done) {
                 line = $0; sub(/#.*/, "", line)
                 if (line ~ "^[[:space:]]*" k "[[:space:]]*=") {
-                    print k " = " v; done = 1; next
+                    # The note beside the value stays. The file is written
+                    # with one on every line, and a value changed from the
+                    # manager should not lose the sentence that explains it.
+                    note = ""
+                    if (match($0, /[[:space:]]*#.*$/)) note = substr($0, RSTART)
+                    print k " = " v note; done = 1; next
                 }
             }
             print

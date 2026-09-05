@@ -74,6 +74,11 @@ const (
 	// nothing for it to collide with: it is bound to this tunnel's own tun
 	// address. Set status.health_port to -1 to turn it off.
 	DefaultHealthPort = 19999
+
+	// How many packets the tun device holds for the link to read. A thousand
+	// carries what ten thousand carried and answers in less than half the
+	// time; the measurement is beside configureDevice.
+	DefaultTxQueueLen = 1000
 )
 
 type Config struct {
@@ -144,6 +149,11 @@ type Config struct {
 		Profile   string // gaming | balanced | download
 		QueuePkts int    // how deep that queue may get; the profile sets it
 
+		// A DSCP mark on every packet the carrier sends, 0 to 63. Zero is
+		// none. 46 is the expedited class most routers know; whether the
+		// route honours it is the route's business, and most do not.
+		DSCP int
+
 		// One parity packet per this many, on a carrier that can lose one.
 		// Zero is off, and off is the default: it is a tenth of the bandwidth
 		// spent on a path that may not need it, and the health check says so
@@ -162,6 +172,11 @@ type Config struct {
 		Kharej string
 		MTU    int
 		Queues int // 0 means choose one
+
+		// How many packets the device may hold between the kernel putting
+		// them there and the link reading them. Zero is the measured default;
+		// see configureDevice for the table.
+		TxQueueLen int
 
 		// How many goroutines put arriving packets into the device. Zero
 		// means one per core; a negative number means the goroutine that
@@ -457,6 +472,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.Profile, err = str()
 	case "tuning.queue_packets":
 		c.Tuning.QueuePkts, err = num()
+	case "tuning.dscp":
+		c.Tuning.DSCP, err = num()
 	case "tuning.fec":
 		c.Tuning.FEC, err = num()
 
@@ -470,6 +487,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.TUN.MTU, err = num()
 	case "tun.write_workers":
 		c.TUN.WriteWorkers, err = num()
+	case "tun.txqueuelen":
+		c.TUN.TxQueueLen, err = num()
 	case "tun.queues":
 		c.TUN.Queues, err = num()
 
@@ -764,6 +783,15 @@ func (c *Config) check() error {
 	}
 	if c.TUN.Queues < 0 || c.TUN.Queues > 16 {
 		return fmt.Errorf("tun.queues %d is not a number of queues", c.TUN.Queues)
+	}
+	if c.TUN.TxQueueLen == 0 {
+		c.TUN.TxQueueLen = DefaultTxQueueLen
+	}
+	if c.TUN.TxQueueLen < 100 || c.TUN.TxQueueLen > 100000 {
+		return fmt.Errorf("tun.txqueuelen %d: between 100 and 100000", c.TUN.TxQueueLen)
+	}
+	if c.Tuning.DSCP < 0 || c.Tuning.DSCP > 63 {
+		return fmt.Errorf("tuning.dscp %d: a DSCP value is 0 to 63", c.Tuning.DSCP)
 	}
 	if c.Name == "" {
 		c.Name = "pingify"

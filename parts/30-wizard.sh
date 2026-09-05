@@ -889,81 +889,175 @@ wiz_confirm() {
 # files would show a formatting change beside the one real difference - and
 # that diff is how anybody checks the pair is a pair.
 wiz_render() {
+    local mode=${T_MODE:-$(mode_of "$T_TRANSPORT")}
+    # One note beside every value, in the file itself, because the file is
+    # where a person looks at three in the morning when the pair will not come
+    # up - not the manager, and not this script. The keys that are not set are
+    # there too, commented out with their defaults, so that what the core can
+    # be told is visible without reading its source. toml_get ignores the
+    # notes and toml_set keeps them.
+    # Thirty-four columns for the value: wide enough for the token, which is
+    # the longest thing written, so every note starts in the same column.
+    kv() { # key value note   ("value" already rendered: quoted or bare)
+        printf '%-34s # %s\n' "$1 = $2" "$3"
+    }
+    off() { # key default note   (a key left at its default, shown commented)
+        printf '# %-32s # %s\n' "$1 = $2" "$3"
+    }
     printf '# Pingify %s\n' "$PINGIFY_VERSION"
     printf '#\n'
-    printf '# The same file runs on both servers, but for the side and the name.\n'
+    printf '# The same file runs on both servers; only side and name differ. The manager\n'
+    printf '# reads and rewrites the values and keeps the notes. A line starting with #\n'
+    printf '# is a note or a key left at its default.\n'
+
     printf '\n[tunnel]\n'
-    printf 'name = "%s"\n' "$T_NAME"
-    printf 'side = "%s"\n' "$T_SIDE"
-    printf 'mode = "%s"\n' "${T_MODE:-$(mode_of "$T_TRANSPORT")}"
+    kv name "\"$T_NAME\"" "what the manager and the logs call this tunnel"
+    kv side "\"$T_SIDE\"" "which server this file is on: iran | kharej - the one value that differs"
+    if [ "$mode" = forward ]; then
+        kv mode "\"forward\"" "forward: users connect to IRAN's ports, KHAREJ dials the real service"
+    else
+        kv mode "\"tun\"" "tun: a private network between the two servers, one packet per message"
+    fi
+
     printf '\n[transport]\n'
-    printf 'type = "%s"\n' "$T_TRANSPORT"
-    printf 'kharej = "%s"\n' "$T_KHAREJ"
+    kv type "\"$T_TRANSPORT\"" "forward: tcp ws wss utls fallback   tun: icmp gre udp rawtcp awg"
+    kv kharej "\"$T_KHAREJ\"" "the server abroad: its public IP"
     # This is the address KHAREJ dials, so it is not optional on either file:
     # one file describes the whole tunnel, and the end that reaches in has
     # nothing to reach without it.
-    printf 'iran = "%s"\n' "$T_IRAN"
-    # No port key at all for icmp. Writing port = 0 would pass the core's check
-    # and then sit in the file looking like a setting somebody chose.
-    [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"
+    case $T_TRANSPORT in
+    ws | wss) kv iran "\"$T_IRAN\"" "the Iran server: public IP, or the domain a CDN answers on in front of it" ;;
+    *) kv iran "\"$T_IRAN\"" "the Iran server: its public IP" ;;
+    esac
+    # No port key at all for icmp and gre. Writing port = 0 would pass the
+    # core's check and then sit in the file looking like a setting somebody
+    # chose.
+    case $T_TRANSPORT in
+    icmp | gre) printf '# %-24s # %s\n' "port" "none: this transport has no port and nothing to open" ;;
+    awg) kv port "$T_PORT" "the carrier's port inside the AmneziaWG link; awg.port below is the one to open" ;;
+    *) [ -n "$T_PORT" ] && kv port "$T_PORT" "the one port the tunnel uses, the same on both servers" ;;
+    esac
     # Only a stream carrier opens more than one. On this path a single TCP
     # connection is shaped to nothing and eight together are not shaped at
     # all, which is the whole reason the number is here.
     case $T_TRANSPORT in
-    tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
+    tcp | ws | wss) kv connections "${T_CONNS:-8}" "TCP connections kept open, 1-32: one is shaped to nothing, eight are not" ;;
+    utls | fallback) off connections 8 "TCP connections kept open, 1-32" ;;
     esac
-    [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
+    case $T_TRANSPORT in
+    ws | wss)
+        [ -n "$T_PATH" ] && kv path "\"$T_PATH\"" "the path the WebSocket handshake asks for; anything else gets a 404"
+        off listen_port "$T_PORT" "the port the waiting side binds when the CDN edge connects on another"
+        ;;
+    esac
+    case $mode in
+    forward)
+        off keepalive_sec 10 "seconds between keepalives on every connection"
+        off dials "\"kharej\"" "which side opens the connection: kharej (default) or iran"
+        ;;
+    *)
+        off keepalive_sec 10 "seconds between keepalives"
+        off dials "\"kharej\"" "which side sends first: kharej (default) or iran"
+        ;;
+    esac
+    case $T_TRANSPORT in
+    wss | utls | fallback)
+        off cert "\"\"" "a certificate for the waiting side, when nothing in front of it does the TLS"
+        off key "\"\"" "and its private key"
+        off insecure false "accept a certificate nobody vouches for: a self-made pair, never behind a CDN"
+        ;;
+    esac
+
     # AmneziaWG's own half of the tunnel. The keys are both pairs, because
     # WireGuard needs a private key on each side and the other side's public
     # one - four values where every other transport has a single shared token -
     # and one file still has to describe the whole tunnel.
     if [ "$T_TRANSPORT" = awg ]; then
         printf '\n[awg]\n'
-        printf 'name = "%s"\n' "$T_AWG_IFACE"
-        printf 'iran = "10.%s.20.1/24"\n' "$T_OCTET"
-        printf 'kharej = "10.%s.20.2/24"\n' "$T_OCTET"
-        printf 'mtu = 1320\n'
-        printf 'port = %s\n' "$T_AWG_PORT"
-        printf 'iran_key = "%s"\n' "$T_AWG_IKEY"
-        printf 'iran_pub = "%s"\n' "$T_AWG_IPUB"
-        printf 'kharej_key = "%s"\n' "$T_AWG_KKEY"
-        printf 'kharej_pub = "%s"\n' "$T_AWG_KPUB"
-        printf 'jc = %s\n' "$T_AWG_JC"
-        printf 'jmin = %s\n' "$T_AWG_JMIN"
-        printf 'jmax = %s\n' "$T_AWG_JMAX"
-        printf 's1 = %s\n' "$T_AWG_S1"
-        printf 's2 = %s\n' "$T_AWG_S2"
-        printf 'h1 = %s\n' "$T_AWG_H1"
-        printf 'h2 = %s\n' "$T_AWG_H2"
-        printf 'h3 = %s\n' "$T_AWG_H3"
-        printf 'h4 = %s\n' "$T_AWG_H4"
+        kv name "\"$T_AWG_IFACE\"" "the AmneziaWG interface on this server"
+        kv iran "\"10.$T_OCTET.20.1/24\"" "the link's own addresses, beside the tunnel's"
+        kv kharej "\"10.$T_OCTET.20.2/24\"" ""
+        kv mtu 1320 "the link's packet size; the tunnel inside it uses 1280"
+        kv port "$T_AWG_PORT" "where AmneziaWG listens - the port to open in a firewall"
+        kv iran_key "\"$T_AWG_IKEY\"" "IRAN's private key"
+        kv iran_pub "\"$T_AWG_IPUB\"" "and its public one"
+        kv kharej_key "\"$T_AWG_KKEY\"" "KHAREJ's private key"
+        kv kharej_pub "\"$T_AWG_KPUB\"" "and its public one"
+        kv jc "$T_AWG_JC" "obfuscation: junk packets before the handshake"
+        kv jmin "$T_AWG_JMIN" "smallest junk packet"
+        kv jmax "$T_AWG_JMAX" "largest"
+        kv s1 "$T_AWG_S1" "padding on the handshake initiation"
+        kv s2 "$T_AWG_S2" "and on the response"
+        kv h1 "$T_AWG_H1" "the four message type numbers, changed from WireGuard's"
+        kv h2 "$T_AWG_H2" ""
+        kv h3 "$T_AWG_H3" ""
+        kv h4 "$T_AWG_H4" ""
     fi
+
     printf '\n[security]\n'
-    printf 'token = "%s"\n' "$T_TOKEN"
+    kv token "\"$T_TOKEN\"" "the same on both servers; every packet carries a tag made from it"
+
     printf '\n[tuning]\n'
-    printf 'profile = "%s"\n' "$T_PROFILE"
-    if [ "${T_MODE:-$(mode_of "$T_TRANSPORT")}" = forward ]; then
+    kv profile "\"$T_PROFILE\"" "gaming | balanced | download - how deep the queues may get"
+    off queue_packets "$(wiz_queue "$T_PROFILE")" "the queue depth the profile chose; set to choose your own, 200-20000"
+    case $mode in
+    forward)
+        off sndbuf_kb 16384 "the carrier socket's send buffer"
+        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
+        ;;
+    *)
+        off rcvbuf_kb "$([ "$T_PROFILE" = download ] && echo 3072 || echo 256)" "the carrier socket's receive queue; deep carries more, shallow answers faster"
+        off sndbuf_kb 16384 "its send buffer"
+        off send_batch 32 "packets handed to the kernel per crossing, 1-64"
+        off pace true "put fq on the way out so bursts leave as a stream"
+        off pace_mbit 0 "and cap the rate, in Mbit/s; 0 means no cap"
+        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
+        case $T_TRANSPORT in
+        gre) ;;
+        *) off fec 0 "one parity packet per this many, 4-32; 0 is off. A tenth of the bandwidth, for a path that loses packets" ;;
+        esac
+        ;;
+    esac
+
+    if [ "$mode" = forward ]; then
         # The ports, in the Ports screen's spelling, one list for both
         # servers: IRAN binds them, KHAREJ reads them to know what it will be
-        # asked to dial.
+        # asked to dial. On one line, which is the shape toml_get reads.
         printf '\n[forward]\n'
+        printf '# The ports users connect to on IRAN, and where each one goes on KHAREJ:\n'
+        printf '#   "443"                 tcp 443 here, to 127.0.0.1:443 there\n'
+        printf '#   "8000-8010"           a range, port for port\n'
+        printf '#   "udp:500"             the same for udp\n'
+        printf '#   "443=8443"            a different port there\n'
+        printf '#   "443=10.99.10.5:443"  a different host there\n'
         printf 'ports = [%s]\n' "$(fwd_toml_list $T_PORTS)"
+        off bind_addr "\"0.0.0.0\"" "the address IRAN binds the ports on"
+        off allow "[]" "KHAREJ only: the targets it will dial, host:port; empty means any"
     else
         printf '\n[tun]\n'
-        printf 'name = "%s"\n' "$T_DEV"
-        printf 'iran = "10.%s.10.1/24"\n' "$T_OCTET"
-        printf 'kharej = "10.%s.10.2/24"\n' "$T_OCTET"
+        kv name "\"$T_DEV\"" "the device on this server"
+        kv iran "\"10.$T_OCTET.10.1/24\"" "IRAN's address on the link"
+        kv kharej "\"10.$T_OCTET.10.2/24\"" "KHAREJ's"
         # Not asked. 1320 works on every path we have measured, and Measure
         # MTU on the tunnel screen finds the real number properly.
-        printf 'mtu = %s\n' "${T_MTU:-1320}"
+        kv mtu "${T_MTU:-1320}" "inner packet size, 576-9000; Measure MTU on the tunnel screen finds yours"
+        off txqueuelen 1000 "packets the device holds for the link, 100-100000"
+        off write_workers 0 "goroutines putting arriving packets into the device; 0 is one per core"
+        off queues 1 "device queues, 1-16; more than one reorders a flow"
     fi
+
     printf '\n[logging]\n'
-    printf 'level = "info"\n'
+    kv level "\"info\"" "debug | info | warn | error"
+
     printf '\n[status]\n'
-    printf 'port = %s\n' "${T_STATUS:-$STATUS_BASE}"
+    kv port "${T_STATUS:-$STATUS_BASE}" "answers about this tunnel, on 127.0.0.1 only; 0 turns it off"
     # The same on both servers, and it stays that way: it is bound to this
     # tunnel's private address, which nothing else on either machine has.
-    printf 'health_port = %s\n' "${T_HEALTH:-$HEALTH_PORT}"
+    if [ "$mode" = forward ]; then
+        kv health_port -1 "no private address in forward mode, so none"
+    else
+        kv health_port "${T_HEALTH:-$HEALTH_PORT}" "the same answers on the link's own address, for the far end; -1 turns it off"
+    fi
 }
 
 # --------------------------------------------------------------------------

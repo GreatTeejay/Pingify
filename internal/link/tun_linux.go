@@ -70,7 +70,7 @@ func openTUN(name string, multi bool) (*os.File, error) {
 // iproute2 rather than by opening a netlink socket. It runs once at startup,
 // where a fork costs nothing and a hand-rolled netlink implementation would
 // cost several hundred lines that only ever run once.
-func configureDevice(name, addr string, mtu int) error {
+func configureDevice(name, addr string, mtu, txqueuelen int) error {
 	run := func(args ...string) error {
 		out, err := exec.Command("ip", args...).CombinedOutput()
 		if err != nil {
@@ -114,9 +114,10 @@ func configureDevice(name, addr string, mtu int) error {
 	// less than half the time; one stream on its own went up rather than
 	// down, 381 to 432. The device drops more - that is the point of a queue
 	// with an end to it, and the TCP inside reads a drop as the signal it is
-	// for, which is what keeps the queue short.
+	// for, which is what keeps the queue short. tun.txqueuelen moves it, for
+	// a path that measures differently.
 	if err := run("link", "set", "dev", name, "mtu", fmt.Sprint(mtu),
-		"txqueuelen", "1000", "up"); err != nil {
+		"txqueuelen", fmt.Sprint(txqueuelen), "up"); err != nil {
 		return err
 	}
 	return run("addr", "add", addr, "dev", name)

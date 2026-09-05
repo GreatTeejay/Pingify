@@ -209,6 +209,21 @@ func newStreamCarrierOn(cfg *config.Config, kind string, head int,
 // kernel's receive window auto-tuning, and this path needs a window of about
 // four megabytes to fill four hundred megabits at eighty milliseconds. The
 // auto-tuned maximum covers that; a hand-set buffer would cap it.
+// tcpOf is the TCP connection under a wrapped one, or nil.
+func tcpOf(c net.Conn) *net.TCPConn {
+	for c != nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			return tc
+		}
+		w, ok := c.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil
+		}
+		c = w.NetConn()
+	}
+	return nil
+}
+
 func prepStream(c net.Conn) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
@@ -400,6 +415,7 @@ func (c *streamCarrier) dialForever(slot int) {
 			continue
 		}
 		wait = streamRedialMin
+		markDSCP(nc, c.cfg.Tuning.DSCP)
 
 		l := &streamLink{c: nc, fm: fm, seq: uint64(slot)}
 		// Say which slot this is before anything else can be written on it:
@@ -450,6 +466,7 @@ func (c *streamCarrier) acceptForever() {
 // otherwise hold up every connection behind it.
 func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 	prepStream(nc)
+	markDSCP(nc, c.cfg.Tuning.DSCP)
 	_ = nc.SetDeadline(time.Now().Add(streamDialWait))
 	up, fm, err := c.accept(nc)
 	if err != nil {

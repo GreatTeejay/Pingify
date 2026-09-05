@@ -36,7 +36,7 @@ import (
 //	over UDP, or ICMP, or something dressed as TLS          udp.go, ...
 //	and one thing rides on it, chosen by the mode:
 //	    the private link - one IP packet per message        link.go
-//	    forwarded ports  - many connections per carrier     (not yet)
+//	    forwarded ports  - many connections per carrier     forward.go
 //
 // Transports are added one at a time and each is measured on the real path
 // between Tehran and Frankfurt before the next one starts. What was learned
