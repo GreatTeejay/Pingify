@@ -61,9 +61,9 @@ other_side() { [ "$1" = iran ] && printf 'kharej' || printf 'iran'; }
 
 transport_label() {
     case $1 in
-    tcp) printf 'TCP' ;;
-    ws) printf 'WS' ;;
-    wss) printf 'WSS' ;;
+    tcp) printf 'TCP MUX' ;;
+    ws) printf 'WS MUX' ;;
+    wss) printf 'WSS MUX' ;;
     utls) printf 'TCP UTLS' ;;
     fallback) printf 'TLS FALLBACK' ;;
     icmp) printf 'ICMP' ;;
@@ -178,16 +178,12 @@ preset_queue() {
 
 preset_menu() {
     CHOICE_DEF=2
-    choice 1 "Gaming" "shallow queues - a small packet waits behind the least"
+    choice 1 "Gaming" "shallow queues - lowest delay under load"
     choice 2 "Balanced" "the one to pick if unsure"
-    choice 3 "Download" "deep queues - most when many streams pull at once"
+    choice 3 "Download" "deep queues - most throughput for many streams"
     CHOICE_DEF=
     blank
-    dim "Measured on the real path, restarted fresh at each depth:"
-    dim "  gaming    600 packets   397 Mbit/s over 16 streams   84 ms under load"
-    dim "  balanced  900           448                          93 ms"
-    dim "  download  1500          466                         116 ms"
-    dim "Changeable later, on either server, without rebuilding anything."
+    dim "Deeper queues carry more; shallower ones answer faster. Changeable later."
     blank
     local n
     pick n "select" 2 3 || return 1
@@ -719,98 +715,44 @@ ask_side() {
 }
 
 ask_transport() {
-    wiz "Transport" "FORWARDING carries your ports over a connection. TUN builds a private link."
-    group "FORWARDING"
-    choice 1 "TCP" "plain TCP, eight connections - the compatible default"
-    choice 2 "WS" "an ordinary WebSocket - goes where HTTP goes, a CDN can front it"
-    choice 3 "WSS" "the same inside TLS - behind Cloudflare, the fastest measured"
-    choice 4 "TCP UTLS" "TLS with Chrome's own fingerprint - the pick for a direct pair"
-    choice 5 "TLS FALLBACK" "TCP UTLS, and a real website to anything that probes it"
-    group "TUN"
-    choice 6 "ICMP" "inside ping packets - no port at all, for a path that shapes TCP"
-    choice 7 "GRE" "IP protocol 47 - no port, plainly visible, fast where allowed"
+    wiz "Transport"
+    group "FORWARDING - your ports, carried over a connection"
+    choice 1 "TCP MUX" "plain TCP, several connections multiplexed"
+    choice 2 "WS MUX" "WebSocket on port 80 - a CDN can front it"
+    choice 3 "WSS MUX" "WebSocket inside TLS - a domain or Cloudflare"
+    choice 4 "TCP UTLS" "TLS that looks like Chrome on the wire"
+    choice 5 "TLS FALLBACK" "UTLS, and a real website for anyone probing"
+    group "TUN - a private link between the two servers"
+    choice 6 "ICMP" "inside ping packets - no port at all"
+    choice 7 "GRE" "IP protocol 47 - fast, not hidden, no port"
     choice 8 "UDP" "plain UDP on one port"
-    choice 9 "Raw TCP" "TCP segments without a handshake - no socket to throttle"
-    choice 10 "AmneziaWG" "obfuscated WireGuard - encrypted, and shaped not to look like it"
-    blank
-    dim "Tehran to Frankfurt, one connection, download/upload, on a wire"
-    dim "that carries 746/694 Mbit/s:"
-    dim "  UTLS 732/654   WSS via Cloudflare 824/759   TCP 594/671   FALLBACK 598/679"
-    dim "  ICMP 516/393   GRE 515/401   Raw TCP 532/364"
-    dim "UDP does not pass from Iran on most lines - inbound UDP stops after a"
-    dim "few packets - and AmneziaWG rides on UDP. ICMP depends on the route:"
-    dim "516 to Frankfurt, nothing at all to Istanbul. The health check says"
-    dim "which yours is."
+    choice 9 "Raw TCP" "TCP-shaped packets, no connection to throttle"
+    choice 10 "AmneziaWG" "obfuscated WireGuard - encrypted"
     blank
     local proto
     pick proto "select" "" 10 || return 1
     case $proto in
-    1) T_TRANSPORT=tcp
-        blank
-        dim "Eight plain TCP connections, with every forwarded stream pinned to"
-        dim "one of them. A single connection is shaped to nothing on this path;"
-        dim "eight together are not shaped at all. Nothing to install, nothing to"
-        dim "open but one port. Start here, and move only if the path gives you a"
-        dim "reason to. BBR on both servers is what makes it worth having." ;;
+    1) T_TRANSPORT=tcp ;;
     2) T_TRANSPORT=ws
         blank
-        dim "An HTTP request that becomes a WebSocket, which is what a chat app"
-        dim "looks like. A proxy that passes 80 passes this. Anything that is not"
-        dim "the tunnel gets a 404, so a scanner finds a web server with nothing"
-        dim "on it."
-        blank
-        warn "WS is not encrypted by itself - choose WSS when TLS or a CDN is there" ;;
-    3) T_TRANSPORT=wss
-        blank
-        dim "WSS can go straight to the origin or through a CDN. Behind Cloudflare"
-        dim "the domain is the address: the edge answers on the name and connects"
-        dim "in to the server behind it, so that server is the one that waits."
-        dim "Measured through Cloudflare: 824/759, the fastest of all of them." ;;
-    4) T_TRANSPORT=utls
-        blank
-        dim "TLS whose ClientHello is Chrome's, byte for byte, so a filter that"
-        dim "fingerprints handshakes sees a browser. The fastest direct transport"
-        dim "measured: 732/654 on a 746/694 wire." ;;
-    5) T_TRANSPORT=fallback
-        blank
-        dim "TCP UTLS, and a real website behind it: a probe that connects without"
-        dim "the token is handed a genuine page, certificate and all. Costs a"
-        dim "little against UTLS - 598/679 - and hides from a filter that connects"
-        dim "as well as one that watches." ;;
+        warn "WS is not encrypted by itself - choose WSS when TLS or a CDN is available" ;;
+    3) T_TRANSPORT=wss ;;
+    4) T_TRANSPORT=utls ;;
+    5) T_TRANSPORT=fallback ;;
     6) T_TRANSPORT=icmp
         blank
-        dim "Both ends send echo requests, so the tunnel has no port and nothing"
-        dim "to open. Where TCP is shaped and ICMP is not, this is the one that"
-        dim "carries: 516/393 to Frankfurt. Some routes drop it entirely - the"
-        dim "health check tells you within a minute of building it."
-        dim "The kernel stops answering ordinary pings while this runs." ;;
+        dim "This server stops answering ordinary pings while the tunnel runs." ;;
     7) T_TRANSPORT=gre
         blank
-        warn "GRE carries nothing secret and hides nothing"
-        dim "it is IP protocol 47 with no encryption and no disguise, so anything"
-        dim "watching the path can see what it is. Fast, and worth it where the"
-        dim "path still allows it: 515/401 measured."
-        blank
-        confirm_yes "use TUN-GRE?" || return 1 ;;
+        warn "GRE is not encrypted and not hidden - anything on the path can read it"
+        confirm_yes "use GRE?" || return 1 ;;
     8) T_TRANSPORT=udp
         blank
-        warn "needs UDP to pass between the two servers"
-        dim "measured from Iran: inbound UDP stops after a handful of packets on"
-        dim "most lines. Test it before committing to it; ICMP or Raw TCP is the"
-        dim "usual answer when it does not." ;;
-    9) T_TRANSPORT=rawtcp
-        blank
-        dim "Builds established-looking TCP segments directly and reads them off"
-        dim "a raw socket, so there is no kernel TCP connection for a middlebox to"
-        dim "throttle or reset. A firewall rule keeps the kernel from answering"
-        dim "them itself; Pingify installs it. 532/364 measured." ;;
+        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
+    9) T_TRANSPORT=rawtcp ;;
     10) T_TRANSPORT=awg
         blank
-        dim "AmneziaWG from its own packages, with the tunnel running inside the"
-        dim "link it makes. Both keypairs are generated here and travel in the"
-        dim "token, so the other server still needs nothing but the paste."
-        blank
-        warn "rides on UDP, which most Iranian lines stop after a few packets"
+        warn "rides on UDP, which many Iranian lines stop"
         awg_install || return 1 ;;
     esac
     cfg_mode
@@ -820,29 +762,19 @@ ask_transport() {
 # Only transports that bind a port have a direction to choose. ICMP has no
 # port to be reachable on, GRE is its own protocol, and AmneziaWG names both
 # ends itself; on all three IRAN sends first.
+# Only transports that bind a port have a direction to choose. ICMP has no
+# port to be reachable on, GRE is its own protocol, and AmneziaWG names both
+# ends itself; on all three IRAN sends first.
 ask_direction() {
     T_DIALS=iran
     case $T_TRANSPORT in icmp | gre | awg) return 0 ;; esac
     wiz "Link direction"
     CHOICE_DEF=1
-    choice 1 "IRAN dials out" "IRAN opens the connection to KHAREJ - what works through the filtering"
-    choice 2 "KHAREJ dials in" "only if KHAREJ cannot take a connection, or a CDN fronts IRAN"
+    choice 1 "Direct" "IRAN connects out to KHAREJ"
+    choice 2 "Reverse" "KHAREJ connects in - a CDN in front of IRAN, or NAT"
     CHOICE_DEF=
     blank
-    dim "Ports live on IRAN either way and clients always arrive there. This is"
-    dim "only about which end makes the connection, and the two are not equally"
-    dim "reachable: a connection dialled into Iran is commonly allowed to"
-    dim "complete, carry a few exchanges, and then be blackholed - no reset, no"
-    dim "error, which looks exactly like a tunnel that is up and carrying"
-    dim "nothing. Dialled the other way the same path is clean."
-    case $T_TRANSPORT in
-    ws | wss)
-        blank
-        dim "Behind Cloudflare the edge connects in to the origin, so a domain in"
-        dim "front of IRAN means KHAREJ dials in; a domain in front of KHAREJ"
-        dim "means IRAN dials out, as usual."
-        ;;
-    esac
+    dim "Users and ports stay on IRAN either way; this is only who opens the connection."
     blank
     local dir
     pick dir "select" 1 2 || return 1
@@ -861,18 +793,10 @@ ask_addresses() {
     wiz "Addresses"
     while IFS= read -r n; do addrs+=("$n"); done < <(wiz_public_ips)
     case $T_TRANSPORT in
-    ws | wss)
-        dim "The public IP of each server. A domain instead of the IP of the end"
-        dim "that waits puts a CDN in front of it: the edge answers on the name"
-        dim "and connects in to the server behind it."
-        blank
-        ;;
-    icmp | gre)
-        dim "The public IP of each server. This transport has no port, so there is"
-        dim "nothing to open on either firewall."
-        blank
-        ;;
+    ws | wss) dim "The public IP of each server, or a domain for the end a CDN fronts." ;;
+    *) dim "The public IP of each server." ;;
     esac
+    blank
     if [ "${#addrs[@]}" -gt 1 ]; then
         dim "this server answers on more than one address - pick the right one"
         blank
@@ -1017,7 +941,6 @@ ask_link() {
     *) T_TUNMTU=1320 ;;
     esac
     ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu || return 1
-    dim "1320 is right on a 1500 path; Find the MTU under Diagnostics measures yours"
     return 0
 }
 
@@ -1029,7 +952,7 @@ ask_forwards() {
     [ "$T_SIDE" = iran ] || return 0
     wiz "Ports" "The ports your clients will connect to, here on IRAN."
     show_taken_ports
-    dim "443   443=8443   443=10.0.0.5:443   udp:500   8000-8010"
+    dim "one port 443   a range 8000-8010   udp udp:500   elsewhere 443=8443"
     blank
     local raw clashes
     while :; do
@@ -1051,7 +974,7 @@ v_forwards_needed() {
 }
 
 ask_preset() {
-    wiz "Performance" "Pick the shape of your traffic; you can change it later."
+    wiz "Performance" "The shape of your traffic. You can change it later."
     preset_menu
 }
 
@@ -1081,9 +1004,9 @@ ask_logging() {
 
 dials_text() {
     if [ "$T_SIDE" = "$T_DIALS" ]; then
-        printf 'dials %s' "$(addr_tint "$T_PEER_IP")"
+        printf 'direct - connects to %s' "$(addr_tint "$T_PEER_IP")"
     else
-        printf 'accepts from %s' "$(addr_tint "$T_PEER_IP")"
+        printf 'reverse - accepts from %s' "$(addr_tint "$T_PEER_IP")"
     fi
 }
 
