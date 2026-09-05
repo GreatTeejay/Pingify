@@ -6481,6 +6481,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"strings"
 
 	"pingify/internal/config"
 	"pingify/internal/logging"
@@ -6508,23 +6509,26 @@ func newWSSCarrier(cfg *config.Config) (*streamCarrier, error) {
 		return c, nil
 	}
 
-	// The side that waits. A certificate turns the listener into a TLS one;
-	// without it this is a plain WebSocket behind something that has already
-	// done the TLS.
-	if cfg.Transport.Cert == "" {
+	// The side that waits. A certificate turns the listener into a TLS one.
+	// Without one there are two cases, and the address tells them apart: a
+	// name in front of this server means a CDN or a proxy is doing the TLS
+	// and this end speaks plain WebSocket behind it; a bare address means the
+	// two servers are talking directly, and the dialler is going to speak TLS
+	// whatever happens - so a certificate is made here, the way the UTLS
+	// carrier makes one, and the dialler knows not to expect anyone to vouch
+	// for it. Found by a direct WSS pair that never came up: the dialler's
+	// ClientHello arrived at a plain HTTP listener and was refused as "not an
+	// http request", eight times a minute, for ever.
+	if cfg.Transport.Cert == "" && fronted(cfg) {
 		logging.Info("carrier: no certificate here, so this end speaks plain " +
 			"websocket - whatever fronts it is doing the TLS")
 		return c, nil
 	}
-	cert, err := tls.LoadX509KeyPair(cfg.Transport.Cert, cfg.Transport.Key)
+	conf, err := utlsServerConfig(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("certificate: %v", err)
+		return nil, err
 	}
-	conf := &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		MinVersion:   tls.VersionTLS12,
-		NextProtos:   []string{"http/1.1"},
-	}
+	conf.NextProtos = []string{"http/1.1"}
 	inner := c.accept
 	c.accept = func(nc net.Conn) (net.Conn, framing, error) {
 		ts := tls.Server(nc, conf)
@@ -6533,25 +6537,35 @@ func newWSSCarrier(cfg *config.Config) (*streamCarrier, error) {
 		}
 		return inner(ts)
 	}
-	logging.Info("carrier: serving tls from %s", cfg.Transport.Cert)
 	return c, nil
+}
+
+// fronted says whether the address the dialler reaches is a name rather than
+// an address - which is the whole of what a CDN or a proxy in front of the
+// waiting side looks like from here.
+func fronted(cfg *config.Config) bool {
+	return strings.ContainsAny(cfg.DialHost(),
+		"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")
 }
 
 // tlsDial is the client half. The name it verifies against is the domain,
 // which is also the name in the Host header and the one the CDN answers for.
 //
-// Verification is on, and it stays on: the certificate the edge presents is a
-// public one for a name somebody owns, and turning the check off here would
-// mean any machine on the way could answer instead. `insecure = true` in the
-// file is for a certificate this pair generated for itself, which has nobody
-// to vouch for it.
+// Verification is on whenever there is somebody to vouch for the certificate:
+// behind a name, the edge presents a public one, and turning the check off
+// there would let any machine on the way answer instead. Between two bare
+// addresses with no certificate file there is nobody - the waiting side made
+// its own - so the check is off, exactly as it is for the UTLS carrier.
+// `insecure = true` in the file turns it off for a self-made pair behind a
+// name too.
 func tlsDial(cfg *config.Config) func(net.Conn, string) (net.Conn, error) {
+	selfMade := cfg.Transport.Cert == "" && !fronted(cfg)
 	return func(nc net.Conn, host string) (net.Conn, error) {
 		tc := tls.Client(nc, &tls.Config{
 			ServerName:         host,
 			MinVersion:         tls.VersionTLS12,
 			NextProtos:         []string{"http/1.1"},
-			InsecureSkipVerify: cfg.Transport.Insecure,
+			InsecureSkipVerify: cfg.Transport.Insecure || selfMade,
 		})
 		if err := tc.Handshake(); err != nil {
 			return nil, fmt.Errorf("tls to %s: %v", host, err)
@@ -23339,10 +23353,21 @@ tun_rtt() {
         LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
         return 0
     fi
-    have ping || return 0
-    out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
-        awk -F'/' '/^rtt|^round-trip/ { printf "%.0f", $5 }')
-    printf '%s' "$out"
+    if have ping; then
+        out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
+            awk -F'/' '/^rtt|^round-trip/ { printf "%.0f", $5 }')
+        [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+    fi
+    # No echo across this link - an ICMP tunnel on the same server mutes
+    # echo for every link on it - so the health port is asked instead, the
+    # way it is on an ICMP tunnel.
+    have curl || return 0
+    hp=$(health_port_of "$name")
+    peer=$(peer_addr "$name")
+    [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
+    out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
+    case $out in '' | 0 | 0.000000) return 0 ;; esac
+    LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
 }
 
 # ---------------------------------------------------------------------------
