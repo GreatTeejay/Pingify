@@ -373,7 +373,7 @@ tuning_menu() {
             item 3 "Connections" "$T_CONNS parallel TCP connections, 1 to 32"
             item 4 "Keepalive" "seconds between keepalives on every connection"
         fi
-        case $T_TRANSPORT in icmp | gre | awg) ;; *) item 5 "Link direction" "$(dials_text) - must match" ;; esac
+        case $T_TRANSPORT in icmp | gre | awg) ;; *) item 5 "Link direction" "$(dials_text)" ;; esac
         case $T_TRANSPORT in ws | wss) item 6 "Web path" "$T_PATH - must match" ;; esac
         item 7 "Logging" "$T_LOG"
         item 8 "Status port" "127.0.0.1:$T_STATUS - local, where the manager asks"
@@ -409,9 +409,8 @@ tuning_menu() {
             pause ;;
         5) case $T_TRANSPORT in icmp | gre | awg) blank; warn "this transport has no direction to choose"; pause; continue ;; esac
             blank
-            dim "IRAN dials out by default: a connection dialled into Iran is often"
-            dim "taken and then carries nothing. KHAREJ dials in when a CDN fronts"
-            dim "IRAN, or KHAREJ cannot take a connection. Set the same on both."
+            dim "direct: IRAN connects out (iran).  reverse: KHAREJ connects in (kharej)."
+            dim "Set the same on both servers."
             ask v "which end opens it (iran or kharej)" "$T_DIALS" v_dials && { DIALS_WANT=$v; cfg_apply "$name" _edit_dials yes && dim "now set the same on the other server"; }
             pause ;;
         6) case $T_TRANSPORT in ws | wss) ;; *) blank; warn "only a WebSocket tunnel has a path"; pause; continue ;; esac

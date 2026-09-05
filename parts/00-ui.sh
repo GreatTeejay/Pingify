@@ -445,7 +445,7 @@ choice() {
         mark="${C_GRN}${BX_ARR}${C_OFF}  "
         hint="${hint}${hint:+  }${C_GRN}(default)${C_OFF}"
     fi
-    printf '  %s%s%s%s  %s  %s%s%s\n' \
+    printf '  %s%s%2s%s  %s  %s%s%s\n' \
         "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
         "$(pad_to "${C_B}$2${C_OFF}" 14)" \
         "$C_DIM" "$(trunc_to "$hint" $((UI_TERM - 24)))" "$C_OFF"
