@@ -164,19 +164,20 @@ ensure_go() {
     fi
 
     tmp=$(mktemp) || return 1
-    if have curl; then
-        curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url"             >"$STATE_DIR/fetch.log" 2>&1 &
-        pid=$!
-    elif have wget; then
-        wget -O "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1 &
-        pid=$!
-    else
+    go_fetch_now() {
+        if have curl; then
+            curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1
+        else
+            wget -O "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1
+        fi
+    }
+    if ! have curl && ! have wget; then
         rm -f "$tmp"
         bad "neither curl nor wget is installed, so nothing here can fetch it"
         fix "apt install curl   (or install Go yourself from $url)"
         return 1
     fi
-    spin "fetching go$tar_ver for $arch" "$pid"
+    spin "fetching go$tar_ver for $arch" go_fetch_now
     rc=$?
 
     if [ "$rc" != 0 ]; then
@@ -252,14 +253,16 @@ build_core() {
     # try to download the toolchain the go directive names, over the network
     # this machine may not have - ensure_go has already checked the local one
     # is new enough, so there is nothing to gain and a hang to lose.
-    (
-        cd "$SRC_DIR" &&
-            GOTOOLCHAIN=local GO111MODULE=on GOPROXY=off GOSUMDB=off \
-                GOFLAGS=-mod=mod GOPATH="$SRC_DIR/gopath" \
-                GOCACHE="$SRC_DIR/gocache" CGO_ENABLED=0 \
-                "$GO_BIN" build -trimpath -ldflags "-s -w" -o "$out" ./cmd/pingify
-    ) >"$log" 2>&1 &
-    spin "building the core - up to a minute on a small server" $!
+    go_build_now() {
+        (
+            cd "$SRC_DIR" &&
+                GOTOOLCHAIN=local GO111MODULE=on GOPROXY=off GOSUMDB=off \
+                    GOFLAGS=-mod=mod GOPATH="$SRC_DIR/gopath" \
+                    GOCACHE="$SRC_DIR/gocache" CGO_ENABLED=0 \
+                    "$GO_BIN" build -trimpath -ldflags "-s -w" -o "$out" ./cmd/pingify
+        ) >"$log" 2>&1
+    }
+    spin "compiling the core (a minute or so on a small VPS)" go_build_now
     rc=$?
 
     if [ "$rc" != 0 ]; then
@@ -327,4 +330,12 @@ ensure_core() {
         dim "the core here is $here and this manager is $PINGIFY_VERSION - rebuilding"
     fi
     build_core
+}
+
+# core_matches_script is the one comparison every screen makes: the two ship
+# together, and a config key the manager writes may be one an older core
+# refuses.
+core_matches_script() {
+    [ -x "$CORE_BIN" ] || return 1
+    [ "$(core_version)" = "$PINGIFY_VERSION" ]
 }
