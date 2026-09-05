@@ -175,3 +175,23 @@ func TestTheDialledAddressIsTheEndThatWaits(t *testing.T) {
 		t.Fatalf("dials = iran dialled %q, not the kharej address", c.DialHost())
 	}
 }
+
+func TestTheDeviceQueueAndTheMarkAreBounded(t *testing.T) {
+	got := load(t, "")
+	if got.TUN.TxQueueLen != DefaultTxQueueLen || got.Tuning.DSCP != 0 {
+		t.Fatalf("defaults: txqueuelen %d, dscp %d", got.TUN.TxQueueLen, got.Tuning.DSCP)
+	}
+	got = load(t, "[tun]\ntxqueuelen = 250\n[tuning]\ndscp = 46\n")
+	if got.TUN.TxQueueLen != 250 || got.Tuning.DSCP != 46 {
+		t.Fatalf("set: txqueuelen %d, dscp %d", got.TUN.TxQueueLen, got.Tuning.DSCP)
+	}
+	for _, body := range []string{"[tun]\ntxqueuelen = 10\n", "[tuning]\ndscp = 64\n"} {
+		c := &Config{}
+		if err := parseTOML(head+body, c); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.check(); err == nil {
+			t.Fatalf("%q was accepted", body)
+		}
+	}
+}

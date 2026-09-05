@@ -856,7 +856,12 @@ toml_set() {
             if (cur == t && !done) {
                 line = $0; sub(/#.*/, "", line)
                 if (line ~ "^[[:space:]]*" k "[[:space:]]*=") {
-                    print k " = " v; done = 1; next
+                    # The note beside the value stays. The file is written
+                    # with one on every line, and a value changed from the
+                    # manager should not lose the sentence that explains it.
+                    note = ""
+                    if (match($0, /[[:space:]]*#.*$/)) note = substr($0, RSTART)
+                    print k " = " v note; done = 1; next
                 }
             }
             print
@@ -1254,7 +1259,7 @@ import (
 //	over UDP, or ICMP, or something dressed as TLS          udp.go, ...
 //	and one thing rides on it, chosen by the mode:
 //	    the private link - one IP packet per message        link.go
-//	    forwarded ports  - many connections per carrier     (not yet)
+//	    forwarded ports  - many connections per carrier     forward.go
 //
 // Transports are added one at a time and each is measured on the real path
 // between Tehran and Frankfurt before the next one starts. What was learned
@@ -4759,6 +4764,9 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {
 		// Interactive class. This queue holds one user's latency, and it should
 		// leave the machine ahead of a backup or an apt update.
 		_ = syscall.SetsockoptInt(f, syscall.SOL_SOCKET, soPriority, 6)
+		if cfg.Tuning.DSCP > 0 {
+			_ = syscall.SetsockoptInt(f, syscall.IPPROTO_IP, syscall.IP_TOS, cfg.Tuning.DSCP<<2)
+		}
 
 		// The kernel reports double what it gave, by long-standing convention.
 		if v, e := syscall.GetsockoptInt(f, syscall.SOL_SOCKET, syscall.SO_RCVBUF); e == nil {
@@ -4792,6 +4800,27 @@ func setUserTimeout(tc *net.TCPConn, d time.Duration) {
 			int(d/time.Millisecond))
 	})
 }
+
+// markDSCP puts the configured mark on one TCP connection's packets. The
+// stream carriers hand their connections in wrapped - a TLS connection, a
+// WebSocket - so the socket underneath is asked for through NetConn where
+// there is one, and a wrapping that does not offer it is left unmarked.
+func markDSCP(c net.Conn, dscp int) {
+	if dscp <= 0 {
+		return
+	}
+	tc := tcpOf(c)
+	if tc == nil {
+		return
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, dscp<<2)
+	})
+}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/sockopt_other.go" <<'PINGIFY_GO_SOURCE_EOF'
 //go:build !linux
@@ -4814,6 +4843,8 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {}
 func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
 
 func setUserTimeout(tc *net.TCPConn, d time.Duration) {}
+
+func markDSCP(c net.Conn, dscp int) {}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/stream.go" <<'PINGIFY_GO_SOURCE_EOF'
 package carrier
@@ -5027,6 +5058,21 @@ func newStreamCarrierOn(cfg *config.Config, kind string, head int,
 // kernel's receive window auto-tuning, and this path needs a window of about
 // four megabytes to fill four hundred megabits at eighty milliseconds. The
 // auto-tuned maximum covers that; a hand-set buffer would cap it.
+// tcpOf is the TCP connection under a wrapped one, or nil.
+func tcpOf(c net.Conn) *net.TCPConn {
+	for c != nil {
+		if tc, ok := c.(*net.TCPConn); ok {
+			return tc
+		}
+		w, ok := c.(interface{ NetConn() net.Conn })
+		if !ok {
+			return nil
+		}
+		c = w.NetConn()
+	}
+	return nil
+}
+
 func prepStream(c net.Conn) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
@@ -5218,6 +5264,7 @@ func (c *streamCarrier) dialForever(slot int) {
 			continue
 		}
 		wait = streamRedialMin
+		markDSCP(nc, c.cfg.Tuning.DSCP)
 
 		l := &streamLink{c: nc, fm: fm, seq: uint64(slot)}
 		// Say which slot this is before anything else can be written on it:
@@ -5268,6 +5315,7 @@ func (c *streamCarrier) acceptForever() {
 // otherwise hold up every connection behind it.
 func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 	prepStream(nc)
+	markDSCP(nc, c.cfg.Tuning.DSCP)
 	_ = nc.SetDeadline(time.Now().Add(streamDialWait))
 	up, fm, err := c.accept(nc)
 	if err != nil {
@@ -6323,10 +6371,10 @@ func (f *wsFraming) next(r *bufio.Reader, dst []byte) (int, error) {
 	}
 }
 
-// pong is a dead end for now: the reader has no writer to hand, so a ping is
-// counted and ignored rather than answered. Nothing in this tunnel pings -
-// both ends send their own keepalives as data - and a CDN that pings will
-// keep the connection alive on its own timer regardless.
+// pong answers nothing, by design: the reader has no writer to hand, and
+// nothing needs one. Nothing in this tunnel pings - both ends send their own
+// keepalives as data - and a CDN that pings keeps the connection alive on its
+// own timer whether or not it is answered.
 func (f *wsFraming) pong(_ *bufio.Reader, _ []byte) error {
 	return nil
 }
@@ -6494,6 +6542,11 @@ const (
 	// nothing for it to collide with: it is bound to this tunnel's own tun
 	// address. Set status.health_port to -1 to turn it off.
 	DefaultHealthPort = 19999
+
+	// How many packets the tun device holds for the link to read. A thousand
+	// carries what ten thousand carried and answers in less than half the
+	// time; the measurement is beside configureDevice.
+	DefaultTxQueueLen = 1000
 )
 
 type Config struct {
@@ -6564,6 +6617,11 @@ type Config struct {
 		Profile   string // gaming | balanced | download
 		QueuePkts int    // how deep that queue may get; the profile sets it
 
+		// A DSCP mark on every packet the carrier sends, 0 to 63. Zero is
+		// none. 46 is the expedited class most routers know; whether the
+		// route honours it is the route's business, and most do not.
+		DSCP int
+
 		// One parity packet per this many, on a carrier that can lose one.
 		// Zero is off, and off is the default: it is a tenth of the bandwidth
 		// spent on a path that may not need it, and the health check says so
@@ -6582,6 +6640,11 @@ type Config struct {
 		Kharej string
 		MTU    int
 		Queues int // 0 means choose one
+
+		// How many packets the device may hold between the kernel putting
+		// them there and the link reading them. Zero is the measured default;
+		// see configureDevice for the table.
+		TxQueueLen int
 
 		// How many goroutines put arriving packets into the device. Zero
 		// means one per core; a negative number means the goroutine that
@@ -6877,6 +6940,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.Profile, err = str()
 	case "tuning.queue_packets":
 		c.Tuning.QueuePkts, err = num()
+	case "tuning.dscp":
+		c.Tuning.DSCP, err = num()
 	case "tuning.fec":
 		c.Tuning.FEC, err = num()
 
@@ -6890,6 +6955,8 @@ func assign(c *Config, table, key, raw string) error {
 		c.TUN.MTU, err = num()
 	case "tun.write_workers":
 		c.TUN.WriteWorkers, err = num()
+	case "tun.txqueuelen":
+		c.TUN.TxQueueLen, err = num()
 	case "tun.queues":
 		c.TUN.Queues, err = num()
 
@@ -7184,6 +7251,15 @@ func (c *Config) check() error {
 	}
 	if c.TUN.Queues < 0 || c.TUN.Queues > 16 {
 		return fmt.Errorf("tun.queues %d is not a number of queues", c.TUN.Queues)
+	}
+	if c.TUN.TxQueueLen == 0 {
+		c.TUN.TxQueueLen = DefaultTxQueueLen
+	}
+	if c.TUN.TxQueueLen < 100 || c.TUN.TxQueueLen > 100000 {
+		return fmt.Errorf("tun.txqueuelen %d: between 100 and 100000", c.TUN.TxQueueLen)
+	}
+	if c.Tuning.DSCP < 0 || c.Tuning.DSCP > 63 {
+		return fmt.Errorf("tuning.dscp %d: a DSCP value is 0 to 63", c.Tuning.DSCP)
 	}
 	if c.Name == "" {
 		c.Name = "pingify"
@@ -8219,7 +8295,7 @@ func New(cfg *config.Config, car carrier.Carrier) (*Link, error) {
 	}
 
 	mine, _ := cfg.Mine()
-	if err := configureDevice(l.name, mine, cfg.TUN.MTU); err != nil {
+	if err := configureDevice(l.name, mine, cfg.TUN.MTU, cfg.TUN.TxQueueLen); err != nil {
 		l.closeDevices()
 		return nil, err
 	}
@@ -8637,7 +8713,7 @@ func openTUN(name string, multi bool) (*os.File, error) {
 // iproute2 rather than by opening a netlink socket. It runs once at startup,
 // where a fork costs nothing and a hand-rolled netlink implementation would
 // cost several hundred lines that only ever run once.
-func configureDevice(name, addr string, mtu int) error {
+func configureDevice(name, addr string, mtu, txqueuelen int) error {
 	run := func(args ...string) error {
 		out, err := exec.Command("ip", args...).CombinedOutput()
 		if err != nil {
@@ -8681,9 +8757,10 @@ func configureDevice(name, addr string, mtu int) error {
 	// less than half the time; one stream on its own went up rather than
 	// down, 381 to 432. The device drops more - that is the point of a queue
 	// with an end to it, and the TCP inside reads a drop as the signal it is
-	// for, which is what keeps the queue short.
+	// for, which is what keeps the queue short. tun.txqueuelen moves it, for
+	// a path that measures differently.
 	if err := run("link", "set", "dev", name, "mtu", fmt.Sprint(mtu),
-		"txqueuelen", "1000", "up"); err != nil {
+		"txqueuelen", fmt.Sprint(txqueuelen), "up"); err != nil {
 		return err
 	}
 	return run("addr", "add", addr, "dev", name)
@@ -8711,7 +8788,7 @@ var errNoTUN = errors.New("a tun device needs Linux")
 
 func openTUN(name string, multi bool) (*os.File, error) { return nil, errNoTUN }
 
-func configureDevice(name, addr string, mtu int) error { return errNoTUN }
+func configureDevice(name, addr string, mtu, txqueuelen int) error { return errNoTUN }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/logging/log.go" <<'PINGIFY_GO_SOURCE_EOF'
 package logging
@@ -22306,81 +22383,175 @@ wiz_confirm() {
 # files would show a formatting change beside the one real difference - and
 # that diff is how anybody checks the pair is a pair.
 wiz_render() {
+    local mode=${T_MODE:-$(mode_of "$T_TRANSPORT")}
+    # One note beside every value, in the file itself, because the file is
+    # where a person looks at three in the morning when the pair will not come
+    # up - not the manager, and not this script. The keys that are not set are
+    # there too, commented out with their defaults, so that what the core can
+    # be told is visible without reading its source. toml_get ignores the
+    # notes and toml_set keeps them.
+    # Thirty-four columns for the value: wide enough for the token, which is
+    # the longest thing written, so every note starts in the same column.
+    kv() { # key value note   ("value" already rendered: quoted or bare)
+        printf '%-34s # %s\n' "$1 = $2" "$3"
+    }
+    off() { # key default note   (a key left at its default, shown commented)
+        printf '# %-32s # %s\n' "$1 = $2" "$3"
+    }
     printf '# Pingify %s\n' "$PINGIFY_VERSION"
     printf '#\n'
-    printf '# The same file runs on both servers, but for the side and the name.\n'
+    printf '# The same file runs on both servers; only side and name differ. The manager\n'
+    printf '# reads and rewrites the values and keeps the notes. A line starting with #\n'
+    printf '# is a note or a key left at its default.\n'
+
     printf '\n[tunnel]\n'
-    printf 'name = "%s"\n' "$T_NAME"
-    printf 'side = "%s"\n' "$T_SIDE"
-    printf 'mode = "%s"\n' "${T_MODE:-$(mode_of "$T_TRANSPORT")}"
+    kv name "\"$T_NAME\"" "what the manager and the logs call this tunnel"
+    kv side "\"$T_SIDE\"" "which server this file is on: iran | kharej - the one value that differs"
+    if [ "$mode" = forward ]; then
+        kv mode "\"forward\"" "forward: users connect to IRAN's ports, KHAREJ dials the real service"
+    else
+        kv mode "\"tun\"" "tun: a private network between the two servers, one packet per message"
+    fi
+
     printf '\n[transport]\n'
-    printf 'type = "%s"\n' "$T_TRANSPORT"
-    printf 'kharej = "%s"\n' "$T_KHAREJ"
+    kv type "\"$T_TRANSPORT\"" "forward: tcp ws wss utls fallback   tun: icmp gre udp rawtcp awg"
+    kv kharej "\"$T_KHAREJ\"" "the server abroad: its public IP"
     # This is the address KHAREJ dials, so it is not optional on either file:
     # one file describes the whole tunnel, and the end that reaches in has
     # nothing to reach without it.
-    printf 'iran = "%s"\n' "$T_IRAN"
-    # No port key at all for icmp. Writing port = 0 would pass the core's check
-    # and then sit in the file looking like a setting somebody chose.
-    [ -n "$T_PORT" ] && printf 'port = %s\n' "$T_PORT"
+    case $T_TRANSPORT in
+    ws | wss) kv iran "\"$T_IRAN\"" "the Iran server: public IP, or the domain a CDN answers on in front of it" ;;
+    *) kv iran "\"$T_IRAN\"" "the Iran server: its public IP" ;;
+    esac
+    # No port key at all for icmp and gre. Writing port = 0 would pass the
+    # core's check and then sit in the file looking like a setting somebody
+    # chose.
+    case $T_TRANSPORT in
+    icmp | gre) printf '# %-24s # %s\n' "port" "none: this transport has no port and nothing to open" ;;
+    awg) kv port "$T_PORT" "the carrier's port inside the AmneziaWG link; awg.port below is the one to open" ;;
+    *) [ -n "$T_PORT" ] && kv port "$T_PORT" "the one port the tunnel uses, the same on both servers" ;;
+    esac
     # Only a stream carrier opens more than one. On this path a single TCP
     # connection is shaped to nothing and eight together are not shaped at
     # all, which is the whole reason the number is here.
     case $T_TRANSPORT in
-    tcp | ws | wss) printf 'connections = %s\n' "${T_CONNS:-8}" ;;
+    tcp | ws | wss) kv connections "${T_CONNS:-8}" "TCP connections kept open, 1-32: one is shaped to nothing, eight are not" ;;
+    utls | fallback) off connections 8 "TCP connections kept open, 1-32" ;;
     esac
-    [ -n "$T_PATH" ] && printf 'path = "%s"\n' "$T_PATH"
+    case $T_TRANSPORT in
+    ws | wss)
+        [ -n "$T_PATH" ] && kv path "\"$T_PATH\"" "the path the WebSocket handshake asks for; anything else gets a 404"
+        off listen_port "$T_PORT" "the port the waiting side binds when the CDN edge connects on another"
+        ;;
+    esac
+    case $mode in
+    forward)
+        off keepalive_sec 10 "seconds between keepalives on every connection"
+        off dials "\"kharej\"" "which side opens the connection: kharej (default) or iran"
+        ;;
+    *)
+        off keepalive_sec 10 "seconds between keepalives"
+        off dials "\"kharej\"" "which side sends first: kharej (default) or iran"
+        ;;
+    esac
+    case $T_TRANSPORT in
+    wss | utls | fallback)
+        off cert "\"\"" "a certificate for the waiting side, when nothing in front of it does the TLS"
+        off key "\"\"" "and its private key"
+        off insecure false "accept a certificate nobody vouches for: a self-made pair, never behind a CDN"
+        ;;
+    esac
+
     # AmneziaWG's own half of the tunnel. The keys are both pairs, because
     # WireGuard needs a private key on each side and the other side's public
     # one - four values where every other transport has a single shared token -
     # and one file still has to describe the whole tunnel.
     if [ "$T_TRANSPORT" = awg ]; then
         printf '\n[awg]\n'
-        printf 'name = "%s"\n' "$T_AWG_IFACE"
-        printf 'iran = "10.%s.20.1/24"\n' "$T_OCTET"
-        printf 'kharej = "10.%s.20.2/24"\n' "$T_OCTET"
-        printf 'mtu = 1320\n'
-        printf 'port = %s\n' "$T_AWG_PORT"
-        printf 'iran_key = "%s"\n' "$T_AWG_IKEY"
-        printf 'iran_pub = "%s"\n' "$T_AWG_IPUB"
-        printf 'kharej_key = "%s"\n' "$T_AWG_KKEY"
-        printf 'kharej_pub = "%s"\n' "$T_AWG_KPUB"
-        printf 'jc = %s\n' "$T_AWG_JC"
-        printf 'jmin = %s\n' "$T_AWG_JMIN"
-        printf 'jmax = %s\n' "$T_AWG_JMAX"
-        printf 's1 = %s\n' "$T_AWG_S1"
-        printf 's2 = %s\n' "$T_AWG_S2"
-        printf 'h1 = %s\n' "$T_AWG_H1"
-        printf 'h2 = %s\n' "$T_AWG_H2"
-        printf 'h3 = %s\n' "$T_AWG_H3"
-        printf 'h4 = %s\n' "$T_AWG_H4"
+        kv name "\"$T_AWG_IFACE\"" "the AmneziaWG interface on this server"
+        kv iran "\"10.$T_OCTET.20.1/24\"" "the link's own addresses, beside the tunnel's"
+        kv kharej "\"10.$T_OCTET.20.2/24\"" ""
+        kv mtu 1320 "the link's packet size; the tunnel inside it uses 1280"
+        kv port "$T_AWG_PORT" "where AmneziaWG listens - the port to open in a firewall"
+        kv iran_key "\"$T_AWG_IKEY\"" "IRAN's private key"
+        kv iran_pub "\"$T_AWG_IPUB\"" "and its public one"
+        kv kharej_key "\"$T_AWG_KKEY\"" "KHAREJ's private key"
+        kv kharej_pub "\"$T_AWG_KPUB\"" "and its public one"
+        kv jc "$T_AWG_JC" "obfuscation: junk packets before the handshake"
+        kv jmin "$T_AWG_JMIN" "smallest junk packet"
+        kv jmax "$T_AWG_JMAX" "largest"
+        kv s1 "$T_AWG_S1" "padding on the handshake initiation"
+        kv s2 "$T_AWG_S2" "and on the response"
+        kv h1 "$T_AWG_H1" "the four message type numbers, changed from WireGuard's"
+        kv h2 "$T_AWG_H2" ""
+        kv h3 "$T_AWG_H3" ""
+        kv h4 "$T_AWG_H4" ""
     fi
+
     printf '\n[security]\n'
-    printf 'token = "%s"\n' "$T_TOKEN"
+    kv token "\"$T_TOKEN\"" "the same on both servers; every packet carries a tag made from it"
+
     printf '\n[tuning]\n'
-    printf 'profile = "%s"\n' "$T_PROFILE"
-    if [ "${T_MODE:-$(mode_of "$T_TRANSPORT")}" = forward ]; then
+    kv profile "\"$T_PROFILE\"" "gaming | balanced | download - how deep the queues may get"
+    off queue_packets "$(wiz_queue "$T_PROFILE")" "the queue depth the profile chose; set to choose your own, 200-20000"
+    case $mode in
+    forward)
+        off sndbuf_kb 16384 "the carrier socket's send buffer"
+        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
+        ;;
+    *)
+        off rcvbuf_kb "$([ "$T_PROFILE" = download ] && echo 3072 || echo 256)" "the carrier socket's receive queue; deep carries more, shallow answers faster"
+        off sndbuf_kb 16384 "its send buffer"
+        off send_batch 32 "packets handed to the kernel per crossing, 1-64"
+        off pace true "put fq on the way out so bursts leave as a stream"
+        off pace_mbit 0 "and cap the rate, in Mbit/s; 0 means no cap"
+        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
+        case $T_TRANSPORT in
+        gre) ;;
+        *) off fec 0 "one parity packet per this many, 4-32; 0 is off. A tenth of the bandwidth, for a path that loses packets" ;;
+        esac
+        ;;
+    esac
+
+    if [ "$mode" = forward ]; then
         # The ports, in the Ports screen's spelling, one list for both
         # servers: IRAN binds them, KHAREJ reads them to know what it will be
-        # asked to dial.
+        # asked to dial. On one line, which is the shape toml_get reads.
         printf '\n[forward]\n'
+        printf '# The ports users connect to on IRAN, and where each one goes on KHAREJ:\n'
+        printf '#   "443"                 tcp 443 here, to 127.0.0.1:443 there\n'
+        printf '#   "8000-8010"           a range, port for port\n'
+        printf '#   "udp:500"             the same for udp\n'
+        printf '#   "443=8443"            a different port there\n'
+        printf '#   "443=10.99.10.5:443"  a different host there\n'
         printf 'ports = [%s]\n' "$(fwd_toml_list $T_PORTS)"
+        off bind_addr "\"0.0.0.0\"" "the address IRAN binds the ports on"
+        off allow "[]" "KHAREJ only: the targets it will dial, host:port; empty means any"
     else
         printf '\n[tun]\n'
-        printf 'name = "%s"\n' "$T_DEV"
-        printf 'iran = "10.%s.10.1/24"\n' "$T_OCTET"
-        printf 'kharej = "10.%s.10.2/24"\n' "$T_OCTET"
+        kv name "\"$T_DEV\"" "the device on this server"
+        kv iran "\"10.$T_OCTET.10.1/24\"" "IRAN's address on the link"
+        kv kharej "\"10.$T_OCTET.10.2/24\"" "KHAREJ's"
         # Not asked. 1320 works on every path we have measured, and Measure
         # MTU on the tunnel screen finds the real number properly.
-        printf 'mtu = %s\n' "${T_MTU:-1320}"
+        kv mtu "${T_MTU:-1320}" "inner packet size, 576-9000; Measure MTU on the tunnel screen finds yours"
+        off txqueuelen 1000 "packets the device holds for the link, 100-100000"
+        off write_workers 0 "goroutines putting arriving packets into the device; 0 is one per core"
+        off queues 1 "device queues, 1-16; more than one reorders a flow"
     fi
+
     printf '\n[logging]\n'
-    printf 'level = "info"\n'
+    kv level "\"info\"" "debug | info | warn | error"
+
     printf '\n[status]\n'
-    printf 'port = %s\n' "${T_STATUS:-$STATUS_BASE}"
+    kv port "${T_STATUS:-$STATUS_BASE}" "answers about this tunnel, on 127.0.0.1 only; 0 turns it off"
     # The same on both servers, and it stays that way: it is bound to this
     # tunnel's private address, which nothing else on either machine has.
-    printf 'health_port = %s\n' "${T_HEALTH:-$HEALTH_PORT}"
+    if [ "$mode" = forward ]; then
+        kv health_port -1 "no private address in forward mode, so none"
+    else
+        kv health_port "${T_HEALTH:-$HEALTH_PORT}" "the same answers on the link's own address, for the far end; -1 turns it off"
+    fi
 }
 
 # --------------------------------------------------------------------------

@@ -167,7 +167,7 @@ if [ -n "$CORE" ] && [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
         d=$(diff "$iran" "$kharej" | grep -c '^[<>]')
         check "two lines differ between the two servers" "$d" "4"
         check "and they are the side and the name" \
-            "$(diff "$iran" "$kharej" | grep '^>' | sed 's/^> //' | LC_ALL=C sort | tr '\n' ' ')" \
+            "$(diff "$iran" "$kharej" | grep '^>' | sed 's/^> //; s/[[:space:]]*#.*$//' | LC_ALL=C sort | tr '\n' ' ')" \
             'name = "kharej-udp-8443" side = "kharej" '
         check "the core accepts the far side too" \
             "$("$CORE" -c "$kharej" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"

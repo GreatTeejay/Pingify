@@ -88,6 +88,9 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {
 		// Interactive class. This queue holds one user's latency, and it should
 		// leave the machine ahead of a backup or an apt update.
 		_ = syscall.SetsockoptInt(f, syscall.SOL_SOCKET, soPriority, 6)
+		if cfg.Tuning.DSCP > 0 {
+			_ = syscall.SetsockoptInt(f, syscall.IPPROTO_IP, syscall.IP_TOS, cfg.Tuning.DSCP<<2)
+		}
 
 		// The kernel reports double what it gave, by long-standing convention.
 		if v, e := syscall.GetsockoptInt(f, syscall.SOL_SOCKET, syscall.SO_RCVBUF); e == nil {
@@ -119,5 +122,26 @@ func setUserTimeout(tc *net.TCPConn, d time.Duration) {
 	_ = raw.Control(func(fd uintptr) {
 		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpUserTimeout,
 			int(d/time.Millisecond))
+	})
+}
+
+// markDSCP puts the configured mark on one TCP connection's packets. The
+// stream carriers hand their connections in wrapped - a TLS connection, a
+// WebSocket - so the socket underneath is asked for through NetConn where
+// there is one, and a wrapping that does not offer it is left unmarked.
+func markDSCP(c net.Conn, dscp int) {
+	if dscp <= 0 {
+		return
+	}
+	tc := tcpOf(c)
+	if tc == nil {
+		return
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, dscp<<2)
 	})
 }

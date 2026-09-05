@@ -68,7 +68,7 @@ func New(cfg *config.Config, car carrier.Carrier) (*Link, error) {
 	}
 
 	mine, _ := cfg.Mine()
-	if err := configureDevice(l.name, mine, cfg.TUN.MTU); err != nil {
+	if err := configureDevice(l.name, mine, cfg.TUN.MTU, cfg.TUN.TxQueueLen); err != nil {
 		l.closeDevices()
 		return nil, err
 	}

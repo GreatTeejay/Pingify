@@ -19,4 +19,4 @@ var errNoTUN = errors.New("a tun device needs Linux")
 
 func openTUN(name string, multi bool) (*os.File, error) { return nil, errNoTUN }
 
-func configureDevice(name, addr string, mtu int) error { return errNoTUN }
+func configureDevice(name, addr string, mtu, txqueuelen int) error { return errNoTUN }

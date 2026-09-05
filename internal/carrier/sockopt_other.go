@@ -18,3 +18,5 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {}
 func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
 
 func setUserTimeout(tc *net.TCPConn, d time.Duration) {}
+
+func markDSCP(c net.Conn, dscp int) {}
