@@ -6,7 +6,7 @@
 # internet and a panel running on the other server.
 #
 # The state file is the truth and iptables is a copy of it. Every change
-# writes the list under /var/lib/pingify and then rebuilds the chains from
+# writes the list under the state directory and then rebuilds the chains from
 # every tunnel's list. Nothing edits a live rule in place, so the rules cannot
 # end up describing something nobody asked for - which is what happens when a
 # tool adds and deletes single rules and one of the deletes quietly fails.

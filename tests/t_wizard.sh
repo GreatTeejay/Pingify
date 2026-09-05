@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 #
-# The wizard, driven rather than grepped.
+# The wizard, driven through its stdin, the way a person drives it.
 #
-# The old suite could not do this: its questions were inline in one long
-# function, so a test could only look at the source and count how many times a
-# phrase appeared in it. Those assertions passed on code that could never run
-# and broke whenever anybody improved the wording. Here the questions are
-# functions and the answers come from stdin, so a test answers them the way a
-# person does and then reads what was written.
+# The questions, in the order they are asked:
+#
+#   side  transport  [direction]  this address  other address  [port]
+#   [octet  device  mtu]  [ports]  preset  logging  confirm
+#
+# and on the second server: side 3, the token, confirm. Every test here
+# answers the real questions and reads the real file that came out, so a
+# wizard that stops producing a config the core accepts fails here rather
+# than on a server.
 
 cd "$(dirname "$0")/.." || exit 1
 . tests/lib.sh
@@ -15,280 +18,198 @@ load_parts .
 sandbox
 trap sandbox_clean EXIT
 
-# The wizard writes a file and then asks the core whether it is any good, so
-# there has to be a core. Without one, the parts that can be tested without it
-# still are.
-CORE=
-if command -v go >/dev/null 2>&1 && go build -o "$SANDBOX/pingify-core" ./cmd/pingify 2>/dev/null; then
-    CORE=$SANDBOX/pingify-core
-    CORE_BIN=$CORE
-fi
-
-# systemd is not here and must not be reached for. Stub the two things the
-# wizard calls, and record what it asked for.
-systemctl() { printf '%s\n' "systemctl $*" >>"$SANDBOX/systemctl.log"; return 0; }
-svc_do() { printf '%s\n' "svc_do $*" >>"$SANDBOX/systemctl.log"; return 0; }
+# Nothing here may reach systemd, the firewall, or an interface.
+systemctl() { return 0; }
+journalctl() { return 0; }
 nat_apply() { return 0; }
+nat_drop() { return 0; }
+awg_install() { return 0; }
+sleep() { :; }
+srv_info() { SRV_IP=1.2.3.4 SRV_LOC=x SRV_ORG=y; }
+wiz_public_ips() { return 1; }
+curl() { return 1; }
 
-# Seven answers: iran, this server's address, the one abroad, udp, the port,
-# the octet, balanced, then y to create.
 answers() { printf '%s\n' "$@"; }
 
-section "seven questions on the first server"
+# the core, so the wizard's file can be judged by the real reader
+CORE=
+if have go && [ -f go.mod ]; then
+    CORE=$SANDBOX/pingify-core
+    go build -o "$CORE" ./cmd/pingify 2>/dev/null || CORE=
+fi
+CORE_BIN=${CORE:-/nonexistent/pingify-core}
+ensure_core() { [ -x "$CORE_BIN" ]; }
+
+# The value of a key with the note stripped; toml_get does that already.
+val() { toml_get "$1" "$2" "$3"; }
+
+section "the questions come in the order they were designed in"
+
+out=$(answers 1 6 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 n | new_tunnel 2>&1)
+check_contains "which server comes first" "$out" "1 . Which server is this?"
+check_contains "then the transport" "$out" "2 . Transport"
+check_contains "an ICMP tunnel is not asked its direction" "$out" "3 . Addresses"
+check_contains "the private link comes after the addresses" "$out" "4 . Private link"
+check_contains "then the ports" "$out" "5 . Ports"
+check_contains "then the preset" "$out" "6 . Performance"
+check_contains "then the logging" "$out" "7 . How much to log"
+check_contains "the review panel names the tunnel" "$out" "Ready to create"
+check_contains "and says no when told no" "$out" "cancelled, nothing was written"
+check "nothing was written on no" "$(ls "$CFG_DIR" | wc -l | tr -d ' ')" "0"
+
+section "a TCP tunnel is asked its direction and its port, and no link"
+
+out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "443,udp:500" 2 3 n | new_tunnel 2>&1)
+check_contains "the direction question comes after the transport" "$out" "3 . Link direction"
+check_contains "then the addresses" "$out" "4 . Addresses"
+check_contains "then the port" "$out" "5 . Port"
+check_missing "a forward tunnel has no private link" "$out" "Private link"
+check_contains "the review shows the ports" "$out" "443 udp:500"
+
+section "q leaves without building anything"
+
+out=$(answers 1 1 q | new_tunnel 2>&1)
+check "nothing was written on q" "$(ls "$CFG_DIR" | wc -l | tr -d ' ')" "0"
+check_missing "and no later question was asked" "$out" "Addresses"
+
+section "the first server builds a [TUN] ICMP tunnel"
 
 if [ -z "$CORE" ]; then
-    skip "the wizard end to end" "no core could be built"
+    skip "the icmp wizard" "no core could be built"
 else
-    # 8 is [TUN] UDP: the link kind, with the address pair the octet derives.
-    out=$(answers 1 8 185.31.8.129 46.247.109.83 8443 99 "" 2 y | wizard_new 2>&1)
-    rc=$?
-    check "the wizard finished" "$rc" "0"
-
-    f=$CFG_DIR/iran-udp-8443.toml
+    out=$(answers 1 6 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 y | new_tunnel 2>&1)
+    f=$CFG_DIR/iran-icmp-1.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
         printf '    \033[31mx\033[0m no config was written\n'
-        printf '%s\n' "$out" | tail -20 | sed 's/^/        /'
-    else
-        check "the side that was chosen" "$(toml_get "$f" tunnel side)" "iran"
-        check "the address abroad" "$(toml_get "$f" transport kharej)" "46.247.109.83"
-        # Recorded rather than dialled, and the wizard asks for it because a
-        # server with several addresses had the first one taken silently.
-        check "this server's own address" "$(toml_get "$f" transport iran)" "185.31.8.129"
-        check "the transport" "$(toml_get "$f" transport type)" "udp"
-        check "the port" "$(toml_get "$f" transport port)" "8443"
-        check "the profile" "$(toml_get "$f" tuning profile)" "balanced"
-        check "iran's address, derived from the octet" \
-            "$(toml_get "$f" tun iran)" "10.99.10.1/24"
-        check "kharej's, derived from the same octet" \
-            "$(toml_get "$f" tun kharej)" "10.99.10.2/24"
-        check "the core accepts what the wizard wrote" \
-            "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
-
-        # The token is generated, not asked for. A question removed is a
-        # question nobody gets wrong, and it removes the class of bug where
-        # one server has a trailing space on the end of its token.
-        tok=$(toml_get "$f" security token)
-        if [ "${#tok}" -ge 8 ]; then PASS=$((PASS + 1)); else
-            FAIL=$((FAIL + 1))
-            printf '    \033[31mx\033[0m the generated token was %s characters\n' "${#tok}"
-        fi
-
-        # chmod does nothing at all on some filesystems - NTFS under Git Bash
-        # for one - and a test that always fails there is a test people learn
-        # to ignore. Find out whether chmod works before believing it.
-        probe=$SANDBOX/mode.probe
-        : >"$probe"
-        chmod 0600 "$probe" 2>/dev/null
-        if [ "$(stat -c %a "$probe" 2>/dev/null)" = 600 ]; then
-            check "the config is not readable by anyone else" \
-                "$(stat -c %a "$f" 2>/dev/null)" "600"
-        else
-            skip "the config file's mode" "chmod does nothing on this filesystem"
-        fi
-    fi
-fi
-
-section "the name says which side it is"
-
-# The first thing anybody needs to know about a tunnel is which end of the
-# border it is, and `ls /root/pingify` should answer that without opening
-# anything. It is why the two files differ in two lines rather than one: the
-# paste rewrites the name along with the side.
-if [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
-    n=$(toml_get "$CFG_DIR/iran-udp-8443.toml" tunnel name)
-    check "the name is side, transport and port" "$n" "iran-udp-8443"
-    check "flipping it gives the other server's name" \
-        "$(name_for_side "$n" kharej)" "kharej-udp-8443"
-    check "a name nobody built from a side is left alone" \
-        "$(name_for_side "something-else" kharej)" "something-else"
-
-    # The device name is not the tunnel's name and must not become it: linux
-    # takes fifteen characters and kharej-icmp-100 is already fifteen.
-    d=$(toml_get "$CFG_DIR/iran-udp-8443.toml" tun name)
-    check_missing "the device is not named after a side" "$d" "iran"
-    if [ "${#d}" -le 15 ]; then PASS=$((PASS + 1)); else
-        FAIL=$((FAIL + 1))
-        printf '    \033[31mx\033[0m the device name is %s characters; linux allows 15\n' "${#d}"
-    fi
-fi
-
-section "the token carries the whole file"
-
-if [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
-    f=$CFG_DIR/iran-udp-8443.toml
-    line=$(token_encode "$f")
-    check_contains "it is marked as ours" "$line" "PFY2."
-
-    back=$(token_decode "$line")
-    check "what comes out is what went in" "$back" "$(cat "$f")"
-
-    # One hash over the body. The old format was thirty-one fields separated
-    # by pipes, so every new config key meant editing both halves and keeping
-    # them in step, and a truncated paste was caught only by field arithmetic.
-    bent=${line%??}zz
-    check_rc "a token that was damaged in the paste is refused" 1 token_decode "$bent"
-
-    # A token with awkward characters in it must survive the round trip, since
-    # the security token is arbitrary text and people paste it from anywhere.
-    g=$SANDBOX/awkward.toml
-    cp "$f" "$g"
-    toml_set "$g" security token 'a|b"c#d e	f'
-    back=$(token_decode "$(token_encode "$g")")
-    check "quotes, pipes and hashes come back unharmed" "$back" "$(cat "$g")"
-fi
-
-section "one paste finishes the pair"
-
-if [ -n "$CORE" ] && [ -f "$CFG_DIR/iran-udp-8443.toml" ]; then
-    iran=$SANDBOX/iran.toml
-    cp "$CFG_DIR/iran-udp-8443.toml" "$iran"
-    line=$(token_encode "$iran")
-
-    # The far server, from nothing but that line.
-    rm -f "$CFG_DIR"/*.toml
-    out=$(printf '%s\ny\n' "$line" | wizard_paste 2>&1)
-    kharej=$CFG_DIR/kharej-udp-8443.toml
-
-    if [ ! -f "$kharej" ]; then
-        FAIL=$((FAIL + 1))
-        printf '    \033[31mx\033[0m the paste did not produce a config\n'
         printf '%s\n' "$out" | tail -15 | sed 's/^/        /'
-        ls "$CFG_DIR" | sed 's/^/        found: /'
     else
-        check "the far side knows which side it is" \
-            "$(toml_get "$kharej" tunnel side)" "kharej"
-        check "and renamed itself to match" \
-            "$(toml_get "$kharej" tunnel name)" "kharej-udp-8443"
-
-        # The property the whole design rests on: one file, two servers. Two
-        # lines differ now rather than one, and the second is the name, which
-        # is the price of a name that says which end it is.
-        d=$(diff "$iran" "$kharej" | grep -c '^[<>]')
-        check "two lines differ between the two servers" "$d" "4"
-        check "and they are the side and the name" \
-            "$(diff "$iran" "$kharej" | grep '^>' | sed 's/^> //; s/[[:space:]]*#.*$//' | LC_ALL=C sort | tr '\n' ' ')" \
-            'name = "kharej-udp-8443" side = "kharej" '
-        check "the core accepts the far side too" \
-            "$("$CORE" -c "$kharej" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
-    fi
-fi
-
-section "what is already taken"
-
-# Nothing may be handed out twice, and a tunnel being edited may keep what it
-# already has - which is the case the old collision check got wrong, so
-# changing anything about a tunnel told you its own address was in use.
-rm -f "$CFG_DIR"/*.toml
-cat >"$CFG_DIR/taken.toml" <<'T'
-[tunnel]
-name = "taken"
-side = "iran"
-[transport]
-type = "udp"
-port = 8443
-[tun]
-name = "pfy0"
-iran = "10.77.10.1/24"
-kharej = "10.77.10.2/24"
-T
-
-check "an octet another tunnel holds is taken" "$(wiz_link_owner 77)" "the tunnel taken"
-check "a free one is free" "$(wiz_link_owner 78)" ""
-check "a device another tunnel holds is taken" "$(wiz_device_owner pfy0)" "the tunnel taken"
-check "a free device is free" "$(wiz_device_owner pfy1)" ""
-check "a port another tunnel holds is taken" "$(wiz_port_owner 8443)" "the tunnel taken"
-check "a free port is free" "$(wiz_port_owner 8444)" ""
-
-# The exception that matters: editing a tunnel, its own values are not a clash.
-check "a tunnel may keep its own octet" "$(wiz_link_owner 77 taken)" ""
-check "and its own device" "$(wiz_device_owner pfy0 taken)" ""
-check "and its own port" "$(wiz_port_owner 8443 taken)" ""
-
-check "the next free octet skips what is taken" \
-    "$(free_octet | head -1)" "$(free_octet | head -1)"
-o=$(free_octet)
-check_rc "and what it offers is genuinely free" 0 test -z "$(wiz_link_owner "$o")"
-
-
-section "a bound port is checked on the end that waits"
-
-# KHAREJ dials IRAN, so the port has to be free on IRAN. The check used to
-# run on kharej - from when Iran was the end that dialled - which was the end
-# with no socket, and skipped the end with one.
-T_DIALS=
-check_contains "by default the end that waits is iran" "$(wiz_waits)" "iran"
-T_DIALS=iran
-check_contains "with transport.dials = iran it is kharej" "$(wiz_waits)" "kharej"
-T_DIALS=
-
-wiz_port_owner() { return 1; }
-wiz_port_bound() { return 0; } # everything is taken, as far as the kernel says
-T_TRANSPORT=tcp
-T_SIDE=iran
-check_rc "on iran, the end that waits, a bound port is refused" 1 v_wiz_port 8443
-T_SIDE=kharej
-check_rc "on kharej, the end that dials, the same port is fine" 0 v_wiz_port 8443
-unset -f wiz_port_owner wiz_port_bound
-
-
-section "two kinds of tunnel, and the transport decides which"
-
-# Streams forward ports and packets need a link; the core refuses the other
-# pairing, so the wizard has to get it right every time.
-for t in tcp ws wss utls fallback; do
-    check_contains "$t forwards ports" "$(mode_of $t)" "forward"
-done
-for t in icmp gre udp rawtcp awg; do
-    check_contains "$t is a [TUN] link" "$(mode_of $t)" "tun"
-done
-check_contains "a [TUN] transport wears the label" "$(kind_label icmp)" "[TUN] ICMP"
-check_contains "and Raw TCP keeps its name under it" "$(kind_label rawtcp)" "[TUN] Raw TCP"
-check_missing "a TCP tunnel does not" "$(kind_label fallback)" "[TUN]"
-check_contains "the port list renders as a TOML array" "$(fwd_toml_list 443 udp:500 8000-8010=9000)" '"443", "udp:500", "8000-8010=9000"'
-
-
-section "a TCP tunnel: ports instead of a link"
-
-if [ -z "$CORE" ]; then
-    skip "the forward wizard end to end" "no core could be built"
-else
-    out=$(answers 1 1 185.31.8.129 46.247.109.83 8443 "443,udp:500" 2 y | wizard_new 2>&1)
-    check "the wizard finished" "$?" "0"
-    f=$CFG_DIR/iran-tcp-8443.toml
-    if [ ! -f "$f" ]; then
-        FAIL=$((FAIL + 1))
-        printf '    [31mx[0m no config was written
-'
-        printf '%s
-' "$out" | tail -12 | sed 's/^/        /'
-    else
-        check "it is a forward tunnel" "$(toml_get "$f" tunnel mode)" "forward"
-        check_contains "the ports went into the file, both of them" "$(toml_get "$f" forward ports)" '"443", "udp:500"'
-        check_missing "and there is no private link in it" "$(cat "$f")" "[tun]"
-        check "the core accepts it"             "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
-    fi
-fi
-
-section "a [TUN] tunnel asks for its ports too"
-
-if [ -z "$CORE" ]; then
-    skip "the tun wizard with ports" "no core could be built"
-else
-    out=$(answers 1 8 185.31.8.129 46.247.109.83 8444 98 "443,udp:500" 2 y | wizard_new 2>&1)
-    check "the wizard finished" "$?" "0"
-    f=$CFG_DIR/iran-udp-8444.toml
-    if [ ! -f "$f" ]; then
-        FAIL=$((FAIL + 1))
-        printf '    \033[31mx\033[0m no config was written\n'
-        printf '%s\n' "$out" | tail -12 | sed 's/^/        /'
-    else
-        check "it is still a tun tunnel" "$(toml_get "$f" tunnel mode)" "tun"
-        check_contains "the ports went into the file" "$(toml_get "$f" forward ports)" '"443", "udp:500"'
-        check "and into the forwards state on IRAN" "$(forwards_of iran-udp-8444 | tr '\n' ' ')" "443 udp:500 "
-        check_contains "the review panel showed them" "$out" "443 udp:500"
+        check "the name carries the side, the transport and the octet" "$(val "$f" tunnel name)" "iran-icmp-1"
+        check "the side is iran" "$(val "$f" tunnel side)" "iran"
+        check "the mode is tun" "$(val "$f" tunnel mode)" "tun"
+        check "the transport is icmp" "$(val "$f" transport type)" "icmp"
+        check "iran's address" "$(val "$f" transport iran)" "185.31.8.129"
+        check "kharej's address" "$(val "$f" transport kharej)" "46.247.109.83"
+        check "IRAN dials out by default" "$(val "$f" transport dials)" "iran"
+        check "there is no port line for icmp" "$(val "$f" transport port)" ""
+        check "the link addresses come from the octet" "$(val "$f" tun iran)" "10.1.10.1/24"
+        check "on both sides" "$(val "$f" tun kharej)" "10.1.10.2/24"
+        check "the device" "$(val "$f" tun name)" "pfy0"
+        check "the mtu default" "$(val "$f" tun mtu)" "1320"
+        check "the ports went into the file" "$(val "$f" forward ports)" '["3030"]'
+        check "and into the forwards state on IRAN" "$(forwards_of iran-icmp-1 | tr '\n' ' ')" "3030 "
+        check "the preset" "$(val "$f" tuning profile)" "balanced"
+        check "the logging level" "$(val "$f" logging level)" "info"
+        check "the status port" "$(val "$f" status port)" "19900"
+        check "the health port" "$(val "$f" status health_port)" "19999"
+        tok=$(val "$f" security token)
+        check "the token was generated" "$([ "${#tok}" -ge 16 ] && echo long)" "long"
         check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+        check_contains "the wizard printed a token for the other server" "$out" "PFY3."
+        check_contains "and said which server to take it to" "$out" "Now the KHAREJ server"
+        TOKEN=$(printf '%s\n' "$out" | grep -o 'PFY3\.[A-Za-z0-9+/=]*' | head -1)
+        check "the token is short enough to paste over a phone" "$([ "${#TOKEN}" -lt 700 ] && echo short)" "short"
     fi
+fi
+
+section "the second server finishes the pair from the token"
+
+if [ -z "$CORE" ] || [ -z "${TOKEN:-}" ]; then
+    skip "the paste path" "no token from the first half"
+else
+    IRAN_FILE=$CFG_DIR/iran-icmp-1.toml
+    IRAN_DIR=$CFG_DIR
+    KH_DIR=$SANDBOX/etc2
+    mkdir -p "$KH_DIR" "$SANDBOX/var2"
+    CFG_DIR=$KH_DIR STATE_DIR=$SANDBOX/var2
+    out=$(answers 3 "$TOKEN" y | new_tunnel 2>&1)
+    kf=$KH_DIR/kharej-icmp-1.toml
+    if [ ! -f "$kf" ]; then
+        FAIL=$((FAIL + 1))
+        printf '    \033[31mx\033[0m the paste wrote no config\n'
+        printf '%s\n' "$out" | tail -15 | sed 's/^/        /'
+    else
+        check "the side flipped" "$(val "$kf" tunnel side)" "kharej"
+        check "and the name with it" "$(val "$kf" tunnel name)" "kharej-icmp-1"
+        check "the token is the same" "$(val "$kf" security token)" "$(val "$IRAN_FILE" security token)"
+        check "the core accepts it too" "$("$CORE" -c "$kf" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+        d=$(diff <(sed 's/[[:space:]]*#.*$//' "$IRAN_FILE") <(sed 's/[[:space:]]*#.*$//' "$kf") | grep '^>' | sed 's/^> //' | tr '\n' '|')
+        check "only the side and the name differ" "$d" 'name = "kharej-icmp-1"|side = "kharej"|'
+        check_contains "the paste told the person which side this is" "$out" "this is the KHAREJ side"
+        check_contains "and said both are done" "$out" "Both servers are set up"
+    fi
+    CFG_DIR=$IRAN_DIR STATE_DIR=$SANDBOX/var
+fi
+
+section "what is taken is refused"
+
+if [ -z "$CORE" ]; then
+    skip "collisions" "no core could be built"
+else
+    # The octet 1 belongs to the tunnel above; the wizard must refuse it and
+    # offer the next one as the default.
+    out=$(answers 1 8 "" 185.31.8.129 46.247.109.83 "" 1 "" "" "" "3031" 2 3 n | new_tunnel 2>&1)
+    check_contains "a taken network is listed" "$out" "10.1.10.0/24"
+    check_contains "and refused" "$out" "already belongs to iran-icmp-1"
+    check_contains "the next free one is taken" "$out" "10.2.10.1/24"
+    check_contains "a forwarded port is listed as taken" "$out" "3030"
+
+    # A port already forwarded by another tunnel is refused at the Ports question.
+    out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "3030" "3031" 2 3 n | new_tunnel 2>&1)
+    check_contains "a port another tunnel forwards is refused" "$out" "already forwarded by the tunnel iran-icmp-1"
+    check_contains "and the next answer is taken" "$out" "3031"
+
+    # An empty ports answer is an error, not a tunnel with no ports.
+    out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "3032" 2 3 n | new_tunnel 2>&1)
+    check_contains "no ports is refused" "$out" "at least one port is required"
+
+    # A tunnel port another tunnel here waits on is refused for a second one.
+    answers 1 1 2 185.31.8.129 46.247.109.83 8443 "3040" 2 3 y | new_tunnel >/dev/null 2>&1
+    check "a tcp tunnel that waits here was built" "$(val "$CFG_DIR/iran-tcp-8443.toml" transport dials)" "kharej"
+    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 8443 8444 "3041" 2 3 n | new_tunnel 2>&1)
+    check_contains "its port is listed as taken" "$out" "8443/tcp"
+    check_contains "and refused for a second tunnel" "$out" "already the tunnel port of iran-tcp-8443"
+fi
+
+section "the token survives the trip"
+
+if [ -z "$CORE" ]; then
+    skip "token round trip" "no core could be built"
+else
+    cfg_load iran-tcp-8443
+    t=$(cfg_setup_token)
+    cfg_reset
+    setup_token_read "$t" || { FAIL=$((FAIL + 1)); printf '    \033[31mx\033[0m %s\n' "$SETUP_TOKEN_ERROR"; }
+    check "the transport came back" "$T_TRANSPORT" "tcp"
+    check "the dials came back" "$T_DIALS" "kharej"
+    check "the port came back" "$T_PORT" "8443"
+    check "the forwards came back" "$T_FORWARDS" "3040"
+    check "the addresses came back" "$T_IRAN/$T_KHAREJ" "185.31.8.129/46.247.109.83"
+    check "the token came back" "$T_TOKEN" "$(val "$CFG_DIR/iran-tcp-8443.toml" security token)"
+    check_rc "a damaged token is refused" 1 setup_token_read "${t:0:60}"
+    check_rc "a line that is not a token is refused" 1 setup_token_read "hello there"
+
+    # A 2.2.0 token carries the whole file; it is still accepted.
+    body=$(cat "$CFG_DIR/iran-tcp-8443.toml")
+    sum=$(printf '%s\n' "$body" | wiz_sha256)
+    old="PFY2.$( { printf '%s|' "$sum"; printf '%s\n' "$body"; } | base64 | tr -d '\n')"
+    cfg_reset
+    setup_token_read "$old" || { FAIL=$((FAIL + 1)); printf '    \033[31mx\033[0m %s\n' "$SETUP_TOKEN_ERROR"; }
+    check "an old full-file token is read" "$T_NAME/$T_TRANSPORT/$T_PORT" "iran-tcp-8443/tcp/8443"
+fi
+
+section "the file reads back into the same values"
+
+if [ -z "$CORE" ]; then
+    skip "cfg_load" "no core could be built"
+else
+    cfg_load iran-icmp-1
+    check "the octet" "$T_OCTET" "1"
+    check "this server's link address" "$T_TUNLOCAL" "10.1.10.1/24"
+    check "the other one's" "$T_TUNPEER" "10.1.10.2/24"
+    check "the forwards" "$T_FORWARDS" "3030"
+    check "the health port" "$T_HEALTH" "19999"
+    check "the public addresses by side" "$T_PUBLIC_IP/$T_PEER_IP" "185.31.8.129/46.247.109.83"
 fi
 
 report

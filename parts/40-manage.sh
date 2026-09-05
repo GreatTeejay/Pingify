@@ -1,84 +1,20 @@
 #!/usr/bin/env bash
 #
-# The screen a person looks at most: one tunnel, what it is doing, and the
-# things they might want to do to it.
-#
-# It is one screen and it fits on a phone. The old manager put the same
-# information behind three menus and then listed the tunnels twice on the way
-# in - once as a status table and again as a numbered list of the same names -
-# so choosing one meant reading the same six words in two places and matching
-# them up by eye.
+# Manage tunnels: the list, one tunnel's screen, and the things that can be
+# changed on it. Everything a screen reports comes from two sources and no
+# third: systemd says whether the unit is running, and the core's own status
+# endpoint says whether it is carrying anything. Nothing reads the log.
 
-# --------------------------------------------------------------------------
-# what a tunnel is doing
-# --------------------------------------------------------------------------
-
-# tun_line fills TL_* for one tunnel: enough for a row on the home screen.
-#
-# Two sources and no third. systemd says whether the unit is running, and the
-# core's own status endpoint says whether it is carrying anything. Nothing here
-# reads the log, because a log line is prose and prose gets reworded - the old
-# manager took the eighth field of an English sentence and broke the day
-# somebody improved the sentence.
-# The queue depth beside the profile's name. "balanced" on its own does not
-# say what it does; the depth is the half of what a profile changes that a
-# person can picture (the other half is the receiving socket's queue).
-prof_queue_note() {
-    local f=$1 q
-    q=$(toml_get "$f" tuning queue_packets)
-    [ -n "$q" ] || q=$(wiz_queue "$(toml_get "$f" tuning profile)")
-    [ -n "$q" ] || return 0
-    printf ' %s %s packets' "$G_DASH" "$q"
-}
-
-tun_line() {
-    local name=$1 state
-    TL_STATE=unknown TL_RATE= TL_PEER= TL_RTT= TL_TRANSPORT= TL_SIDE= TL_UPTIME=
-
-    local f
-    f=$(cfg_file "$name")
-    TL_TRANSPORT=$(toml_get "$f" transport type)
-    TL_SIDE=$(toml_get "$f" tunnel side)
-    TL_PEER=$(peer_addr "$name")
-
-    state=$(svc_state "$name")
-    case $state in
-    disabled | stopped)
-        TL_STATE=$state
-        return
-        ;;
-    esac
-
-    if tun_stats "$name"; then
-        # Running and the far end has been seen is the only state that earns a
-        # green dot. Running and alone looks identical from here and is not
-        # the same thing at all.
-        if [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ]; then
-            TL_STATE=running
-        else
-            TL_STATE=idle
-        fi
-        TL_RATE="$(round1 "$ST_IN") in, $(round1 "$ST_OUT") out"
-        TL_UPTIME=$(human_secs "$ST_UPTIME")
-    else
-        # The unit is up but the endpoint does not answer. That is a real
-        # state and it is not a failure to report in red: it happens for the
-        # first second of every start.
-        TL_STATE=idle
-    fi
-    TL_RTT=$(tun_rtt "$name")
-}
+# ---------------------------------------------------------------------------
+# where the other end is
+# ---------------------------------------------------------------------------
 
 # peer_addr is the other end of the private link, without its prefix.
 peer_addr() {
     local f side a
     f=$(cfg_file "$1")
     side=$(toml_get "$f" tunnel side)
-    if [ "$side" = iran ]; then
-        a=$(toml_get "$f" tun kharej)
-    else
-        a=$(toml_get "$f" tun iran)
-    fi
+    if [ "$side" = iran ]; then a=$(toml_get "$f" tun kharej); else a=$(toml_get "$f" tun iran); fi
     printf '%s' "${a%%/*}"
 }
 
@@ -86,453 +22,274 @@ my_addr() {
     local f side a
     f=$(cfg_file "$1")
     side=$(toml_get "$f" tunnel side)
-    if [ "$side" = iran ]; then
-        a=$(toml_get "$f" tun iran)
-    else
-        a=$(toml_get "$f" tun kharej)
-    fi
+    if [ "$side" = iran ]; then a=$(toml_get "$f" tun iran); else a=$(toml_get "$f" tun kharej); fi
     printf '%s' "${a%%/*}"
 }
 
-# tun_rtt is the round trip across the private link, or nothing.
-#
-# Nothing, on an ICMP tunnel, and that is the correct answer rather than a
-# missing one. An ICMP carrier stops both kernels answering echo - it has to,
-# or every packet it sends is answered twice - so a ping across the link goes
-# out and is deliberately ignored. The old manager would have drawn that in red
-# and told the user their working tunnel was dead.
-tun_rtt() {
-    local name=$1 t out hp peer
-    t=$(toml_get "$(cfg_file "$name")" transport type)
+# peer_public is the other server's public address, from the file.
+peer_public() {
+    local f side
+    f=$(cfg_file "$1")
+    side=$(toml_get "$f" tunnel side)
+    if [ "$side" = iran ]; then toml_get "$f" transport kharej; else toml_get "$f" transport iran; fi
+}
 
-    # A forward tunnel has no address to ping and no health port to connect
-    # to; it measures itself, with a ping record every ten seconds, and the
-    # status endpoint says what it found.
-    if [ "$(toml_get "$(cfg_file "$name")" tunnel mode)" = forward ]; then
+# tun_rtt is the round trip to the other end, in whole milliseconds, or
+# nothing when it cannot be measured.
+#
+# A forward tunnel measures itself with a ping record every ten seconds and
+# reports it. An ICMP tunnel cannot be pinged across - the carrier stops both
+# kernels answering echo - so the far end is asked on its health port instead,
+# and curl's connect time is one round trip across the link. Everything else
+# is two pings, a fifth of a second apart.
+tun_rtt() {
+    local name=$1 f t out hp peer
+    f=$(cfg_file "$name")
+    t=$(toml_get "$f" transport type)
+    if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
         tun_stats "$name" || return 0
-        case $ST_FAR_RTT in
-        '' | 0 | *[!0-9.]*) return 0 ;;
-        esac
+        case $ST_FAR_RTT in '' | 0 | *[!0-9.]*) return 0 ;; esac
         LC_ALL=C awk -v t="$ST_FAR_RTT" 'BEGIN { printf "%.0f", t }'
         return 0
     fi
-
-    # An ICMP tunnel cannot be pinged. The carrier stops both kernels
-    # answering echo - it has to, or every packet it sends is answered twice -
-    # so the ping goes out and is deliberately ignored, and for a long time
-    # this returned nothing at all and every screen showed a dash.
-    #
-    # The far end answers on its health port instead, and curl's time_connect
-    # is the TCP handshake: one round trip across the link and nothing else in
-    # it. It is the same measurement a ping would have made.
     if [ "$t" = icmp ]; then
         have curl || return 0
         hp=$(health_port_of "$name")
         peer=$(peer_addr "$name")
         [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
-        out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 \
-            -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
+        out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
         case $out in '' | 0 | 0.000000) return 0 ;; esac
         LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
         return 0
     fi
-
     have ping || return 0
-    # Two packets a fifth of a second apart, and one second to wait. This is
-    # on the path of every redraw of the home screen: -c 2 -W 2 meant a tunnel
-    # whose far end had stopped answering cost four seconds of nothing before
-    # the menu appeared, once for every tunnel on the server.
     out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
-        awk -F'/' '/^rtt|^round-trip/ {printf "%.0f", $5}')
+        awk -F'/' '/^rtt|^round-trip/ { printf "%.0f", $5 }')
     printf '%s' "$out"
 }
 
-# --------------------------------------------------------------------------
-# the tunnel screen
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# status rendering
+# ---------------------------------------------------------------------------
 
-screen_tunnel() {
-    local name=$1 f
+# tunnel_status_block is the few lines under a tunnel's name: the service,
+# the token's fingerprint, and what the core says it is doing.
+tunnel_status_block() {
+    local name=$1 f state colour
     f=$(cfg_file "$name")
-    [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
+    [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
+    state=$(svc_state "$name")
+    colour=$C_RED
+    [ "$state" = active ] && colour=$C_GRN
+    printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
+        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
+    if [ "$state" != active ]; then
+        dim "not running - nothing to report"
+        return 0
+    fi
+    if ! tun_stats "$name"; then
+        dim "starting up, or the status port is not answering yet"
+        return 0
+    fi
+    local link
+    if [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ]; then
+        link="${C_GRN}up${C_OFF} for $(human_secs "$ST_UPTIME"), the other server has been heard from"
+    elif [ "$ST_UP" = true ]; then
+        link="${C_YEL}up${C_OFF} for $(human_secs "$ST_UPTIME"), nothing from the other server yet"
+    else
+        link="${C_YEL}waiting${C_OFF} for the other server, $(human_secs "$ST_UPTIME") so far"
+    fi
+    dim "$link"
+    dim "carrying $(round1 "$ST_IN") Mbit/s in, $(round1 "$ST_OUT") out"
+    if [ "${ST_LOST:-0}" -gt 0 ] 2>/dev/null; then
+        dim "the path has lost $ST_LOST packets in ${ST_GAPS:-0} runs, ${ST_LATE:-0} arrived late"
+    fi
+    local rtt
+    rtt=$(tun_rtt "$name")
+    [ -n "$rtt" ] && dim "round trip $(rtt_tint "${rtt}ms") to the other server"
+    return 0
+}
 
+# One line per tunnel, for the overview table. NAME SIDE PROTO LINK RTT MBIT
+tunnel_row() {
+    local name=$1 nw=${2:-13} f side proto state dot link rtt=- rate=-
+    f=$(cfg_file "$name")
+    side=$(side_label "$(toml_get "$f" tunnel side)")
+    proto=$(transport_label "$(toml_get "$f" transport type)")
+    state=$(svc_state "$name")
+    dot="$C_GRY$BX_OFF$C_OFF" link=-
+    case $state in
+    active)
+        if tun_stats "$name"; then
+            if [ "$ST_UP" = true ] && [ "${ST_INB:-0}" != 0 ]; then
+                dot="$C_GRN$BX_ON$C_OFF" link=up
+            else
+                dot="$C_YEL$BX_ON$C_OFF" link=alone
+            fi
+            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
+            rtt=$(tun_rtt "$name")
+            [ -n "$rtt" ] && rtt="${rtt}ms" || rtt=-
+        else
+            dot="$C_YEL$BX_ON$C_OFF" link=starting
+        fi
+        ;;
+    stopped) dot="$C_YEL$BX_OFF$C_OFF" link=stopped ;;
+    *) dot="$C_GRY$BX_OFF$C_OFF" link=disabled ;;
+    esac
+    printf '  %s %s %s %s %s %s%s%s %s\n' \
+        "$dot" \
+        "$(pad_to "${C_B}${name}${C_OFF}" "$nw")" \
+        "$(pad_to "$side" 7)" \
+        "$(pad_to "$proto" 13)" \
+        "$(pad_to "$link" 9)" \
+        "$(rtt_colour "$rtt")" "$(pad_to "$rtt" 6)" "$C_OFF" \
+        "$rate"
+}
+
+list_tunnels() {
+    local names w=13 n
+    names=$(cfg_list)
+    if [ -z "$names" ]; then
+        dim "no tunnels configured yet - pick New tunnel to make one"
+        return 1
+    fi
+    for n in $names; do
+        [ "${#n}" -gt "$w" ] && w=${#n}
+    done
+    printf '    %s%s %s %s %s %s %s%s\n' "$C_DIM" \
+        "$(pad_to NAME "$w")" "$(pad_to SIDE 7)" "$(pad_to PROTO 13)" \
+        "$(pad_to LINK 9)" "$(pad_to RTT 6)" "MBIT/S in/out" "$C_OFF"
+    for n in $names; do tunnel_row "$n" "$w"; done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# manage tunnels
+# ---------------------------------------------------------------------------
+
+pick_tunnel() {
+    local names i=0 n sel
+    names=$(cfg_list)
+    [ -n "$names" ] || { dim "no tunnels configured yet"; return 1; }
+    blank
+    for n in $names; do
+        i=$((i + 1))
+        item "$i" "$n" "$(svc_state "$n")"
+    done
+    item 0 "Back"
+    blank
+    menu_key sel || return 1
+    case $sel in '' | 0 | *[!0-9]*) return 1 ;; esac
+    PICKED=$(printf '%s\n' $names | sed -n "${sel}p")
+    [ -n "$PICKED" ]
+}
+
+manage_tunnels() {
     while :; do
-        screen_top
-        tun_line "$name"
-        blank
-        printf '  %s%s%s%s%s %s\n' "$C_B" "$name" "$C_OFF" \
-            "$(rep ' ' $((UI_W - ${#name} - 16)))" \
-            "$(state_dot "$TL_STATE")" "$TL_STATE"
-        blank
+        banner
+        head2 "Manage tunnels"
+        list_tunnels || { pause; return 0; }
+        pick_tunnel || return 0
+        tunnel_menu "$PICKED"
+    done
+}
+screen_tunnels() { manage_tunnels; }
 
-        local side kharej port transport mtu dev prof
+tunnel_menu() {
+    local name=$1 f c side mode
+    f=$(cfg_file "$name")
+    while :; do
+        [ -f "$f" ] || return 0
         side=$(toml_get "$f" tunnel side)
-        kharej=$(toml_get "$f" transport kharej)
-        port=$(toml_get "$f" transport port)
-        transport=$(toml_get "$f" transport type)
-        mtu=$(toml_get "$f" tun mtu)
-        dev=$(toml_get "$f" tun name)
-        prof=$(toml_get "$f" tuning profile)
-
-        # What this server is, in one line, said the way round that matters:
-        # which end dials and which end waits. It used to read that off the
-        # side alone - IRAN dials, KHAREJ waits - and that was true only while
-        # Iran was the end that dialled. It comes from transport.dials now, so
-        # the line says what this server actually does.
-        local dials far how
-        dials=$(toml_get "$f" transport dials)
-        [ -n "$dials" ] || dials=kharej
-        if [ "$side" = iran ]; then far=$kharej; else far=$(toml_get "$f" transport iran); fi
-        local waiting
-        case $transport in
-        icmp) how="inside ping packets"; waiting="waits for ping packets" ;;
-        gre) how="as ip protocol 47"; waiting="waits for ip protocol 47" ;;
-        awg) how="inside the AmneziaWG link"; waiting="waits inside the AmneziaWG link" ;;
-        *) how="on $transport/$port"; waiting="waits on $transport/$port" ;;
-        esac
-        if [ "$side" = "$dials" ]; then
-            field "This end" "${side^^} $G_DASH dials $(addr_text "$far") $how"
-        else
-            field "This end" "${side^^} $G_DASH $waiting"
-            [ -n "$far" ] && field "Dialled by" "$(addr_text "$far")"
-        fi
-        # The name and the path, for the transports that have one. It is the
-        # one thing about a WebSocket tunnel that is not in the line above,
-        # and the one somebody putting a proxy in front of it needs.
-        local dom
-        dom=$(toml_get "$f" transport domain)
-        if [ -n "$dom" ]; then
-            field "Address" "$(addr_text "$dom")$(toml_get "$f" transport path)"
-        fi
-        if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
-            local plist
-            plist=$(toml_get "$f" forward ports | tr -d '[]"' | sed 's/, */  /g')
-            field "Ports" "${plist:-none yet - set them on the Ports screen}"
-        else
-            field "Link" "$(my_addr "$name") $G_BOTH $(peer_addr "$name")   $dev   mtu $mtu"
-        fi
-
-        # One measurement to a line, each with the name of what it is. They
-        # were one line with two numbers on it and nothing saying which was
-        # which, five blank columns apart.
-        if [ -n "$TL_RATE" ]; then
-            field "Traffic" "$TL_RATE  Mbit/s"
-        fi
-        if [ -n "$TL_RTT" ]; then
-            field "Round trip" "$(rtt_colour "$TL_RTT")$TL_RTT ms$C_OFF"
-        elif [ "$transport" = icmp ]; then
-            field "Round trip" "$C_MUTE""not measurable across an ICMP tunnel""$C_OFF"
-        fi
-        [ -n "${TL_UPTIME:-}" ] && field "Up for" "$TL_UPTIME"
-
-        # Losses only when there are some. A line saying zero every time is a
-        # line people stop reading, and then they do not see it change.
-        if [ -n "${ST_LOST:-}" ] && [ "${ST_LOST:-0}" -gt 0 ]; then
-            local per=$((ST_LOST / (ST_GAPS > 0 ? ST_GAPS : 1)))
-            field "Path lost" "$ST_LOST packets in $ST_GAPS gaps, about $per at a time"
-        fi
-
-        local fw
-        fw=$(forwards_of "$name" 2>/dev/null || true)
-        [ -n "$fw" ] && field "Ports" "$fw  $G_ARROW  $(peer_addr "$name")"
-
-        blank
-        group "RUN"
-        case $TL_STATE in
-        stopped | disabled) item 1 "Start" "and start it again at every boot" ;;
-        *) item 1 "Restart" "stop it and start it again" ;;
-        esac
-        item 2 "Stop" "until you start it, or the server reboots"
-        item 3 "Live view" "the numbers above, once a second"
-        blank
-        group "CHECK"
-        item 4 "Health check" "what is wrong, and what to do about it"
-        item 5 "Log" "the last forty lines the core wrote"
-        item 6 "Measure MTU" "the largest packet this path will carry"
-        item 7 "Speed test" "iperf3 across the tunnel, sixteen streams"
-        blank
-        group "CHANGE"
+        mode=$(toml_get "$f" tunnel mode)
+        banner
+        head2 "Tunnel: $name"
+        tunnel_status_block "$name"
+        rule
+        group "Service"
+        item 1 "Restart"
+        item 2 "Stop"
+        item 3 "Start"
+        item 4 "Delete this tunnel" "here only - the other server keeps its copy"
+        group "Check"
+        item 5 "Health check" "what is wrong, and what to do about it"
+        item 6 "Live status" "the numbers, once a second"
+        item 7 "Live log" "follow the core as it runs"
+        group "Settings"
         if [ "$side" = iran ]; then
-            item2 8 "Ports" "${fw:-nothing is forwarded yet}"
+            item 8 "Ports" "$(ports_of "$name")"
         else
-            item2 8 "Ports" "IRAN forwards them, not this side"
+            item 8 "Ports" "IRAN forwards them, not this side"
         fi
-        item2 9 "Profile" "$prof$(prof_queue_note "$f")"
-        item 10 "Advanced" "mtu, log level, queue depth, the file itself"
-        item 11 "Delete this tunnel" "here only - the other server keeps its copy"
+        item 9 "Tuning" "profile, queue, mtu, direction, logging"
+        item 10 "Scheduled restart"
+        blank
         item 0 "Back"
         blank
-
-        local k
-        menu_key k || return 0
-        case $k in
-        1) svc_do restart "$name"; pause ;;
-        2) svc_do stop "$name"; pause ;;
-        3) screen_live "$name" ;;
-        4) health_check "$name"; pause ;;
-        5) show_log "$name" ;;
-        6) measure_mtu "$name"; pause ;;
-        7) speed_test "$name"; pause ;;
-        8) [ "$side" = iran ] && { screen_ports "$name"; } ||
-            { warn "ports are forwarded from the IRAN side"; pause; } ;;
-        9) edit_profile "$name" ;;
-        10) screen_advanced "$name" ;;
-        11) delete_tunnel "$name" && return 0 ;;
+        menu_key c || return 0
+        case $c in
+        1) blank; svc_do restart "$name"; sleep 1 ;;
+        2) blank; svc_do stop "$name"; sleep 1 ;;
+        3) blank; svc_do start "$name"; sleep 1 ;;
+        4) delete_tunnel "$name" && return 0 ;;
+        5) health_check "$name"; pause ;;
+        6) screen_live "$name" ;;
+        7) live_log "$name" ;;
+        8) if [ "$side" = iran ]; then screen_ports "$name"
+           else blank; warn "the port list lives on the IRAN server; this is the KHAREJ end"; pause; fi ;;
+        9) tuning_menu "$name" ;;
+        10) recycle_menu "$name" ;;
         0 | '') return 0 ;;
+        *) blank; warn "there is nothing on $c"; sleep 1 ;;
         esac
     done
 }
+screen_tunnel() { tunnel_menu "$1"; }
 
-pause() {
+# journald puts its own timestamp, the hostname and unit[pid] in front of
+# every line; -o cat prints only what the core wrote. ctrl-c goes to every
+# process in the foreground group, so it is caught here and journalctl takes
+# the signal, and the menu comes back instead of a shell prompt.
+live_log() {
+    local name=$1
+    banner
+    head2 "Live log: $name"
+    dim "ctrl-c to stop following"
     blank
-    printf '  %spress enter%s' "$C_MUTE" "$C_OFF" >&2
-    IFS= read -r _ || true
+    trap ':' INT
+    journalctl -u "pingify@$name" -n 60 -f --no-pager -o cat 2>/dev/null || true
+    trap - INT
 }
 
 show_log() {
-    screen_top
-    blank
-    rule "Log $G_DASH $1"
-    blank
-    journalctl -u "pingify@$1" -n 40 --no-pager -o cat 2>/dev/null |
-        sed 's/^/    /' || dim "there is no journal for this tunnel yet"
+    banner
+    head2 "Log: $1"
+    journalctl -u "pingify@$1" -n 40 --no-pager -o cat 2>/dev/null | sed 's/^/    /' ||
+        dim "there is no journal for this tunnel yet"
     pause
 }
 
-# --------------------------------------------------------------------------
-# changing one
-# --------------------------------------------------------------------------
-
-# edit_profile is the screen that justifies the whole tool: it does not show a
-# setting, it shows what the setting buys. Every number here was measured on a
-# real path between Tehran and Frankfurt.
-edit_profile() {
-    local name=$1 cur choice
-    cur=$(toml_get "$(cfg_file "$name")" tuning profile)
-
-    screen_top
-    blank
-    rule "Profile"
-    blank
-    profile_row 1 gaming "$cur" "600 packets - a small one waits behind less"
-    profile_row 2 balanced "$cur" "900 packets - the one to pick if unsure"
-    profile_row 3 download "$cur" "1500 packets - most on a long transfer"
-    blank
-    dim "A profile sets one number: how many packets may wait in the tunnel's"
-    dim "queue. A deeper queue carries more at once and holds a packet longer;"
-    dim "a shallower one answers sooner and gives up some throughput for it."
-    blank
-    dim "Both servers should be on the same one. Changing it restarts the"
-    dim "tunnel here, which costs a second of traffic and nothing else."
-    blank
-
-    local def=2
-    case $cur in gaming) def=1 ;; download) def=3 ;; esac
-
-    # A way out that is a number, like every other screen reached from a menu.
-    # This used pick, which answers 1 to 3 and nothing else on purpose - that
-    # is right for a question in the wizard and wrong here: 0 was refused and
-    # the screen asked again, so the only exit was the q nothing on it
-    # mentions. Enter still keeps what the tunnel already has.
-    item 0 "Leave it on $cur"
-    blank
-    menu_key choice || return 0
-    [ -z "$choice" ] && choice=$def
-
-    local want
-    case $choice in
-    1) want=gaming ;;
-    2) want=balanced ;;
-    3) want=download ;;
-    0) return 0 ;;
-    *) blank; warn "there is nothing on $choice"; pause; return 0 ;;
-    esac
-    [ "$want" = "$cur" ] && return 0
-
-    PROFILE_WANT=$want
-    if cfg_apply "$name" _edit_profile yes; then
-        ok "$name is on the $want profile"
-    fi
-    pause
-}
+# ---------------------------------------------------------------------------
+# tuning
+#
+# Every number that shapes a tunnel, on one screen, split by the only
+# distinction that matters when two servers disagree: the settings that have
+# to match, and the ones that are nobody's business but this machine's.
+# ---------------------------------------------------------------------------
 
 _edit_profile() { toml_set "$1" tuning profile "$PROFILE_WANT"; }
-
-# One profile, with a mark against the one this tunnel is on now.
-#
-# It is item() with that mark written over the left margin rather than a line
-# of its own, so the three of them line up with every other menu in the script
-# and there is only one place that decides how a menu line looks.
-profile_row() {
-    local key=$1 name=$2 cur=$3 hint=$4 line mark=' '
-    # A dot, not the same arrow the line already has: two arrows on one line
-    # is a line where neither of them means anything.
-    [ "$name" = "$cur" ] && mark=$G_ON
-    line=$(item "$key" "${name^}" "$hint")
-    printf ' %s%s%s%s\n' "$C_OK" "$mark" "$C_OFF" "${line#  }"
-}
-
-screen_advanced() {
-    local name=$1 f k q qs lv
-    f=$(cfg_file "$name")
-    while :; do
-        screen_top
-        # Two of these are not in the file until somebody sets them: the
-        # profile carries the queue depth, and the core picks the number of
-        # device queues. Reading the file alone drew "Queue depth  packets,
-        # from the profile" with the number missing out of the middle of it,
-        # and then offered an empty default that the validator refused - so
-        # pressing enter at the question did nothing at all, twice.
-        q=$(toml_get "$f" tuning queue_packets)
-        qs=$(toml_get "$f" tun queues)
-        lv=$(toml_get "$f" logging level)
-        # Same as the two below: the core fills this in when the file leaves
-        # it out, so reading the file alone drew an empty row and offered an
-        # empty default that the validator then refused.
-        [ -n "$lv" ] || lv=info
-        blank
-        rule "Advanced $G_DASH $name"
-        blank
-        item2 1 "MTU" "$(toml_get "$f" tun mtu)"
-        item2 2 "Log level" "$lv"
-        if [ -n "$q" ]; then
-            item2 3 "Queue depth" "$q packets, set here"
-        else
-            q=$(wiz_queue "$(toml_get "$f" tuning profile)")
-            item2 3 "Queue depth" "$q packets, from the profile"
-        fi
-        item2 4 "Device queues" "${qs:-the core chooses}"
-        item2 5 "Health port" "$(health_port_of "$name") on $(my_addr "$name")"
-        case $(toml_get "$f" transport type) in
-        ws | wss) item2 6 "Web path" "$(toml_get "$f" transport path)" ;;
-        esac
-        # Parity is not offered where the core would ignore it: a stream
-        # cannot lose a packet, and GRE's payload has to stay a well formed IP
-        # packet or the path drops every one of them.
-        case $(toml_get "$f" transport type) in
-        tcp | ws | wss | utls | fallback | gre) ;;
-        *) item2 7 "Parity" "$(fec_label "$f")" ;;
-        esac
-        item 8 "Show the config file"
-        item2 9 "Dial direction" "$(dials_label "$f")"
-        item 0 "Back"
-        blank
-        menu_key k || return 0
-        case $k in
-        1) local v
-            ask v "mtu" "$(toml_get "$f" tun mtu)" v_mtu || continue
-            MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes; pause ;;
-        2) local v
-            blank; dim "debug says a great deal; info says what changed"; blank
-            ask v "level" "$lv" v_level || continue
-            LEVEL_WANT=$v; cfg_apply "$name" _edit_level yes; pause ;;
-        3) blank
-            dim "This comes from the profile and is the one number a profile moves."
-            dim "Set it directly only if you have measured your own path."
-            local v
-            ask v "packets" "$q" v_queue || continue
-            QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; pause ;;
-        4) local v
-            ask v "queues (0 lets the core choose)" "${qs:-0}" v_queues || continue
-            QUEUES_WANT=$v; cfg_apply "$name" _edit_queues yes; pause ;;
-        5) blank
-            dim "The port the server at the other end is asked on, over the"
-            dim "private link. It is bound to this tunnel's own address, so"
-            dim "nothing else on this machine can be in the way of it unless"
-            dim "something holds that port on every address."
-            blank
-            dim "Both servers must use the same number, and changing it here"
-            dim "changes it here only."
-            blank
-            local v
-            ask v "port (-1 turns it off)" "$(health_port_of "$name")" v_hport || continue
-            HEALTH_WANT=$v; cfg_apply "$name" _edit_health_port yes; pause ;;
-        6) case $(toml_get "$f" transport type) in
-            ws | wss) ;;
-            *) blank; warn "there is nothing on 6"; pause; continue ;;
-            esac
-            blank
-            dim "What the WebSocket handshake asks for. Anything else that"
-            dim "arrives gets a 404, the way a web server would answer it."
-            dim "It has to match on both servers."
-            blank
-            local v
-            ask v "path" "$(toml_get "$f" transport path)" v_path || continue
-            PATH_WANT=$v; cfg_apply "$name" _edit_path yes; pause ;;
-        7) case $(toml_get "$f" transport type) in
-            tcp | ws | wss | utls | fallback)
-                blank; warn "a stream transport cannot lose a packet, so there is nothing to repair"
-                pause; continue ;;
-            esac
-            blank
-            dim "One extra packet per N, made of the N before it. Lose any one"
-            dim "of them and this end rebuilds it at once, with nothing asked"
-            dim "for and no round trip; lose two of the same N and TCP does what"
-            dim "it would have done anyway."
-            blank
-            dim "It costs one packet in N of bandwidth. 10 is a good place to"
-            dim "start on a path that drops the odd packet; 0 turns it off."
-            blank
-            local v
-            ask v "one parity per (0 off, 4 to 32)" "$(toml_get "$f" tuning fec)" v_fec || continue
-            FEC_WANT=$v; cfg_apply "$name" _edit_fec yes; pause ;;
-        8) blank; sed 's/^/    /' "$f"; pause ;;
-        9) blank
-            dim "A reverse tunnel has the server abroad reach in, and Iran is"
-            dim "the end that waits, because Iran is where the ports are."
-            blank
-            dim "Some Iranian networks take that connection and then carry"
-            dim "nothing on it. Measured on one server: 0 bit/s inbound on 80,"
-            dim "443, 2053 and 8080, against 713 Mbit/s outward on the same"
-            dim "wire - and 521 Mbit/s back into Iran once the connection was"
-            dim "opened from Iran instead. The traffic still flows inward; it"
-            dim "is only the connection that has to start on the other side."
-            blank
-            dim "Set the same value on both servers."
-            blank
-            local v
-            ask v "which end opens it (kharej or iran)" "$(dials_now "$f")" v_dials || continue
-            DIALS_WANT=$v; cfg_apply "$name" _edit_dials yes; pause ;;
-        0 | '') return 0 ;;
-        esac
-    done
-}
-
+_edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
 _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }
-_edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
-_edit_queues() { toml_set "$1" tun queues "$QUEUES_WANT"; }
-_edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
-_edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
 _edit_fec() { toml_set "$1" tuning fec "$FEC_WANT"; }
 _edit_dials() { toml_set "$1" transport dials "$DIALS_WANT"; }
+_edit_path() { toml_set "$1" transport path "$PATH_WANT"; }
+_edit_health_port() { toml_set "$1" status health_port "$HEALTH_WANT"; }
+_edit_status_port() { toml_set "$1" status port "$STATUS_WANT"; }
+_edit_conns() { toml_set "$1" transport connections "$CONNS_WANT"; }
+_edit_keepalive() { toml_set "$1" transport keepalive_sec "$KEEPALIVE_WANT"; }
 
-# Which end opens the connection. Empty means the default, and the default is
-# what a reverse tunnel is: the server abroad reaches in.
-dials_now() {
-    local d
-    d=$(toml_get "$1" transport dials)
-    [ -n "$d" ] || d=kharej
-    printf '%s' "$d"
-}
-
-dials_label() {
-    case $(dials_now "$1") in
-    iran) printf 'iran opens it, outward' ;;
-    *) printf 'kharej reaches in' ;;
-    esac
-}
-
-v_dials() {
-    case $1 in
-    iran | kharej) return 0 ;;
-    esac
-    echo "kharej or iran"
-    return 1
-}
-
-# What the Advanced screen shows beside Parity, which is the setting and what
-# it costs rather than the number on its own.
 fec_label() {
     local n
     n=$(toml_get "$1" tuning fec)
@@ -543,52 +300,198 @@ fec_label() {
 }
 
 v_fec() {
-    case $1 in
-    0) return 0 ;;
-    '' | *[!0-9]*) echo "a number: 0 turns it off, otherwise 4 to 32"; return 1 ;;
-    esac
+    case $1 in 0) return 0 ;; '' | *[!0-9]*) echo "a number: 0 turns it off, otherwise 4 to 32"; return 1 ;; esac
     { [ "$1" -ge 4 ] && [ "$1" -le 32 ]; } || { echo "4 to 32, or 0 to turn it off"; return 1; }
 }
-
-v_path() {
-    case $1 in
-    /*) return 0 ;;
-    esac
-    echo "a path starts with a slash"
-    return 1
-}
-
+v_path() { case $1 in /*) return 0 ;; esac; echo "a path starts with a slash"; return 1; }
 v_hport() {
-    case $1 in
-    -1) return 0 ;;
-    '' | *[!0-9]*) echo "a port, or -1 to turn it off"; return 1 ;;
-    esac
+    case $1 in -1) return 0 ;; '' | *[!0-9]*) echo "a port, or -1 to turn it off"; return 1 ;; esac
     { [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; } || { echo "a port is between 1 and 65535"; return 1; }
 }
-
-v_level() {
-    case $1 in
-    debug | info | warn | error) return 0 ;;
-    esac
-    echo "debug, info, warn or error"
-    return 1
-}
-
+v_level() { case $1 in debug | info | warn | error) return 0 ;; esac; echo "debug, info, warn or error"; return 1; }
 v_queue() {
     case $1 in '' | *[!0-9]*) echo "a number of packets"; return 1 ;; esac
-    { [ "$1" -ge 200 ] && [ "$1" -le 20000 ]; } || {
-        echo "200 to 20000 - below that the queue refuses work the link could carry"
-        return 1
-    }
+    { [ "$1" -ge 200 ] && [ "$1" -le 20000 ]; } || { echo "200 to 20000 - below that the queue refuses work the link could carry"; return 1; }
+}
+v_conns() {
+    case $1 in '' | *[!0-9]*) echo "a number of connections"; return 1 ;; esac
+    { [ "$1" -ge 1 ] && [ "$1" -le 32 ]; } || { echo "1 to 32"; return 1; }
+}
+v_keepalive() {
+    case $1 in '' | *[!0-9]*) echo "seconds"; return 1 ;; esac
+    { [ "$1" -ge 1 ] && [ "$1" -le 300 ]; } || { echo "1 to 300 seconds"; return 1; }
+}
+v_dials() { case $1 in iran | kharej) return 0 ;; esac; echo "iran or kharej"; return 1; }
+v_status_port() {
+    local who
+    v_port "$1" || return 1
+    who=$(status_owner "$1" "${WIZ_KEEP:-}")
+    [ -z "$who" ] || { echo "port $1 is already $who's status port"; return 1; }
+    return 0
 }
 
-v_queues() {
-    case $1 in '' | *[!0-9]*) echo "a number"; return 1 ;; esac
-    [ "$1" -le 16 ] || { echo "0 to 16"; return 1; }
+tuning_menu() {
+    local name=$1 f c v
+    f=$(cfg_file "$name")
+    while :; do
+        cfg_load "$name" || return 1
+        WIZ_KEEP=$name
+        banner
+        head2 "Tuning: $name"
+        panel "IDENTITY"
+        panel_field "Token" "$(token_print "$T_TOKEN")" "Type" "$(kind_label "$T_TRANSPORT")"
+        panel_field "Link" "$(dials_text)"
+        panel_end
+        blank
+        panel "PERFORMANCE - KEEP BOTH SERVERS THE SAME"
+        panel_field "Profile" "$T_PRESET" "Queue" "${T_QUEUE:-$(preset_queue "$T_PRESET")} packets"
+        if [ "$T_MODE" = tun ]; then
+            panel_field "MTU" "$T_TUNMTU" "Parity" "$(fec_label "$f")"
+        else
+            panel_field "Connections" "$T_CONNS" "Keepalive" "$(toml_get "$f" transport keepalive_sec | sed 's/^$/10/') s"
+        fi
+        [ -n "$T_PATH" ] && panel_field "Web path" "$T_PATH"
+        panel_end
+        blank
+        panel "LOCAL TO THIS SERVER"
+        panel_field "Logging" "$T_LOG" "Status port" "127.0.0.1:$T_STATUS"
+        [ "$T_MODE" = tun ] && panel_field "Health port" "$T_HEALTH on $(my_addr "$name")"
+        panel_end
+        blank
+        dim "Read the top box on the other server and make it read the same."
+        dim "Every change here restarts the tunnel, which costs a second of traffic."
+        rule
+        item 1 "Profile" "$T_PRESET - the shape of the queues"
+        item 2 "Queue depth" "${T_QUEUE:-from the profile} - set directly only if you measured your path"
+        if [ "$T_MODE" = tun ]; then
+            item 3 "MTU" "$T_TUNMTU - Find the MTU under Diagnostics measures it"
+            case $T_TRANSPORT in
+            gre) ;;
+            *) item 4 "Parity" "$(fec_label "$f") - repairs a lost packet without a round trip" ;;
+            esac
+        else
+            item 3 "Connections" "$T_CONNS parallel TCP connections, 1 to 32"
+            item 4 "Keepalive" "seconds between keepalives on every connection"
+        fi
+        case $T_TRANSPORT in icmp | gre | awg) ;; *) item 5 "Link direction" "$(dials_text) - must match" ;; esac
+        case $T_TRANSPORT in ws | wss) item 6 "Web path" "$T_PATH - must match" ;; esac
+        item 7 "Logging" "$T_LOG"
+        item 8 "Status port" "127.0.0.1:$T_STATUS - local, where the manager asks"
+        [ "$T_MODE" = tun ] && item 9 "Health port" "$T_HEALTH - the same on both, on the link's own address"
+        item 10 "Show the config file"
+        item 0 "Back"
+        blank
+        menu_key c || { WIZ_KEEP=; return 0; }
+        case $c in
+        1) blank; preset_menu && { PROFILE_WANT=$T_PRESET; cfg_apply "$name" _edit_profile yes; }; pause ;;
+        2) blank
+            dim "This comes from the profile and is the one number a profile moves."
+            dim "gaming 600, balanced 900, download 1500."
+            ask v "packets" "${T_QUEUE:-$(preset_queue "$T_PRESET")}" v_queue && { QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; }
+            pause ;;
+        3) blank
+            if [ "$T_MODE" = tun ]; then
+                ask v "mtu" "$T_TUNMTU" v_mtu && { MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes && dim "set the same on the other server"; }
+            else
+                ask v "parallel connections" "$T_CONNS" v_conns && { CONNS_WANT=$v; cfg_apply "$name" _edit_conns yes; }
+            fi
+            pause ;;
+        4) blank
+            if [ "$T_MODE" = tun ]; then
+                [ "$T_TRANSPORT" = gre ] && { warn "GRE's payload has to stay a well formed packet, so it never gets parity"; pause; continue; }
+                dim "One extra packet per N, made of the N before it. Lose any one of"
+                dim "them and this end rebuilds it at once, with no round trip. It costs"
+                dim "one packet in N of bandwidth; 10 is a good start on a lossy path."
+                ask v "one parity per (0 off, 4 to 32)" "${T_FEC:-0}" v_fec && { FEC_WANT=$v; cfg_apply "$name" _edit_fec yes; }
+            else
+                ask v "keepalive seconds" "$(toml_get "$f" transport keepalive_sec | sed 's/^$/10/')" v_keepalive && { KEEPALIVE_WANT=$v; cfg_apply "$name" _edit_keepalive yes; }
+            fi
+            pause ;;
+        5) case $T_TRANSPORT in icmp | gre | awg) blank; warn "this transport has no direction to choose"; pause; continue ;; esac
+            blank
+            dim "IRAN dials out by default: a connection dialled into Iran is often"
+            dim "taken and then carries nothing. KHAREJ dials in when a CDN fronts"
+            dim "IRAN, or KHAREJ cannot take a connection. Set the same on both."
+            ask v "which end opens it (iran or kharej)" "$T_DIALS" v_dials && { DIALS_WANT=$v; cfg_apply "$name" _edit_dials yes && dim "now set the same on the other server"; }
+            pause ;;
+        6) case $T_TRANSPORT in ws | wss) ;; *) blank; warn "only a WebSocket tunnel has a path"; pause; continue ;; esac
+            blank
+            dim "What the WebSocket handshake asks for; anything else gets a 404."
+            ask v "path" "$T_PATH" v_path && { PATH_WANT=$v; cfg_apply "$name" _edit_path yes && dim "set the same on the other server"; }
+            pause ;;
+        7) blank
+            dim "This is local. The two servers may log at different levels."
+            ask v "level (error, warn, info, debug)" "$T_LOG" v_level && { LEVEL_WANT=$v; cfg_apply "$name" _edit_level yes; }
+            pause ;;
+        8) blank
+            dim "Bound to 127.0.0.1, so nothing outside this server can reach it."
+            dim "One per tunnel, always: two processes cannot bind one port."
+            show_taken_status "$name"
+            ask v "port" "$T_STATUS" v_status_port && { STATUS_WANT=$v; cfg_apply "$name" _edit_status_port yes; }
+            pause ;;
+        9) [ "$T_MODE" = tun ] || { blank; warn "a forward tunnel has no private address to answer on"; pause; continue; }
+            blank
+            dim "The port the other server is asked on, over the private link. Both"
+            dim "servers must use the same number; changing it here changes it here."
+            ask v "port (-1 turns it off)" "$T_HEALTH" v_hport && { HEALTH_WANT=$v; cfg_apply "$name" _edit_health_port yes; }
+            pause ;;
+        10) blank; sed 's/^/    /' "$f"; pause ;;
+        0 | '') WIZ_KEEP=; return 0 ;;
+        *) blank; warn "there is nothing on $c"; sleep 1 ;;
+        esac
+    done
 }
+
+# ---------------------------------------------------------------------------
+# scheduled restart
+# ---------------------------------------------------------------------------
+
+recycle_menu() {
+    local name=$1 hours
+    blank
+    if systemctl is-enabled --quiet "pingify-recycle@$name.timer" 2>/dev/null; then
+        dim "a scheduled restart is currently active"
+        if confirm "turn it off?"; then
+            systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
+            rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
+            systemctl daemon-reload 2>/dev/null
+            ok "scheduled restart removed"
+        fi
+        pause
+        return 0
+    fi
+    dim "Some Iranian ISPs quietly degrade long-lived connections. A periodic"
+    dim "restart costs a second of downtime and clears that up."
+    blank
+    ask hours "restart every N hours (0 to cancel)" "6" v_number || return 0
+    [ "$hours" = 0 ] && return 0
+    [ -f "$UNIT_DIR/pingify-recycle@.service" ] || unit_write
+    cat >"$UNIT_DIR/pingify-recycle@$name.timer" <<TIMER
+[Unit]
+Description=Pingify scheduled restart of tunnel $name
+
+[Timer]
+OnBootSec=${hours}h
+OnUnitActiveSec=${hours}h
+RandomizedDelaySec=120
+Unit=pingify-recycle@$name.service
+
+[Install]
+WantedBy=timers.target
+TIMER
+    systemctl daemon-reload 2>/dev/null
+    systemctl enable --now "pingify-recycle@$name.timer" >/dev/null 2>&1
+    ok "the tunnel will restart every ${hours}h"
+    pause
+}
+
+# ---------------------------------------------------------------------------
+# delete
+# ---------------------------------------------------------------------------
 
 delete_tunnel() {
-    local name=$1
+    local name=$1 f
+    f=$(cfg_file "$name")
     blank
     warn "this removes the tunnel $name from this server"
     dim "the other server keeps its own copy until you remove it there too"
@@ -597,13 +500,14 @@ delete_tunnel() {
 
     svc_do stop "$name" 2>/dev/null || true
     systemctl disable "pingify@$name" >/dev/null 2>&1 || true
+    systemctl disable --now "pingify-recycle@$name.timer" >/dev/null 2>&1 || true
+    rm -f "$UNIT_DIR/pingify-recycle@$name.timer"
     nat_drop "$name" 2>/dev/null || true
-    # The link underneath goes with it, and its config file with the private
-    # key in it goes too.
     awg_down "$name" 2>/dev/null || true
-    [ "$(toml_get "$(cfg_file "$name")" transport type)" = rawtcp ] &&
-        rawtcp_unguard "$(toml_get "$(cfg_file "$name")" transport port)" 2>/dev/null
-    rm -f "$(cfg_file "$name")" "$STATE_DIR/$name.forwards"
+    [ "$(toml_get "$f" transport type)" = rawtcp ] &&
+        rawtcp_unguard "$(toml_get "$f" transport port)" 2>/dev/null
+    rm -f "$f" "$f.bak" "$STATE_DIR/$name.forwards" "$STATE_DIR/$name.fail"
+    systemctl daemon-reload 2>/dev/null
     ok "$name is gone"
     pause
     return 0
