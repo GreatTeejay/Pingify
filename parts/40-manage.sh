@@ -38,43 +38,25 @@ peer_public() {
 # nothing when it cannot be measured.
 #
 # A forward tunnel measures itself with a ping record every ten seconds and
-# reports it. An ICMP tunnel cannot be pinged across - the carrier stops both
-# kernels answering echo - so the far end is asked on its health port instead,
-# and curl's connect time is one round trip across the link. Everything else
-# is two pings, a fifth of a second apart.
+# reports it. A private link is measured on the far end's health port: one
+# TCP handshake across the link, which is one round trip and nothing else.
+# Not with ping - an ICMP tunnel on either server mutes echo for every link
+# on it, and a ping that waits a second for a reply that is never coming,
+# once per tunnel, is why a list of nine took thirteen seconds to draw.
 tun_rtt() {
-    local name=$1 f t out hp peer
+    local name=$1 f out hp peer
     f=$(cfg_file "$name")
-    t=$(toml_get "$f" transport type)
     if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
         tun_stats "$name" || return 0
         case $ST_FAR_RTT in '' | 0 | *[!0-9.]*) return 0 ;; esac
         LC_ALL=C awk -v t="$ST_FAR_RTT" 'BEGIN { printf "%.0f", t }'
         return 0
     fi
-    if [ "$t" = icmp ]; then
-        have curl || return 0
-        hp=$(health_port_of "$name")
-        peer=$(peer_addr "$name")
-        [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
-        out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
-        case $out in '' | 0 | 0.000000) return 0 ;; esac
-        LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
-        return 0
-    fi
-    if have ping; then
-        out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
-            awk -F'/' '/^rtt|^round-trip/ { printf "%.0f", $5 }')
-        [ -n "$out" ] && { printf '%s' "$out"; return 0; }
-    fi
-    # No echo across this link - an ICMP tunnel on the same server mutes
-    # echo for every link on it - so the health port is asked instead, the
-    # way it is on an ICMP tunnel.
     have curl || return 0
     hp=$(health_port_of "$name")
     peer=$(peer_addr "$name")
     [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
-    out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
+    out=$(LC_ALL=C curl -s -o /dev/null --max-time 1 -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
     case $out in '' | 0 | 0.000000) return 0 ;; esac
     LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
 }
@@ -171,7 +153,22 @@ list_tunnels() {
     printf '    %s%s %s %s %s %s %s%s\n' "$C_DIM" \
         "$(pad_to NAME "$w")" "$(pad_to SIDE 7)" "$(pad_to PROTO 13)" \
         "$(pad_to LINK 9)" "$(pad_to RTT 6)" "MBIT/S in/out" "$C_OFF"
-    for n in $names; do tunnel_row "$n" "$w"; done
+    # Every row at once, each in its own subshell, and printed in order:
+    # a row asks the far end for its round trip, and nine of those one
+    # after another is nine round trips before the screen appears.
+    local tmp i=0
+    tmp=$(mktemp -d) || { for n in $names; do tunnel_row "$n" "$w"; done; return 0; }
+    for n in $names; do
+        i=$((i + 1))
+        tunnel_row "$n" "$w" >"$tmp/$i" 2>&1 &
+    done
+    wait
+    i=0
+    for n in $names; do
+        i=$((i + 1))
+        cat "$tmp/$i"
+    done
+    rm -rf "$tmp"
     return 0
 }
 
