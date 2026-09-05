@@ -40,7 +40,7 @@ if [ -z "$CORE" ]; then
     skip "the wizard end to end" "no core could be built"
 else
     # 8 is [TUN] UDP: the link kind, with the address pair the octet derives.
-    out=$(answers 1 8 185.31.8.129 46.247.109.83 8443 99 2 y | wizard_new 2>&1)
+    out=$(answers 1 8 185.31.8.129 46.247.109.83 8443 99 "" 2 y | wizard_new 2>&1)
     rc=$?
     check "the wizard finished" "$rc" "0"
 
@@ -267,6 +267,27 @@ else
         check_contains "the ports went into the file, both of them" "$(toml_get "$f" forward ports)" '"443", "udp:500"'
         check_missing "and there is no private link in it" "$(cat "$f")" "[tun]"
         check "the core accepts it"             "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+    fi
+fi
+
+section "a [TUN] tunnel asks for its ports too"
+
+if [ -z "$CORE" ]; then
+    skip "the tun wizard with ports" "no core could be built"
+else
+    out=$(answers 1 8 185.31.8.129 46.247.109.83 8444 98 "443,udp:500" 2 y | wizard_new 2>&1)
+    check "the wizard finished" "$?" "0"
+    f=$CFG_DIR/iran-udp-8444.toml
+    if [ ! -f "$f" ]; then
+        FAIL=$((FAIL + 1))
+        printf '    \033[31mx\033[0m no config was written\n'
+        printf '%s\n' "$out" | tail -12 | sed 's/^/        /'
+    else
+        check "it is still a tun tunnel" "$(toml_get "$f" tunnel mode)" "tun"
+        check_contains "the ports went into the file" "$(toml_get "$f" forward ports)" '"443", "udp:500"'
+        check "and into the forwards state on IRAN" "$(forwards_of iran-udp-8444 | tr '\n' ' ')" "443 udp:500 "
+        check_contains "the review panel showed them" "$out" "443 udp:500"
+        check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
     fi
 fi
 

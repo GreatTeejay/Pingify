@@ -692,7 +692,12 @@ q_forward_ports() {
     local answer clashes
     wiz_ask "Ports"
     blank
-    dim "The ports users connect to on IRAN, and where each goes on KHAREJ."
+    if [ "${T_MODE:-$(mode_of "$T_TRANSPORT")}" = forward ]; then
+        dim "The ports users connect to on IRAN, and where each goes on KHAREJ."
+    else
+        dim "The ports users connect to on IRAN, sent over the link to KHAREJ by"
+        dim "IRAN's firewall. Where each goes on KHAREJ, if not the same port."
+    fi
     dim "one port  443     a range  8000-8010     udp  udp:500"
     dim "somewhere else  443=8443  or  443=10.99.10.5:443"
     blank
@@ -841,9 +846,12 @@ wiz_review() {
     # with every other value in the box. The tunnel screen already calls it
     # this, so the two screens now agree as well.
     if [ "$T_MODE" = forward ]; then
-        panel_field "Ports" "${T_PORTS:-none yet - set them on the Ports screen}"
+        panel_field "Ports" "${T_PORTS:+${T_PORTS//$'
+'/ }}${T_PORTS:-none yet - set them on the Ports screen}"
     else
         panel_field "Link" "10.$T_OCTET.10.1  $G_BOTH  10.$T_OCTET.10.2   $T_DEV"
+        panel_field "Ports" "${T_PORTS:+${T_PORTS//$'
+'/ }}${T_PORTS:-none yet - set them on the Ports screen}"
     fi
     panel_field "Profile" "${prof^}   queue $(wiz_queue "$prof") packets"
     panel_field "Token" "${T_TOKEN:0:8}$G_CUT  (fingerprint $(wiz_fingerprint "$T_TOKEN"))"
@@ -1034,6 +1042,15 @@ wiz_render() {
         off bind_addr "\"0.0.0.0\"" "the address IRAN binds the ports on"
         off allow "[]" "KHAREJ only: the targets it will dial, host:port; empty means any"
     else
+        printf '\n[forward]\n'
+        printf '# The ports users connect to on IRAN, sent over the link by its firewall,\n'
+        printf '# and where each one goes on KHAREJ - the same port there unless said:\n'
+        printf '#   "443"                 tcp 443 here, to KHAREJ:443 over the link\n'
+        printf '#   "8000-8010"           a range, port for port\n'
+        printf '#   "udp:500"             the same for udp\n'
+        printf '#   "443=8443"            a different port there\n'
+        printf '# The manager applies these on IRAN and edits them on the Ports screen.\n'
+        printf 'ports = [%s]\n' "$(fwd_toml_list $T_PORTS)"
         printf '\n[tun]\n'
         kv name "\"$T_DEV\"" "the device on this server"
         kv iran "\"10.$T_OCTET.10.1/24\"" "IRAN's address on the link"
@@ -1109,6 +1126,22 @@ tunnel_create() {
     # Cut to fit rather than run over the edge: a long tunnel name makes a long
     # path, and this is the one line in the wizard that carries one.
     ok "$(trunc_to "$f" $((UI_W - 30))) accepted by the core"
+
+    # A [TUN] tunnel's ports live in its file so that they travel in the
+    # token, and in the forwards state on IRAN so that the firewall has them.
+    # The file seeds the state here, once; the Ports screen owns it after.
+    if [ "$(toml_get "$f" tunnel mode)" = tun ] && [ "$(toml_get "$f" tunnel side)" = iran ] &&
+        [ ! -s "$(fwd_file "$name")" ]; then
+        local ports
+        ports=$(toml_get "$f" forward ports | tr -d '[]"')
+        if [ -n "${ports//[ ,]/}" ]; then
+            if ! forwards_set "$name" "$ports"; then
+                warn "the ports in the file could not be kept; set them on the Ports screen"
+            elif have iptables; then
+                nat_apply "$name" || warn "the ports are kept but not yet in the firewall; set them again on the Ports screen"
+            fi
+        fi
+    fi
 
     # A repair, not a rewrite: the units are written once at install, and doing
     # it per tunnel is how the old script came to rewrite four units whenever
@@ -1253,11 +1286,17 @@ wizard_new() {
     q_port || return 1
     blank
     # A TCP tunnel has no link to make; it has ports to forward. A [TUN] one
-    # has a link and forwards its ports over it, later, from its own screen.
+    # has a link, and forwards its ports over it - and it is asked for them
+    # here, in the same words, rather than left to find the Ports screen
+    # after a wizard that ended without mentioning it. Watched: an ICMP
+    # tunnel built, up, and reachable by nobody, because nothing had said the
+    # ports were still to be set.
     if [ "$T_MODE" = forward ]; then
         q_forward_ports || return 1
     else
         q_link || return 1
+        blank
+        q_forward_ports || return 1
     fi
     blank
     q_profile || return 1
@@ -1387,6 +1426,7 @@ wizard_paste() {
     T_IRAN=$(toml_get "$f" transport iran)
     T_PORT=$(toml_get "$f" transport port)
     T_PATH=$(toml_get "$f" transport path)
+    T_PORTS=$(toml_get "$f" forward ports | tr -d '[]"' | tr ',' ' ')
     T_TOKEN=$(toml_get "$f" security token)
     T_PROFILE=$(toml_get "$f" tuning profile)
     T_DEV=$(toml_get "$f" tun name)
