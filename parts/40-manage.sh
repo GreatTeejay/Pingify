@@ -62,10 +62,21 @@ tun_rtt() {
         LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
         return 0
     fi
-    have ping || return 0
-    out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
-        awk -F'/' '/^rtt|^round-trip/ { printf "%.0f", $5 }')
-    printf '%s' "$out"
+    if have ping; then
+        out=$(ping -c 2 -i 0.2 -W 1 -q "$(peer_addr "$name")" 2>/dev/null |
+            awk -F'/' '/^rtt|^round-trip/ { printf "%.0f", $5 }')
+        [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+    fi
+    # No echo across this link - an ICMP tunnel on the same server mutes
+    # echo for every link on it - so the health port is asked instead, the
+    # way it is on an ICMP tunnel.
+    have curl || return 0
+    hp=$(health_port_of "$name")
+    peer=$(peer_addr "$name")
+    [ -n "$peer" ] && [ "$hp" -gt 0 ] 2>/dev/null || return 0
+    out=$(LC_ALL=C curl -s -o /dev/null --max-time 2 -w '%{time_connect}' "http://$peer:$hp/healthz" 2>/dev/null) || return 0
+    case $out in '' | 0 | 0.000000) return 0 ;; esac
+    LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
 }
 
 # ---------------------------------------------------------------------------
