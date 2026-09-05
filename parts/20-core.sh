@@ -247,7 +247,7 @@ build_core() {
         return 1
     fi
 
-    # GOPROXY=off and GOFLAGS=-mod=mod because there is nothing to fetch:
+    # GOPROXY=off and GOFLAGS=-mod=vendor because everything is already here:
     # saying so turns a confusing "cannot reach proxy.golang.org" into a build
     # that simply works. GOTOOLCHAIN=local because from 1.21 go will otherwise
     # try to download the toolchain the go directive names, over the network
@@ -257,7 +257,7 @@ build_core() {
         (
             cd "$SRC_DIR" &&
                 GOTOOLCHAIN=local GO111MODULE=on GOPROXY=off GOSUMDB=off \
-                    GOFLAGS=-mod=mod GOPATH="$SRC_DIR/gopath" \
+                    GOFLAGS=-mod=vendor GOPATH="$SRC_DIR/gopath" \
                     GOCACHE="$SRC_DIR/gocache" CGO_ENABLED=0 \
                     "$GO_BIN" build -trimpath -ldflags "-s -w" -o "$out" ./cmd/pingify
         ) >"$log" 2>&1

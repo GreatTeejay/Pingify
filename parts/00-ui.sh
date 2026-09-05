@@ -36,6 +36,20 @@ ui_detect() {
     *[Uu][Tt][Ff]*) UI_GLYPH=utf8 ;;
     esac
     [ -n "${PINGIFY_ASCII:-}" ] && UI_GLYPH=ascii
+    # A locale that names UTF-8 but is not installed - LANG carried over ssh
+    # from a laptop to a server that never generated it - leaves bash
+    # counting bytes, so every box drawn with glyphs comes out shredded.
+    # If this shell cannot see one glyph as one character, draw in ASCII.
+    # Every measurement of text below is made under a UTF-8 character type
+    # that this bash can actually use: the session's own if it works, one of
+    # the two every server has otherwise. With none, the glyphs are ASCII.
+    UI_CTYPE=
+    local l
+    for l in "${LC_ALL:-}" "${LC_CTYPE:-}" "${LANG:-}" C.UTF-8 C.utf8 en_US.UTF-8; do
+        [ -n "$l" ] || continue
+        ui_mb_ok "$l" 2>/dev/null && { UI_CTYPE=$l; break; }
+    done
+    [ -n "$UI_CTYPE" ] || UI_GLYPH=ascii
     PINGIFY_UTF8=0
     [ "$UI_GLYPH" = utf8 ] && PINGIFY_UTF8=1
 
@@ -48,6 +62,12 @@ ui_detect() {
 
     ui_palette
     ui_glyphs
+}
+
+# ui_mb_ok says whether bash sees one glyph as one character under a locale.
+ui_mb_ok() {
+    local LC_ALL=$1 probe='─'
+    [ "${#probe}" = 1 ]
 }
 
 ui_palette() {
@@ -101,11 +121,11 @@ repeat() { rep "$1" "$2"; }
 # none. Parameter expansion rather than sed, because this runs once per cell
 # and a subprocess per cell is how a menu comes to take a second over ssh.
 vislen() {
-    local s=$1 out= n c i ch
+    local LC_ALL=${UI_CTYPE:-C} s=$1 out= n i ch cp
     while [ -n "$s" ]; do
         case $s in
-        $'\033['*)
-            s=${s#$'\033['}
+        $'['*)
+            s=${s#$'['}
             s=${s#*m}
             continue
             ;;
@@ -114,14 +134,21 @@ vislen() {
         s=${s:1}
     done
     n=${#out}
+    # Bash counts characters; correct for the ones that are not one column.
+    # By code point rather than by a bracket range: in en_US.UTF-8 a range
+    # is collated, not ordered, and a box-drawing glyph fell inside the CJK
+    # range on a server abroad, so every frame there came out shredded.
     for ((i = 0; i < ${#out}; i++)); do
         ch=${out:i:1}
-        case $ch in
-        [$'̀'-$'ͯ'] | [$'ً'-$'ٟ'] | [$'‌'-$'‏']) n=$((n - 1)) ;;
-        [$'ᄀ'-$'ᅟ'] | [$'⺀'-$'꓏'] | [$'가'-$'힣'] | \
-            [$'豈'-$'﫿'] | [$'︰'-$'﹯'] | [$'＀'-$'｠'] | \
-            [$'￠'-$'￦']) n=$((n + 1)) ;;
-        esac
+        printf -v cp '%d' "'$ch" 2>/dev/null || cp=0
+        [ "$cp" -lt 768 ] && continue
+        if ((cp <= 879 || (cp >= 1611 && cp <= 1631) || (cp >= 8204 && cp <= 8207))); then
+            n=$((n - 1))
+        elif (((cp >= 4352 && cp <= 4447) || (cp >= 11904 && cp <= 42191) || (cp >= 44032 && cp <= 55203) ||
+            (cp >= 63744 && cp <= 64255) || (cp >= 65072 && cp <= 65103) || (cp >= 65280 && cp <= 65376) ||
+            (cp >= 65504 && cp <= 65510) || (cp >= 127744 && cp <= 129791))); then
+            n=$((n + 1))
+        fi
     done
     printf '%s' "$n"
 }
@@ -129,7 +156,7 @@ vislen() {
 # trunc_to cuts a string to a width and marks that it did. A value that does
 # not fit and is printed anyway takes the next column's place.
 trunc_to() {
-    local s=$1 w=$2 cut
+    local LC_ALL=${UI_CTYPE:-C} s=$1 w=$2 cut
     [ "$(vislen "$s")" -le "$w" ] && { printf '%s' "$s"; return; }
     cut=$((w - 1))
     [ "$cut" -lt 1 ] && cut=1
