@@ -23023,11 +23023,25 @@ v_wiz_port() {
         echo "$1/$fam is already the tunnel port of $who - pick another, or delete that tunnel first"
         return 1
     fi
-    if this_side_waits && ! port_free "$1" "$fam"; then
-        echo "something is already listening on $1/$fam - check with:  ss -lnp | grep :$1"
-        return 1
+    if this_side_waits; then
+        local bind
+        bind=$(cdn_listen_port "$1")
+        if ! port_free "$bind" "$fam"; then
+            echo "something is already listening on $bind/$fam - check with:  ss -lnp | grep :$bind"
+            return 1
+        fi
     fi
     return 0
+}
+
+# cdn_listen_port is the port the waiting side really binds. Behind a name
+# on one of the HTTPS ports, Cloudflare's flexible mode ends the TLS at the
+# edge and comes to the origin in plain HTTP on 80 - which is what the core
+# binds in that case, so that is the port to check for a clash.
+cdn_listen_port() {
+    case $T_TRANSPORT in ws | wss) ;; *) printf '%s' "$1"; return ;; esac
+    is_name "$T_PUBLIC_IP" || { printf '%s' "$1"; return; }
+    case $1 in 443 | 2053 | 2083 | 2087 | 2096 | 8443) printf '80' ;; *) printf '%s' "$1" ;; esac
 }
 
 v_awg_port() {
@@ -23064,7 +23078,13 @@ ask_port() {
         [ "$def" -gt 8500 ] && break
     done
     ask T_PORT "port for the tunnel itself, same on both" "$def" v_wiz_port || return 1
-    this_side_waits && dim "leave ${T_PORT}/${fam} open in this server's firewall"
+    if this_side_waits; then
+        if [ "$(cdn_listen_port "$T_PORT")" != "$T_PORT" ]; then
+            dim "behind the CDN this end listens on 80 in plain HTTP; leave 80/tcp open here"
+        else
+            dim "leave ${T_PORT}/${fam} open in this server's firewall"
+        fi
+    fi
     cdn_port_warn
     return 0
 }
