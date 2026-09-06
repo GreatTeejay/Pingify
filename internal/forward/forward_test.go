@@ -2,8 +2,10 @@ package forward
 
 import (
 	"bytes"
+	"encoding/binary"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,12 +20,16 @@ import (
 // receives, in order, on a goroutine of its own - which is what a stream
 // carrier does across a wire.
 type pipeCarrier struct {
-	head int
-	peer *pipeCarrier
-	on   atomic.Pointer[func([]byte)]
-	q    chan []byte
-	sent uint64
+	head       int
+	peer       *pipeCarrier
+	on         atomic.Pointer[func([]byte)]
+	q          chan []byte
+	sent       uint64
+	down       atomic.Bool // the carrier away, as a test sees fit
+	onLinkDown atomic.Pointer[func(int)]
 }
+
+func (p *pipeCarrier) OnLinkDown(f func(int)) { p.onLinkDown.Store(&f) }
 
 func pipePair() (*pipeCarrier, *pipeCarrier) {
 	a := &pipeCarrier{head: 12, q: make(chan []byte, 4096)}
@@ -45,7 +51,7 @@ func (p *pipeCarrier) run() {
 func (p *pipeCarrier) Headroom() int                    { return p.head }
 func (p *pipeCarrier) MaxPayload() int                  { return 1400 }
 func (p *pipeCarrier) Burst() int                       { return 1 }
-func (p *pipeCarrier) Up() bool                         { return true }
+func (p *pipeCarrier) Up() bool                         { return !p.down.Load() }
 func (p *pipeCarrier) Close() error                     { return nil }
 func (p *pipeCarrier) Run()                             {}
 func (p *pipeCarrier) Keepalive(time.Duration)          {}
@@ -72,7 +78,13 @@ func (p *pipeCarrier) Send(bp *[]byte) error {
 	return nil
 }
 
-func (p *pipeCarrier) SendFlow(_ uint32, bp *[]byte) error { return p.Send(bp) }
+func (p *pipeCarrier) SendFlow(_ uint32, bp *[]byte) error {
+	if p.down.Load() {
+		buf.Put(bp)
+		return carrier.ErrNoPeer
+	}
+	return p.Send(bp)
+}
 
 func pair(t *testing.T, ports []string) (*Forwarder, *Forwarder) {
 	t.Helper()
@@ -313,3 +325,183 @@ func freePort(t *testing.T) string {
 }
 
 var _ = sync.Mutex{}
+
+// A carrier that goes away and comes back within the grace loses nothing:
+// the writer waits in front of it, the pumps wait behind the writer, and the
+// user's program waits behind the pumps.
+func TestACarrierThatComesBackLosesNothing(t *testing.T) {
+	svc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	var got bytes.Buffer
+	var done = make(chan struct{})
+	go func() {
+		c, err := svc.Accept()
+		if err != nil {
+			return
+		}
+		io.Copy(&got, c)
+		c.Close()
+		close(done)
+	}()
+	port := svc.Addr().(*net.TCPAddr).Port
+	userPort := freePort(t)
+	e, _ := pair(t, []string{userPort + "=127.0.0.1:" + itoa(port)})
+	ca := e.car.(*pipeCarrier)
+
+	user, err := net.Dial("tcp", "127.0.0.1:"+userPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("the carrier went away and came back "), 60000) // ~2 MB
+	ca.down.Store(true)
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		ca.down.Store(false)
+	}()
+	if _, err := user.Write(payload); err != nil {
+		t.Fatalf("the user's write failed while the carrier was merely away: %v", err)
+	}
+	user.Close()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the far end never saw the end of the stream")
+	}
+	if !bytes.Equal(got.Bytes(), payload) {
+		t.Fatalf("the far end got %d bytes of %d, and not the same ones", got.Len(), len(payload))
+	}
+}
+
+// A carrier away past the grace resets the user's connection, so the program
+// behind it learns at once instead of waiting on a stream that will never
+// move again.
+func TestACarrierAwayTooLongResetsTheConnection(t *testing.T) {
+	old := carrierGrace
+	carrierGrace = 300 * time.Millisecond
+	defer func() { carrierGrace = old }()
+
+	svc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	go func() {
+		for {
+			c, err := svc.Accept()
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, c)
+		}
+	}()
+	port := svc.Addr().(*net.TCPAddr).Port
+	userPort := freePort(t)
+	e, _ := pair(t, []string{userPort + "=127.0.0.1:" + itoa(port)})
+	ca := e.car.(*pipeCarrier)
+
+	user, err := net.Dial("tcp", "127.0.0.1:"+userPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer user.Close()
+	// One record through first, so the stream exists on both ends and its
+	// records are what the writer holds when the carrier goes.
+	if _, err := user.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	ca.down.Store(true)
+	chunk := bytes.Repeat([]byte("x"), 64*1024)
+	deadline := time.Now().Add(5 * time.Second)
+	_ = user.SetDeadline(deadline)
+	var werr error
+	for time.Now().Before(deadline) {
+		if _, werr = user.Write(chunk); werr != nil {
+			break
+		}
+	}
+	if werr == nil {
+		t.Fatal("the user's connection was never reset; its writes were accepted for five seconds into a carrier that was not there")
+	}
+}
+
+// Data for a stream this end has never heard of gets a reset back, so the
+// far end's program stops writing into nothing.
+func TestDataForAStreamNobodyHasIsRefused(t *testing.T) {
+	e, o := pair(t, nil)
+	_ = o
+	ca := e.car.(*pipeCarrier)
+	cb := ca.peer
+	saw := make(chan struct{}, 1)
+	prev := cb.on.Load()
+	cb.OnPacket(func(b []byte) {
+		if len(b) >= hdrLen && b[0] == cmdRST && binary.BigEndian.Uint32(b[1:5]) == 4242 {
+			select {
+			case saw <- struct{}{}:
+			default:
+			}
+		}
+		(*prev)(b)
+	})
+	// A data record for stream 4242, which the edge has no record of.
+	rec := make([]byte, hdrLen+5)
+	rec[0] = cmdData
+	binary.BigEndian.PutUint32(rec[1:5], 4242)
+	copy(rec[hdrLen:], "hello")
+	ca.q <- rec
+	select {
+	case <-saw:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no reset came back for a stream nobody has")
+	}
+}
+
+func itoa(n int) string { return strconv.Itoa(n) }
+
+// A carrier connection that ends takes its streams with it, at once: what was
+// in flight on it is gone, and a program left waiting on a stream with a hole
+// in it would wait for ever.
+func TestADeadCarrierConnectionResetsItsStreams(t *testing.T) {
+	svc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	go func() {
+		for {
+			c, err := svc.Accept()
+			if err != nil {
+				return
+			}
+			go io.Copy(io.Discard, c)
+		}
+	}()
+	port := svc.Addr().(*net.TCPAddr).Port
+	userPort := freePort(t)
+	e, _ := pair(t, []string{userPort + "=127.0.0.1:" + itoa(port)})
+	ca := e.car.(*pipeCarrier)
+
+	user, err := net.Dial("tcp", "127.0.0.1:"+userPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer user.Close()
+	if _, err := user.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond)
+
+	// The one connection this test's carrier has ends.
+	(*ca.onLinkDown.Load())(0)
+
+	_ = user.SetDeadline(time.Now().Add(3 * time.Second))
+	b := make([]byte, 1)
+	if _, err := user.Read(b); err == nil {
+		t.Fatal("the user's connection is still open after the carrier connection under it ended")
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatal("the user's connection was left waiting, not reset")
+	}
+}

@@ -147,6 +147,11 @@ type streamCarrier struct {
 	head     int // the largest headroom any framing here will need
 	onPacket atomic.Pointer[func([]byte)]
 
+	// Told when a connection ends, with its slot. What rode on that
+	// connection and had not been acknowledged is gone, and only the thing
+	// riding knows what that means for it.
+	onLinkDown atomic.Pointer[func(int)]
+
 	done chan struct{}
 	once sync.Once
 
@@ -252,6 +257,20 @@ func (c *streamCarrier) Up() bool { return c.pick(0) != nil }
 
 func (c *streamCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
 
+// OnLinkDown registers what to tell when one connection ends. A stream
+// carrier's connections are TCP, and TCP will have taken bytes into its send
+// buffer that never reached the far end when the connection died; there is no
+// telling which. So a connection ending is not a hiccup to wait out - it is
+// the end of everything that was in flight on it, and the forwarder resets
+// those streams so their programs learn at once. See forward.resetSlot.
+func (c *streamCarrier) OnLinkDown(f func(slot int)) { c.onLinkDown.Store(&f) }
+
+func (c *streamCarrier) linkDown(slot int) {
+	if f := c.onLinkDown.Load(); f != nil {
+		(*f)(slot)
+	}
+}
+
 type streamSender struct{ c *streamCarrier }
 
 func (c *streamCarrier) NewSender() Sender { return &streamSender{c: c} }
@@ -325,7 +344,13 @@ func (c *streamCarrier) Send(bp *[]byte) error {
 		buf.Put(bp)
 		return ErrNoPeer
 	}
-	return c.sendOn(l, bp)
+	// A datagram: one that did not go is one that was lost, which is what
+	// the TCP inside expects of a link and repairs on its own.
+	if err := c.sendOn(l, bp); err != nil {
+		buf.Put(bp)
+		return err
+	}
+	return nil
 }
 
 // SendFlow puts a datagram on the connection its flow number picks, every
@@ -342,6 +367,10 @@ func (c *streamCarrier) SendFlow(flow uint32, bp *[]byte) error {
 		buf.Put(bp)
 		return ErrNoPeer
 	}
+	// On a write error the buffer is the caller's again, untouched, so that a
+	// stream - which cannot lose a record the way a datagram can - tries it
+	// again on the connection that replaces this one. ErrNoPeer frees it,
+	// because there was nothing to try.
 	return c.sendOn(l, bp)
 }
 
@@ -356,13 +385,16 @@ func (c *streamCarrier) sendOn(l *streamLink, bp *[]byte) error {
 	n, err := l.c.Write(l.fm.wrap(b))
 	l.mu.Unlock()
 
-	buf.Put(bp)
 	if err != nil {
 		atomic.AddUint64(&c.sendErrs, 1)
-		// Not logged and not retried. The reader on this connection is about
-		// to see the same failure, and it is the one that redials.
+		// Not logged, and not retried here. The connection is closed so that
+		// its reader ends now rather than whenever the kernel gives up, and
+		// the reader is the one that redials and says the slot is down. The
+		// buffer is handed back untouched for the caller to free or keep.
+		_ = l.c.Close()
 		return err
 	}
+	buf.Put(bp)
 	atomic.AddUint64(&c.txBytes, uint64(n))
 	return nil
 }
@@ -423,6 +455,7 @@ func (c *streamCarrier) dialForever(slot int) {
 		bp := buf.Take(c.Headroom(), helloLen)
 		copy((*bp)[c.Headroom():], helloOf(slot))
 		if err := c.sendOn(l, bp); err != nil {
+			buf.Put(bp)
 			_ = nc.Close()
 			continue
 		}
@@ -436,6 +469,7 @@ func (c *streamCarrier) dialForever(slot int) {
 		c.links[slot].CompareAndSwap(l, nil)
 		_ = nc.Close()
 		logging.Debug("carrier: connection %d dropped", slot)
+		c.linkDown(slot)
 	}
 }
 
@@ -534,6 +568,7 @@ func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 	c.readFrom(l, r, body)
 	c.links[slot].CompareAndSwap(l, nil)
 	_ = up.Close()
+	c.linkDown(slot)
 }
 
 // read takes whole datagrams off one connection until it ends.
@@ -609,6 +644,7 @@ func (c *streamCarrier) Keepalive(every time.Duration) {
 				}
 				bp := buf.Take(c.Headroom(), 0)
 				if err := c.sendOn(l, bp); err != nil {
+					buf.Put(bp)
 					logging.Debug("keepalive on connection %d: %v", i, err)
 				}
 			}

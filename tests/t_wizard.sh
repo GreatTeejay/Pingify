@@ -133,7 +133,8 @@ else
         check "and the name with it" "$(val "$kf" tunnel name)" "kharej-icmp-1"
         check "the token is the same" "$(val "$kf" security token)" "$(val "$IRAN_FILE" security token)"
         check "the core accepts it too" "$("$CORE" -c "$kf" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
-        d=$(diff <(sed 's/[[:space:]]*#.*$//' "$IRAN_FILE") <(sed 's/[[:space:]]*#.*$//' "$kf") | grep '^>' | sed 's/^> //' | tr '\n' '|')
+        d=$(diff <(sed 's/[[:space:]]*#.*$//; s/ *= */ = /' "$IRAN_FILE") <(sed 's/[[:space:]]*#.*$//; s/ *= */ = /' "$kf") | grep '^>' | sed 's/^> //' | tr '
+' '|')
         check "only the side and the name differ" "$d" 'name = "kharej-icmp-1"|side = "kharej"|'
         check_contains "the paste told the person which side this is" "$out" "this is the KHAREJ side"
         check_contains "and said both are done" "$out" "Both servers are set up"
