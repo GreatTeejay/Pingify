@@ -131,10 +131,16 @@ func (l *Link) startWriters() {
 		" so reading the wire never waits on a device write", l.name, n, depth)
 }
 
-// writeQueueDepth is how many packets may wait for one writer: one batch of
-// the largest recvmmsg takes, so a reader emptying the socket in one call
-// never has to wait, and no deeper, because a queue here is latency here.
-const writeQueueDepth = 128
+// writeQueueDepth is how many packets may wait for one writer.
+//
+// Deep enough to hold a whole burst. The socket reader hands over up to 128
+// packets per recvmmsg and the writer behind it may be mid-write, or on a
+// one-core server not even scheduled: at 128 the queue was full the moment a
+// burst arrived, and two hundred users downloading through an ICMP link lost
+// five packets in a hundred inside this machine - 280,000 in two minutes -
+// which the TCP inside then paid for in stalls. Three megabytes a worker at
+// most, and only when it is behind.
+const writeQueueDepth = 1024
 
 func (l *Link) writeQueue(q chan *[]byte) {
 	for {
