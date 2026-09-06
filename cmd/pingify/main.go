@@ -209,7 +209,7 @@ func reportEvery(every time.Duration, c carrier.Full, l tunnel) {
 			logging.Debug("carrier: %d sends failed", errs)
 		}
 		if d := l.Dropped(); d > 0 {
-			logging.Warn("private link: %d packets could not be put on the wire", d)
+			logging.Warn("private link: %d packets arrived faster than the device would take them, and were dropped", d)
 		}
 		lastRx, lastTx = rx, tx
 	}
