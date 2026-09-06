@@ -88,13 +88,15 @@ this_side_waits() { [ "$T_SIDE" = "$(waits_side)" ]; }
 # The name a tunnel is given, which is also the name of its file. It starts
 # with the side, so `ls /root/pingify` says which end of the border each
 # file is; then the transport, then the one number that tells two of the
-# same kind apart - the port, or the private link's octet where there is no
-# port. iran-tcp-8443, kharej-icmp-20.
+# same kind apart - the port, or for ICMP and GRE, which have none, the
+# private link's octet. iran-tcp-8443, iran-udp-8446, kharej-icmp-20.
 tunnel_default_name() {
     local side=${1:-$T_SIDE} trans=${2:-$T_TRANSPORT} num
-    if [ "$trans" = awg ]; then num=$T_AWG_PORT
-    elif cfg_needs_link "$trans"; then num=$T_OCTET
-    else num=$T_PORT; fi
+    case $trans in
+    awg) num=$T_AWG_PORT ;;
+    icmp | gre) num=$T_OCTET ;;
+    *) num=$T_PORT ;;
+    esac
     printf '%s-%s-%s' "$side" "$trans" "${num:-1}"
 }
 
@@ -167,6 +169,13 @@ wiz_fingerprint() { token_print "$1"; }
 #   balanced      900     448          254          93.3 / 106.5
 #   download     1500     466          253         115.8 / 139.3
 # ---------------------------------------------------------------------------
+
+preset_rcvbuf() {
+    case $1 in
+    download) printf '3072' ;;
+    *) printf '256' ;;
+    esac
+}
 
 preset_queue() {
     case $1 in
@@ -267,11 +276,10 @@ cfg_load() {
 # ---------------------------------------------------------------------------
 # the file
 #
-# One note beside every value, in the file itself, because the file is where
-# a person looks at three in the morning when the pair will not come up. The
-# keys that are not set are there too, commented out with their defaults, so
-# what the core can be told is visible without reading its source. toml_get
-# ignores the notes and toml_set keeps them.
+# Every setting the core reads, written out with its value, in two columns
+# and nothing else - what a person expects to find when they open it, and
+# what the Tuning screen edits in place. The values a preset chooses are in
+# the file as numbers, so what the tunnel runs with is what the file says.
 # ---------------------------------------------------------------------------
 
 fwd_toml_list() {
@@ -285,145 +293,106 @@ fwd_toml_list() {
 
 cfg_render() {
     local mode=${T_MODE:-$(mode_of "$T_TRANSPORT")}
-    kv() { printf '%-34s # %s\n' "$1 = $2" "$3"; }
-    off() { printf '# %-32s # %s\n' "$1 = $2" "$3"; }
+    kv() { printf '%-16s = %s\n' "$1" "$2"; }
+    q() { printf '"%s"' "$1"; }
 
-    printf '# Pingify %s\n' "$PINGIFY_VERSION"
-    printf '#\n'
-    printf '# The same file runs on both servers; only side and name differ. The manager\n'
-    printf '# reads and rewrites the values and keeps the notes. A line starting with #\n'
-    printf '# is a note or a key left at its default.\n'
-
-    printf '\n[tunnel]\n'
-    kv name "\"$T_NAME\"" "what the manager and the logs call this tunnel"
-    kv side "\"$T_SIDE\"" "which server this file is on: iran | kharej - the one value that differs"
-    if [ "$mode" = forward ]; then
-        kv mode "\"forward\"" "forward: users connect to IRAN's ports, KHAREJ dials the real service"
-    else
-        kv mode "\"tun\"" "tun: a private network between the two servers, one packet per message"
-    fi
+    printf '[tunnel]\n'
+    kv name "$(q "$T_NAME")"
+    kv side "$(q "$T_SIDE")"
+    kv mode "$(q "$mode")"
 
     printf '\n[transport]\n'
-    kv type "\"$T_TRANSPORT\"" "forward: tcp ws wss utls fallback   tun: icmp gre udp rawtcp awg"
-    kv kharej "\"$T_KHAREJ\"" "the server abroad: its public IP, or a domain a CDN answers on in front of it"
-    kv iran "\"$T_IRAN\"" "the Iran server: its public IP, or a domain a CDN answers on in front of it"
+    kv type "$(q "$T_TRANSPORT")"
+    kv kharej "$(q "$T_KHAREJ")"
+    kv iran "$(q "$T_IRAN")"
     case $T_TRANSPORT in
-    icmp | gre) printf '# %-24s # %s\n' "port" "none: this transport has no port and nothing to open" ;;
-    awg) kv port "$T_PORT" "the carrier's port inside the AmneziaWG link; awg.port below is the one to open" ;;
-    *) kv port "$T_PORT" "the one port the tunnel uses, the same on both servers" ;;
+    icmp | gre) ;;
+    *) kv port "$T_PORT" ;;
     esac
-    kv dials "\"$T_DIALS\"" "which side opens the connection: iran (out of Iran) or kharej (in to it)"
+    kv dials "$(q "$T_DIALS")"
     case $T_TRANSPORT in
-    tcp | ws | wss) kv connections "${T_CONNS:-8}" "TCP connections kept open, 1-32: one is shaped to nothing, eight are not" ;;
-    utls | fallback) off connections 8 "TCP connections kept open, 1-32" ;;
+    tcp | ws | wss | utls | fallback) kv connections "${T_CONNS:-8}" ;;
     esac
+    kv keepalive_sec 10
     case $T_TRANSPORT in
-    ws | wss)
-        [ -n "$T_PATH" ] && kv path "\"$T_PATH\"" "the path the WebSocket handshake asks for; anything else gets a 404"
-        off listen_port "$T_PORT" "the port the waiting side binds when a CDN edge connects on another"
-        ;;
+    ws | wss) kv path "$(q "$T_PATH")" ;;
     esac
-    off keepalive_sec 10 "seconds between keepalives"
     case $T_TRANSPORT in
     wss | utls | fallback)
-        off cert "\"\"" "a certificate for the waiting side, when nothing in front of it does the TLS"
-        off key "\"\"" "and its private key"
-        off insecure false "accept a certificate nobody vouches for: a self-made pair, never behind a CDN"
+        kv cert '""'
+        kv key '""'
+        kv insecure false
         ;;
     esac
 
     if [ "$T_TRANSPORT" = awg ]; then
         printf '\n[awg]\n'
-        kv name "\"$T_AWG_IFACE\"" "the AmneziaWG interface on this server"
-        kv iran "\"10.$T_OCTET.20.1/24\"" "the link's own addresses, beside the tunnel's"
-        kv kharej "\"10.$T_OCTET.20.2/24\"" ""
-        kv mtu 1320 "the link's packet size; the tunnel inside it uses 1280"
-        kv port "$T_AWG_PORT" "where AmneziaWG listens - the port to open in a firewall"
-        kv iran_key "\"$T_AWG_IKEY\"" "IRAN's private key"
-        kv iran_pub "\"$T_AWG_IPUB\"" "and its public one"
-        kv kharej_key "\"$T_AWG_KKEY\"" "KHAREJ's private key"
-        kv kharej_pub "\"$T_AWG_KPUB\"" "and its public one"
-        kv jc "$T_AWG_JC" "obfuscation: junk packets before the handshake"
-        kv jmin "$T_AWG_JMIN" "smallest junk packet"
-        kv jmax "$T_AWG_JMAX" "largest"
-        kv s1 "$T_AWG_S1" "padding on the handshake initiation"
-        kv s2 "$T_AWG_S2" "and on the response"
-        kv h1 "$T_AWG_H1" "the four message type numbers, changed from WireGuard's"
-        kv h2 "$T_AWG_H2" ""
-        kv h3 "$T_AWG_H3" ""
-        kv h4 "$T_AWG_H4" ""
+        kv name "$(q "$T_AWG_IFACE")"
+        kv iran "$(q "10.$T_OCTET.20.1/24")"
+        kv kharej "$(q "10.$T_OCTET.20.2/24")"
+        kv mtu 1320
+        kv port "$T_AWG_PORT"
+        kv iran_key "$(q "$T_AWG_IKEY")"
+        kv iran_pub "$(q "$T_AWG_IPUB")"
+        kv kharej_key "$(q "$T_AWG_KKEY")"
+        kv kharej_pub "$(q "$T_AWG_KPUB")"
+        kv jc "$T_AWG_JC"
+        kv jmin "$T_AWG_JMIN"
+        kv jmax "$T_AWG_JMAX"
+        kv s1 "$T_AWG_S1"
+        kv s2 "$T_AWG_S2"
+        kv h1 "$T_AWG_H1"
+        kv h2 "$T_AWG_H2"
+        kv h3 "$T_AWG_H3"
+        kv h4 "$T_AWG_H4"
     fi
 
     printf '\n[security]\n'
-    kv token "\"$T_TOKEN\"" "the same on both servers; every packet carries a tag made from it"
+    kv token "$(q "$T_TOKEN")"
 
     printf '\n[tuning]\n'
-    kv profile "\"$T_PRESET\"" "gaming | balanced | download - how deep the queues may get"
-    if [ -n "$T_QUEUE" ]; then
-        kv queue_packets "$T_QUEUE" "the queue depth, 200-20000; set by hand, so it overrides the profile"
-    else
-        off queue_packets "$(preset_queue "$T_PRESET")" "the queue depth the profile chose; set to choose your own, 200-20000"
+    kv profile "$(q "$T_PRESET")"
+    kv queue_packets "${T_QUEUE:-$(preset_queue "$T_PRESET")}"
+    kv rcvbuf_kb "$(preset_rcvbuf "$T_PRESET")"
+    kv sndbuf_kb 16384
+    if [ "$mode" = tun ]; then
+        kv send_batch 32
+        kv pace true
+        kv pace_mbit 0
     fi
-    if [ "$mode" = forward ]; then
-        off sndbuf_kb 16384 "the carrier socket's send buffer"
-        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
-    else
-        off rcvbuf_kb "$([ "$T_PRESET" = download ] && echo 3072 || echo 256)" "the carrier socket's receive queue; deep carries more, shallow answers faster"
-        off sndbuf_kb 16384 "its send buffer"
-        off send_batch 32 "packets handed to the kernel per crossing, 1-64"
-        off pace true "put fq on the way out so bursts leave as a stream"
-        off pace_mbit 0 "and cap the rate, in Mbit/s; 0 means no cap"
-        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
-        if [ "$T_TRANSPORT" != gre ]; then
-            if [ -n "$T_FEC" ] && [ "$T_FEC" != 0 ]; then
-                kv fec "$T_FEC" "one parity packet per this many, 4-32; 0 is off"
-            else
-                off fec 0 "one parity packet per this many, 4-32; 0 is off. A tenth of the bandwidth, for a path that loses packets"
-            fi
-        fi
+    kv dscp 0
+    if [ "$mode" = tun ] && [ "$T_TRANSPORT" != gre ]; then
+        kv fec "${T_FEC:-0}"
     fi
 
     printf '\n[forward]\n'
+    # shellcheck disable=SC2086
+    kv ports "[$(fwd_toml_list $T_FORWARDS)]"
     if [ "$mode" = forward ]; then
-        printf '# The ports users connect to on IRAN, and where each one goes on KHAREJ:\n'
-        printf '#   "443"                 tcp 443 here, to 127.0.0.1:443 there\n'
-        printf '#   "8000-8010"           a range, port for port\n'
-        printf '#   "udp:500"             the same for udp\n'
-        printf '#   "443=8443"            a different port there\n'
-        printf '#   "443=10.99.10.5:443"  a different host there\n'
-        # shellcheck disable=SC2086
-        printf 'ports = [%s]\n' "$(fwd_toml_list $T_FORWARDS)"
-        off bind_addr "\"0.0.0.0\"" "the address IRAN binds the ports on"
-        off allow "[]" "KHAREJ only: the targets it will dial, host:port; empty means any"
-    else
-        printf '# The ports users connect to on IRAN, sent over the link by its firewall,\n'
-        printf '# and where each one goes on KHAREJ - the same port there unless said:\n'
-        printf '#   "443"                 tcp 443 here, to KHAREJ:443 over the link\n'
-        printf '#   "8000-8010"           a range, port for port\n'
-        printf '#   "udp:500"             the same for udp\n'
-        printf '#   "443=8443"            a different port there\n'
-        printf '# The manager applies these on IRAN and edits them on the Ports screen.\n'
-        # shellcheck disable=SC2086
-        printf 'ports = [%s]\n' "$(fwd_toml_list $T_FORWARDS)"
+        kv bind_addr '"0.0.0.0"'
+        kv allow "[]"
+    fi
+
+    if [ "$mode" = tun ]; then
         printf '\n[tun]\n'
-        kv name "\"$T_TUNIF\"" "the device on this server"
-        kv iran "\"10.$T_OCTET.10.1/24\"" "IRAN's address on the link"
-        kv kharej "\"10.$T_OCTET.10.2/24\"" "KHAREJ's"
-        kv mtu "${T_TUNMTU:-1320}" "inner packet size, 576-9000; Find the MTU under Diagnostics measures yours"
-        off txqueuelen 1000 "packets the device holds for the link, 100-100000"
-        off write_workers 0 "goroutines putting arriving packets into the device; 0 is one per core"
-        off queues 1 "device queues, 1-16; more than one reorders a flow"
+        kv name "$(q "$T_TUNIF")"
+        kv iran "$(q "10.$T_OCTET.10.1/24")"
+        kv kharej "$(q "10.$T_OCTET.10.2/24")"
+        kv mtu "${T_TUNMTU:-1320}"
+        kv txqueuelen 1000
+        kv write_workers 0
+        kv queues 1
     fi
 
     printf '\n[logging]\n'
-    kv level "\"${T_LOG:-info}\"" "debug | info | warn | error"
+    kv level "$(q "${T_LOG:-info}")"
 
     printf '\n[status]\n'
-    kv port "${T_STATUS:-$STATUS_BASE}" "answers about this tunnel, on 127.0.0.1 only; 0 turns it off"
+    kv port "${T_STATUS:-$STATUS_BASE}"
     if [ "$mode" = forward ]; then
-        kv health_port -1 "no private address in forward mode, so none"
+        kv health_port -1
     else
-        kv health_port "${T_HEALTH:-$HEALTH_PORT}" "the same answers on the link's own address, for the far end; -1 turns it off"
+        kv health_port "${T_HEALTH:-$HEALTH_PORT}"
     fi
 }
 

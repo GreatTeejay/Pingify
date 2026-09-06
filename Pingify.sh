@@ -5091,6 +5091,11 @@ type streamCarrier struct {
 	head     int // the largest headroom any framing here will need
 	onPacket atomic.Pointer[func([]byte)]
 
+	// Told when a connection ends, with its slot. What rode on that
+	// connection and had not been acknowledged is gone, and only the thing
+	// riding knows what that means for it.
+	onLinkDown atomic.Pointer[func(int)]
+
 	done chan struct{}
 	once sync.Once
 
@@ -5196,6 +5201,20 @@ func (c *streamCarrier) Up() bool { return c.pick(0) != nil }
 
 func (c *streamCarrier) OnPacket(f func([]byte)) { c.onPacket.Store(&f) }
 
+// OnLinkDown registers what to tell when one connection ends. A stream
+// carrier's connections are TCP, and TCP will have taken bytes into its send
+// buffer that never reached the far end when the connection died; there is no
+// telling which. So a connection ending is not a hiccup to wait out - it is
+// the end of everything that was in flight on it, and the forwarder resets
+// those streams so their programs learn at once. See forward.resetSlot.
+func (c *streamCarrier) OnLinkDown(f func(slot int)) { c.onLinkDown.Store(&f) }
+
+func (c *streamCarrier) linkDown(slot int) {
+	if f := c.onLinkDown.Load(); f != nil {
+		(*f)(slot)
+	}
+}
+
 type streamSender struct{ c *streamCarrier }
 
 func (c *streamCarrier) NewSender() Sender { return &streamSender{c: c} }
@@ -5269,7 +5288,13 @@ func (c *streamCarrier) Send(bp *[]byte) error {
 		buf.Put(bp)
 		return ErrNoPeer
 	}
-	return c.sendOn(l, bp)
+	// A datagram: one that did not go is one that was lost, which is what
+	// the TCP inside expects of a link and repairs on its own.
+	if err := c.sendOn(l, bp); err != nil {
+		buf.Put(bp)
+		return err
+	}
+	return nil
 }
 
 // SendFlow puts a datagram on the connection its flow number picks, every
@@ -5286,6 +5311,10 @@ func (c *streamCarrier) SendFlow(flow uint32, bp *[]byte) error {
 		buf.Put(bp)
 		return ErrNoPeer
 	}
+	// On a write error the buffer is the caller's again, untouched, so that a
+	// stream - which cannot lose a record the way a datagram can - tries it
+	// again on the connection that replaces this one. ErrNoPeer frees it,
+	// because there was nothing to try.
 	return c.sendOn(l, bp)
 }
 
@@ -5300,13 +5329,16 @@ func (c *streamCarrier) sendOn(l *streamLink, bp *[]byte) error {
 	n, err := l.c.Write(l.fm.wrap(b))
 	l.mu.Unlock()
 
-	buf.Put(bp)
 	if err != nil {
 		atomic.AddUint64(&c.sendErrs, 1)
-		// Not logged and not retried. The reader on this connection is about
-		// to see the same failure, and it is the one that redials.
+		// Not logged, and not retried here. The connection is closed so that
+		// its reader ends now rather than whenever the kernel gives up, and
+		// the reader is the one that redials and says the slot is down. The
+		// buffer is handed back untouched for the caller to free or keep.
+		_ = l.c.Close()
 		return err
 	}
+	buf.Put(bp)
 	atomic.AddUint64(&c.txBytes, uint64(n))
 	return nil
 }
@@ -5367,6 +5399,7 @@ func (c *streamCarrier) dialForever(slot int) {
 		bp := buf.Take(c.Headroom(), helloLen)
 		copy((*bp)[c.Headroom():], helloOf(slot))
 		if err := c.sendOn(l, bp); err != nil {
+			buf.Put(bp)
 			_ = nc.Close()
 			continue
 		}
@@ -5380,6 +5413,7 @@ func (c *streamCarrier) dialForever(slot int) {
 		c.links[slot].CompareAndSwap(l, nil)
 		_ = nc.Close()
 		logging.Debug("carrier: connection %d dropped", slot)
+		c.linkDown(slot)
 	}
 }
 
@@ -5478,6 +5512,7 @@ func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 	c.readFrom(l, r, body)
 	c.links[slot].CompareAndSwap(l, nil)
 	_ = up.Close()
+	c.linkDown(slot)
 }
 
 // read takes whole datagrams off one connection until it ends.
@@ -5553,6 +5588,7 @@ func (c *streamCarrier) Keepalive(every time.Duration) {
 				}
 				bp := buf.Take(c.Headroom(), 0)
 				if err := c.sendOn(l, bp); err != nil {
+					buf.Put(bp)
 					logging.Debug("keepalive on connection %d: %v", i, err)
 				}
 			}
@@ -7487,6 +7523,9 @@ const (
 	udpIdle   = 90 * time.Second
 	pingEvery = 10 * time.Second
 	dialWait  = 10 * time.Second
+
+	// How often a writer looks again while the carrier is away.
+	carrierPoll = 50 * time.Millisecond
 )
 
 // FlowSender is the one thing a carrier has to offer for this: sending a
@@ -7515,6 +7554,7 @@ type Forwarder struct {
 
 	toWire, fromWire, dropped, refused uint64
 	farSeen                            int64 // unix nanos of the last record in
+	lastReset                          time.Time
 	rtt                                int64 // nanos, from the last pong
 
 	// Records on their way out, one queue per carrier connection, each drained
@@ -7570,8 +7610,29 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 		f.out[i] = make(chan outRec, outDepth)
 	}
 	car.OnPacket(f.onRecord)
+	// A stream carrier says when one of its connections ends. A datagram
+	// carrier has no connections to end and no streams to lose, and does
+	// not offer this.
+	if h, ok := car.(interface{ OnLinkDown(func(int)) }); ok {
+		h.OnLinkDown(f.resetSlot)
+	}
 	return f, nil
 }
+
+// carrierGrace is how long the carrier may be away before the connections
+// waiting on it are given up. A variable rather than a constant so a test can
+// shorten it; nothing else writes it.
+//
+// Until it expires nothing is lost: the writer holds the record it has, the
+// queue behind it fills, record blocks the pump that fills it, the pump stops
+// reading the user's socket, and the user's write waits - which is TCP flow
+// control doing its job through four layers. When it expires the connections
+// are reset, which the user's program sees at once and answers by connecting
+// again. What it is not, any more, is the third thing: reading the user's
+// socket at full speed and throwing the bytes away - 1,949,268 records in
+// seventeen seconds, measured, every one of them a write the user's program
+// had been told succeeded.
+var carrierGrace = 15 * time.Second
 
 // writer drains one outbound queue onto the carrier. One per connection,
 // so a stream's records leave in the order they were queued.
@@ -7581,13 +7642,144 @@ func (f *Forwarder) writer(q chan outRec) {
 		case <-f.closing:
 			return
 		case r := <-q:
-			if err := f.send.SendFlow(r.id, r.bp); err != nil {
-				atomic.AddUint64(&f.dropped, 1)
-				continue
-			}
-			atomic.AddUint64(&f.toWire, 1)
+			f.put(r)
 		}
 	}
+}
+
+// put sends one record, and keeps it while the carrier is away.
+//
+// It waits in front of the hand-over, on Up: a record for a stream that has
+// nothing in flight - a connection that arrived while the carrier was away -
+// loses nothing by waiting, and goes when the carrier is back. It does not
+// wait after a send that fails. A stream carrier's connection that dies under
+// a write has already lost what its kernel had taken and not delivered, and
+// there is no telling how much; the stream that was riding it is reset, here
+// and by the far end's reader, so the program behind it learns at once. The
+// record leaves when it can, or when its stream is gone and there is nobody
+// left to wait for.
+func (f *Forwarder) put(r outRec) {
+	for {
+		if f.car.Up() {
+			err := f.send.SendFlow(r.id, r.bp)
+			if err == nil {
+				atomic.AddUint64(&f.toWire, 1)
+				if r.id != 0 && r.id&udpIDBit == 0 {
+					if s := f.stream(r.id); s != nil {
+						atomic.StoreUint32(&s.wired, 1)
+					}
+				}
+				return
+			}
+			atomic.AddUint64(&f.dropped, 1)
+			if err != carrier.ErrNoPeer {
+				buf.Put(r.bp) // handed back on a write error; there was a peer
+				f.resetSlot(int(r.id % uint32(len(f.out))))
+			}
+			return
+		}
+		if r.id != 0 && f.stream(r.id) == nil && !f.udpAlive(r.id) {
+			buf.Put(r.bp)
+			return
+		}
+		if r.id == 0 {
+			buf.Put(r.bp) // a ping: the next one is as good
+			return
+		}
+		select {
+		case <-f.closing:
+			buf.Put(r.bp)
+			return
+		case <-time.After(carrierPoll):
+		}
+	}
+}
+
+// resetSlot gives up every stream that rode the carrier connection in one
+// slot, because that connection has ended and what was in flight on it is
+// gone. Both ends do this for the same connection: since the dialler names
+// its slot, the two ends' slot numbers are the same connection, and the same
+// streams are the ones on it - id modulo the connection count, which is how
+// SendFlow chose the connection in the first place.
+func (f *Forwarder) resetSlot(slot int) {
+	n := uint32(len(f.out))
+	f.mu.Lock()
+	streams := make([]*stream, 0)
+	for id, s := range f.streams {
+		if int(id%n) == slot && atomic.LoadUint32(&s.wired) == 1 {
+			streams = append(streams, s)
+		}
+	}
+	f.mu.Unlock()
+	if len(streams) == 0 {
+		return
+	}
+	logging.Info("forward: carrier connection %d ended; %d connections on it reset so their programs can reconnect",
+		slot, len(streams))
+	for _, s := range streams {
+		s.kill()
+	}
+}
+
+// watch counts how long the carrier has been away, whether or not anything is
+// waiting to be sent on it, and past the grace gives every connection up.
+//
+// It has to be its own goroutine and not a side effect of a record waiting:
+// the end that is only receiving - the Iran end during a download - has no
+// record in flight when the carrier goes, and before this it noticed nothing,
+// and the user's program sat on a connection that would never move for as
+// long as it was willing to sit.
+func (f *Forwarder) watch() {
+	tk := time.NewTicker(carrierPoll * 4)
+	defer tk.Stop()
+	var away time.Time
+	for {
+		select {
+		case <-f.closing:
+			return
+		case <-tk.C:
+		}
+		if f.car.Up() {
+			away = time.Time{}
+			continue
+		}
+		if away.IsZero() {
+			away = time.Now()
+			continue
+		}
+		if time.Since(away) > carrierGrace {
+			f.resetAll("the carrier has been away for " + carrierGrace.String())
+			away = time.Now() // and again, if it stays away
+		}
+	}
+}
+
+// resetAll gives up every connection at once, and says so once.
+func (f *Forwarder) resetAll(why string) {
+	f.mu.Lock()
+	if time.Since(f.lastReset) < carrierGrace {
+		f.mu.Unlock()
+		return
+	}
+	f.lastReset = time.Now()
+	streams := make([]*stream, 0, len(f.streams))
+	for _, s := range f.streams {
+		streams = append(streams, s)
+	}
+	f.mu.Unlock()
+	if len(streams) == 0 {
+		return
+	}
+	logging.Warn("forward: %s; %d connections reset so their programs can reconnect", why, len(streams))
+	for _, s := range streams {
+		s.kill()
+	}
+}
+
+func (f *Forwarder) udpAlive(id uint32) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.udp[id] != nil
 }
 
 // Start binds the ports on the edge and starts the pinger on both.
@@ -7607,6 +7799,7 @@ func (f *Forwarder) Start() error {
 		go f.writer(q)
 	}
 	go f.pinger()
+	go f.watch()
 	go f.reapUDP()
 	return nil
 }
@@ -7731,6 +7924,12 @@ func (f *Forwarder) onRecord(b []byte) {
 	case cmdData:
 		if s := f.stream(id); s != nil {
 			s.deliver(body)
+		} else {
+			// Data for a stream this end has no record of. It happens when
+			// this end restarted while the other went on sending, and before
+			// this the bytes went quietly into nothing while the far end's
+			// program was told they had arrived. A reset tells it.
+			f.recordNB(cmdRST, id, []byte("no such stream at this end"))
 		}
 	case cmdFIN:
 		if s := f.stream(id); s != nil {
@@ -7818,6 +8017,13 @@ type stream struct {
 	in     chan []byte
 	inEOF  chan struct{}
 	inOnce sync.Once
+
+	// Set once the first record of this stream has been written to a
+	// carrier connection. Until then nothing of it is in flight anywhere,
+	// so a connection ending cannot have lost any of it - and a stream that
+	// arrived while the carrier was away waits for it rather than being
+	// reset for the death of a connection it never rode.
+	wired uint32
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -7981,12 +8187,14 @@ func (f *Forwarder) serveTCP(ln net.Listener, r Rule) {
 }
 
 // open is a user's connection on the edge becoming a stream.
+//
+// It is not refused while the carrier is away. A connection that arrives
+// then has nothing in flight to lose: its SYN waits in put until the carrier
+// is back, and if the carrier stays away past the grace the watchdog resets
+// it. This used to close the connection on the spot, which the lab caught -
+// a download started two seconds into a five second cut failed at once
+// instead of arriving whole three seconds later.
 func (f *Forwarder) open(c net.Conn, r Rule) {
-	if !f.car.Up() {
-		atomic.AddUint64(&f.dropped, 1)
-		_ = c.Close()
-		return
-	}
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}
@@ -22090,13 +22298,15 @@ this_side_waits() { [ "$T_SIDE" = "$(waits_side)" ]; }
 # The name a tunnel is given, which is also the name of its file. It starts
 # with the side, so `ls /root/pingify` says which end of the border each
 # file is; then the transport, then the one number that tells two of the
-# same kind apart - the port, or the private link's octet where there is no
-# port. iran-tcp-8443, kharej-icmp-20.
+# same kind apart - the port, or for ICMP and GRE, which have none, the
+# private link's octet. iran-tcp-8443, iran-udp-8446, kharej-icmp-20.
 tunnel_default_name() {
     local side=${1:-$T_SIDE} trans=${2:-$T_TRANSPORT} num
-    if [ "$trans" = awg ]; then num=$T_AWG_PORT
-    elif cfg_needs_link "$trans"; then num=$T_OCTET
-    else num=$T_PORT; fi
+    case $trans in
+    awg) num=$T_AWG_PORT ;;
+    icmp | gre) num=$T_OCTET ;;
+    *) num=$T_PORT ;;
+    esac
     printf '%s-%s-%s' "$side" "$trans" "${num:-1}"
 }
 
@@ -22169,6 +22379,13 @@ wiz_fingerprint() { token_print "$1"; }
 #   balanced      900     448          254          93.3 / 106.5
 #   download     1500     466          253         115.8 / 139.3
 # ---------------------------------------------------------------------------
+
+preset_rcvbuf() {
+    case $1 in
+    download) printf '3072' ;;
+    *) printf '256' ;;
+    esac
+}
 
 preset_queue() {
     case $1 in
@@ -22269,11 +22486,10 @@ cfg_load() {
 # ---------------------------------------------------------------------------
 # the file
 #
-# One note beside every value, in the file itself, because the file is where
-# a person looks at three in the morning when the pair will not come up. The
-# keys that are not set are there too, commented out with their defaults, so
-# what the core can be told is visible without reading its source. toml_get
-# ignores the notes and toml_set keeps them.
+# Every setting the core reads, written out with its value, in two columns
+# and nothing else - what a person expects to find when they open it, and
+# what the Tuning screen edits in place. The values a preset chooses are in
+# the file as numbers, so what the tunnel runs with is what the file says.
 # ---------------------------------------------------------------------------
 
 fwd_toml_list() {
@@ -22287,145 +22503,106 @@ fwd_toml_list() {
 
 cfg_render() {
     local mode=${T_MODE:-$(mode_of "$T_TRANSPORT")}
-    kv() { printf '%-34s # %s\n' "$1 = $2" "$3"; }
-    off() { printf '# %-32s # %s\n' "$1 = $2" "$3"; }
+    kv() { printf '%-16s = %s\n' "$1" "$2"; }
+    q() { printf '"%s"' "$1"; }
 
-    printf '# Pingify %s\n' "$PINGIFY_VERSION"
-    printf '#\n'
-    printf '# The same file runs on both servers; only side and name differ. The manager\n'
-    printf '# reads and rewrites the values and keeps the notes. A line starting with #\n'
-    printf '# is a note or a key left at its default.\n'
-
-    printf '\n[tunnel]\n'
-    kv name "\"$T_NAME\"" "what the manager and the logs call this tunnel"
-    kv side "\"$T_SIDE\"" "which server this file is on: iran | kharej - the one value that differs"
-    if [ "$mode" = forward ]; then
-        kv mode "\"forward\"" "forward: users connect to IRAN's ports, KHAREJ dials the real service"
-    else
-        kv mode "\"tun\"" "tun: a private network between the two servers, one packet per message"
-    fi
+    printf '[tunnel]\n'
+    kv name "$(q "$T_NAME")"
+    kv side "$(q "$T_SIDE")"
+    kv mode "$(q "$mode")"
 
     printf '\n[transport]\n'
-    kv type "\"$T_TRANSPORT\"" "forward: tcp ws wss utls fallback   tun: icmp gre udp rawtcp awg"
-    kv kharej "\"$T_KHAREJ\"" "the server abroad: its public IP, or a domain a CDN answers on in front of it"
-    kv iran "\"$T_IRAN\"" "the Iran server: its public IP, or a domain a CDN answers on in front of it"
+    kv type "$(q "$T_TRANSPORT")"
+    kv kharej "$(q "$T_KHAREJ")"
+    kv iran "$(q "$T_IRAN")"
     case $T_TRANSPORT in
-    icmp | gre) printf '# %-24s # %s\n' "port" "none: this transport has no port and nothing to open" ;;
-    awg) kv port "$T_PORT" "the carrier's port inside the AmneziaWG link; awg.port below is the one to open" ;;
-    *) kv port "$T_PORT" "the one port the tunnel uses, the same on both servers" ;;
+    icmp | gre) ;;
+    *) kv port "$T_PORT" ;;
     esac
-    kv dials "\"$T_DIALS\"" "which side opens the connection: iran (out of Iran) or kharej (in to it)"
+    kv dials "$(q "$T_DIALS")"
     case $T_TRANSPORT in
-    tcp | ws | wss) kv connections "${T_CONNS:-8}" "TCP connections kept open, 1-32: one is shaped to nothing, eight are not" ;;
-    utls | fallback) off connections 8 "TCP connections kept open, 1-32" ;;
+    tcp | ws | wss | utls | fallback) kv connections "${T_CONNS:-8}" ;;
     esac
+    kv keepalive_sec 10
     case $T_TRANSPORT in
-    ws | wss)
-        [ -n "$T_PATH" ] && kv path "\"$T_PATH\"" "the path the WebSocket handshake asks for; anything else gets a 404"
-        off listen_port "$T_PORT" "the port the waiting side binds when a CDN edge connects on another"
-        ;;
+    ws | wss) kv path "$(q "$T_PATH")" ;;
     esac
-    off keepalive_sec 10 "seconds between keepalives"
     case $T_TRANSPORT in
     wss | utls | fallback)
-        off cert "\"\"" "a certificate for the waiting side, when nothing in front of it does the TLS"
-        off key "\"\"" "and its private key"
-        off insecure false "accept a certificate nobody vouches for: a self-made pair, never behind a CDN"
+        kv cert '""'
+        kv key '""'
+        kv insecure false
         ;;
     esac
 
     if [ "$T_TRANSPORT" = awg ]; then
         printf '\n[awg]\n'
-        kv name "\"$T_AWG_IFACE\"" "the AmneziaWG interface on this server"
-        kv iran "\"10.$T_OCTET.20.1/24\"" "the link's own addresses, beside the tunnel's"
-        kv kharej "\"10.$T_OCTET.20.2/24\"" ""
-        kv mtu 1320 "the link's packet size; the tunnel inside it uses 1280"
-        kv port "$T_AWG_PORT" "where AmneziaWG listens - the port to open in a firewall"
-        kv iran_key "\"$T_AWG_IKEY\"" "IRAN's private key"
-        kv iran_pub "\"$T_AWG_IPUB\"" "and its public one"
-        kv kharej_key "\"$T_AWG_KKEY\"" "KHAREJ's private key"
-        kv kharej_pub "\"$T_AWG_KPUB\"" "and its public one"
-        kv jc "$T_AWG_JC" "obfuscation: junk packets before the handshake"
-        kv jmin "$T_AWG_JMIN" "smallest junk packet"
-        kv jmax "$T_AWG_JMAX" "largest"
-        kv s1 "$T_AWG_S1" "padding on the handshake initiation"
-        kv s2 "$T_AWG_S2" "and on the response"
-        kv h1 "$T_AWG_H1" "the four message type numbers, changed from WireGuard's"
-        kv h2 "$T_AWG_H2" ""
-        kv h3 "$T_AWG_H3" ""
-        kv h4 "$T_AWG_H4" ""
+        kv name "$(q "$T_AWG_IFACE")"
+        kv iran "$(q "10.$T_OCTET.20.1/24")"
+        kv kharej "$(q "10.$T_OCTET.20.2/24")"
+        kv mtu 1320
+        kv port "$T_AWG_PORT"
+        kv iran_key "$(q "$T_AWG_IKEY")"
+        kv iran_pub "$(q "$T_AWG_IPUB")"
+        kv kharej_key "$(q "$T_AWG_KKEY")"
+        kv kharej_pub "$(q "$T_AWG_KPUB")"
+        kv jc "$T_AWG_JC"
+        kv jmin "$T_AWG_JMIN"
+        kv jmax "$T_AWG_JMAX"
+        kv s1 "$T_AWG_S1"
+        kv s2 "$T_AWG_S2"
+        kv h1 "$T_AWG_H1"
+        kv h2 "$T_AWG_H2"
+        kv h3 "$T_AWG_H3"
+        kv h4 "$T_AWG_H4"
     fi
 
     printf '\n[security]\n'
-    kv token "\"$T_TOKEN\"" "the same on both servers; every packet carries a tag made from it"
+    kv token "$(q "$T_TOKEN")"
 
     printf '\n[tuning]\n'
-    kv profile "\"$T_PRESET\"" "gaming | balanced | download - how deep the queues may get"
-    if [ -n "$T_QUEUE" ]; then
-        kv queue_packets "$T_QUEUE" "the queue depth, 200-20000; set by hand, so it overrides the profile"
-    else
-        off queue_packets "$(preset_queue "$T_PRESET")" "the queue depth the profile chose; set to choose your own, 200-20000"
+    kv profile "$(q "$T_PRESET")"
+    kv queue_packets "${T_QUEUE:-$(preset_queue "$T_PRESET")}"
+    kv rcvbuf_kb "$(preset_rcvbuf "$T_PRESET")"
+    kv sndbuf_kb 16384
+    if [ "$mode" = tun ]; then
+        kv send_batch 32
+        kv pace true
+        kv pace_mbit 0
     fi
-    if [ "$mode" = forward ]; then
-        off sndbuf_kb 16384 "the carrier socket's send buffer"
-        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
-    else
-        off rcvbuf_kb "$([ "$T_PRESET" = download ] && echo 3072 || echo 256)" "the carrier socket's receive queue; deep carries more, shallow answers faster"
-        off sndbuf_kb 16384 "its send buffer"
-        off send_batch 32 "packets handed to the kernel per crossing, 1-64"
-        off pace true "put fq on the way out so bursts leave as a stream"
-        off pace_mbit 0 "and cap the rate, in Mbit/s; 0 means no cap"
-        off dscp 0 "a DSCP mark on the carrier's packets, 0-63; 46 is expedited"
-        if [ "$T_TRANSPORT" != gre ]; then
-            if [ -n "$T_FEC" ] && [ "$T_FEC" != 0 ]; then
-                kv fec "$T_FEC" "one parity packet per this many, 4-32; 0 is off"
-            else
-                off fec 0 "one parity packet per this many, 4-32; 0 is off. A tenth of the bandwidth, for a path that loses packets"
-            fi
-        fi
+    kv dscp 0
+    if [ "$mode" = tun ] && [ "$T_TRANSPORT" != gre ]; then
+        kv fec "${T_FEC:-0}"
     fi
 
     printf '\n[forward]\n'
+    # shellcheck disable=SC2086
+    kv ports "[$(fwd_toml_list $T_FORWARDS)]"
     if [ "$mode" = forward ]; then
-        printf '# The ports users connect to on IRAN, and where each one goes on KHAREJ:\n'
-        printf '#   "443"                 tcp 443 here, to 127.0.0.1:443 there\n'
-        printf '#   "8000-8010"           a range, port for port\n'
-        printf '#   "udp:500"             the same for udp\n'
-        printf '#   "443=8443"            a different port there\n'
-        printf '#   "443=10.99.10.5:443"  a different host there\n'
-        # shellcheck disable=SC2086
-        printf 'ports = [%s]\n' "$(fwd_toml_list $T_FORWARDS)"
-        off bind_addr "\"0.0.0.0\"" "the address IRAN binds the ports on"
-        off allow "[]" "KHAREJ only: the targets it will dial, host:port; empty means any"
-    else
-        printf '# The ports users connect to on IRAN, sent over the link by its firewall,\n'
-        printf '# and where each one goes on KHAREJ - the same port there unless said:\n'
-        printf '#   "443"                 tcp 443 here, to KHAREJ:443 over the link\n'
-        printf '#   "8000-8010"           a range, port for port\n'
-        printf '#   "udp:500"             the same for udp\n'
-        printf '#   "443=8443"            a different port there\n'
-        printf '# The manager applies these on IRAN and edits them on the Ports screen.\n'
-        # shellcheck disable=SC2086
-        printf 'ports = [%s]\n' "$(fwd_toml_list $T_FORWARDS)"
+        kv bind_addr '"0.0.0.0"'
+        kv allow "[]"
+    fi
+
+    if [ "$mode" = tun ]; then
         printf '\n[tun]\n'
-        kv name "\"$T_TUNIF\"" "the device on this server"
-        kv iran "\"10.$T_OCTET.10.1/24\"" "IRAN's address on the link"
-        kv kharej "\"10.$T_OCTET.10.2/24\"" "KHAREJ's"
-        kv mtu "${T_TUNMTU:-1320}" "inner packet size, 576-9000; Find the MTU under Diagnostics measures yours"
-        off txqueuelen 1000 "packets the device holds for the link, 100-100000"
-        off write_workers 0 "goroutines putting arriving packets into the device; 0 is one per core"
-        off queues 1 "device queues, 1-16; more than one reorders a flow"
+        kv name "$(q "$T_TUNIF")"
+        kv iran "$(q "10.$T_OCTET.10.1/24")"
+        kv kharej "$(q "10.$T_OCTET.10.2/24")"
+        kv mtu "${T_TUNMTU:-1320}"
+        kv txqueuelen 1000
+        kv write_workers 0
+        kv queues 1
     fi
 
     printf '\n[logging]\n'
-    kv level "\"${T_LOG:-info}\"" "debug | info | warn | error"
+    kv level "$(q "${T_LOG:-info}")"
 
     printf '\n[status]\n'
-    kv port "${T_STATUS:-$STATUS_BASE}" "answers about this tunnel, on 127.0.0.1 only; 0 turns it off"
+    kv port "${T_STATUS:-$STATUS_BASE}"
     if [ "$mode" = forward ]; then
-        kv health_port -1 "no private address in forward mode, so none"
+        kv health_port -1
     else
-        kv health_port "${T_HEALTH:-$HEALTH_PORT}" "the same answers on the link's own address, for the far end; -1 turns it off"
+        kv health_port "${T_HEALTH:-$HEALTH_PORT}"
     fi
 }
 
@@ -23577,7 +23754,14 @@ show_log() {
 # to match, and the ones that are nobody's business but this machine's.
 # ---------------------------------------------------------------------------
 
-_edit_profile() { toml_set "$1" tuning profile "$PROFILE_WANT"; }
+# A profile is three lines in the file, not one: the depth and the receive
+# queue it chooses are written as numbers, and an explicit number wins over
+# the profile in the core, so changing the word alone would change nothing.
+_edit_profile() {
+    toml_set "$1" tuning profile "$PROFILE_WANT" &&
+        toml_set "$1" tuning queue_packets "$(preset_queue "$PROFILE_WANT")" &&
+        toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
+}
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
 _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }

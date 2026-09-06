@@ -70,6 +70,9 @@ const (
 	udpIdle   = 90 * time.Second
 	pingEvery = 10 * time.Second
 	dialWait  = 10 * time.Second
+
+	// How often a writer looks again while the carrier is away.
+	carrierPoll = 50 * time.Millisecond
 )
 
 // FlowSender is the one thing a carrier has to offer for this: sending a
@@ -98,6 +101,7 @@ type Forwarder struct {
 
 	toWire, fromWire, dropped, refused uint64
 	farSeen                            int64 // unix nanos of the last record in
+	lastReset                          time.Time
 	rtt                                int64 // nanos, from the last pong
 
 	// Records on their way out, one queue per carrier connection, each drained
@@ -153,8 +157,29 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 		f.out[i] = make(chan outRec, outDepth)
 	}
 	car.OnPacket(f.onRecord)
+	// A stream carrier says when one of its connections ends. A datagram
+	// carrier has no connections to end and no streams to lose, and does
+	// not offer this.
+	if h, ok := car.(interface{ OnLinkDown(func(int)) }); ok {
+		h.OnLinkDown(f.resetSlot)
+	}
 	return f, nil
 }
+
+// carrierGrace is how long the carrier may be away before the connections
+// waiting on it are given up. A variable rather than a constant so a test can
+// shorten it; nothing else writes it.
+//
+// Until it expires nothing is lost: the writer holds the record it has, the
+// queue behind it fills, record blocks the pump that fills it, the pump stops
+// reading the user's socket, and the user's write waits - which is TCP flow
+// control doing its job through four layers. When it expires the connections
+// are reset, which the user's program sees at once and answers by connecting
+// again. What it is not, any more, is the third thing: reading the user's
+// socket at full speed and throwing the bytes away - 1,949,268 records in
+// seventeen seconds, measured, every one of them a write the user's program
+// had been told succeeded.
+var carrierGrace = 15 * time.Second
 
 // writer drains one outbound queue onto the carrier. One per connection,
 // so a stream's records leave in the order they were queued.
@@ -164,13 +189,144 @@ func (f *Forwarder) writer(q chan outRec) {
 		case <-f.closing:
 			return
 		case r := <-q:
-			if err := f.send.SendFlow(r.id, r.bp); err != nil {
-				atomic.AddUint64(&f.dropped, 1)
-				continue
-			}
-			atomic.AddUint64(&f.toWire, 1)
+			f.put(r)
 		}
 	}
+}
+
+// put sends one record, and keeps it while the carrier is away.
+//
+// It waits in front of the hand-over, on Up: a record for a stream that has
+// nothing in flight - a connection that arrived while the carrier was away -
+// loses nothing by waiting, and goes when the carrier is back. It does not
+// wait after a send that fails. A stream carrier's connection that dies under
+// a write has already lost what its kernel had taken and not delivered, and
+// there is no telling how much; the stream that was riding it is reset, here
+// and by the far end's reader, so the program behind it learns at once. The
+// record leaves when it can, or when its stream is gone and there is nobody
+// left to wait for.
+func (f *Forwarder) put(r outRec) {
+	for {
+		if f.car.Up() {
+			err := f.send.SendFlow(r.id, r.bp)
+			if err == nil {
+				atomic.AddUint64(&f.toWire, 1)
+				if r.id != 0 && r.id&udpIDBit == 0 {
+					if s := f.stream(r.id); s != nil {
+						atomic.StoreUint32(&s.wired, 1)
+					}
+				}
+				return
+			}
+			atomic.AddUint64(&f.dropped, 1)
+			if err != carrier.ErrNoPeer {
+				buf.Put(r.bp) // handed back on a write error; there was a peer
+				f.resetSlot(int(r.id % uint32(len(f.out))))
+			}
+			return
+		}
+		if r.id != 0 && f.stream(r.id) == nil && !f.udpAlive(r.id) {
+			buf.Put(r.bp)
+			return
+		}
+		if r.id == 0 {
+			buf.Put(r.bp) // a ping: the next one is as good
+			return
+		}
+		select {
+		case <-f.closing:
+			buf.Put(r.bp)
+			return
+		case <-time.After(carrierPoll):
+		}
+	}
+}
+
+// resetSlot gives up every stream that rode the carrier connection in one
+// slot, because that connection has ended and what was in flight on it is
+// gone. Both ends do this for the same connection: since the dialler names
+// its slot, the two ends' slot numbers are the same connection, and the same
+// streams are the ones on it - id modulo the connection count, which is how
+// SendFlow chose the connection in the first place.
+func (f *Forwarder) resetSlot(slot int) {
+	n := uint32(len(f.out))
+	f.mu.Lock()
+	streams := make([]*stream, 0)
+	for id, s := range f.streams {
+		if int(id%n) == slot && atomic.LoadUint32(&s.wired) == 1 {
+			streams = append(streams, s)
+		}
+	}
+	f.mu.Unlock()
+	if len(streams) == 0 {
+		return
+	}
+	logging.Info("forward: carrier connection %d ended; %d connections on it reset so their programs can reconnect",
+		slot, len(streams))
+	for _, s := range streams {
+		s.kill()
+	}
+}
+
+// watch counts how long the carrier has been away, whether or not anything is
+// waiting to be sent on it, and past the grace gives every connection up.
+//
+// It has to be its own goroutine and not a side effect of a record waiting:
+// the end that is only receiving - the Iran end during a download - has no
+// record in flight when the carrier goes, and before this it noticed nothing,
+// and the user's program sat on a connection that would never move for as
+// long as it was willing to sit.
+func (f *Forwarder) watch() {
+	tk := time.NewTicker(carrierPoll * 4)
+	defer tk.Stop()
+	var away time.Time
+	for {
+		select {
+		case <-f.closing:
+			return
+		case <-tk.C:
+		}
+		if f.car.Up() {
+			away = time.Time{}
+			continue
+		}
+		if away.IsZero() {
+			away = time.Now()
+			continue
+		}
+		if time.Since(away) > carrierGrace {
+			f.resetAll("the carrier has been away for " + carrierGrace.String())
+			away = time.Now() // and again, if it stays away
+		}
+	}
+}
+
+// resetAll gives up every connection at once, and says so once.
+func (f *Forwarder) resetAll(why string) {
+	f.mu.Lock()
+	if time.Since(f.lastReset) < carrierGrace {
+		f.mu.Unlock()
+		return
+	}
+	f.lastReset = time.Now()
+	streams := make([]*stream, 0, len(f.streams))
+	for _, s := range f.streams {
+		streams = append(streams, s)
+	}
+	f.mu.Unlock()
+	if len(streams) == 0 {
+		return
+	}
+	logging.Warn("forward: %s; %d connections reset so their programs can reconnect", why, len(streams))
+	for _, s := range streams {
+		s.kill()
+	}
+}
+
+func (f *Forwarder) udpAlive(id uint32) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.udp[id] != nil
 }
 
 // Start binds the ports on the edge and starts the pinger on both.
@@ -190,6 +346,7 @@ func (f *Forwarder) Start() error {
 		go f.writer(q)
 	}
 	go f.pinger()
+	go f.watch()
 	go f.reapUDP()
 	return nil
 }
@@ -314,6 +471,12 @@ func (f *Forwarder) onRecord(b []byte) {
 	case cmdData:
 		if s := f.stream(id); s != nil {
 			s.deliver(body)
+		} else {
+			// Data for a stream this end has no record of. It happens when
+			// this end restarted while the other went on sending, and before
+			// this the bytes went quietly into nothing while the far end's
+			// program was told they had arrived. A reset tells it.
+			f.recordNB(cmdRST, id, []byte("no such stream at this end"))
 		}
 	case cmdFIN:
 		if s := f.stream(id); s != nil {
@@ -401,6 +564,13 @@ type stream struct {
 	in     chan []byte
 	inEOF  chan struct{}
 	inOnce sync.Once
+
+	// Set once the first record of this stream has been written to a
+	// carrier connection. Until then nothing of it is in flight anywhere,
+	// so a connection ending cannot have lost any of it - and a stream that
+	// arrived while the carrier was away waits for it rather than being
+	// reset for the death of a connection it never rode.
+	wired uint32
 
 	done     chan struct{}
 	doneOnce sync.Once
@@ -564,12 +734,14 @@ func (f *Forwarder) serveTCP(ln net.Listener, r Rule) {
 }
 
 // open is a user's connection on the edge becoming a stream.
+//
+// It is not refused while the carrier is away. A connection that arrives
+// then has nothing in flight to lose: its SYN waits in put until the carrier
+// is back, and if the carrier stays away past the grace the watchdog resets
+// it. This used to close the connection on the spot, which the lab caught -
+// a download started two seconds into a five second cut failed at once
+// instead of arriving whole three seconds later.
 func (f *Forwarder) open(c net.Conn, r Rule) {
-	if !f.car.Up() {
-		atomic.AddUint64(&f.dropped, 1)
-		_ = c.Close()
-		return
-	}
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
 	}

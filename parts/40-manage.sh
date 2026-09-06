@@ -286,7 +286,14 @@ show_log() {
 # to match, and the ones that are nobody's business but this machine's.
 # ---------------------------------------------------------------------------
 
-_edit_profile() { toml_set "$1" tuning profile "$PROFILE_WANT"; }
+# A profile is three lines in the file, not one: the depth and the receive
+# queue it chooses are written as numbers, and an explicit number wins over
+# the profile in the core, so changing the word alone would change nothing.
+_edit_profile() {
+    toml_set "$1" tuning profile "$PROFILE_WANT" &&
+        toml_set "$1" tuning queue_packets "$(preset_queue "$PROFILE_WANT")" &&
+        toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
+}
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
 _edit_level() { toml_set "$1" logging level "$LEVEL_WANT"; }
