@@ -1527,7 +1527,7 @@ func reportEvery(every time.Duration, c carrier.Full, l tunnel) {
 			logging.Debug("carrier: %d sends failed", errs)
 		}
 		if d := l.Dropped(); d > 0 {
-			logging.Warn("private link: %d packets could not be put on the wire", d)
+			logging.Warn("private link: %d packets arrived faster than the device would take them, and were dropped", d)
 		}
 		lastRx, lastTx = rx, tx
 	}
@@ -8550,6 +8550,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"pingify/internal/buf"
 	"pingify/internal/carrier"
@@ -8686,6 +8687,10 @@ func (l *Link) startWriters() {
 // most, and only when it is behind.
 const writeQueueDepth = 1024
 
+// writeQueueWait is how long the reader will wait for a full queue before it
+// drops the packet instead.
+const writeQueueWait = 5 * time.Millisecond
+
 func (l *Link) writeQueue(q chan *[]byte) {
 	for {
 		select {
@@ -8783,7 +8788,20 @@ func (l *Link) fromWire(b []byte) {
 	copy(*bp, b)
 	select {
 	case q <- bp:
+		return
 	default:
+	}
+	// The writer is behind. Wait for it a little rather than dropping at
+	// once: a burst that fills the queue is over in a millisecond or two,
+	// and a packet dropped here is one the TCP inside has to notice and ask
+	// for again across the whole path. Not for long, though - a writer that
+	// is stuck must not take the reader down with it, so past this the
+	// packet goes and the counter says so.
+	t := time.NewTimer(writeQueueWait)
+	select {
+	case q <- bp:
+		t.Stop()
+	case <-t.C:
 		buf.Put(bp)
 		atomic.AddUint64(&l.dropped, 1)
 	}
