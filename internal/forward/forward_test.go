@@ -86,7 +86,7 @@ func (p *pipeCarrier) SendFlow(_ uint32, bp *[]byte) error {
 	return p.Send(bp)
 }
 
-func pair(t *testing.T, ports []string) (*Forwarder, *Forwarder) {
+func pair(t *testing.T, ports []string, opts ...func(*Forwarder)) (*Forwarder, *Forwarder) {
 	t.Helper()
 	ca, cb := pipePair()
 	edge := &config.Config{Side: config.SideIran}
@@ -102,6 +102,10 @@ func pair(t *testing.T, ports []string) (*Forwarder, *Forwarder) {
 	o, err := New(origin, cb)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for _, opt := range opts {
+		opt(e)
+		opt(o)
 	}
 	if err := e.Start(); err != nil {
 		t.Fatal(err)
@@ -379,10 +383,6 @@ func TestACarrierThatComesBackLosesNothing(t *testing.T) {
 // behind it learns at once instead of waiting on a stream that will never
 // move again.
 func TestACarrierAwayTooLongResetsTheConnection(t *testing.T) {
-	old := carrierGrace
-	carrierGrace = 300 * time.Millisecond
-	defer func() { carrierGrace = old }()
-
 	svc, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +399,8 @@ func TestACarrierAwayTooLongResetsTheConnection(t *testing.T) {
 	}()
 	port := svc.Addr().(*net.TCPAddr).Port
 	userPort := freePort(t)
-	e, _ := pair(t, []string{userPort + "=127.0.0.1:" + itoa(port)})
+	e, _ := pair(t, []string{userPort + "=127.0.0.1:" + itoa(port)},
+		func(f *Forwarder) { f.grace = 300 * time.Millisecond })
 	ca := e.car.(*pipeCarrier)
 
 	user, err := net.Dial("tcp", "127.0.0.1:"+userPort)

@@ -104,6 +104,13 @@ type Forwarder struct {
 	lastReset                          time.Time
 	rtt                                int64 // nanos, from the last pong
 
+	// How long this tunnel's carrier may be away, copied from carrierGrace
+	// when the forwarder is made. A field and not the variable itself because
+	// watch() reads it for as long as the tunnel lives: a test that shortened
+	// the variable was writing it while the previous test's watch was still
+	// reading, which is a race whatever the values happen to be.
+	grace time.Duration
+
 	// Records on their way out, one queue per carrier connection, each drained
 	// by a goroutine of its own. The receive path never writes to the carrier
 	// directly: it hands a pong or a refusal to these queues without blocking
@@ -134,6 +141,7 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 		udp:     map[uint32]*udpSess{},
 		udpEdge: map[string]*udpSess{},
 		closing: make(chan struct{}),
+		grace:   carrierGrace,
 	}
 	if f.edge {
 		rules, err := ParseAll(cfg.Forward.Ports)
@@ -167,8 +175,8 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 }
 
 // carrierGrace is how long the carrier may be away before the connections
-// waiting on it are given up. A variable rather than a constant so a test can
-// shorten it; nothing else writes it.
+// waiting on it are given up. Every forwarder copies it once, into a field of
+// its own, and reads only that afterwards.
 //
 // Until it expires nothing is lost: the writer holds the record it has, the
 // queue behind it fills, record blocks the pump that fills it, the pump stops
@@ -294,8 +302,8 @@ func (f *Forwarder) watch() {
 			away = time.Now()
 			continue
 		}
-		if time.Since(away) > carrierGrace {
-			f.resetAll("the carrier has been away for " + carrierGrace.String())
+		if time.Since(away) > f.grace {
+			f.resetAll("the carrier has been away for " + f.grace.String())
 			away = time.Now() // and again, if it stays away
 		}
 	}
@@ -304,7 +312,7 @@ func (f *Forwarder) watch() {
 // resetAll gives up every connection at once, and says so once.
 func (f *Forwarder) resetAll(why string) {
 	f.mu.Lock()
-	if time.Since(f.lastReset) < carrierGrace {
+	if time.Since(f.lastReset) < f.grace {
 		f.mu.Unlock()
 		return
 	}
