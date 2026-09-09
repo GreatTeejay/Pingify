@@ -1,8 +1,9 @@
 name: release
 
-# Publishes the prebuilt engine so servers never have to compile it. Pingify.sh
-# falls back to building from its embedded sources, but that path only exists
-# for a server that cannot reach these files at all.
+# Publishes Pingify.sh. That single file is the whole product: it carries the
+# manager, the engine's sources and the vendored modules, and builds the engine
+# on the server it lands on. There is no prebuilt binary to ship, because the
+# manager deliberately has no path that would download one.
 
 on:
   push:
@@ -21,76 +22,63 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: false          # the engine has no dependencies to cache
+          cache: false
 
-      # The race detector needs cgo, which is why this runs here rather than on
-      # the developer machine.
+      # The race detector needs cgo, which is why this runs here rather than
+      # on the machine the script was written on.
       - name: Test the engine
-        working-directory: core
         run: go test -count=1 -race -timeout 300s ./...
 
-      # build.sh validates bash syntax, rebuilds every embedded source, then
-      # extracts the result and compares that tree with the input. The gzip
-      # stream itself is not compared with Git: different gzip versions can
-      # encode identical input differently, which is not a stale artifact.
-      - name: Build and verify the bundled script
-        run: |
-          bash build.sh
-
-      # These drive the manager's own functions, so a wizard that stops
-      # producing a config the core accepts fails the release rather than
-      # reaching a server.
+      # These drive the manager's own functions in a sandbox, so a wizard that
+      # stops producing a config the engine accepts fails the release rather
+      # than reaching a server.
       - name: Test the manager
-        run: |
-          bash tests/manager_test.sh
-          bash tests/matrix_test.sh
+        run: bash tests/run.sh
 
-      - name: Build the engine
+      # build.sh checks gofmt and go vet, refuses a script that does not parse,
+      # extracts the embedded sources again and compares them byte for byte,
+      # and proves the result still compiles offline for both architectures.
+      - name: Build and verify the bundled script
+        run: bash build.sh
+
+      - name: The tag and the script must agree
         run: |
-          mkdir -p dist
-          for arch in amd64 arm64; do
-            (cd core && GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w" -o "../dist/pingify-core-linux-$arch" .)
-          done
-          cd dist && sha256sum pingify-core-linux-* > SHA256SUMS
-          cat SHA256SUMS
+          tag="${GITHUB_REF_NAME#v}"
+          have="$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$tag" != "$have" ]; then
+            echo "tag v$tag but the script says $have - one of them is wrong"
+            exit 1
+          fi
 
       - name: Write the release notes
         env:
           REPO: ${{ github.repository }}
         run: |
-          # Built with a quoted heredoc so nothing here has to survive both YAML
-          # and shell quoting - the previous inline version broke the workflow.
           cat > notes.md <<'NOTES'
-          Prebuilt engine for `linux/amd64` and `linux/arm64`, plus the manager script.
+          The manager and the engine in one file.
 
-          Install or update on either server:
+          Install or update, on both servers:
 
           ```bash
           bash <(wget -qO- https://github.com/OWNER_REPO/releases/latest/download/Pingify.sh)
           ```
 
-          Check a download against `SHA256SUMS`.
+          The engine is compiled on the server from the sources inside the
+          script, so no server has to reach a Go proxy to install it.
           NOTES
           sed -i "s#OWNER_REPO#${REPO}#" notes.md
-          sed -i 's/^          //' notes.md
-          cat notes.md
 
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="${GITHUB_REF_NAME}"
-          if [ "$tag" = "main" ]; then
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
             tag="v$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
           fi
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/pingify-core-linux-amd64 \
-                                     dist/pingify-core-linux-arm64 \
-                                     dist/SHA256SUMS Pingify.sh --clobber
+            gh release upload "$tag" Pingify.sh --clobber
           else
-            gh release create "$tag" dist/pingify-core-linux-amd64 \
-                                     dist/pingify-core-linux-arm64 \
-                                     dist/SHA256SUMS Pingify.sh \
+            gh release create "$tag" Pingify.sh \
               --title "Pingify $tag" --notes-file notes.md
           fi
