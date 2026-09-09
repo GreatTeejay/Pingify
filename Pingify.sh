@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="2.3.0"
+PINGIFY_VERSION="1.1.0"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -1361,7 +1361,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "2.3.0"
+const version = "1.1.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
