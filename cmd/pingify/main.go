@@ -130,7 +130,7 @@ func main() {
 	if cfg.Dials() {
 		go car.Keepalive(time.Duration(cfg.Transport.Keepalive) * time.Second)
 	}
-	go reportEvery(30*time.Second, car, l)
+	go reportEvery(30*time.Second, car, l, cfg.Mode == "forward")
 	go status.New(cfg, version, car, l).Serve(cfg.StatusPort, cfg.HealthPort)
 
 	logging.Info("running")
@@ -173,11 +173,12 @@ func since(now, then uint64) uint64 {
 	return now - then
 }
 
-func reportEvery(every time.Duration, c carrier.Full, l tunnel) {
+func reportEvery(every time.Duration, c carrier.Full, l tunnel, forwarding bool) {
 	tk := time.NewTicker(every)
 	defer tk.Stop()
 	var lastRx, lastTx uint64
 	var lastMissing, lastLate, lastGaps uint64
+	var lastDropped uint64
 	for range tk.C {
 		rx, tx, bad, replay, errs := c.Counters()
 		if rx == lastRx && tx == lastTx {
@@ -208,8 +209,18 @@ func reportEvery(every time.Duration, c carrier.Full, l tunnel) {
 		if errs > 0 {
 			logging.Debug("carrier: %d sends failed", errs)
 		}
-		if d := l.Dropped(); d > 0 {
-			logging.Warn("private link: %d packets arrived faster than the device would take them, and were dropped", d)
+		// Dropped is a total, not a rate. Reporting the total made one bad
+		// half-second warn again every thirty seconds for as long as the
+		// tunnel ran - a server three days up said "4 packets dropped" 8640
+		// times about the same four. What is worth a line is the growth.
+		if d := l.Dropped(); d > lastDropped {
+			n := since(d, lastDropped)
+			if forwarding {
+				logging.Warn("%d records could not be put on the wire and were dropped", n)
+			} else {
+				logging.Warn("private link: %d packets arrived faster than the device would take them, and were dropped", n)
+			}
+			lastDropped = d
 		}
 		lastRx, lastTx = rx, tx
 	}
