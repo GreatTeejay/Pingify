@@ -1,9 +1,13 @@
 name: release
 
-# Publishes Pingify.sh. That single file is the whole product: it carries the
-# manager, the engine's sources and the vendored modules, and builds the engine
-# on the server it lands on. There is no prebuilt binary to ship, because the
+# Publishes Pingify.sh. That single file is the whole product: the manager,
+# the engine's sources and the vendored modules, and it builds the engine on
+# the server it lands on. There is no prebuilt binary to ship, because the
 # manager deliberately has no path that would download one.
+#
+# The engine's sources are not a second copy in this repository. They are in
+# the script, so this workflow takes them out of it and tests those - which
+# also proves that what a server would extract and compile is what passed.
 
 on:
   push:
@@ -24,6 +28,15 @@ jobs:
           go-version: '1.22'
           cache: false
 
+      - name: The script must parse before anything is taken out of it
+        run: bash -n Pingify.sh
+
+      - name: Take the engine out of the script
+        run: |
+          PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
+          test -f go.mod && test -d internal && test -d vendor
+          echo "extracted $(find cmd internal -name '*.go' | wc -l) Go files"
+
       # The race detector needs cgo, which is why this runs here rather than
       # on the machine the script was written on.
       - name: Test the engine
@@ -35,17 +48,19 @@ jobs:
       - name: Test the manager
         run: bash tests/run.sh
 
-      # build.sh checks gofmt and go vet, refuses a script that does not parse,
-      # extracts the embedded sources again and compares them byte for byte,
-      # and proves the result still compiles offline for both architectures.
-      - name: Build and verify the bundled script
-        run: bash build.sh
+      - name: It must still compile for both architectures, offline
+        run: |
+          for arch in amd64 arm64; do
+            GOPROXY=off GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+              go build -o /dev/null ./cmd/pingify
+          done
 
       - name: The tag and the script must agree
+        if: github.ref_type == 'tag'
         run: |
           tag="${GITHUB_REF_NAME#v}"
           have="$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$tag" != "$have" ]; then
+          if [ "$tag" != "$have" ]; then
             echo "tag v$tag but the script says $have - one of them is wrong"
             exit 1
           fi

@@ -152,17 +152,25 @@ Protect the setup token, the `.toml` files and `/root/pingify`; the configs are 
 /root/pingify/state/          state the manager keeps
 /etc/systemd/system/pingify@.service
 parts/                        the manager, in order
-cmd/ internal/ vendor/        the core
 tests/                        the test suites
 build.sh                      assembles Pingify.sh
 ```
+
+The engine's Go sources are not a second copy in this repository. `Pingify.sh` carries every one of them, which is how a server with no route to a Go proxy still builds the engine, and they come back out of it unchanged:
+
+```bash
+PINGIFY_NO_MAIN=1 bash -c '. ./Pingify.sh; write_core_sources .'
+go test ./...
+```
+
+Edit `parts/` and the extracted Go tree, never the generated blocks inside `Pingify.sh`, then rebuild:
 
 ```bash
 bash build.sh
 bash tests/run.sh
 ```
 
-Edit `parts/` and the Go tree, never the generated blocks inside `Pingify.sh`, then rebuild. `build.sh` refuses to write a script that does not parse, checks the sources come back out byte for byte, and proves they still compile offline for `linux/amd64` and `linux/arm64`.
+`build.sh` refuses to write a script that does not parse, checks the sources come back out byte for byte, and proves they still compile offline for `linux/amd64` and `linux/arm64`.
 
 ## License
 

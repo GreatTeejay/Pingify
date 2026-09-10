@@ -4,3 +4,16 @@ core/pingify-core.exe
 *.test.exe
 /tmp/
 Pingify-CORE2/
+
+# The engine's sources. They are not absent - Pingify.sh carries every one of
+# them, and build.sh proves it puts them back byte for byte:
+#
+#   PINGIFY_NO_MAIN=1 bash -c '. ./Pingify.sh; write_core_sources .'
+#
+# They are simply not a second copy in the tree, where the only thing they
+# would add is a folder for people to read.
+/cmd/
+/internal/
+/vendor/
+/go.mod
+/go.sum
