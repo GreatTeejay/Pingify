@@ -37,6 +37,17 @@ jobs:
           test -f go.mod && test -d internal && test -d vendor
           echo "extracted $(find cmd internal -name '*.go' | wc -l) Go files"
 
+      # The script carries every Go file except the tests, which would only be
+      # weight on a server that is never going to run them. They are in the
+      # repository instead, and go over the extracted tree here - so what is
+      # tested is exactly what a server extracts and compiles.
+      - name: Lay the engine's tests over it
+        run: |
+          cp -r tests/_engine/internal tests/_engine/cmd . 2>/dev/null || true
+          n=$(find cmd internal -name '*_test.go' | wc -l)
+          [ "$n" -gt 0 ] || { echo "no engine tests were laid down"; exit 1; }
+          echo "$n test files"
+
       # The race detector needs cgo, which is why this runs here rather than
       # on the machine the script was written on.
       - name: Test the engine
