@@ -188,7 +188,7 @@ full_uninstall() {
     rm -rf "$CORE_DIR" "$STATE_DIR"
     if [ "$keep" = no ]; then rm -rf "$CFG_DIR"; ok "tunnels deleted"; else ok "tunnels left in $CFG_DIR"; fi
     rmdir "$BASE_DIR" 2>/dev/null
-    if [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
+    if icmp_echo_muted; then
         sysctl -qw net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 && ok "this server answers pings again"
     fi
     blank

@@ -990,6 +990,11 @@ svc_state() {
 # answered twice. What it does not do is give it back. This counts the
 # remaining ICMP tunnels first: two of them, one stopped, must not unmute the
 # one still running.
+# Whether the kernel is muted right now. Its own function so that what the
+# machine happens to be doing is not baked into the one below - a test can
+# say yes here and get the same answer on any machine.
+icmp_echo_muted() { [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ]; }
+
 icmp_echo_restore() {
     local n t
     while IFS= read -r n; do
@@ -998,7 +1003,7 @@ icmp_echo_restore() {
         [ "$t" = icmp ] || continue
         [ "$(svc_state "$n")" = active ] && return 0
     done < <(cfg_list)
-    [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ] || return 0
+    icmp_echo_muted || return 0
     sysctl -qw net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 &&
         ok "this server answers pings again"
 }
@@ -26031,7 +26036,7 @@ full_uninstall() {
     rm -rf "$CORE_DIR" "$STATE_DIR"
     if [ "$keep" = no ]; then rm -rf "$CFG_DIR"; ok "tunnels deleted"; else ok "tunnels left in $CFG_DIR"; fi
     rmdir "$BASE_DIR" 2>/dev/null
-    if [ "$(cat /proc/sys/net/ipv4/icmp_echo_ignore_all 2>/dev/null)" = 1 ]; then
+    if icmp_echo_muted; then
         sysctl -qw net.ipv4.icmp_echo_ignore_all=0 >/dev/null 2>&1 && ok "this server answers pings again"
     fi
     blank

@@ -29,6 +29,17 @@ srv_info() { SRV_IP=1.2.3.4 SRV_LOC=x SRV_ORG=y; }
 wiz_public_ips() { return 1; }
 curl() { return 1; }
 
+# Nor may it read the machine it runs on. The wizard asks the host which
+# networks, devices and ports are already taken, and a test that let it ask
+# got a different answer on every machine: on a laptop with no tunnels the
+# first free network is 10.1, on a server already running five it is 10.6,
+# and the file the wizard wrote then failed every check below. Here the host
+# is empty, so the answers are the same everywhere.
+host_net_owner() { return 1; }
+host_has_iface() { return 1; }
+health_bound() { return 1; }
+port_free() { return 0; }
+
 answers() { printf '%s\n' "$@"; }
 
 # the core, so the wizard's file can be judged by the real reader
