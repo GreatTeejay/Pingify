@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.2.0"
+PINGIFY_VERSION="1.2.1"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -1366,7 +1366,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "1.2.0"
+const version = "1.2.1"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -4895,6 +4895,17 @@ func tuneSocket(pc net.PacketConn, cfg *config.Config) {
 			rcv/1024, gotRcv/1024)
 	}
 }
+
+// Capping a carrier connection's send buffer was tried here and taken out
+// again. It does bound what a stream can have outstanding, which is what has
+// to be held to carry it over a dead connection - but measured on the real
+// pair it cost more than it bought: four megabytes took one stream from 734
+// to 342 Mbit/s and eight took it to 505, because a stream rides one
+// connection and its ceiling is that buffer over the round trip. What is
+// outstanding for a stream is its own rate times the delay, not the buffer's
+// size, and a person watching a video has fifty kilobytes in flight. Only a
+// single stream taking the whole path has tens of megabytes, and that one is
+// left uninsurable on purpose.
 
 // setUserTimeout is TCP_USER_TIMEOUT: how long transmitted data may go
 // unacknowledged before the kernel gives the connection up with an error,
@@ -8630,12 +8641,14 @@ const (
 	// What has to be held is what the far end has not confirmed: the records
 	// still in our kernel's send buffer, the ones on the wire, and the ones
 	// it has taken but not yet acknowledged. On this path that is a bandwidth
-	// times delay figure - about five megabytes for the whole tunnel at five
-	// hundred megabits and eighty milliseconds - divided over the connections
-	// carrying it. Two megabytes covers a stream's share of that with room to
-	// spare, and a stream that still outruns it is moving faster than the
-	// path, which cannot last.
-	resumeHold = 2 << 20
+	// times delay figure - for the stream itself, not for the path: someone
+	// watching a video at five megabits has fifty kilobytes outstanding over
+	// eighty milliseconds, and four megabytes covers a stream moving at four
+	// hundred. What it does not cover is one stream taking the whole path at
+	// once, which on the real pair had seventy-four megabytes outstanding.
+	// That one is left to be reset, which is what every tunnel of this kind
+	// does to every stream today.
+	resumeHold = 4 << 20
 
 	// And for every stream at once. The Iran side of a pair is often a small
 	// machine, and this is memory it is not otherwise spending, so the cap is
