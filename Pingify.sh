@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.1.0"
+PINGIFY_VERSION="1.2.0"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -1366,7 +1366,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "1.1.0"
+const version = "1.2.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -7489,9 +7489,9 @@ PINGIFY_GO_SOURCE_EOF
 //	| cmd  |  stream id |  body                         |
 //	+------+------------+-------------------------------+
 //
-// A stream lives on one carrier connection from its first record to its
-// last. The carrier picks the connection from the flow number, and the flow
-// number is the stream id, so nothing arrives out of order.
+// A stream rides one carrier connection, picked from its id, so nothing
+// arrives out of order. When that connection dies the stream moves to another
+// and carries on from where the far end says it got to - see resume.go.
 package forward
 
 import (
@@ -7520,6 +7520,12 @@ const (
 	cmdUSYN = 8  // open a UDP session; body is the target
 	cmdUDP  = 9  // one datagram
 	cmdUFIN = 10 // the session is gone
+
+	// A data record's body begins with the byte of its stream it starts at,
+	// and this says how much of that stream the far end has taken. Together
+	// they are what lets a stream outlive the connection it was riding; see
+	// resume.go.
+	cmdAck = 11 // body is 8 bytes: payload bytes this side has taken
 
 	hdrLen = 5
 
@@ -7588,6 +7594,16 @@ type Forwarder struct {
 	// pressure a fast local end should feel.
 	out []chan outRec
 
+	// Streams owing the far end an acknowledgement. They cannot be sent from
+	// the read goroutine that notices they are due: record blocks on a full
+	// queue, and that queue drains onto the connection the far end is trying
+	// to read, so both ends wedge. recordNB does not block but is allowed to
+	// drop, and a dropped acknowledgement is memory the sender never lets go
+	// of - worse, a stream whose first one was dropped is one it will not
+	// resume. So they go through here, where a goroutine of their own can
+	// afford to wait, and only the newest count for a stream is ever sent.
+	acks chan uint32
+
 	closing chan struct{}
 	once    sync.Once
 }
@@ -7611,6 +7627,7 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 		udpEdge: map[string]*udpSess{},
 		closing: make(chan struct{}),
 		grace:   carrierGrace,
+		acks:    make(chan uint32, 4096),
 	}
 	if f.edge {
 		rules, err := ParseAll(cfg.Forward.Ports)
@@ -7725,6 +7742,17 @@ func (f *Forwarder) put(r outRec) {
 // its slot, the two ends' slot numbers are the same connection, and the same
 // streams are the ones on it - id modulo the connection count, which is how
 // SendFlow chose the connection in the first place.
+// resetSlot is a carrier connection that has ended. The streams that were
+// riding it have lost whatever the kernel had taken and not delivered, so they
+// cannot simply go on: each is offered again from the last byte the far end
+// acknowledged, down whichever connection is alive now. Only a stream that
+// cannot be made whole - one that outran what this end could hold, or whose
+// far end has never acknowledged anything and so may not understand the offer
+// - is still reset.
+//
+// It runs in a goroutine of its own because the carrier calls this from the
+// loop that is about to dial the replacement connection, and the resending
+// waits on queues that the replacement is what drains.
 func (f *Forwarder) resetSlot(slot int) {
 	n := uint32(len(f.out))
 	f.mu.Lock()
@@ -7738,10 +7766,42 @@ func (f *Forwarder) resetSlot(slot int) {
 	if len(streams) == 0 {
 		return
 	}
-	logging.Info("forward: carrier connection %d ended; %d connections on it reset so their programs can reconnect",
-		slot, len(streams))
+	go f.resume(slot, streams)
+}
+
+// resume offers every stream that was on a dead connection to the far end
+// again, from the last byte it acknowledged.
+func (f *Forwarder) resume(slot int, streams []*stream) {
+	var carried, lost, bytes int
 	for _, s := range streams {
-		s.kill()
+		s.sendMu.Lock()
+		from, parts, ok := s.out.replay()
+		for _, p := range parts {
+			if !ok {
+				break
+			}
+			ok = f.dataRec(s.id, from, p)
+			from += uint64(len(p))
+			bytes += len(p)
+		}
+		s.sendMu.Unlock()
+		if !ok {
+			s.kill()
+			lost++
+			continue
+		}
+		carried++
+	}
+	switch {
+	case lost == 0:
+		logging.Info("forward: carrier connection %d ended; %d connections moved to another and carried on, %d KB sent again",
+			slot, carried, bytes/1024)
+	case carried == 0:
+		logging.Info("forward: carrier connection %d ended; %d connections reset so their programs can reconnect",
+			slot, lost)
+	default:
+		logging.Info("forward: carrier connection %d ended; %d connections carried on, %d had to be reset",
+			slot, carried, lost)
 	}
 }
 
@@ -7824,6 +7884,7 @@ func (f *Forwarder) Start() error {
 	}
 	go f.pinger()
 	go f.watch()
+	go f.acker()
 	go f.reapUDP()
 	return nil
 }
@@ -7880,9 +7941,29 @@ func (f *Forwarder) String() string {
 
 // --- records ----------------------------------------------------------------
 
-func (f *Forwarder) maxBody() int { return f.car.MaxPayload() - hdrLen }
+func (f *Forwarder) maxBody() int { return f.car.MaxPayload() - hdrLen - offLen }
 
 // record puts one record on the wire, on the connection the stream id picks.
+// dataRec is a payload record with the offset it begins at in front of it.
+// Built here rather than by record so the two do not have to be concatenated
+// into a third buffer on the way.
+func (f *Forwarder) dataRec(id uint32, off uint64, body []byte) bool {
+	head := f.car.Headroom()
+	bp := buf.Take(head, hdrLen+offLen+len(body))
+	b := (*bp)[head:]
+	b[0] = cmdData
+	binary.BigEndian.PutUint32(b[1:5], id)
+	binary.BigEndian.PutUint64(b[hdrLen:hdrLen+offLen], off)
+	copy(b[hdrLen+offLen:], body)
+	select {
+	case f.out[id%uint32(len(f.out))] <- outRec{id, bp}:
+		return true
+	case <-f.closing:
+		buf.Put(bp)
+		return false
+	}
+}
+
 func (f *Forwarder) record(cmd byte, id uint32, body []byte) bool {
 	head := f.car.Headroom()
 	bp := buf.Take(head, hdrLen+len(body))
@@ -7946,8 +8027,19 @@ func (f *Forwarder) onRecord(b []byte) {
 		}
 		f.accept(id, string(body))
 	case cmdData:
+		if len(body) < offLen {
+			return
+		}
+		off, payload := binary.BigEndian.Uint64(body[:offLen]), body[offLen:]
 		if s := f.stream(id); s != nil {
-			s.deliver(body)
+			payload = s.got.accept(off, payload)
+			if len(payload) == 0 {
+				return // already had it, or it arrives before what it follows
+			}
+			s.deliver(payload)
+			if s.got.took(len(payload)) {
+				f.owed(id)
+			}
 		} else {
 			// Data for a stream this end has no record of. It happens when
 			// this end restarted while the other went on sending, and before
@@ -7963,6 +8055,13 @@ func (f *Forwarder) onRecord(b []byte) {
 		if s := f.stream(id); s != nil {
 			s.kill()
 		}
+	case cmdAck:
+		if len(body) == offLen {
+			if s := f.stream(id); s != nil {
+				s.out.ack(binary.BigEndian.Uint64(body))
+			}
+		}
+
 	case cmdUSYN:
 		if !f.edge {
 			f.openUDP(id, string(body))
@@ -7994,6 +8093,34 @@ func (f *Forwarder) forget(id uint32) {
 	f.mu.Lock()
 	delete(f.streams, id)
 	f.mu.Unlock()
+}
+
+// acker tells the far end how much of each stream has arrived, from a
+// goroutine that is allowed to block on a full queue.
+func (f *Forwarder) acker() {
+	for {
+		select {
+		case <-f.closing:
+			return
+		case id := <-f.acks:
+			s := f.stream(id)
+			if s == nil {
+				continue
+			}
+			// where reads the count now, not when the nudge was queued, so a
+			// backlog of nudges collapses into one true answer each.
+			f.record(cmdAck, id, be64(s.got.where()))
+		}
+	}
+}
+
+// owed queues a stream for an acknowledgement. Dropping the nudge is safe:
+// what is sent is always the current count, so the next one covers this.
+func (f *Forwarder) owed(id uint32) {
+	select {
+	case f.acks <- id:
+	default:
+	}
 }
 
 func (f *Forwarder) pinger() {
@@ -8051,6 +8178,16 @@ type stream struct {
 
 	done     chan struct{}
 	doneOnce sync.Once
+
+	// What this stream is holding in case its carrier connection dies, and
+	// what it has taken from the far end. See resume.go.
+	out held
+	got taken
+
+	// sendMu orders what goes out for this stream: a record and the copy
+	// kept beside it are one step, and a resend must not be cut in half by
+	// a pump that is still reading the local socket.
+	sendMu sync.Mutex
 }
 
 // inDepth is how many records a stream may hold before the carrier read
@@ -8107,7 +8244,13 @@ func (s *stream) pumpOut() {
 	for {
 		n, err := s.local.Read(b)
 		if n > 0 {
-			if !s.f.record(cmdData, s.id, b[:n]) {
+			s.sendMu.Lock()
+			ok := s.f.dataRec(s.id, s.out.at(), b[:n])
+			if ok {
+				s.out.keep(b[:n])
+			}
+			s.sendMu.Unlock()
+			if !ok {
 				s.kill()
 				return
 			}
@@ -8433,6 +8576,244 @@ func (f *Forwarder) reapUDP() {
 			}
 		}
 	}
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/forward/resume.go" <<'PINGIFY_GO_SOURCE_EOF'
+package forward
+
+// Surviving the death of a carrier connection.
+//
+// A stream rides one carrier connection, chosen from its id, and until now the
+// death of that connection was the death of every stream on it. Measured on
+// the real pair: one connection of eight hit TCP_USER_TIMEOUT after a stall,
+// the carrier had a new connection in its place forty-one milliseconds later,
+// and nineteen people's sessions had already been reset. The tunnel was fine.
+// Their downloads were not.
+//
+// The reason it had to reset them is real: what the kernel had taken from us
+// and not yet delivered is lost when the socket dies, so the bytes the far end
+// receives next would not follow the bytes it received last.
+//
+// Three things together make that survivable:
+//
+//	every data record says which byte of its stream it begins at
+//	the receiver counts what it has taken, and says so now and then
+//	the sender holds what it has sent and not had acknowledged
+//
+// When a connection dies the sender puts what it is holding down another one.
+// The receiver keeps only what follows what it has: a record it already has is
+// dropped, and so is one that arrives before the bytes in front of it - that
+// one is still held by the sender and comes again behind them. So the order
+// records arrive in after a death does not have to be arranged, which is the
+// whole difficulty: the queue for the dead connection still holds records that
+// were never sent, and they cannot be made to jump it.
+//
+// What it costs is eight bytes on each data record and one copy of it kept
+// until it is acknowledged, never more than resumeHold for one stream or
+// resumeBudget for all of them. A stream that outruns either is reset the old
+// way - which is what a tunnel of this kind does to every stream today.
+
+import (
+	"encoding/binary"
+	"sync"
+	"sync/atomic"
+
+	"pingify/internal/logging"
+)
+
+const (
+	// offLen is the byte offset carried by every data record.
+	offLen = 8
+
+	// How much of one stream may be held for a resend.
+	//
+	// What has to be held is what the far end has not confirmed: the records
+	// still in our kernel's send buffer, the ones on the wire, and the ones
+	// it has taken but not yet acknowledged. On this path that is a bandwidth
+	// times delay figure - about five megabytes for the whole tunnel at five
+	// hundred megabits and eighty milliseconds - divided over the connections
+	// carrying it. Two megabytes covers a stream's share of that with room to
+	// spare, and a stream that still outruns it is moving faster than the
+	// path, which cannot last.
+	resumeHold = 2 << 20
+
+	// And for every stream at once. The Iran side of a pair is often a small
+	// machine, and this is memory it is not otherwise spending, so the cap is
+	// one it cannot be argued out of: past this, streams stop being insurable
+	// rather than the machine running out.
+	resumeBudget = 64 << 20
+
+	// How much may arrive before the receiver says so. An acknowledgement is
+	// thirteen bytes, so they are close to free, and each one is memory the
+	// sender can let go of: fine is better than frugal here.
+	ackEvery = 16 << 10
+)
+
+// budget is the memory every stream on this tunnel is holding, together.
+var budget atomic.Int64
+
+// held is what one stream is holding for a resend, in the order it was sent.
+// parts is exactly the bytes from acked to sent, so the first of them begins
+// at acked and the rest follow on.
+type held struct {
+	mu    sync.Mutex
+	sent  uint64
+	acked uint64
+	parts [][]byte
+	bytes int
+	// gap is set when something that should have been held was not, because
+	// a cap was reached. A stream with a gap cannot be carried on: the bytes
+	// it would need to send again are not there. It clears when everything
+	// sent has been acknowledged, because then there is nothing to send.
+	gap bool
+	// seen is set by the first acknowledgement to arrive. A far end that has
+	// never acknowledged anything may be an older build, which would take a
+	// resent record as a new one, so such a stream is not carried on.
+	seen bool
+}
+
+// at is the offset the next record will begin at.
+func (h *held) at() uint64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.sent
+}
+
+// keep copies what was just sent, if it can be afforded, and moves the stream
+// on by that much. The bytes are the caller's read buffer, so the copy is not
+// optional.
+func (h *held) keep(b []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.sent += uint64(len(b))
+	if h.gap {
+		return
+	}
+	if h.bytes+len(b) > resumeHold || budget.Add(int64(len(b))) > resumeBudget {
+		budget.Add(-int64(len(b)))
+		h.drop()
+		return
+	}
+	c := make([]byte, len(b))
+	copy(c, b)
+	h.parts = append(h.parts, c)
+	h.bytes += len(b)
+}
+
+// drop lets go of everything held and says so. Called with the lock.
+func (h *held) drop() {
+	budget.Add(-int64(h.bytes))
+	h.parts, h.bytes, h.gap = nil, 0, true
+}
+
+// ack is the far end saying how much of this stream it has taken. What is
+// below that line is not needed any more.
+func (h *held) ack(n uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.seen = true
+	if n > h.sent {
+		n = h.sent // a far end that claims more than was sent is not believed
+	}
+	if n <= h.acked {
+		return
+	}
+	for len(h.parts) > 0 {
+		p := h.parts[0]
+		if h.acked+uint64(len(p)) > n {
+			// Part of this one is still wanted. Keeping the whole of it is
+			// simpler than splitting it and costs one record.
+			break
+		}
+		h.acked += uint64(len(p))
+		h.parts = h.parts[1:]
+		h.bytes -= len(p)
+		budget.Add(-int64(len(p)))
+	}
+	if len(h.parts) == 0 {
+		h.acked = n
+		if h.gap && h.acked == h.sent {
+			h.gap = false // nothing is missing when nothing is outstanding
+		}
+	}
+}
+
+// replay is what has to be sent again after the connection a stream was on
+// died: the offset the first record begins at, the records, and whether the
+// stream can be carried on at all.
+func (h *held) replay() (uint64, [][]byte, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// A stream with nothing outstanding lost nothing, whatever it has been
+	// told: the next record it sends follows the last one that arrived. Most
+	// streams are in this state most of the time - a direction that only
+	// answers, or one between requests.
+	if h.sent == h.acked && !h.gap {
+		return h.acked, nil, true
+	}
+	if h.gap || !h.seen {
+		logging.Debug("a stream cannot be carried on: outran what was held=%v, never acknowledged=%v, sent %d taken %d",
+			h.gap, !h.seen, h.sent, h.acked)
+		return 0, nil, false
+	}
+	out := make([][]byte, len(h.parts))
+	copy(out, h.parts)
+	return h.acked, out, true
+}
+
+// taken is what one stream has received.
+type taken struct {
+	mu   sync.Mutex
+	rcvd uint64
+	told uint64
+}
+
+// accept returns the part of a record that is new, and nothing when the record
+// is one this end already has or one that arrives before the bytes in front of
+// it. Dropping the second kind is what makes the order records come back in
+// after a death stop mattering: whatever is dropped is still held by the
+// sender and arrives again behind the bytes it follows.
+func (t *taken) accept(off uint64, b []byte) []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if off > t.rcvd {
+		return nil
+	}
+	skip := t.rcvd - off
+	if skip >= uint64(len(b)) {
+		return nil
+	}
+	return b[skip:]
+}
+
+// took counts what has been handed to the local socket and says whether the
+// far end is owed an acknowledgement.
+func (t *taken) took(n int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	first := t.told == 0
+	t.rcvd += uint64(n)
+	// The first record is acknowledged at once, whatever its size. Not for
+	// the sender's memory - there is nothing to let go of yet - but because
+	// an acknowledgement is how it learns the far end understands them at
+	// all, and a stream it has never heard one for is one it will not carry
+	// on. Without this, a connection that had moved less than ackEvery was
+	// still lost with its carrier, which is most of them.
+	return first || t.rcvd-t.told >= ackEvery
+}
+
+// where is what this end has taken, and marks it as told.
+func (t *taken) where() uint64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.told = t.rcvd
+	return t.rcvd
+}
+
+func be64(n uint64) []byte {
+	b := make([]byte, offLen)
+	binary.BigEndian.PutUint64(b, n)
+	return b
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/forward/rules.go" <<'PINGIFY_GO_SOURCE_EOF'

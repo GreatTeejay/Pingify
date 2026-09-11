@@ -26,14 +26,38 @@ type pipeCarrier struct {
 	q          chan []byte
 	sent       uint64
 	down       atomic.Bool // the carrier away, as a test sees fit
+	lose       atomic.Bool // and swallowing what is handed to it, as one does
+	lost       uint64      // how many records that swallowed
 	onLinkDown atomic.Pointer[func(int)]
+}
+
+// cut is a connection dying the way a real one does: what was handed over and
+// not yet delivered is gone, and then both ends are told the connection ended.
+func (p *pipeCarrier) cut(slot int, d time.Duration) {
+	p.lose.Store(true)
+	p.peer.lose.Store(true)
+	time.Sleep(d)
+	p.lose.Store(false)
+	p.peer.lose.Store(false)
+	if f := p.onLinkDown.Load(); f != nil {
+		(*f)(slot)
+	}
+	if f := p.peer.onLinkDown.Load(); f != nil {
+		(*f)(slot)
+	}
 }
 
 func (p *pipeCarrier) OnLinkDown(f func(int)) { p.onLinkDown.Store(&f) }
 
-func pipePair() (*pipeCarrier, *pipeCarrier) {
-	a := &pipeCarrier{head: 12, q: make(chan []byte, 4096)}
-	b := &pipeCarrier{head: 12, q: make(chan []byte, 4096)}
+func pipePair() (*pipeCarrier, *pipeCarrier) { return pipePairQ(4096) }
+
+// pipePairQ is the same with a chosen depth. The depth is how much the wire
+// holds: a test about what is lost when a connection dies wants that to be a
+// real path's worth and not five megabytes of free buffer, or the sender runs
+// so far ahead of the far end that nothing could insure it.
+func pipePairQ(depth int) (*pipeCarrier, *pipeCarrier) {
+	a := &pipeCarrier{head: 12, q: make(chan []byte, depth)}
+	b := &pipeCarrier{head: 12, q: make(chan []byte, depth)}
 	a.peer, b.peer = b, a
 	go a.run()
 	go b.run()
@@ -73,6 +97,18 @@ func (p *pipeCarrier) Send(bp *[]byte) error {
 	c := make([]byte, len(b))
 	copy(c, b)
 	buf.Put(bp)
+	if p.lose.Load() {
+		// A socket whose route has stopped answering does not swallow at
+		// infinite speed: its buffer fills and the writer waits. Waiting is
+		// the part that matters - without it the sender races a whole
+		// transfer into a connection that is already dead, which no amount
+		// of holding could insure and no real path would allow.
+		for p.lose.Load() {
+			time.Sleep(time.Millisecond)
+		}
+		atomic.AddUint64(&p.lost, 1)
+		return nil // taken by the kernel, and lost with the socket
+	}
 	atomic.AddUint64(&p.sent, 1)
 	p.peer.q <- c
 	return nil
@@ -88,7 +124,12 @@ func (p *pipeCarrier) SendFlow(_ uint32, bp *[]byte) error {
 
 func pair(t *testing.T, ports []string, opts ...func(*Forwarder)) (*Forwarder, *Forwarder) {
 	t.Helper()
-	ca, cb := pipePair()
+	return pairQ(t, ports, 4096, opts...)
+}
+
+func pairQ(t *testing.T, ports []string, depth int, opts ...func(*Forwarder)) (*Forwarder, *Forwarder) {
+	t.Helper()
+	ca, cb := pipePairQ(depth)
 	edge := &config.Config{Side: config.SideIran}
 	edge.Transport.Type = "tcp"
 	edge.Forward.Ports = ports
@@ -447,11 +488,13 @@ func TestDataForAStreamNobodyHasIsRefused(t *testing.T) {
 		}
 		(*prev)(b)
 	})
-	// A data record for stream 4242, which the edge has no record of.
-	rec := make([]byte, hdrLen+5)
+	// A data record for stream 4242, which the edge has no record of. Its
+	// body begins with the offset every data record carries.
+	rec := make([]byte, hdrLen+offLen+5)
 	rec[0] = cmdData
 	binary.BigEndian.PutUint32(rec[1:5], 4242)
-	copy(rec[hdrLen:], "hello")
+	binary.BigEndian.PutUint64(rec[hdrLen:hdrLen+offLen], 0)
+	copy(rec[hdrLen+offLen:], "hello")
 	ca.q <- rec
 	select {
 	case <-saw:
@@ -462,10 +505,11 @@ func TestDataForAStreamNobodyHasIsRefused(t *testing.T) {
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
-// A carrier connection that ends takes its streams with it, at once: what was
-// in flight on it is gone, and a program left waiting on a stream with a hole
-// in it would wait for ever.
-func TestADeadCarrierConnectionResetsItsStreams(t *testing.T) {
+// A stream the far end has never acknowledged is one that may be talking to an
+// older build, which would take a resent record as a new one. That stream is
+// still reset when its connection dies, because carrying it on could corrupt
+// it - and a reset the program can see beats bytes it cannot trust.
+func TestAStreamNobodyAcknowledgedIsStillReset(t *testing.T) {
 	svc, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -495,7 +539,17 @@ func TestADeadCarrierConnectionResetsItsStreams(t *testing.T) {
 	}
 	time.Sleep(100 * time.Millisecond)
 
-	// The one connection this test's carrier has ends.
+	// Silence every acknowledgement, as a build that does not send them
+	// would, and take away what this end is holding.
+	e.mu.Lock()
+	for _, s := range e.streams {
+		s.out.mu.Lock()
+		s.out.seen = false
+		s.out.gap = true
+		s.out.mu.Unlock()
+	}
+	e.mu.Unlock()
+
 	(*ca.onLinkDown.Load())(0)
 
 	_ = user.SetDeadline(time.Now().Add(3 * time.Second))
@@ -504,5 +558,103 @@ func TestADeadCarrierConnectionResetsItsStreams(t *testing.T) {
 		t.Fatal("the user's connection is still open after the carrier connection under it ended")
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		t.Fatal("the user's connection was left waiting, not reset")
+	}
+}
+
+// A carrier connection that dies mid-transfer used to take every stream on it
+// with it. Now the stream moves to whatever is alive and carries on from the
+// last byte the far end acknowledged - so what arrives is what was sent, once
+// each and in order, across a cut that really did lose records in flight.
+func TestAStreamOutlivesTheConnectionItWasRiding(t *testing.T) {
+	const total = 16 << 20
+
+	started := make(chan struct{})
+	got := make(chan []byte, 1)
+	svc, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	go func() {
+		c, err := svc.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		var all []byte
+		b := make([]byte, 32<<10)
+		once := sync.Once{}
+		for {
+			n, err := c.Read(b)
+			if n > 0 {
+				all = append(all, b[:n]...)
+				if len(all) > 2<<20 {
+					once.Do(func() { close(started) })
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		got <- all
+	}()
+
+	port := svc.Addr().(*net.TCPAddr).Port
+	userPort := freePort(t)
+	e, _ := pairQ(t, []string{userPort + "=127.0.0.1:" + itoa(port)}, 128)
+	ca := e.car.(*pipeCarrier)
+
+	user, err := net.Dial("tcp", "127.0.0.1:"+userPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := make([]byte, total)
+	for i := range want {
+		want[i] = byte(i % 251)
+	}
+
+	go func() {
+		select {
+		case <-started:
+		case <-time.After(10 * time.Second):
+		}
+		ca.cut(0, 30*time.Millisecond)
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := user.Write(want)
+		if cw, ok := user.(*net.TCPConn); ok {
+			_ = cw.CloseWrite()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("the user's write failed across the cut: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the write never finished")
+	}
+
+	select {
+	case b := <-got:
+		if n := atomic.LoadUint64(&ca.lost) + atomic.LoadUint64(&ca.peer.lost); n == 0 {
+			t.Fatal("the cut swallowed nothing, so this proves nothing")
+		}
+		if len(b) != total {
+			t.Fatalf("the far end got %d bytes of %d - the stream did not survive the cut", len(b), total)
+		}
+		if !bytes.Equal(b, want) {
+			for i := range b {
+				if b[i] != want[i] {
+					t.Fatalf("byte %d of %d is wrong: the resend overlapped or left a hole", i, total)
+				}
+			}
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the far end never saw the end of the stream")
 	}
 }
