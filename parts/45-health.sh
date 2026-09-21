@@ -143,10 +143,6 @@ chk_add() {
     esac
 }
 
-hc_ok() { chk_add ok "${2:-x}" "$1"; }
-hc_bad() { chk_add bad "${2:-x}" "$1"; }
-hc_warn() { chk_add warn "${2:-x}" "$1"; }
-
 count_word() {
     case $1 in 1) printf 'one' ;; 2) printf 'two' ;; 3) printf 'three' ;; *) printf '%s' "$1" ;; esac
 }

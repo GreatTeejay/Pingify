@@ -206,7 +206,6 @@ cfg_list() {
         printf '%s\n' "${n%.$CFG_EXT}"
     done
 }
-cfg_count() { cfg_list | grep -c . || true; }
 
 # cfg_apply is the only way a config is changed: copy, edit, ask the core
 # whether it will accept the result, and put the old one back if it will not.

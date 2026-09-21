@@ -304,5 +304,3 @@ tunnel_boot() {
 boot_say() {
     sed "s|^[[:space:]]*|pingify: $1: |" >&2
 }
-# The name the units written before this release call.
-grefou_boot() { tunnel_boot "$@"; }

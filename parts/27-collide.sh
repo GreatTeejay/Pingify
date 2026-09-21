@@ -190,7 +190,7 @@ free_tun_iface() {
 port_family() {
     case $1 in
     tcp | ws | wss | utls | fallback | rawtcp) printf 'tcp' ;;
-    udp | awg | kcp | grefou) printf 'udp' ;;
+    kcp | grefou | udp | awg) printf 'udp' ;;
     *) printf 'none' ;;
     esac
 }

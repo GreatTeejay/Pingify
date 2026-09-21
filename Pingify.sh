@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.0.0"
+PINGIFY_VERSION="1.0.1"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -939,7 +939,6 @@ cfg_list() {
         printf '%s\n' "${n%.$CFG_EXT}"
     done
 }
-cfg_count() { cfg_list | grep -c . || true; }
 
 # cfg_apply is the only way a config is changed: copy, edit, ask the core
 # whether it will accept the result, and put the old one back if it will not.
@@ -1643,7 +1642,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "1.0.0"
+const version = "1.0.1"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -7686,19 +7685,27 @@ func Open(cfg *config.Config) (Full, error) {
 }
 
 func open(cfg *config.Config) (Full, error) {
+	// In the order the manager offers them: the six that carry ports over
+	// a connection, then the private links by what carries them on the
+	// wire - protocol 47, the same inside UDP, UDP, UDP with a disguise,
+	// something TCP-shaped, and ping.
 	switch cfg.Transport.Type {
-	case "icmp":
-		return newICMPCarrier(cfg)
-	case "udp":
-		return newUDPCarrier(cfg)
 	case "tcp":
 		return newTCPCarrier(cfg)
 	case "ws":
 		return newWSCarrier(cfg)
 	case "wss":
 		return newWSSCarrier(cfg)
+	case "utls":
+		return newUTLSCarrier(cfg)
+	case "fallback":
+		return newFallbackCarrier(cfg)
+	case "kcp":
+		return newKCPCarrier(cfg)
 	case "gre":
 		return newGRECarrier(cfg)
+	case "udp":
+		return newUDPCarrier(cfg)
 	// AmneziaWG is not a carrier of ours. The link is theirs, brought up by
 	// awg-quick from their own packages, and what runs inside it is the same
 	// UDP carrier as anywhere else - which is how a tunnel over it still has
@@ -7707,12 +7714,8 @@ func open(cfg *config.Config) (Full, error) {
 		return newUDPCarrier(cfg)
 	case "rawtcp":
 		return newRawTCPCarrier(cfg)
-	case "utls":
-		return newUTLSCarrier(cfg)
-	case "fallback":
-		return newFallbackCarrier(cfg)
-	case "kcp":
-		return newKCPCarrier(cfg)
+	case "icmp":
+		return newICMPCarrier(cfg)
 	}
 	return nil, fmt.Errorf("no transport called %q", cfg.Transport.Type)
 }
@@ -34546,8 +34549,6 @@ tunnel_boot() {
 boot_say() {
     sed "s|^[[:space:]]*|pingify: $1: |" >&2
 }
-# The name the units written before this release call.
-grefou_boot() { tunnel_boot "$@"; }
 #!/usr/bin/env bash
 #
 # What is already taken on this server, and by whom.
@@ -34740,7 +34741,7 @@ free_tun_iface() {
 port_family() {
     case $1 in
     tcp | ws | wss | utls | fallback | rawtcp) printf 'tcp' ;;
-    udp | awg | kcp | grefou) printf 'udp' ;;
+    kcp | grefou | udp | awg) printf 'udp' ;;
     *) printf 'none' ;;
     esac
 }
@@ -34992,12 +34993,12 @@ transport_label() {
     utls) printf 'Chrome TLS MUX' ;;
     fallback) printf 'Decoy TLS MUX' ;;
     kcp) printf 'KCP MUX' ;;
-    icmp) printf 'ICMP' ;;
     gre) printf 'GRE' ;;
     grefou) printf 'GRE FOU' ;;
     udp) printf 'UDP' ;;
-    rawtcp) printf 'Fake TCP' ;;
     awg) printf 'AmneziaWG' ;;
+    rawtcp) printf 'Fake TCP' ;;
+    icmp) printf 'ICMP' ;;
     *) printf '%s' "${1^^}" ;;
     esac
 }
@@ -35574,7 +35575,7 @@ setup_token_read_file() {
 # cannot build, before a single question is asked about it.
 setup_token_check() {
     case $T_TRANSPORT in
-    tcp | ws | wss | utls | fallback | kcp | icmp | gre | grefou | udp | rawtcp | awg) ;;
+    tcp | ws | wss | utls | fallback | kcp | gre | grefou | udp | awg | rawtcp | icmp) ;;
     *) setup_token_bad "unknown transport $T_TRANSPORT"; return 1 ;;
     esac
     [ "$T_MODE" = "$(mode_of "$T_TRANSPORT")" ] || { setup_token_bad "transport and mode disagree"; return 1; }
@@ -35632,12 +35633,6 @@ wiz_public_ips() {
     done
     return "$found"
 }
-wiz_public_ip() {
-    local a
-    a=$(wiz_public_ips | head -1)
-    [ -n "$a" ] || return 1
-    printf '%s' "$a"
-}
 
 # is_name says "this is a domain and not an address".
 is_name() { case $1 in *[a-zA-Z]*) return 0 ;; *) return 1 ;; esac; }
@@ -35693,15 +35688,19 @@ ask_transport() {
     choice 2 "WS MUX" "WebSocket on port 80 - a CDN can front it"
     choice 3 "WSS MUX" "WebSocket inside TLS - a domain or Cloudflare"
     choice 4 "Chrome TLS MUX" "TLS whose handshake is Chrome's"
-    choice 5 "Decoy TLS MUX" "Chrome TLS, and a real website for anyone probing"
-    choice 6 "KCP MUX" "reliable streams over UDP - for when TCP is throttled"
+    choice 5 "Decoy TLS MUX" "Chrome TLS, and a website for anyone probing"
+    choice 6 "KCP MUX" "reliable streams over UDP, for when TCP is throttled"
+    # The private links, in the order of what carries them on the wire:
+    # protocol 47, the same inside UDP, UDP itself, UDP again with a
+    # disguise, something TCP-shaped, and ping. Two of a kind sit
+    # together, which is the whole reason for this order.
     group "TUN - a private link between the two servers"
-    choice 7 "ICMP" "inside ping packets - no port at all"
-    choice 8 "GRE" "IP protocol 47 - fast, not hidden, no port"
+    choice 7 "GRE" "IP protocol 47, nothing wrapping it"
+    choice 8 "GRE FOU" "the same inside UDP, carried by the kernel"
     choice 9 "UDP" "plain UDP on one port"
-    choice 10 "Fake TCP" "TCP-shaped packets, no connection to throttle"
-    choice 11 "AmneziaWG" "obfuscated WireGuard - encrypted"
-    choice 12 "GRE FOU" "GRE inside UDP, carried by the kernel - fastest, no token"
+    choice 10 "AmneziaWG" "obfuscated WireGuard over UDP - encrypted"
+    choice 11 "Fake TCP" "TCP-shaped packets, no connection to throttle"
+    choice 12 "ICMP" "inside ping packets - no port at all"
     blank
     local proto
     pick proto "select" "" 12 || return 1
@@ -35716,26 +35715,26 @@ ask_transport() {
     6) T_TRANSPORT=kcp
         blank
         warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
-    7) T_TRANSPORT=icmp
-        blank
-        dim "This server stops answering ordinary pings while the tunnel runs." ;;
-    8) T_TRANSPORT=gre
+    7) T_TRANSPORT=gre
         blank
         warn "GRE is not encrypted and not hidden - anything on the path can read it" ;;
-    9) T_TRANSPORT=udp
-        blank
-        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
-    10) T_TRANSPORT=rawtcp ;;
-    12) T_TRANSPORT=grefou
+    8) T_TRANSPORT=grefou
         blank
         grefou_note
         # The only transport that asks, and the only one that changes a
         # setting the whole server shares. Every other warning here is
         # about the tunnel being built, and a warning is all it needs.
         confirm_yes "use GRE FOU?" || return 1 ;;
-    11) T_TRANSPORT=awg
+    9) T_TRANSPORT=udp
+        blank
+        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
+    10) T_TRANSPORT=awg
         blank
         warn "rides on UDP, which many Iranian lines stop" ;;
+    11) T_TRANSPORT=rawtcp ;;
+    12) T_TRANSPORT=icmp
+        blank
+        dim "This server stops answering ordinary pings while the tunnel runs." ;;
     esac
     cfg_mode
     transport_needs
@@ -35757,12 +35756,12 @@ transport_needs() {
         dim "made-up certificate unless one is set later under Tuning." ;;
     kcp) dim "Needs UDP to cross both ways. More CPU and memory than TCP; the one to"
         dim "reach for when TCP is throttled and UDP is not." ;;
-    icmp) dim "Needs ping to cross. No port at all." ;;
     gre) dim "Needs IP protocol 47 to cross. No port, no disguise." ;;
-    udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
-    rawtcp) dim "Needs Linux, IPv4 and root on both servers. Adds one narrow firewall rule." ;;
-    awg) dim "Needs the AmneziaWG tools installed here and UDP to cross." ;;
     grefou) dim "Needs UDP to cross, ethtool here, and the fou and ip_gre kernel modules." ;;
+    udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
+    awg) dim "Needs the AmneziaWG tools installed here and UDP to cross." ;;
+    rawtcp) dim "Needs Linux, IPv4 and root on both servers. Adds one narrow firewall rule." ;;
+    icmp) dim "Needs ping to cross. No port at all." ;;
     esac
     return 0
 }
@@ -36966,7 +36965,6 @@ v_hport() {
     case $1 in -1) return 0 ;; '' | *[!0-9]*) echo "a port, or -1 to turn it off"; return 1 ;; esac
     { [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; } || { echo "a port is between 1 and 65535"; return 1; }
 }
-v_level() { case $1 in debug | info | warn | error) return 0 ;; esac; echo "debug, info, warn or error"; return 1; }
 v_queue() {
     case $1 in '' | *[!0-9]*) echo "a number of packets"; return 1 ;; esac
     { [ "$1" -ge 200 ] && [ "$1" -le 20000 ]; } || { echo "200 to 20000 - below that the queue refuses work the link could carry"; return 1; }
@@ -36979,7 +36977,6 @@ v_keepalive() {
     case $1 in '' | *[!0-9]*) echo "seconds"; return 1 ;; esac
     { [ "$1" -ge 1 ] && [ "$1" -le 300 ]; } || { echo "1 to 300 seconds"; return 1; }
 }
-v_dials() { case $1 in iran | kharej) return 0 ;; esac; echo "iran or kharej"; return 1; }
 v_status_port() {
     local who
     v_port "$1" || return 1
@@ -37379,10 +37376,6 @@ chk_add() {
     warn) CHK_NWARN=$((CHK_NWARN + 1)) ;;
     esac
 }
-
-hc_ok() { chk_add ok "${2:-x}" "$1"; }
-hc_bad() { chk_add bad "${2:-x}" "$1"; }
-hc_warn() { chk_add warn "${2:-x}" "$1"; }
 
 count_word() {
     case $1 in 1) printf 'one' ;; 2) printf 'two' ;; 3) printf 'three' ;; *) printf '%s' "$1" ;; esac
@@ -39691,10 +39684,6 @@ disable_bbr() {
     host_write_sysctl "$(host_profile)" off || return 1
     sysctl -qw net.ipv4.tcp_congestion_control=cubic net.core.default_qdisc=fq_codel >/dev/null 2>&1
     ok "back to $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-}
-
-enable_forwarding() {
-    nat_ip_forward && ok "IPv4 forwarding is on, and stays on after a reboot"
 }
 
 revert_tuning() {

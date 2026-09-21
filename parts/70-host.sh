@@ -196,10 +196,6 @@ disable_bbr() {
     ok "back to $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
 }
 
-enable_forwarding() {
-    nat_ip_forward && ok "IPv4 forwarding is on, and stays on after a reboot"
-}
-
 revert_tuning() {
     rm -f "$HOST_SYSCTL" "$HOST_LIMITS" "$NAT_SYSCTL" /etc/sysctl.d/98-pingify-bbr.conf \
         /etc/modules-load.d/pingify.conf /etc/sysctl.d/97-pingify-forward.conf

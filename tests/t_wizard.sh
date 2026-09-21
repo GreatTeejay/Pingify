@@ -63,7 +63,7 @@ val() { toml_get "$1" "$2" "$3"; }
 
 section "the questions come in the order they were designed in"
 
-out=$(answers 1 7 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 n | new_tunnel 2>&1)
+out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 n | new_tunnel 2>&1)
 check_contains "which server comes first" "$out" "1 . Which server is this?"
 check_contains "then the transport" "$out" "2 . Transport"
 check_contains "an ICMP tunnel is not asked its direction" "$out" "3 . Addresses"
@@ -95,7 +95,7 @@ section "the first server builds a [TUN] ICMP tunnel"
 if [ -z "$CORE" ]; then
     skip "the icmp wizard" "no core could be built"
 else
-    out=$(answers 1 7 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 y | new_tunnel 2>&1)
+    out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-icmp-1.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
@@ -284,7 +284,7 @@ else
         check "the backups came back from the token" "$T_BACKUPS" "kcp:9443 utls:9444"
     fi
 
-    out=$(answers 1 7 185.31.8.129 46.247.109.83 "" "" "" "3071" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3071" 2 3 n | new_tunnel 2>&1)
     check_missing "a private link is not asked for backups" "$out" "Backups"
 
     out=$(answers 1 1 2 185.31.8.129 46.247.109.83 9543 "1" "6,6" "6" "3072" 2 3 n | new_tunnel 2>&1)
@@ -297,7 +297,7 @@ section "a kernel-carried GRE FOU tunnel"
 if [ -z "$CORE" ]; then
     skip "the grefou wizard" "no core could be built"
 else
-    out=$(answers 1 12 y 185.31.8.129 46.247.109.83 29501 "" "" "" "3080" 2 3 y | new_tunnel 2>&1)
+    out=$(answers 1 8 y 185.31.8.129 46.247.109.83 29501 "" "" "" "3080" 2 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-grefou-29501.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))

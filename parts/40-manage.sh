@@ -474,7 +474,6 @@ v_hport() {
     case $1 in -1) return 0 ;; '' | *[!0-9]*) echo "a port, or -1 to turn it off"; return 1 ;; esac
     { [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; } || { echo "a port is between 1 and 65535"; return 1; }
 }
-v_level() { case $1 in debug | info | warn | error) return 0 ;; esac; echo "debug, info, warn or error"; return 1; }
 v_queue() {
     case $1 in '' | *[!0-9]*) echo "a number of packets"; return 1 ;; esac
     { [ "$1" -ge 200 ] && [ "$1" -le 20000 ]; } || { echo "200 to 20000 - below that the queue refuses work the link could carry"; return 1; }
@@ -487,7 +486,6 @@ v_keepalive() {
     case $1 in '' | *[!0-9]*) echo "seconds"; return 1 ;; esac
     { [ "$1" -ge 1 ] && [ "$1" -le 300 ]; } || { echo "1 to 300 seconds"; return 1; }
 }
-v_dials() { case $1 in iran | kharej) return 0 ;; esac; echo "iran or kharej"; return 1; }
 v_status_port() {
     local who
     v_port "$1" || return 1

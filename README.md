@@ -64,12 +64,12 @@ The config stores the short slug (`tcp`, `ws`, `wss`, `utls`, `fallback`, `kcp`,
 
 | Transport | What it is | Reach for it when | Costs |
 |---|---|---|---|
-| **ICMP** | Packets carried inside pings. No port exists at all; each tunnel takes a session tag from its token, so several can share a host. | TCP and UDP are filtered but ping still answers. | **The server stops answering ordinary pings while it runs**, and ICMP rate limits apply on the path. |
 | **GRE** | The kernel's own tunnel, IP protocol 47. The lightest thing here. | Protocol 47 still passes and you want raw speed on a path you trust. | **No disguise at all.** Anything watching sees exactly what it is. |
-| **UDP** | Plain UDP on one port. | UDP crosses cleanly in both directions. | Many Iranian lines drop or throttle inbound UDP. |
-| **Fake TCP** | TCP-shaped packets built and read on the device itself, above conntrack and every netfilter chain. There is no kernel socket to throttle. | A plain TCP tunnel connects and then stalls or dies for no reason the logs explain. | Linux, IPv4 and root on **both** ends. Installs a narrow RST-drop rule and removes it again. |
-| **AmneziaWG** | Obfuscated WireGuard: kernel speed, encrypted, and deliberately shaped not to look like WireGuard. | You want a full encrypted link with kernel performance. | The AmneziaWG tooling must install, and UDP must pass. |
 | **GRE FOU** | The kernel's own GRE device wrapped in UDP (Linux FOU), so nothing on the path sees protocol 47 — and nothing reaches a process: the kernel carries it and the core only watches. Measured at 933 Mbit/s where our own GRE carried 396. | Protocol 47 is dropped, UDP passes, and you want kernel speed on a path you trust. | **No token on the wire**: anything that forges the far address and knows the port is inside. Turns generic receive offload off on the server's interface while it runs — everything else there pays a little — and back on when the tunnel is deleted. |
+| **UDP** | Plain UDP on one port. | UDP crosses cleanly in both directions. | Many Iranian lines drop or throttle inbound UDP. |
+| **AmneziaWG** | Obfuscated WireGuard: kernel speed, encrypted, and deliberately shaped not to look like WireGuard. | You want a full encrypted link with kernel performance. | The AmneziaWG tooling must install, and UDP must pass. |
+| **Fake TCP** | TCP-shaped packets built and read on the device itself, above conntrack and every netfilter chain. There is no kernel socket to throttle. | A plain TCP tunnel connects and then stalls or dies for no reason the logs explain. | Linux, IPv4 and root on **both** ends. Installs a narrow RST-drop rule and removes it again. |
+| **ICMP** | Packets carried inside pings. No port exists at all; each tunnel takes a session tag from its token, so several can share a host. | TCP and UDP are filtered but ping still answers. | **The server stops answering ordinary pings while it runs**, and ICMP rate limits apply on the path. |
 
 ### Choosing one
 

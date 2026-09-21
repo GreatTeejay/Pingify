@@ -70,12 +70,12 @@ transport_label() {
     utls) printf 'Chrome TLS MUX' ;;
     fallback) printf 'Decoy TLS MUX' ;;
     kcp) printf 'KCP MUX' ;;
-    icmp) printf 'ICMP' ;;
     gre) printf 'GRE' ;;
     grefou) printf 'GRE FOU' ;;
     udp) printf 'UDP' ;;
-    rawtcp) printf 'Fake TCP' ;;
     awg) printf 'AmneziaWG' ;;
+    rawtcp) printf 'Fake TCP' ;;
+    icmp) printf 'ICMP' ;;
     *) printf '%s' "${1^^}" ;;
     esac
 }
@@ -652,7 +652,7 @@ setup_token_read_file() {
 # cannot build, before a single question is asked about it.
 setup_token_check() {
     case $T_TRANSPORT in
-    tcp | ws | wss | utls | fallback | kcp | icmp | gre | grefou | udp | rawtcp | awg) ;;
+    tcp | ws | wss | utls | fallback | kcp | gre | grefou | udp | awg | rawtcp | icmp) ;;
     *) setup_token_bad "unknown transport $T_TRANSPORT"; return 1 ;;
     esac
     [ "$T_MODE" = "$(mode_of "$T_TRANSPORT")" ] || { setup_token_bad "transport and mode disagree"; return 1; }
@@ -710,12 +710,6 @@ wiz_public_ips() {
     done
     return "$found"
 }
-wiz_public_ip() {
-    local a
-    a=$(wiz_public_ips | head -1)
-    [ -n "$a" ] || return 1
-    printf '%s' "$a"
-}
 
 # is_name says "this is a domain and not an address".
 is_name() { case $1 in *[a-zA-Z]*) return 0 ;; *) return 1 ;; esac; }
@@ -771,15 +765,19 @@ ask_transport() {
     choice 2 "WS MUX" "WebSocket on port 80 - a CDN can front it"
     choice 3 "WSS MUX" "WebSocket inside TLS - a domain or Cloudflare"
     choice 4 "Chrome TLS MUX" "TLS whose handshake is Chrome's"
-    choice 5 "Decoy TLS MUX" "Chrome TLS, and a real website for anyone probing"
-    choice 6 "KCP MUX" "reliable streams over UDP - for when TCP is throttled"
+    choice 5 "Decoy TLS MUX" "Chrome TLS, and a website for anyone probing"
+    choice 6 "KCP MUX" "reliable streams over UDP, for when TCP is throttled"
+    # The private links, in the order of what carries them on the wire:
+    # protocol 47, the same inside UDP, UDP itself, UDP again with a
+    # disguise, something TCP-shaped, and ping. Two of a kind sit
+    # together, which is the whole reason for this order.
     group "TUN - a private link between the two servers"
-    choice 7 "ICMP" "inside ping packets - no port at all"
-    choice 8 "GRE" "IP protocol 47 - fast, not hidden, no port"
+    choice 7 "GRE" "IP protocol 47, nothing wrapping it"
+    choice 8 "GRE FOU" "the same inside UDP, carried by the kernel"
     choice 9 "UDP" "plain UDP on one port"
-    choice 10 "Fake TCP" "TCP-shaped packets, no connection to throttle"
-    choice 11 "AmneziaWG" "obfuscated WireGuard - encrypted"
-    choice 12 "GRE FOU" "GRE inside UDP, carried by the kernel - fastest, no token"
+    choice 10 "AmneziaWG" "obfuscated WireGuard over UDP - encrypted"
+    choice 11 "Fake TCP" "TCP-shaped packets, no connection to throttle"
+    choice 12 "ICMP" "inside ping packets - no port at all"
     blank
     local proto
     pick proto "select" "" 12 || return 1
@@ -794,26 +792,26 @@ ask_transport() {
     6) T_TRANSPORT=kcp
         blank
         warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
-    7) T_TRANSPORT=icmp
-        blank
-        dim "This server stops answering ordinary pings while the tunnel runs." ;;
-    8) T_TRANSPORT=gre
+    7) T_TRANSPORT=gre
         blank
         warn "GRE is not encrypted and not hidden - anything on the path can read it" ;;
-    9) T_TRANSPORT=udp
-        blank
-        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
-    10) T_TRANSPORT=rawtcp ;;
-    12) T_TRANSPORT=grefou
+    8) T_TRANSPORT=grefou
         blank
         grefou_note
         # The only transport that asks, and the only one that changes a
         # setting the whole server shares. Every other warning here is
         # about the tunnel being built, and a warning is all it needs.
         confirm_yes "use GRE FOU?" || return 1 ;;
-    11) T_TRANSPORT=awg
+    9) T_TRANSPORT=udp
+        blank
+        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
+    10) T_TRANSPORT=awg
         blank
         warn "rides on UDP, which many Iranian lines stop" ;;
+    11) T_TRANSPORT=rawtcp ;;
+    12) T_TRANSPORT=icmp
+        blank
+        dim "This server stops answering ordinary pings while the tunnel runs." ;;
     esac
     cfg_mode
     transport_needs
@@ -835,12 +833,12 @@ transport_needs() {
         dim "made-up certificate unless one is set later under Tuning." ;;
     kcp) dim "Needs UDP to cross both ways. More CPU and memory than TCP; the one to"
         dim "reach for when TCP is throttled and UDP is not." ;;
-    icmp) dim "Needs ping to cross. No port at all." ;;
     gre) dim "Needs IP protocol 47 to cross. No port, no disguise." ;;
-    udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
-    rawtcp) dim "Needs Linux, IPv4 and root on both servers. Adds one narrow firewall rule." ;;
-    awg) dim "Needs the AmneziaWG tools installed here and UDP to cross." ;;
     grefou) dim "Needs UDP to cross, ethtool here, and the fou and ip_gre kernel modules." ;;
+    udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
+    awg) dim "Needs the AmneziaWG tools installed here and UDP to cross." ;;
+    rawtcp) dim "Needs Linux, IPv4 and root on both servers. Adds one narrow firewall rule." ;;
+    icmp) dim "Needs ping to cross. No port at all." ;;
     esac
     return 0
 }
