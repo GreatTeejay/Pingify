@@ -134,6 +134,18 @@ grefou_mss_rule() {
         -m comment --comment "pingify-grefou-$4" -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null
 }
 
+# grefou_key TOKEN - the GRE key for a tunnel: the same number on both
+# servers, because both have the same token. Never zero, because a device
+# with key 0 and one with no key at all are two different things to the
+# kernel and the difference is not worth the confusion.
+grefou_key() {
+    local n
+    n=$(printf '%s' "$1" | cksum | awk '{print $1}')
+    case $n in '' | *[!0-9]*) n=1 ;; esac
+    [ "$n" = 0 ] && n=1
+    printf '%s' "$n"
+}
+
 # grefou_up NAME - the device, the listener, the offload setting and the clamp.
 # A tunnel that is already up comes up again: the device is remade, and any route somebody put on it by hand goes with it.
 grefou_up() {
@@ -167,11 +179,24 @@ grefou_up() {
         } ;;
     esac
 
+    # The key is what lets two of these run between the same two servers.
+    # The kernel files a GRE device under local, remote and key, so without
+    # one the second tunnel to the same peer is refused with "File exists"
+    # however different its port is. It comes from the token, so both ends
+    # work the same number out without being told it. It is on the wire in
+    # the clear: it separates tunnels, it does not protect them.
+    local key
+    key=$(grefou_key "$(toml_get "$f" security token)")
     ip link del "$dev" 2>/dev/null
     if ! ip link add "$dev" type gre local "$local_ip" remote "$peer" ttl 255 \
-        encap fou encap-sport "$port" encap-dport "$port" 2>/dev/null; then
+        key "$key" encap fou encap-sport "$port" encap-dport "$port" 2>/dev/null; then
         fail "the kernel would not make $dev"
-        fix "this needs the ip_gre module: modprobe ip_gre"
+        if ip -d link show type gre 2>/dev/null | grep -q "remote $peer"; then
+            fix "another GRE device here already runs $local_ip to $peer on this key"
+            fix "two tunnels to one server need two tokens: delete one and build it again"
+        else
+            fix "this needs the ip_gre module: modprobe ip_gre"
+        fi
         ip fou del port "$port" 2>/dev/null
         return 1
     fi
@@ -258,7 +283,8 @@ grefou_down() {
 # one place so they cannot disagree.
 grefou_note() {
     dim "The kernel carries this one: fastest here, and the core only watches it."
-    dim "It has no token on the wire, so anything that can forge the other"
+    dim "There is no token on the wire. The tunnel's key is there, in the clear,"
+    dim "and it only tells two tunnels apart - anything that can forge the other"
     dim "server's address and knows the port is inside the tunnel. It also turns"
     dim "generic receive offload off on this server's interface - everything"
     dim "else here pays a little for that - and turns it back on when the"

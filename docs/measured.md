@@ -689,6 +689,65 @@ line the manager prints now folds at the screen's width, with what follows
 indented under it, so a warning on an eighty column terminal is two lines
 instead of one line and a fragment.
 
+## 32. Telling a bad tunnel from a bad path, and what the Turkey route did
+
+2026-09-21, the users on the Iran to Turkey tunnel were seeing loss and
+lag. A probe inside the tunnel said 21 to 34 per cent of packets never came
+back, at 50 ms; the same probe to the same server on a fresh UDP port said
+0.2 per cent at 40 ms. That reads as a broken tunnel and it is not one.
+
+The instrument matters. A `ping` to the far server said 20 per cent loss,
+which was ICMP rate limiting and nothing else; a UDP echo at the same rate
+said 0.2. Never diagnose one of these with ping.
+
+What settled it was offering the same load to both:
+
+	                          loss at 9.6 Mbit/s each way
+	the raw path, no tunnel            59%
+	a fresh UDP tunnel                 64%
+	the GRE FOU tunnel                 36%
+
+The tunnel lost the least of the three. So the probe inside it had been
+riding a flow already past what the path would carry: the tunnel carries
+the users' 8 Mbit/s, and a fresh tunnel carrying nothing was clean at the
+same moment.
+
+The path's own ceiling, measured with no tunnel involved:
+
+	  1.0 Mbit/s    0.1% lost    41 ms
+	  1.9           0.2          40
+	  2.9           0.6          41
+	  4.8          13.3          80
+	  6.7          40.0          82
+
+About three megabits each way, and then it falls over and the round trip
+doubles. TCP straight between the two servers, no tunnel: 2 Mbit/s on one
+stream, 5 on four. The same Iran server to Germany in the same minute: 943
+Mbit/s. Germany to Turkey: 37 ms, no loss. So neither server was at fault
+and neither was the tunnel - that one route was.
+
+The order that gets there: ask whether the box is dropping anything
+(counters, fragmentation, cpu), then whether a fresh flow on the same path
+is clean, then offer both the same load, then measure the bare path with
+nothing of ours in it, and keep a second route as the control.
+
+## 33. Two GRE FOU tunnels to one server need a key
+
+Found while building a second one to test the above. The kernel files a GRE
+device under local address, remote address and key, and we set no key, so
+the second tunnel to the same peer was refused - "RTNETLINK answers: File
+exists" - however different its FOU port was. The manager reported only
+that the kernel would not make the device.
+
+The key now comes from the tunnel's token, so both ends work the same
+number out without being told it, and the refusal says what it means. The
+key is in the clear on the wire and separates tunnels; it does not protect
+them, which is what the transport's own note already says about the token.
+
+It is a change to what is on the wire, so both ends have to be remade
+together. On the pair carrying real users that was two devices recreated
+within three seconds of each other, and the users' connections survived it.
+
 ---
 
 # How to measure, so the numbers mean something
