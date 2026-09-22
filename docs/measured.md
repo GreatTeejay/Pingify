@@ -748,6 +748,61 @@ It is a change to what is on the wire, so both ends have to be remade
 together. On the pair carrying real users that was two devices recreated
 within three seconds of each other, and the users' connections survived it.
 
+## 34. Every transport on 1.0.2, and our ICMP beside flagtun's
+
+2026-09-22, Iran to Germany, because the Turkey route was still carrying
+2 Mbit/s (see 32). Each transport was built through the wizard, measured,
+and deleted, in that order, one after another over twenty minutes.
+
+	                first byte   one down   four down   up
+	TCP MUX           236 ms       380        403       458
+	WS MUX            231          628         86       270
+	WSS MUX           237          383        367       351
+	Chrome TLS MUX    231          398        366       440
+	Decoy TLS MUX     232          305        507       192
+	KCP MUX           236          390        772       203
+	GRE               327          505        473       581
+	GRE FOU           329          505        680       440
+	UDP               328          485        673       568
+	AmneziaWG         330          400        483       506
+	Fake TCP          319          420        653       543
+	ICMP              321          528        643       540
+
+Two things about the first byte before anyone quotes it. Every measurement
+here was taken from the far server against the Iran server's public
+address, because that is the only way the forwarding rule in PREROUTING is
+exercised at all (see 30) - so each number crosses the path twice and is
+about twice what a user sees. And the private links sit ninety milliseconds
+above the forwarding ones for the reason given in 26: their first byte is
+two round trips because the connection inside them handshakes across the
+link.
+
+What holds: the private links carry more on four streams than the
+forwarding ones, the forwarding ones answer sooner, and one stream is
+within noise of 400 Mbit/s for nearly all of them on this path at this
+hour. WS MUX's 86 on four streams and Decoy TLS's 192 up are the path
+moving, not the transport; a run of these takes twenty minutes and the
+path does not hold still for twenty minutes.
+
+Beside it, our ICMP against flagtun's on the same pair, alternating, the
+medians of five rounds, measured Iran to Germany so these first-byte
+numbers cross the path once:
+
+	                          flagtun     ours
+	first byte, idle           160 ms    160 ms
+	first byte, under load     215       171
+	download, one stream       751       649
+	download, four streams     685       680
+	upload                     497       592
+
+Four streams is a tie and the first byte idle is identical. They are ahead
+by about a sixth on a single stream; we are ahead by about a fifth on
+upload, and by forty milliseconds on the thing a user actually feels - a
+new connection while a download is running. That last column is the same
+trade 28 found: our queues are shallower on purpose, and the download
+profile with a deeper device queue closes the single-stream gap at the
+cost of this.
+
 ---
 
 # How to measure, so the numbers mean something
