@@ -245,7 +245,10 @@ else
     else
         check "the transport is kcp" "$(val "$f" transport type)" "kcp"
         check "it forwards rather than building a link" "$(val "$f" tunnel mode)" "forward"
-        check "it has connections like the other stream transports" "$(val "$f" transport connections)" "8"
+        # Sixteen since 1.1.0: measured, a small stream under an eight stream
+        # download answers in 160 ms with sixteen and stalls with eight
+        # (docs/measured.md section 39).
+        check "it has connections like the other stream transports" "$(val "$f" transport connections)" "16"
         check_contains "the review names it" "$out" "KCP MUX"
         check_contains "and says its port is udp" "$out" "udp/8443"
         check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
@@ -320,5 +323,55 @@ else
         check "it survives the token" "$T_TRANSPORT/$T_MODE/$T_PORT" "grefou/tun/29501"
     fi
 fi
+
+section "each key is written only where something reads it"
+
+# The file's own promise is that what the tunnel runs with is what the file
+# says, and in 1.1.0 that meant taking keys out of files that never read them
+# and, twice in the same week, putting send_batch back where a carrier had
+# started to. Pinned here so the next change to any of it is deliberate. The
+# reasons are docs/measured.md sections 7, 35, 36 and 37.
+_render() {
+    cfg_reset
+    T_NAME=t T_SIDE=iran T_TRANSPORT=$1 T_MODE=$(mode_of "$1") T_PRESET=download
+    T_IRAN=198.51.100.7 T_KHAREJ=203.0.113.9 T_PORT=443 T_DIALS=iran T_PATH=/p
+    T_TOKEN=t T_OCTET=9 T_TUNIF=pfy0 T_FORWARDS=443 T_LOG=info T_CONNS=16 T_AWG_PORT=20909
+    cfg_render
+}
+for t in gre icmp rawtcp udp; do
+    check_contains "$t is told how many packets to batch" "$(_render $t)" "send_batch"
+done
+# awg runs the udp carrier but is held at one per call until it is measured.
+for t in awg grefou tcp ws wss utls fallback kcp; do
+    check_missing "$t is not told a batch it would not use" "$(_render $t)" "send_batch"
+done
+# The profile's receive queue reaches a socket only on the datagram carriers;
+# a TCP socket keeps the kernel's own auto-tuning, and kcp states its floor.
+for t in tcp ws wss utls fallback grefou; do
+    check_missing "$t has no receive queue in its file" "$(_render $t)" "rcvbuf_kb"
+done
+check_contains "kcp's file says the floor it really gets" "$(_render kcp)" "8192"
+check_contains "udp's file says the download profile's queue" "$(_render udp)" "3072"
+# Parity where a carrier can rebuild from it: not gre, whose header parity
+# stops dead, not grefou, whose bytes this core never touches.
+for t in udp icmp rawtcp awg kcp; do
+    check_contains "$t can be given parity" "$(_render $t)" "fec"
+done
+for t in gre grefou tcp ws wss utls fallback; do
+    check_missing "$t is not offered parity it cannot use" "$(_render $t)" "fec"
+done
+# GRE FOU: the kernel moves it, so its whole [tuning] table is the profile.
+_g=$(_render grefou)
+for k in queue_packets pace dscp keepalive_sec write_workers; do
+    check_missing "grefou has no $k" "$_g" "$k"
+done
+check_contains "grefou keeps the profile the two ends compare" "$_g" "profile"
+check_contains "grefou keeps the device queue it now applies" "$_g" "txqueuelen"
+# The TLS keys only where they are read, and with the value they run with.
+check_missing "fallback carries no insecure line" "$(_render fallback)" "insecure"
+check_contains "utls says verification is off, which it is" "$(_render utls)" "insecure         = true"
+# Where a CDN can front it, the port the waiting end really binds.
+check_contains "ws writes the port it binds" "$(_render ws)" "listen_port"
+check_missing "tcp has no second port to state" "$(_render tcp)" "listen_port"
 
 report

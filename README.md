@@ -11,13 +11,13 @@
 Requirements: root, a systemd Linux, and a route between the two servers. Install on **both** the Iran server and the Kharej one.
 
 ```bash
-bash <(wget -qO- https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh)
+wget -O Pingify.sh https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh && bash Pingify.sh
 ```
 
 Or with curl:
 
 ```bash
-bash <(curl -fsSL https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh)
+curl -fsSLo Pingify.sh https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh && bash Pingify.sh
 ```
 
 The script installs the `pingify` command, builds the core and writes the systemd units. It carries its own Go sources and vendored modules, so the build works on a server that cannot reach `proxy.golang.org` — which is most Iranian servers. Only the Go toolchain itself has to be fetched, and the script offers to do that when it is missing.
@@ -53,7 +53,7 @@ The config stores the short slug (`tcp`, `ws`, `wss`, `utls`, `fallback`, `kcp`,
 
 | Transport | What it is | Reach for it when | Costs |
 |---|---|---|---|
-| **TCP MUX** | Eight plain TCP connections with every stream multiplexed across them by id. A stall on one does not hold up the rest. | The route is clean and you want the fewest moving parts. **Start here.** | TCP inside TCP on a lossy link: both stacks retransmit the same loss. |
+| **TCP MUX** | Sixteen plain TCP connections with every stream multiplexed across them by id. A stall on one does not hold up the rest. | The route is clean and you want the fewest moving parts. **Start here.** | TCP inside TCP on a lossy link: both stacks retransmit the same loss. |
 | **WS MUX** | An HTTP request that becomes a WebSocket, then RFC 6455 frames. Usually port 80, so a CDN can front it. | Only HTTP crosses, or something in front already terminates TLS. | No TLS of its own. Proxy idle limits apply. |
 | **WSS MUX** | The same inside TLS, with the tunnel's domain in SNI, Host and Origin. Behind Cloudflare the origin address never appears on the wire. | You have a domain, or you want to sit behind a CDN. | TLS and CDN overhead, and whatever the CDN's policy allows. |
 | **Chrome TLS MUX** | TLS whose handshake is shaped like Chrome's, so a fingerprint check sees a browser. | Plain TCP is throttled or reset, and TLS still passes. | A little more setup on the wire; nothing on the host. |
@@ -79,9 +79,11 @@ Measure the same pair at the same hour and compare throughput, loss and jitter �
 
 ### What the carrier count means
 
-A carrier is a multiplexer, not a user connection: streams are opened, fed and closed on it by id, dozens at a time. Eight is the default because one TCP flow on a shaped path is policed and eight together are not — on the pair this was built for, one flow carried 0.39 Mbit/s where sixteen carried 743.
+A carrier is a multiplexer, not a user connection: streams are opened, fed and closed on it by id, dozens at a time. More than one because one TCP flow on a shaped path is policed and many together are not — on the pair this was built for, one flow carried 0.39 Mbit/s where sixteen carried 743.
 
-So the number is not "how many connections the traffic needs". It is how many places the tunnel can be cut at once and carry on, and how finely a shaper's per-flow limit is divided. It is editable per tunnel from **Manage ▸ Tuning**, between 1 and 32, and **both servers must use the same number**.
+Sixteen, not eight, since 1.1.0, and for a different reason: every stream is pinned to one connection, so eight downloads on eight connections leave none free, and a small request that lands beside a download waits behind it. Measured under eight saturating streams, a small request answered in about 160 ms with sixteen connections and stalled for seconds with eight ([docs/measured.md](docs/measured.md), section 39). Sixteen is what eight busy streams cannot fill.
+
+So the number is not "how many connections the traffic needs". It is how many places the tunnel can be cut at once and carry on, how finely a shaper's per-flow limit is divided, and how many connections are left free for what is small. It is editable per tunnel from **Manage ▸ Tuning**, between 1 and 32, and **both servers must use the same number**.
 
 ## Failover
 
@@ -113,17 +115,19 @@ The tunnel's own port and the ports your users connect to are separate things. A
 
 ## Presets and tuning
 
-| Preset | Goal | What it changes |
-|---|---|---|
-| **Gaming** | Lowest delay under load | Queue 600 packets, 256 KB receive buffer |
-| **Balanced** | Daily use — the one to pick if unsure | Queue 900 packets, 256 KB receive buffer |
-| **Download** | Most throughput for many streams | Queue 1500 packets, 3 MB receive buffer |
+| Preset | Goal | Private link (GRE, UDP, ICMP, Fake TCP, AmneziaWG) | TCP carriers (TCP, WS, WSS, Chrome TLS, Decoy TLS) |
+|---|---|---|---|
+| **Gaming** | A small packet waits behind less of a big one | 256 KB receive queue | a bulk stream may park 64 KB in front of a small one |
+| **Balanced** | Daily use — the one to pick if unsure | 256 KB receive queue | 128 KB |
+| **Download** | Many streams at once | 3 MB receive queue | 128 KB |
 
-Every setting the core reads is written into the `.toml` as a number, so what the file says is what the tunnel runs. The Tuning screen edits them in place: profile, queue depth, MTU, carrier count, keepalive, direction, log level, status and health ports.
+The presets used to set three queue depths as well. In September 2026 that was measured on the reference pair and neither queue ever filled at any depth — sixteen streams at 621 Mbit/s put two million packets through with none dropped — so every preset now ships the same depth and the file says so. The whole of it is in [docs/measured.md](docs/measured.md), section 35.
 
-Under a few hundred users on a TUN transport, **Download** is the one to choose: on a link that loses packets it cut stalls and lost packets by roughly four to one against Balanced. On the forwarding transports the preset made no measurable difference.
+Every setting the core reads is written into the `.toml` with the value it runs with, and only where something reads it: a TCP carrier's file carries no socket buffers, because naming one would turn off the kernel's window auto-tuning; a GRE FOU file carries no tuning at all, because the kernel moves it. `pingify-core -check` says which lines, if any, nothing reads. The Tuning screen edits the rest in place: profile, MTU, carrier count, keepalive, direction, log level, status and health ports.
 
-**Optimize** is separate and changes the whole machine: socket ceilings, backlog, scheduler budget, MTU probing, and BBR with the `fq` queue discipline. Apply it once on each server.
+GRE FOU and KCP are not shaped by the preset. GRE FOU is carried by the kernel; KCP's window is a ceiling on one stream's rate, not a queue to shorten.
+
+**Optimize** changes the whole machine: socket ceilings, backlog, scheduler budget, MTU probing, and BBR with the `fq` queue discipline. The wizard offers it once, when the first tunnel is created on a server that still runs the distribution's settings; it is on the menu after that.
 
 ## WS, WSS and Cloudflare
 

@@ -16,9 +16,15 @@
 # whatever lands at that offset.
 install_self() {
     local src=${BASH_SOURCE[0]} dir tmp stamp
+    # Run as bash <(wget -qO- ...) this is /dev/fd/63, a pipe, and there is no
+    # file to copy to /usr/local/bin. Every systemd unit written afterwards
+    # names that path - ExecStartPre sources it, ConditionPathExists guards on
+    # it - so a run that gets past here leaves a server whose tunnels cannot
+    # start. It stops instead, and says the one thing that fixes it.
     if [ ! -f "$src" ]; then
-        warn "the pingify command was not installed - this script has no file on disk"
-        fix "save it first:  curl -fsSLo Pingify.sh <url> && bash Pingify.sh"
+        fail "this script has no file on disk, so the pingify command cannot be installed"
+        fix "save it first, then run it:"
+        fix "  wget -O Pingify.sh https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh && bash Pingify.sh"
         return 1
     fi
     SCRIPT_CHANGED=0
@@ -307,7 +313,10 @@ main() {
 
     ensure_deps
     migrate_layout
-    install_self
+    # Nothing below works without /usr/local/bin/pingify: the units source it
+    # at every start. A failure here is the end of the run, not a warning at
+    # the top of a screen that is about to be wiped.
+    install_self || exit 1
     srv_info
     first_run || exit 1
     ensure_core_current

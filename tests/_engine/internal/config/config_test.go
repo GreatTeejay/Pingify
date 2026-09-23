@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 // The profile is the one thing in this file a user picks by name, so it is the
 // one thing worth a test: a name that does nothing, or quietly does something
@@ -32,18 +35,34 @@ iran = "10.9.0.1/24"
 kharej = "10.9.0.2/24"
 `
 
-func TestEachProfileMovesTheQueue(t *testing.T) {
-	for _, c := range []struct {
-		profile string
-		depth   int
-	}{{"gaming", 600}, {"balanced", 900}, {"download", 1500}} {
-		got := load(t, "[tuning]\nprofile = \""+c.profile+"\"\n")
-		if got.Tuning.QueuePkts != c.depth {
-			t.Errorf("%s asked for a queue of %d, got %d", c.profile, c.depth, got.Tuning.QueuePkts)
+// The profile used to set three different queue depths. It sets one now,
+// because measured on the real pair fq dropped nothing at any of the three -
+// so the depth was never the trade it was described as. This test is here so
+// that a fourth attempt at a queue-depth profile has to argue with a
+// measurement first: see docs/measured.md section 35.
+func TestTheProfileNoLongerPretendsToMoveTheQueue(t *testing.T) {
+	for _, p := range []string{"gaming", "balanced", "download"} {
+		got := load(t, `
+[tuning]
+profile = "`+p+`"
+`)
+		if got.Tuning.QueuePkts != DefaultQueuePkts {
+			t.Errorf("%s asked fq for %d packets, expected %d for every profile",
+				p, got.Tuning.QueuePkts, DefaultQueuePkts)
 		}
-		if got.Tuning.Profile != c.profile {
-			t.Errorf("%s came back as %q", c.profile, got.Tuning.Profile)
+		if got.Tuning.Profile != p {
+			t.Errorf("%s came back as %q", p, got.Tuning.Profile)
 		}
+	}
+}
+
+// fq's own default is a hundred packets, which drops the burst it was put
+// there to space out. Whatever the profile stops doing, the depth must stay
+// well clear of that end.
+func TestTheQueueIsNeverLeftAtSomethingFqWouldDrop(t *testing.T) {
+	if DefaultQueuePkts < 600 {
+		t.Fatalf("fq would be given %d packets, which is near where it starts"+
+			" dropping what it is smoothing", DefaultQueuePkts)
 	}
 }
 
@@ -79,12 +98,16 @@ func TestSayingNothingIsBalanced(t *testing.T) {
 	}
 }
 
-func TestADepthOfYourOwnBeatsTheProfile(t *testing.T) {
-	// Three profiles are three points on a line. Somebody who measured their
-	// own path is entitled to a fourth.
-	got := load(t, "[tuning]\nprofile = \"gaming\"\nqueue_packets = 1100\n")
+// An explicit depth still wins, which is the whole of what the key is for now
+// that no profile moves it.
+func TestADepthOfYourOwnBeatsTheDefault(t *testing.T) {
+	got := load(t, `
+[tuning]
+profile = "gaming"
+queue_packets = 1100
+`)
 	if got.Tuning.QueuePkts != 1100 {
-		t.Fatalf("an explicit depth was overruled by the profile: got %d", got.Tuning.QueuePkts)
+		t.Fatalf("an explicit depth was overruled: got %d", got.Tuning.QueuePkts)
 	}
 }
 
@@ -195,3 +218,91 @@ func TestTheDeviceQueueAndTheMarkAreBounded(t *testing.T) {
 		}
 	}
 }
+
+// A private link is datagrams. Datagrams on a reliable stream is TCP inside
+// TCP: every loss the connection inside has to see arrives late instead of
+// not at all. kcp was refused for this and the other five were not - they
+// came up and carried badly, which is worse than being refused.
+func TestAStreamTransportCannotCarryAPrivateLink(t *testing.T) {
+	for _, kind := range []string{"tcp", "ws", "wss", "utls", "fallback", "kcp"} {
+		body := `
+[tunnel]
+side = "iran"
+mode = "tun"
+[transport]
+type = "` + kind + `"
+iran = "198.51.100.7"
+kharej = "203.0.113.9"
+port = 443
+[security]
+token = "a token typed on both servers"
+[tun]
+iran = "10.9.0.1/24"
+kharej = "10.9.0.2/24"
+`
+		c := &Config{}
+		if err := parseTOML(body, c); err != nil {
+			t.Fatalf("%s: parse: %v", kind, err)
+		}
+		if err := c.check(); err == nil {
+			t.Errorf("%s was accepted as a private link", kind)
+		}
+	}
+}
+
+// The certificate is not opened until the carrier starts, so -check used to
+// call a file valid that could not come up.
+func TestACertificateWithNoKeyIsRefused(t *testing.T) {
+	c := &Config{}
+	body := `
+[tunnel]
+side = "kharej"
+mode = "forward"
+[transport]
+type = "wss"
+iran = "198.51.100.7"
+kharej = "203.0.113.9"
+port = 443
+cert = "/etc/pingify/nope.pem"
+[security]
+token = "a token typed on both servers"
+[forward]
+ports = ["443"]
+`
+	if err := parseTOML(body, c); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if err := c.check(); err == nil {
+		t.Fatal("a certificate with no key was accepted")
+	}
+}
+
+// Every AmneziaWG file written before 1.1.0 says tun.mtu = 1280 inside a
+// 1320 link. That fits exactly with parity off, and a backstop that counted
+// the parity bytes unconditionally refused all of them at start - so this is
+// the upgrade, in a test.
+func TestAnOldAmneziaWGFileStillFitsItsLink(t *testing.T) {
+	body := func(fec int, mtu int) string {
+		return "\n[tunnel]\nside = \"iran\"\nmode = \"tun\"\n[transport]\ntype = \"awg\"\niran = \"198.51.100.7\"\nkharej = \"203.0.113.9\"\nport = 20909\n[security]\ntoken = \"a token typed on both servers\"\n[tuning]\nfec = " + itoa(fec) + "\n[awg]\nname = \"awg0\"\niran = \"10.9.20.1/24\"\nkharej = \"10.9.20.2/24\"\nmtu = 1320\nport = 51820\niran_key = \"k\"\niran_pub = \"k\"\nkharej_key = \"k\"\nkharej_pub = \"k\"\n[tun]\niran = \"10.9.10.1/24\"\nkharej = \"10.9.10.2/24\"\nmtu = " + itoa(mtu) + "\n"
+	}
+	for _, c := range []struct {
+		fec, mtu int
+		ok       bool
+	}{
+		{0, 1280, true},  // what every 1.0.x file says
+		{0, 1281, false}, // one past the link
+		{10, 1276, true}, // what the wizard writes, with parity on
+		{10, 1280, false},
+	} {
+		cfg := &Config{}
+		if err := parseTOML(body(c.fec, c.mtu), cfg); err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		err := cfg.check()
+		if (err == nil) != c.ok {
+			t.Errorf("parity %d, tun.mtu %d: accepted=%v, expected %v (%v)", c.fec, c.mtu, err == nil, c.ok, err)
+		}
+	}
+}
+
+func itoa(n int) string { return fmt.Sprint(n) }

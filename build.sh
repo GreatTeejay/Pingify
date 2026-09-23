@@ -39,6 +39,36 @@ mapfile -t gofiles < <(
 
 # --- 2. check the source is sound before wrapping it -----------------------
 
+# The version is written by hand in two files, and a disagreement between them
+# is not cosmetic. The manager compares the core's -version with its own on
+# every start (core_matches_script, parts/20-core.sh), and refuses the config
+# when they differ - so a build with two versions in it produces an install
+# that cannot create a tunnel. It is caught here rather than on the server.
+script_v=$(grep -m1 '^PINGIFY_VERSION=' parts/00-ui.sh | cut -d'"' -f2)
+core_v=$(grep -m1 '^const version = ' cmd/pingify/main.go | cut -d'"' -f2)
+[ -n "$script_v" ] || { red "no PINGIFY_VERSION in parts/00-ui.sh"; exit 1; }
+[ -n "$core_v" ] || { red "no version constant in cmd/pingify/main.go"; exit 1; }
+if [ "$script_v" != "$core_v" ]; then
+    red "the manager says $script_v and the core says $core_v - one of them is wrong"
+    exit 1
+fi
+
+# The engine's tests live in tests/_engine, which is what the repository
+# tracks, and there is a second copy under internal/ and cmd/, which is what
+# `go test` below actually runs. Nothing keeps the two in step, so a test
+# written in one of them could pass here and never exist in CI - or the other
+# way round. They are compared rather than copied, because copying would throw
+# away whichever one somebody had just written.
+while IFS= read -r t; do
+    [ -f "tests/_engine/$t" ] || { red "$t has no copy in tests/_engine - the release would not run it"; exit 1; }
+    cmp -s "$t" "tests/_engine/$t" ||
+        { red "$t and tests/_engine/$t differ - make them the same before shipping"; exit 1; }
+done < <(find cmd internal -name '*_test.go' | LC_ALL=C sort)
+while IFS= read -r t; do
+    [ -f "${t#tests/_engine/}" ] ||
+        { red "$t has no copy under internal/ or cmd/ - the build would not run it"; exit 1; }
+done < <(find tests/_engine -name '*_test.go' | LC_ALL=C sort)
+
 gofmt -l cmd internal | grep . && { red "gofmt has changes to make - not shipping that"; exit 1; }
 go vet ./... || { red "go vet is unhappy - not shipping that"; exit 1; }
 go test ./... >/dev/null || { red "the tests do not pass - not shipping that"; exit 1; }

@@ -298,13 +298,20 @@ live_log() {
 # to match, and the ones that are nobody's business but this machine's.
 # ---------------------------------------------------------------------------
 
-# A profile is three lines in the file, not one: the depth and the receive
-# queue it chooses are written as numbers, and an explicit number wins over
-# the profile in the core, so changing the word alone would change nothing.
+# A profile is two lines in the file, not one: the receive queue it chooses is
+# written as a number, and an explicit number wins over the profile in the
+# core, so changing the word alone would leave the queue where it was. The
+# depth is no longer one of them - every profile ships the same one, and why is
+# beside QUEUE_PACKETS.
 _edit_profile() {
-    toml_set "$1" tuning profile "$PROFILE_WANT" &&
-        toml_set "$1" tuning queue_packets "$(preset_queue "$PROFILE_WANT")" &&
-        toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
+    toml_set "$1" tuning profile "$PROFILE_WANT" || return 1
+    # The receive queue is only in the file where a socket gets it - see the
+    # same list in cfg_render. Writing it back here for a transport that omits
+    # it would put the key into a file that had correctly left it out.
+    case $T_TRANSPORT in
+    tcp | ws | wss | utls | fallback | grefou | kcp) return 0 ;;
+    esac
+    toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
 }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
@@ -509,9 +516,16 @@ tuning_menu() {
         panel_end
         blank
         panel "PERFORMANCE - KEEP BOTH SERVERS THE SAME"
-        panel_field "Profile" "$T_PRESET" "Queue" "${T_QUEUE:-$(preset_queue "$T_PRESET")} packets"
+        if [ "$T_TRANSPORT" = grefou ]; then
+            panel_field "Profile" "$T_PRESET"
+        else
+            panel_field "Profile" "$T_PRESET" "Queue" "${T_QUEUE:-$QUEUE_PACKETS} packets"
+        fi
         if [ "$T_MODE" = tun ]; then
-            panel_field "MTU" "$T_TUNMTU" "Parity" "$(fec_label "$f")"
+            case $T_TRANSPORT in
+            gre | grefou) panel_field "MTU" "$T_TUNMTU" ;;
+            *) panel_field "MTU" "$T_TUNMTU" "Parity" "$(fec_label "$f")" ;;
+            esac
         else
             panel_field "Connections" "$T_CONNS" "Keepalive" "$(toml_get "$f" transport keepalive_sec | sed 's/^$/10/') s"
         fi
@@ -537,17 +551,28 @@ tuning_menu() {
         # so the list never reads 5, 7, 8, 10.
         local -a keys=()
         tm() { keys+=("$1"); item "${#keys[@]}" "$2" "${3:-}"; }
-        tm profile "Profile" "$T_PRESET - the shape of the queues"
-        tm queue "Queue depth" "${T_QUEUE:-$(preset_queue "$T_PRESET")} packets - what the profile chose; change it only if you measured your path"
+        tm profile "Profile" "$T_PRESET - the shape of the queues, see the manual for what it moves"
+        case $T_TRANSPORT in
+        grefou) ;;
+        *) tm queue "Queue depth" "${T_QUEUE:-$QUEUE_PACKETS} packets - fq's cap; change it only if you measured your own path dropping" ;;
+        esac
         if [ "$T_MODE" = tun ]; then
             tm mtu "MTU" "$T_TUNMTU - Find the MTU under Diagnostics measures it"
+            # gre because parity in front of its header stops it dead, grefou
+            # because this core never touches its bytes. Offering the item for
+            # either was offering a switch with nothing behind it.
             case $T_TRANSPORT in
-            gre) ;;
+            gre | grefou) ;;
             *) tm parity "Parity" "$(fec_label "$f") - repairs a lost packet without a round trip" ;;
             esac
         else
             tm conns "Connections" "$T_CONNS parallel connections, 1 to 32"
             tm keepalive "Keepalive" "seconds between keepalives on every connection"
+            # KCP rebuilds a lost packet below its own stream instead of
+            # resending it, and reads the same key. It was the one forward
+            # transport that could use parity and had no way of being told.
+            [ "$T_TRANSPORT" = kcp ] &&
+                tm parity "Parity" "$(fec_label "$f") - KCP rebuilds a lost packet instead of resending it; set it the same on both servers"
         fi
         case $T_TRANSPORT in icmp | gre | awg | grefou) ;; *) tm dials "Link direction" "$(dials_text)" ;; esac
         case $T_TRANSPORT in ws | wss) tm path "Web path" "$T_PATH - must match" ;; esac
@@ -576,12 +601,13 @@ tuning_menu() {
         case ${keys[c - 1]} in
         profile) blank; preset_menu && { PROFILE_WANT=$T_PRESET; cfg_apply "$name" _edit_profile yes; }; pause ;;
         queue) blank
-            dim "This comes from the profile and is the one number a profile moves."
-            dim "gaming 600, balanced 900, download 1500."
-            ask v "packets" "${T_QUEUE:-$(preset_queue "$T_PRESET")}" v_queue && { QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; }
+            dim "fq's cap on this tunnel's flow, ten times over. No profile moves it:"
+            dim "measured on the pair, fq dropped none of 2.68 GB at any depth."
+            ask v "packets" "${T_QUEUE:-$QUEUE_PACKETS}" v_queue && { QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; }
             pause ;;
         mtu) blank
-            ask v "mtu" "$T_TUNMTU" v_mtu && { MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes && dim "set the same on the other server"; }
+            if [ "$T_TRANSPORT" = awg ]; then _vm=v_mtu_awg; else _vm=v_mtu; fi
+            ask v "mtu" "$T_TUNMTU" $_vm && { MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes && dim "set the same on the other server"; }
             pause ;;
         conns) blank
             ask v "parallel connections" "$T_CONNS" v_conns && { CONNS_WANT=$v; cfg_apply "$name" _edit_conns yes; }
@@ -739,5 +765,28 @@ tunnel_remove() {
     rm -f "$f" "$f.bak" "$STATE_DIR/$name.forwards" "$STATE_DIR/$name.fail" \
         "$STATE_DIR/$name.heard" "$STATE_DIR/$name.stopped"
     systemctl daemon-reload >/dev/null 2>&1
+    qdisc_put_back
+    return 0
+}
+
+# qdisc_put_back - the core puts fq on the egress interface for its own
+# tunnels and never takes it off, so a machine whose last tunnel was deleted
+# kept a queue nobody had chosen. This puts the distribution's default back
+# when nothing of ours is left to want fq - unless the operator chose fq for
+# the whole host under Optimize, in which case it is theirs and stays.
+qdisc_put_back() {
+    [ -z "$(cfg_list)" ] || return 0
+    [ ! -f "$HOST_SYSCTL" ] || return 0
+    have tc || return 0
+    local dev
+    dev=$(ip -o route get 1.1.1.1 2>/dev/null | grep -oE 'dev [^ ]+' | cut -d' ' -f2)
+    [ -n "$dev" ] || return 0
+    case $(tc qdisc show dev "$dev" root 2>/dev/null) in
+    "qdisc fq "*)
+        if tc qdisc replace dev "$dev" root fq_codel >/dev/null 2>&1; then
+            dim "the last tunnel is gone, so $dev has its default queue (fq_codel) back"
+        fi
+        ;;
+    esac
     return 0
 }

@@ -25,7 +25,7 @@ cfg_reset() {
     # on this tool's own test pair. Ports still live on IRAN either way.
     T_DIALS=iran
     T_PUBLIC_IP= T_PEER_IP= T_IRAN= T_KHAREJ=
-    T_PORT=8443 T_PATH= T_CONNS=8
+    T_PORT=8443 T_PATH= T_CONNS=16
     T_TOKEN= T_PRESET=balanced T_LOG=info
     T_STATUS= T_HEALTH=
     T_FORWARDS=
@@ -165,18 +165,44 @@ token_print() {
 # ---------------------------------------------------------------------------
 # performance presets
 #
-# Everything the tunnel tunes was measured to have one right answer whatever
-# it carries - the socket buffers, the batching, a pacing rate it works out
-# for itself. What trades is how deep the queues may get: a deep one absorbs
-# bursts and carries more; a shallow one is emptier when a small packet
-# arrives, so that packet waits less. Measured on the real path, Tehran to
-# Frankfurt, restarted fresh at each depth:
+# A profile used to pick a queue depth, on the reasoning that a shallow queue
+# is emptier when a small packet arrives and a deep one absorbs bursts. That
+# was measured, and it was true; it is not true now, and it took four
+# measurements on the pair to establish that. The whole of it is in
+# docs/measured.md section 35, and the short of it is:
 #
-#   profile     queue    16 streams   one stream   under load
-#   gaming        600     397 Mbit/s   167 Mbit/s   84.5 / 92.5 ms
-#   balanced      900     448          254          93.3 / 106.5
-#   download     1500     466          253         115.8 / 139.3
+#   - fq never dropped a packet at any of the three depths. Sixteen streams at
+#     621 Mbit/s, 1,949,990 packets through the device, none dropped by either
+#     queue. A queue that never drops is not shaping anything.
+#   - At the download profile the depth asked fq for 15000 packets on a qdisc
+#     whose own limit is 10000. Unreachable by arithmetic.
+#   - Under an eight stream download the round trip did not move from its quiet
+#     figure at all.
+#
+# So the depth is one number now - deep enough that neither queue drops, which
+# is where all three already were - and a profile no longer claims to move it.
+#
+# What a profile does move:
+#
+#   private link    the receive queue, 3072 KB for download against 256 for
+#                   the other two. Kept on its older measurement: the attempt
+#                   to take it again could not separate the setting from the
+#                   machine the probe ran on.
+#   tcp ws wss      how much a bulk stream may park in front of a small one on
+#   utls fallback   the connection they share - 64 KB for gaming, 128 for the
+#                   other two. That queue exists on every path, because a
+#                   forward tunnel pins each of its streams to one connection.
+#                   512 was measured to stall the small one for nothing, so
+#                   download does not get it. See notsentLowat in the core's
+#                   carrier/stream.go, and docs/measured.md section 39.
+#
+# Not DSCP: twelve packets marked expedited left Frankfurt as 0xb8 and arrived
+# in Tehran as 0x18, every one re-marked.
 # ---------------------------------------------------------------------------
+
+# How deep fq may let this tunnel's flow get, before the factor of ten the core
+# applies. One number for every profile - see above.
+QUEUE_PACKETS=900
 
 preset_rcvbuf() {
     case $1 in
@@ -185,22 +211,24 @@ preset_rcvbuf() {
     esac
 }
 
-preset_queue() {
-    case $1 in
-    gaming) printf '600' ;;
-    download) printf '1500' ;;
-    *) printf '900' ;;
-    esac
-}
-
 preset_menu() {
     CHOICE_DEF=2
-    choice 1 "Gaming" "shallow queues - lowest delay under load"
+    choice 1 "Gaming" "a small packet waits behind less of a big one"
     choice 2 "Balanced" "the one to pick if unsure"
-    choice 3 "Download" "deep queues - most throughput for many streams"
+    choice 3 "Download" "deeper queues, for many streams at once"
     CHOICE_DEF=
     blank
-    dim "Deeper queues carry more; shallower ones answer faster. Changeable later."
+    # Said differently for the two modes, because it genuinely is a different
+    # queue - and on a private link it is one this pair can no longer measure,
+    # which the operator is better off knowing than guessing at.
+    if [ "${T_MODE:-forward}" = tun ]; then
+        dim "On a private link this sets the receive queue. On a fast, quiet"
+        dim "path all three measure the same; it tells on a busy or slow one."
+    else
+        dim "This sets how much a large transfer may park in front of a small"
+        dim "one on the connection they share."
+    fi
+    dim "Changeable later, on both servers."
     blank
     local n
     pick n "select" 2 3 || return 1
@@ -238,7 +266,7 @@ cfg_load() {
     T_PORT=$(toml_get "$f" transport port)
     T_PATH=$(toml_get "$f" transport path)
     T_CONNS=$(toml_get "$f" transport connections)
-    [ -n "$T_CONNS" ] || T_CONNS=8
+    [ -n "$T_CONNS" ] || T_CONNS=16
     T_TOKEN=$(toml_get "$f" security token)
     T_PRESET=$(toml_get "$f" tuning profile)
     [ -n "$T_PRESET" ] || T_PRESET=balanced
@@ -322,20 +350,45 @@ cfg_render() {
     icmp | gre) ;;
     *) kv port "$T_PORT" ;;
     esac
+    # Which port the waiting end really binds, where that is not the port the
+    # other end asks for. Behind a name on one of the HTTPS ports, a CDN's
+    # flexible mode ends the TLS at the edge and comes to the origin in plain
+    # HTTP on 80. The core works this out when the key is absent, and did so
+    # from a different address than the manager's own copy of the rule - so it
+    # is settled once, here, and written down.
+    case $T_TRANSPORT in
+    ws | wss) kv listen_port "$(cfg_listen_port)" ;;
+    esac
     kv dials "$(q "$T_DIALS")"
     case $T_TRANSPORT in
-    tcp | ws | wss | utls | fallback | kcp) kv connections "${T_CONNS:-8}" ;;
+    # Sixteen, not eight: eight bulk streams fill eight connections and a
+    # small one then waits behind a big one; with sixteen it answered in
+    # 160 ms under full load where eight stalled. docs/measured.md 39.
+    tcp | ws | wss | utls | fallback | kcp) kv connections "${T_CONNS:-16}" ;;
     esac
-    kv keepalive_sec 10
+    # GRE FOU has no connection and nothing that sends a keepalive: the kernel
+    # carries it and this core only watches. There is no right number, so
+    # there is no line.
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv keepalive_sec 10 ;;
+    esac
     case $T_TRANSPORT in
     ws | wss) kv path "$(q "$T_PATH")" ;;
     esac
+    # Read by wss and utls only. Decoy TLS presents the name of a site it is
+    # pretending to be, so there is nothing to vouch for and nothing to
+    # configure - it skips verification outright, and a line saying otherwise
+    # in its file was simply wrong.
     case $T_TRANSPORT in
-    wss | utls | fallback)
+    wss | utls)
         kv cert '""'
         kv key '""'
-        kv insecure false
         ;;
+    esac
+    case $T_TRANSPORT in
+    utls) kv insecure 'true   # the far end makes its own certificate, so there is nothing to vouch for it' ;;
+    wss) kv insecure 'false  # and off anyway between two bare addresses, where nobody vouches for one' ;;
     esac
 
     if [ "$T_TRANSPORT" = awg ]; then
@@ -343,7 +396,7 @@ cfg_render() {
         kv name "$(q "$T_AWG_IFACE")"
         kv iran "$(q "10.$T_OCTET.20.1/24")"
         kv kharej "$(q "10.$T_OCTET.20.2/24")"
-        kv mtu 1320
+        kv mtu "$AWG_LINK_MTU"
         kv port "$T_AWG_PORT"
         kv iran_key "$(q "$T_AWG_IKEY")"
         kv iran_pub "$(q "$T_AWG_IPUB")"
@@ -365,18 +418,68 @@ cfg_render() {
 
     printf '\n[tuning]\n'
     kv profile "$(q "$T_PRESET")"
-    kv queue_packets "${T_QUEUE:-$(preset_queue "$T_PRESET")}"
-    kv rcvbuf_kb "$(preset_rcvbuf "$T_PRESET")"
-    kv sndbuf_kb 16384
-    if [ "$mode" = tun ]; then
-        kv send_batch 32
-        kv pace true
-        kv pace_mbit 0
-    fi
-    kv dscp 0
-    if [ "$mode" = tun ] && [ "$T_TRANSPORT" != gre ]; then
-        kv fec "${T_FEC:-0}"
-    fi
+    # This table is dead for GRE FOU: the kernel moves the packets, this core
+    # returns before a carrier is opened, and nothing set on a socket or a
+    # qdisc ever happens for it. Giving it fq on the way out was tried and
+    # measured away - section 36 - so not even that. Only the profile stays,
+    # because the status report and the health check compare it between the
+    # two ends.
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv queue_packets "${T_QUEUE:-$QUEUE_PACKETS}" ;;
+    esac
+    # Only where a socket gets them. tuneSocket takes a packet connection and
+    # the core forbids it on TCP - naming a size there turns off the receive
+    # window auto-tuning this path needs about four megabytes of - so on the
+    # five stream transports these two lines were a number in a file that
+    # never reached anything. KCP raises whatever it is given to its own floor,
+    # so its file says the floor. GRE FOU opens no carrier in this process at
+    # all; the kernel moves it.
+    case $T_TRANSPORT in
+    tcp | ws | wss | utls | fallback | grefou) ;;
+    kcp)
+        kv rcvbuf_kb 8192
+        kv sndbuf_kb 16384
+        ;;
+    *)
+        kv rcvbuf_kb "$(preset_rcvbuf "$T_PRESET")"
+        kv sndbuf_kb 16384
+        ;;
+    esac
+    # How many packets go into the kernel in one crossing. udp joined the
+    # carriers that read it in 1.1.0. Not awg, which runs the same carrier
+    # and was measured batched - a wash, docs/measured.md section 40 - so it
+    # sends one per call and the core ignores the key for it; and not grefou,
+    # whose packets the kernel sends.
+    case $T_TRANSPORT in
+    gre | icmp | rawtcp | udp) kv send_batch 32 ;;
+    esac
+    # fq on the way out is not a private-link thing - every stream carrier asks
+    # for it too - so the file says so in both modes. It changes the queue for
+    # everything on that interface, which an operator should be able to read in
+    # the file rather than discover in the journal. GRE FOU is the exception
+    # and it is a measured one: it makes no bursts for fq to space out.
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv pace true ;;
+    esac
+    # The rate cap is set on a socket, so it reaches only the carriers with one.
+    case $T_TRANSPORT in
+    gre | icmp | rawtcp | udp | awg) kv pace_mbit 0 ;;
+    esac
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv dscp 0 ;;
+    esac
+    # Parity where a carrier can rebuild a lost packet from it. Not gre: ours
+    # carries a bare IP packet, and with parity in front of it not a single
+    # packet crossed the Tehran path in either direction. Not grefou, whose
+    # bytes this core never touches. KCP is here because its own FEC reads the
+    # same key - it was the one transport that could use it and had no way of
+    # being told.
+    case $T_TRANSPORT in
+    udp | icmp | rawtcp | awg | kcp) kv fec "${T_FEC:-0}" ;;
+    esac
 
     printf '\n[forward]\n'
     # shellcheck disable=SC2086
@@ -404,8 +507,16 @@ cfg_render() {
         kv kharej "$(q "10.$T_OCTET.10.2/24")"
         kv mtu "${T_TUNMTU:-1320}"
         kv txqueuelen 1000
-        kv write_workers 0
-        kv queues 1
+        # A tun device this core opens and reads. GRE FOU's is a kernel gre
+        # device that no goroutine of ours ever touches, so these two would be
+        # settings for a thing that is not there.
+        case $T_TRANSPORT in
+        grefou) ;;
+        *)
+            kv write_workers 0
+            kv queues 1
+            ;;
+        esac
     fi
 
     printf '\n[logging]\n'
@@ -599,7 +710,7 @@ setup_token_read() {
     T_IRAN=$(tok_dec "$ir") || { setup_token_bad "the address field is damaged"; return 1; }
     T_PORT=$port
     T_PATH=$(tok_dec "$path") || T_PATH=
-    T_CONNS=${conns:-8}
+    T_CONNS=${conns:-16}
     T_TOKEN=$(tok_dec "$tok") || { setup_token_bad "the security field is damaged"; return 1; }
     T_PRESET=${preset:-balanced} T_LOG=${lg:-info} T_HEALTH=$health
     T_OCTET=$oct T_TUNIF=$tunif T_TUNMTU=${mtu:-1320}
@@ -677,6 +788,7 @@ setup_token_check() {
         [ -n "$T_AWG_IKEY" ] && [ -n "$T_AWG_KKEY" ] && [ -n "$T_AWG_IPUB" ] && [ -n "$T_AWG_KPUB" ] ||
             { setup_token_bad "the AmneziaWG key material is incomplete"; return 1; }
         v_port "$T_AWG_PORT" >/dev/null 2>&1 || { setup_token_bad "the AmneziaWG port is invalid"; return 1; }
+        v_mtu_awg "$T_TUNMTU" >/dev/null 2>&1 || { setup_token_bad "the private MTU does not fit inside AmneziaWG"; return 1; }
     fi
     local b
     for b in $T_BACKUPS; do
@@ -976,6 +1088,18 @@ cdn_listen_port() {
     case $1 in 443 | 2053 | 2083 | 2087 | 2096 | 8443) printf '80' ;; *) printf '%s' "$1" ;; esac
 }
 
+# cfg_listen_port is the same rule read from the host that gets dialled rather
+# than from this server's own address, which is how the core reads it. Which
+# port the waiting end binds is a fact about the tunnel, not about the side
+# that happens to be writing the file, so both files say the same number - and
+# the rule stops being implemented twice from two different addresses.
+cfg_listen_port() {
+    local host
+    if [ "${T_DIALS:-kharej}" = iran ]; then host=$T_KHAREJ; else host=$T_IRAN; fi
+    is_name "$host" || { printf '%s' "$T_PORT"; return; }
+    case $T_PORT in 443 | 2053 | 2083 | 2087 | 2096 | 8443) printf '80' ;; *) printf '%s' "$T_PORT" ;; esac
+}
+
 v_awg_port() {
     v_port "$1" || return 1
     if ! port_free "$1" udp; then
@@ -1196,12 +1320,15 @@ ask_link() {
     blank
     ask T_TUNIF "device name" "$(free_tun_iface)" v_wiz_iface || return 1
     case $T_TRANSPORT in
-    awg) T_TUNMTU=1280 ;;
+    awg) T_TUNMTU=$(awg_tun_mtu) ;;
     # What Golden GRE uses, and what the kernel's own encapsulation fits.
     grefou) T_TUNMTU=1400 ;;
     *) T_TUNMTU=1320 ;;
     esac
-    ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu || return 1
+    case $T_TRANSPORT in
+    awg) ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu_awg || return 1 ;;
+    *) ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu || return 1 ;;
+    esac
     return 0
 }
 
@@ -1292,7 +1419,7 @@ review_panel() {
     fi
     [ -n "$T_FORWARDS" ] && panel_field "Ports" "$T_FORWARDS"
     panel_field "Token" "$(token_print "$T_TOKEN")"
-    panel_field "Tuning" "${T_PRESET^}, queue $(preset_queue "$T_PRESET") packets"
+    panel_field "Tuning" "${T_PRESET^}"
     panel_field "Logging" "$T_LOG"
     panel_end
 }
@@ -1311,6 +1438,26 @@ wiz_create() {
     rm -f "$tmp"
     enable_watchdog quiet
     dim "$(cfg_file "$T_NAME")"
+
+    # The host's kernel is the other half of a fast tunnel, and until now only
+    # the Optimize screen ever touched it - so a server whose operator never
+    # found that screen ran the distribution's settings under every tunnel.
+    # Asked, not assumed: this file is the whole machine's, not this
+    # tunnel's, and a second tunnel must not pull a host already tuned for
+    # download down to its own profile. Both servers of a pair come through
+    # here, so both are asked, which is what the health check used to tell
+    # people to go and do by hand.
+    if [ ! -f "$HOST_SYSCTL" ]; then
+        blank
+        dim "This server still runs the distribution's kernel network settings."
+        if confirm_yes "apply Pingify's $T_PRESET host tuning as well?"; then
+            apply_tuning "$T_PRESET"
+            case $T_TRANSPORT in
+            tcp | ws | wss | utls | fallback)
+                host_bbr_available && confirm_yes "and BBR, for this tcp carrier?" && enable_bbr ;;
+            esac
+        fi
+    fi
     return 0
 }
 

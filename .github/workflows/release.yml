@@ -23,9 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # From go.mod, not a number typed here: the module says go 1.24.0 and a
+      # workflow pinned to an older toolchain fails before it tests anything.
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version-file: go.mod
           cache: false
 
       - name: The script must parse before anything is taken out of it
@@ -86,7 +88,7 @@ jobs:
           Install or update, on both servers:
 
           ```bash
-          bash <(wget -qO- https://github.com/OWNER_REPO/releases/latest/download/Pingify.sh)
+          wget -O Pingify.sh https://github.com/OWNER_REPO/releases/latest/download/Pingify.sh && bash Pingify.sh
           ```
 
           The engine is compiled on the server from the sources inside the

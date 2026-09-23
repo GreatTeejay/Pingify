@@ -149,11 +149,13 @@ grefou_key() {
 # grefou_up NAME - the device, the listener, the offload setting and the clamp.
 # A tunnel that is already up comes up again: the device is remade, and any route somebody put on it by hand goes with it.
 grefou_up() {
-    local name=$1 f dev port local_ip peer mtu addr ul
+    local name=$1 f dev port local_ip peer mtu qlen addr ul
     f=$(cfg_file "$name")
     dev=$(toml_get "$f" tun name)
     port=$(toml_get "$f" transport port)
     mtu=$(toml_get "$f" tun mtu)
+    qlen=$(toml_get "$f" tun txqueuelen)
+    case $qlen in '' | *[!0-9]*) qlen=1000 ;; esac
     [ -n "$mtu" ] || mtu=1400
     if [ "$(toml_get "$f" tunnel side)" = iran ]; then
         local_ip=$(toml_get "$f" transport iran)
@@ -201,7 +203,11 @@ grefou_up() {
         return 1
     fi
     ip addr add "$addr" dev "$dev" 2>/dev/null
-    ip link set "$dev" mtu "$mtu" up || {
+    # The file states a device queue; before this nothing applied it, so a
+    # GRE FOU tunnel was the one place the number in the file was not the
+    # number the device had. A thousand is what the kernel gives a gre device
+    # anyway, so this makes the file true without moving anything.
+    ip link set "$dev" mtu "$mtu" txqueuelen "$qlen" up || {
         fail "$dev would not come up"
         return 1
     }
@@ -249,6 +255,17 @@ grefou_dev_in_use() {
     return 1
 }
 
+# grefou_gro_owner DEV - the GRE FOU tunnel that has GRO off on DEV, so the
+# other tunnels on that interface can name it in their own health check.
+grefou_gro_owner() {
+    local dev=$1 n f
+    for n in $(grefou_tunnels); do
+        f=$STATE_DIR/$GREFOU_STATE_PREFIX.ul.$n
+        [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "$dev" ] && { printf '%s' "$n"; return 0; }
+    done
+    return 0
+}
+
 # grefou_down NAME - undo all of it, and leave the interface as it was found.
 grefou_down() {
     local name=$1 f dev port peer ul
@@ -286,9 +303,10 @@ grefou_note() {
     dim "There is no token on the wire. The tunnel's key is there, in the clear,"
     dim "and it only tells two tunnels apart - anything that can forge the other"
     dim "server's address and knows the port is inside the tunnel. It also turns"
-    dim "generic receive offload off on this server's interface - everything"
-    dim "else here pays a little for that - and turns it back on when the"
-    dim "tunnel is deleted."
+    dim "generic receive offload off on this server's interface, and every other"
+    dim "tunnel here pays for that: measured on the test pair, an AmneziaWG link"
+    dim "on the same interface fell from 439 to 224 Mbit/s. It goes back on when"
+    dim "the last GRE FOU tunnel here is deleted."
 }
 
 # tunnel_boot NAME - what the unit runs before the core starts: whatever

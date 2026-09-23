@@ -473,6 +473,18 @@ health_check() {
             elif [ -n "$gul" ] && [ "$ggro" = off ]; then
                 chk_add ok gro "generic receive offload is off on $gul, which this transport needs"
             fi
+        else
+            # GRO is the interface's setting, not this tunnel's. A GRE FOU
+            # tunnel here turned it off for everyone leaving by that
+            # interface, and this is the only screen that can tell the tunnel
+            # paying for it who to look at: measured, an AmneziaWG link on the
+            # same interface fell from 439 to 224 Mbit/s.
+            local odev oowner
+            odev=$(grefou_underlay "$(peer_public "$name")")
+            if [ -n "$odev" ] && [ "$(gro_state "$odev")" = off ]; then
+                oowner=$(grefou_gro_owner "$odev")
+                [ -n "$oowner" ] && chk_add note gro                     "generic receive offload is off on $odev because $oowner (GRE FOU) needs it off - this tunnel is slower for it"                     "it goes back on when the last GRE FOU tunnel here is deleted"
+            fi
         fi
 
         if [ "$CK_TRANSPORT" = awg ]; then
@@ -534,9 +546,14 @@ health_check() {
         case $lpm in
         early) chk_add note loss "too early to say anything about loss yet" ;;
         *)
+            # Advise parity only where turning it on would do something. The
+            # list was the wrong way round in two places: it offered parity for
+            # grefou, whose bytes this core never touches, and withheld it from
+            # kcp, which is the one forward transport that rebuilds a lost
+            # packet from it instead of resending.
             local fec_advice=
             case $CK_TRANSPORT in
-            tcp | ws | wss | kcp | utls | fallback | gre) ;;
+            tcp | ws | wss | utls | fallback | gre | grefou) ;;
             *) [ "$(toml_get "$CK_FILE" tuning fec)" -gt 0 ] 2>/dev/null ||
                 fec_advice="turn on Parity: Manage ${BX_ARR} $name ${BX_ARR} Tuning" ;;
             esac
@@ -916,7 +933,7 @@ speed_listen() {
 }
 
 speed_test() {
-    local name=$1 out rc ref target
+    local name=$1 out rc target
     # Shadowed: the forwarded port picked below must not become the
     # port the iperf3 listener on this server binds afterwards.
     local IPERF_PORT=$IPERF_PORT
@@ -975,13 +992,14 @@ speed_test() {
         esac
         return 1
     fi
-    case ${ST_PROFILE:-$(toml_get "$CK_FILE" tuning profile)} in
-    gaming) ref="gaming measured 397 Mbit/s over 16 streams" ;;
-    download) ref="download measured 466 Mbit/s over 16 streams" ;;
-    *) ref="balanced measured 448 Mbit/s over 16 streams" ;;
-    esac
     ok "done"
-    dim "$ref on the reference path, Tehran to Frankfurt."
+    # One figure, not three. The per-profile numbers that were here came from
+    # the queue-depth table the profiles no longer set - see QUEUE_PACKETS in
+    # the wizard, and docs/measured.md section 35. Quoting them against a
+    # profile that no longer produces them told the operator their tunnel was
+    # slow when it was doing exactly what the reference path does.
+    dim "The reference path, Tehran to Frankfurt, carries about 600 Mbit/s over these"
+    dim "sixteen streams on a private link, and about 950 on a kernel-carried GRE FOU one."
     dim "A slower path abroad reads lower; that is the path. Take it more than once."
     return 0
 }

@@ -65,7 +65,7 @@ packets dropped because of it.
 Calling it switches off `tcp_rmem` autotuning for that socket and pins the
 window where you put it. Buffer tuning belongs to the packet transports only.
 
-## 5. The reader that takes the packet off the socket writes it to the device
+## 5. The reader takes the packet off the socket; a writer puts it in the device
 
 A layer of per-flow writers and batched handovers sat between them for a
 while, on the reasoning that one thread doing every write would serialise
@@ -77,19 +77,67 @@ no longer being clamped, sixteen streams pushing:
 | batched      | 160 ms | 179 ms | 561 ms | 427 Mbit/s  |
 | written here | 113 ms | 133 ms | 146 ms | 444 Mbit/s  |
 
-## 6. Device queues follow the processors: floor two, ceiling eight
+**Superseded in part.** That table is still true of what it measured - batched
+handovers behind a channel lose to writing in place. What ships now is neither:
+the reader hands each packet to a writer goroutine chosen by the flow's hash,
+with no batching, so it goes straight back to the socket and never waits on a
+device write. One writer per core, up to four. Measured on the pair, four
+rounds at each setting, both ends the same (internal/link/link.go):
+
+	  writers   download   upload   one stream down   p90 down / up   socket lost
+	     0        457        412        569 Mbit/s      106 / 94        5500
+	     1        572        388        578             108 / 82         160
+	     2        532        438        595             107 / 103        830
+
+The column that decides it is the last one. With nobody but the reader writing
+to the device, the socket overflowed 5500 times while the reader was busy
+there; with a writer beside it, 160. `tun.write_workers = -1` still gives the
+old behaviour, for comparing.
+
+## 6. How many device queues
 
 At eight queues the threads reading the device starved the one putting packets
 on the wire. Its queue filled and it threw away three thousand packets, which
 the TCP inside read as congestion and answered by halving its window. The
 machine was not short of work. It was short of turns - the same shape as (1).
 
-One queue cannot overlap a read with anything, so two is the floor.
+That part stands. What followed from it here - "one queue cannot overlap a read
+with anything, so two is the floor" - does not describe the core any more. It
+opens one queue (`defaultQueues`, internal/link/link.go) and the wizard writes
+`queues = 1`. The reading moved: the goroutine that reads a queue is the one
+that sends what it read, and the writing into the device went to the writers
+in (5), so a single queue no longer has a read to overlap with anything.
+
+**One against two has not been measured on this core.** It is one because one
+flow is read by one queue whatever the count, and more queues bought nothing
+that anyone has shown. Somebody with a reason to think otherwise has
+`tun.queues` and should measure it.
 
 ## 7. One crossing into the kernel per batch
 
-`recvmmsg` and `sendmmsg` for the packet transports, via
-`golang.org/x/net/ipv4` ReadBatch/WriteBatch.
+`sendmmsg` and `recvmmsg`, called directly - `syscall.Syscall6` on a
+hand-laid `mmsghdr` in internal/carrier/batch_linux.go, not through
+`golang.org/x/net/ipv4` as this section used to say.
+
+Who actually uses them is narrower than "the packet transports":
+
+	  transport    sends in batches      reads in batches
+	  gre                yes              yes, one reader per core up to four
+	  icmp               yes              yes, one reader per core up to four
+	  rawtcp             yes              yes, one reader (see below)
+	  udp          yes, from 1.1.0              no
+	  awg                no                     no
+
+Until 1.1.0, gre and rawtcp set up the batched path and then read one packet
+per call, and udp sent one per call; section 37 is the measurement behind udp.
+Raw TCP keeps one reader because the acknowledgement number in the header it
+makes up is taken from the segments it reads, and that number is the thing a
+stateful box in the middle checks. AmneziaWG runs the udp carrier and still
+sends one per call - section 37 says why.
+
+The readers do not make the system call at the same time. Go takes the
+descriptor's read lock inside RawConn.Read, so the recvmmsg calls happen one
+after another; what overlaps is the work each does with its batch afterwards.
 
 ## 8. The private link does not need a reliability layer
 
@@ -190,12 +238,18 @@ This is the same shape as (14) and is probably the same device doing it. It
 means UDP is not a slow transport on this path, it is an unusable one - and it
 is why ICMP is the transport worth making good, not the fallback.
 
+**No longer true of this path.** From 2026-09-16 UDP crossed cleanly on the
+same pair (21), and UDP and AmneziaWG are in every table since (26, 34). The
+count of six was real when it was taken; nothing here says what stopped doing
+it, or that it will not start again - which is why ICMP is still the transport
+this core is built around.
+
 The UDP carrier is still worth having. It is the same code an ICMP carrier
 needs, minus a raw socket, so it is the cheapest place to get the shape right;
 and this is one path, on one ISP, at one time. Somebody else's will carry UDP
 happily.
 
-## 15. No encryption unless it is asked for
+## 16. No encryption unless it is asked for
 
 Off by default. What is wanted from this tunnel is speed, ping and stability,
 and the traffic inside it is already TLS.
@@ -227,6 +281,22 @@ only damage - and the single stream is what the batch was added to help.
 
 **One packet per crossing on the way out. Batch on the way in, never on the
 way out.**
+
+**Superseded by 18.** Every number above was taken before fq went on the
+egress. fq spaces a socket's packets out itself, so a batch handed to it is no
+longer that many packets at line rate - it is that many packets given to a
+queue that releases them evenly. The burst the path was policing stops at fq
+and never reaches the path. Measured again with fq on, three passes each, both
+ends under 65 per cent busy (internal/carrier/batch_linux.go):
+
+	  send_batch   download   one stream down   upload   path lost
+	       1        377 Mbit    435 Mbit         447      none
+	      16        365         593              455      none
+	      32        557         522              444      none
+
+No loss at any of them, and half as much again on the download at thirty-two.
+It ships at thirty-two. The rule above still holds for a tunnel with
+`tuning.pace = false`: take fq away and a batch is a burst again.
 
 ## 18. fq on the egress, and a rate the tunnel works out for itself
 
@@ -281,6 +351,13 @@ faster than either. The quiet round trip does not move between them at all,
 81.0 / 81.1 / 81.2, because an empty queue is an empty queue however deep it
 was allowed to get. **A profile changes what happens when the link is busy,
 which is the only time any of it is felt.**
+
+**Superseded.** This was taken when `queue_packets` was fq's flow limit
+directly and the tunnel was sitting on it. It is multiplied by ten now, the
+tunnel no longer reaches it at any profile, and no profile sets a different
+one. Section 35 has the counters. The table stays because it is the evidence
+for the shallow end - too small and fq throws away the burst it is there to
+space out - and not because it describes a choice anybody is still offered.
 
 ## 20. Count the gaps in your own sequence numbers
 
@@ -531,10 +608,11 @@ every number here is TCP.
 
 One column of that is a real gap and the rest is noise: a single stream
 carried twice as much over theirs, and it won every one of the five rounds.
-Our own queues are why. On the balanced profile the core holds 900 packets
-and the device 1000; flagtun holds what it likes and sets the device to
-10000. Told to keep the same depth - the download profile, and
-`tun.txqueuelen = 10000` - the same measurement over the same hour:
+Our own queues looked like why. On every profile fq is allowed 9000 packets
+(the 900 in the file, ten times over) and the device 1000; flagtun holds what
+it likes and sets the device to 10000. Told to keep the same depth - the
+download profile, and `tun.txqueuelen = 10000` - the same measurement over the
+same hour:
 
 	                          FlagTun   ours
 	download, one stream       618      615
@@ -799,11 +877,355 @@ Four streams is a tie and the first byte idle is identical. They are ahead
 by about a sixth on a single stream; we are ahead by about a fifth on
 upload, and by forty milliseconds on the thing a user actually feels - a
 new connection while a download is running. That last column is the same
-trade 28 found: our queues are shallower on purpose, and the download
-profile with a deeper device queue closes the single-stream gap at the
-cost of this.
+trade 28 found: our queues are shallower on purpose.
+
+What 28 does not show is which change closed the single-stream gap there. That
+run changed three things at once - the download profile, and
+`tun.txqueuelen = 10000` set by hand, which no profile sets: every profile
+ships the device queue at 1000. And section 35 later found neither queue drops
+a packet on this pair at any depth, which makes "the queue was the gap" harder
+to believe than it looked. It is open.
 
 ---
+
+## 35. The profile stopped meaning anything, and what could be shown about it
+
+Three profiles shipped on one idea: a shallow queue is emptier when a small
+packet arrives, so that packet waits less, and a deep one absorbs bursts and
+carries more. Section 19 is the table it was measured on, and it was true.
+
+It is not true now. Nobody broke it - other work in this core made the queues
+stop forming, and nothing went back to ask what that left the profile doing.
+Four things were established, and one was not.
+
+**fq is asked for a queue larger than the qdisc it is asked of.** The profile's
+`queue_packets` reaches exactly one place: fq's per-flow limit, multiplied by
+ten in carrier/pace_linux.go. At the download profile that asks for 15000, of a
+qdisc that holds 10000. Read off the Frankfurt server with the tunnel running:
+
+	qdisc fq 8001: root refcnt 2 limit 10000p flow_limit 15000p
+
+Download's depth is not rarely reached. It cannot be reached.
+
+**No depth drops a packet, at either end of its range.** Counters taken around
+each transfer, sixteen streams and eight, at both extremes of the device queue:
+
+	  txqueuelen   streams   device packets   device dropped   fq dropped   Mbit/s
+	     500          8        1,933,024            0               0         631
+	     500         16        1,949,990            0               0         621
+	   10000          8        1,809,311            0               0         575
+	   10000         16        1,789,354            0               0         603
+
+A queue that never drops is not shaping anything, whatever number is written on
+it. The table in link/tun_linux.go was real when it was taken - 500 dropped 47,
+1167 and 2320 packets then - and the read path has since become fast enough
+that the queue stops building.
+
+**The receive queue is applied, so a null result about it would be a real one.**
+The core prints what it got on every start: `carrier: socket buffers, 256 KB in`
+and `3072 KB in`, matching the file each time.
+
+**DSCP does not survive this route.** Twelve UDP packets from Frankfurt to
+Tehran with `IP_TOS` 0xb8, which is the expedited class, captured on arrival in
+Tehran: twelve of `tos 0x18`. Every one re-marked from DSCP 46 to 6. A profile
+that sets `tuning.dscp` buys nothing here.
+
+### What could not be shown, after four attempts
+
+Whether 256 KB or 3072 KB of receive queue changes anything today. Four
+harnesses, each with the transfer proved to be running underneath the probe,
+put the same tunnel at the same load here:
+
+	  where the probe's client ran        quiet p50   under load p50 / p90 / p99   jitter
+	  Frankfurt, load pulled from Tehran    74.6         74.6 / 75.1 / 75.7         0.3
+	  Frankfurt, both sides detached        85.0         85.2 / 112.1 / 194.4       9.1
+	  a thread beside the senders           76.8        124.8 / 223.5 / 648.7      49.0
+	  a process beside the senders          85.3         90.4 / 225.2 / 533.8      70.6
+
+The spread between harnesses is far larger than anything 256 against 3072 could
+do, so none of these rows is evidence about the setting. They are evidence
+about the harness. The receive queue keeps the value section 19's measurement
+gave it, and this is written down so the next person does not spend an evening
+discovering the same thing.
+
+### Why they disagreed, which is the useful part
+
+`nproc` on the Tehran server is 1.
+
+The first harness put the probe's client on that server, beside eight download
+threads. It read a p90 between 92 and 375 ms and a p99 up to 892, wandering by
+a factor of four between two runs of the same setting, and it looked exactly
+like queueing. At 78 to 83 per cent busy the client was waiting for the
+processor and printing its own scheduling delay. Moving the client to the
+two-core server - same tunnel, same load, same direction - took the p99 from
+551 ms to 75.7.
+
+The third harness fixed the overlap problem by putting the load and the probe
+in one Python process. The probe thread then queued behind eight sender threads
+for the interpreter lock, which is its own version of the same mistake.
+
+So: **a latency measurement is only as good as the idlest machine at either end
+of it.** With one core under the load generator there is no arrangement of
+these tools that measures the path rather than the processor.
+
+## 36. GRE FOU does not want fq, and it is the fastest link here
+
+Every transport asks for fq on the egress interface when its carrier opens.
+GRE FOU opens no carrier - the kernel moves the packets and this core returns
+to watching - so it was the one transport leaving on whatever queue the
+distribution had set. That looked like an oversight worth twenty per cent, by
+analogy with section 18.
+
+It was written, and then measured before being believed. A GRE FOU pair of its
+own between the two servers, eight streams pushed from Frankfurt, the queue on
+Frankfurt's egress flipped between the two and back, three rounds interleaved:
+
+	  qdisc       round 1   round 2   round 3     p50 / p90     jitter
+	  fq_codel    951       928       955        81.4 / 81.7     0.3 ms
+	  fq          945       494       903        81.4 / 81.7     0.3 ms
+
+fq is not better. It is level at best, it had a round at half the rate, and
+the round trip does not move by a tenth of a millisecond either way. The change
+was taken out again.
+
+Why the analogy failed, which is the part worth keeping: fq earns its twenty
+per cent by spacing out bursts **this process makes**. A userspace carrier
+reads a batch off a device and writes it to a socket in one go, and fq spreads
+that burst over time. Nothing here makes a burst - the kernel moves each packet
+as the TCP inside the tunnel releases it, already paced by that TCP's own
+congestion control. There is nothing left for fq to smooth, and its per-flow
+accounting is work for no gain.
+
+So `tuning.pace` and `tuning.queue_packets` are not written into a GRE FOU
+config at all. Its whole `[tuning]` table is one line, the profile, which is
+there because the two ends compare it.
+
+The other number in that table is worth saying out loud. **951 Mbit/s**, with
+the round trip under full load at 81.4 ms against an idle 82, and 0.3 ms of
+jitter. The same pair over a userspace UDP private link, measured the same
+evening, carried about 600. The kernel path is not a little faster, and it
+costs nothing in delay to use it.
+
+## 37. UDP sends in batches, and it loses less for it
+
+Until 1.1.0 the UDP carrier sent one packet per system call, on the reasoning
+that UDP was for paths where it worked and those were not where the last ten
+per cent is fought over. By September both halves had stopped being true: UDP
+carried 600 Mbit/s on this pair, and AmneziaWG runs this very carrier.
+
+So it was given sendmmsg, the way GRE, ICMP and raw TCP already had it, and
+measured with one binary - the 1.1.0 core, run beside the shared one in a unit
+of its own, never in its place. At `send_batch = 1` it takes exactly the old
+path; at 32 it batches. Eight streams each way, both ends set the same,
+interleaved:
+
+	  throughput, Mbit/s        batch 1               batch 32
+	  download                 582  635  430  555      609  747  565  700
+	  upload                   787  705  686  711      802  832  455  838
+
+Download - the Frankfurt end sending - was ahead in all four pairs, by a
+quarter to a third in the second run. Upload - the Tehran end sending - in
+three of four.
+
+**The first reading of this was wrong in a way worth keeping.** Those were
+throughput figures, and throughput hides loss: the TCP inside retransmits and
+the number still looks fine. When the carriers' own counters were read after a
+batched run, about a tenth of the packets had never arrived, and on the
+download they went missing in runs of about twenty-nine - near enough the
+batch size to look like exactly the burst section 17 watched the path police.
+
+So it was measured again, the loss this time, counters read fresh after each
+restart:
+
+	                     batch 1                      batch 32
+	                 lost    per gap              lost    per gap
+	  download      12.06 %     56               10.85 %     60
+	                 8.69 %     49                5.74 %     13
+	  upload        11.96 %      4                4.62 %      3
+
+Batching loses less, in every pair that could be read. And the runs are there
+at a batch of one too - about fifty packets at a time on the download. That
+is the path policing eight saturating streams, whatever sends them; the
+twenty-nine was a coincidence with the batch size and not a cause.
+
+Two readings were thrown away, and why is written down so nobody puts them
+back. A third round returned nothing in either direction: the tunnel's own
+counters and journal were clean, so it was the Python sources the harness
+runs, not the carrier. And one upload count read 238 million packets lost at
+838 Mbit/s, which cannot both be true; it is what the far end's replay window
+reports when the sender restarts under it with fresh sequence numbers.
+
+It also cost a run to learn that two measurement scripts must never share the
+lab: the first was still finishing when the second started, its clean-up
+stopped the second's sources, and the second's restarts landed inside the
+first's last round. Both rounds were discarded.
+
+AmneziaWG does **not** batch, although it runs this carrier. Its packets meet
+the awg device before anything else, and that has no fq on it; it has never
+been measured batched; and every AmneziaWG file from before 1.1.0 already says
+`send_batch = 32`, which this carrier ignored until now - so honouring it would
+switch batching on at upgrade for a transport nobody tried it on. The carrier
+holds AmneziaWG at one per call until somebody measures it.
+
+## 38. GRE and Fake TCP read in batches now, and neither got worse for it
+
+Section 7 said the packet transports read with recvmmsg. Only ICMP did; GRE
+and Fake TCP set the batched path up and then read one packet per call, and
+GRE's own start-up line said "up to 128 in" while it did. In 1.1.0 both read
+in batches - GRE with one reader per core up to four, as ICMP does; Fake TCP
+with one, because the acknowledgement number in the header it makes up is
+taken from the segments it reads, and two readers finishing out of order
+would send it backwards under a middlebox that tracks it.
+
+Measured old core against new on the same pair, each transport's own lab
+tunnel, the arm's binary swapped in under the tunnel's own systemd unit so
+that nothing else differed. Three rounds, interleaved. Download is the Tehran
+end receiving; its core's CPU is over that window; loss is what its carrier
+counted missing.
+
+	  GRE            download 8 / 1        upload 8       rx cpu      lost
+	  1.0.2          575  585              847            64 %       16.1 %
+	  1.1.0          554  649              841            62         10.8
+	  1.0.2          579  681              702            67         14.0
+	  1.1.0          745  721              819            55         12.4
+	  1.0.2          609  726              829            64         14.3
+	  1.1.0          616  631              840            65         15.1
+
+	  Fake TCP       download 8 / 1        upload 8       rx cpu      lost
+	  1.0.2          710  428              688            64 %       14.5 %
+	  1.1.0          657  718              708            65         15.0
+	  1.0.2          747  676              703            69         11.0
+	  1.1.0          760  738              819            79         12.8
+	  1.0.2          692  750              789            80         16.2
+	  1.1.0          811  825              801            77         11.7
+
+GRE is level - each column goes both ways across the three rounds, the
+receiving core a little less busy, loss a little lower. Fake TCP is better:
+a single stream downloaded faster in all three rounds and the upload was
+higher in all three. Neither shows the thing this was measured for, which is
+a regression; the change stays.
+
+Two things the harness got wrong on the way, kept because the next person
+will meet them too. A core copied to another path was not executable - a
+file built on Windows has no execute bit - and the unit failed with
+status=203/EXEC, which the driver reported only as "did not come up", for
+three rounds. And `grep -oE 'd8=[0-9]+' | tr -dc '0-9'` keeps the 8 from the
+field's name: every download read 8,575 where it was 575, and it took two
+full runs and a good deal of theorising about the tunnel before the leading
+digit was seen for what it was. Cut on the equals sign.
+
+## 39. A small stream on a busy forward tunnel: what 1.0.2 did, and what changed
+
+Nothing in this file had measured the thing a person on a forward tunnel
+actually feels: a small request - a keystroke, a game packet, a new page -
+while somebody else's download saturates the link. Section 34's first-byte
+column was a new connection on a quiet tunnel. So a probe was built: one
+byte to an echo on a forwarded port and one byte back, twenty times a second,
+on a connection that stays open, while eight streams pull through the same
+tunnel. The probe records a stall past five seconds as five seconds rather
+than giving up - the first version gave up, and printed zeros where it should
+have printed "the tunnel was stuck".
+
+Three cores, the same TCP MUX pair, arms swapped in under the tunnel's own
+systemd unit, three rounds interleaved:
+
+	                          down 8 / 1     under load   p50    p90    p99   jitter
+	  1.0.2                    469   175                5005   5005   5005    922
+	  2 KB records, 1.1.0      517   440                5002   5005   5005   2503
+	  16 KB records, 1.1.0     511   470                 456   2862   5004    747
+
+	  1.0.2                    574     0                5005   5005   5005      0
+	  2 KB records, 1.1.0      503   168                 785   5004   5005   1461
+	  16 KB records, 1.1.0     651   421                 158    160   1589     37
+
+	  1.0.2                    540   648                 786   5005   5005   1553
+	  2 KB records, 1.1.0      656   260                1471   4974   4974   2816
+	  16 KB records, 1.1.0     590   112                 231   5005   5005   1084
+
+**1.0.2 is stuck.** Every sample past the probe's limit, in two rounds of
+three, with zero jitter because every one of them is the same five seconds.
+A single stream started after the saturation got 0 Mbit/s in one round. This
+is what a forward tunnel did under load before, and nobody had a number for
+it because nobody had asked.
+
+The mechanism is not a queue this core built. A forward tunnel pins every
+stream to one of its connections, eight bulk streams on eight connections
+leave none free, and what a small record waits behind on a shared connection
+is everything that connection holds: the forwarder's own queue in front of
+the socket, the socket's unsent bytes, a window in flight, and - on this
+path, which drops a tenth of what saturates it - every retransmission timeout
+of the TCP underneath. It is TCP inside TCP under loss, which the top of
+carrier/stream.go has warned about since it was written.
+
+**What 1.1.0 does about it,** and each was measured on the way:
+
+- `TCP_NOTSENT_LOWAT` on every carrier connection, by profile: 64 KB for
+  gaming, 128 for the others. The socket buffers cannot be touched - naming
+  one turns off the receive window auto-tuning this path needs - so this is
+  the only queue in the socket a profile can shorten. Measured across the
+  three settings under the same probe, 64 was the least bad and 512 KB, which
+  was going to be the download profile's, stalled the small stream past five
+  seconds in every round for no throughput at all over 128. Download gets 128.
+- Records of 16 KB on every stream carrier, where the five TCP ones had kept
+  2 KB after KCP was measured into 16. Alone, that made the small stream
+  *worse* - 1185 ms against 714 - because the forwarder's queue in front of
+  each connection is sixty-four records, sized when a record was 2 KB, and
+  the 1.2 seconds its own comment records having measured at 4,000 records
+  came straight back at eight times the bytes. The queue is sized in bytes
+  now, as the read side already was.
+- With both, the small stream under saturation comes back in 158 to 456 ms
+  at the median where 1.0.2 never came back at all, and the tunnel carries
+  more on eight streams and much more on one.
+
+It is not finished. p99 still reaches the five second limit in two rounds of
+three: on a path with this much loss, a stream pinned to a connection in
+retransmission backoff waits for it, and no queue setting reaches that. The
+only thing that would is a connection with nothing else on it - and that was
+the next measurement.
+
+**Eight connections against sixteen**, the corrected 16 KB core on both, the
+same probe, three rounds interleaved:
+
+	                 down 8 / 1      under load   p50    p90    p99   jitter
+	  8 connections   537    40                 5005   5005   5005      0.5
+	  16              617   389                  166    166    172      0.5
+	  8               558     0                  344   2120   2607    903
+	  16              422   283                  151    152    435     13.6
+	  8               472     0                  282   2758   5005    872
+	  16              562   507                  158    159    166      1.3
+
+With sixteen the small stream answers in 151 to 166 ms in every round, the
+ninetieth under 170, the jitter under fifteen; with eight it stalls outright
+once and answers in seconds at the ninetieth the other twice, and a stream
+started after the burst gets nothing in two rounds of three. The eight
+stream download does not move. Eight bulk streams can occupy at most eight
+connections; sixteen leaves eight for everything small. **The default is
+sixteen from 1.1.0.** It was never swept before - every table in this file
+up to here was taken at eight, and the note beside DefaultConnections had
+said only why it was not one.
+
+## 40. AmneziaWG batched, measured, and left alone
+
+Section 37 held AmneziaWG at one packet per call while UDP went to batches,
+because its packets meet the awg device before anything else and that device
+has no fq on it. It was measured afterwards, the same A/B as section 37 on
+its own lab pair, the arm's core swapped in under the tunnel's own unit,
+three rounds interleaved:
+
+	                  down 8 / 1     up 8     rx cpu     lost
+	  one per call    566   652     650      45 %      17.1 %
+	  batch of 32     518   629     596      41        15.8
+	  one per call    642   662     650      46        13.2
+	  batch of 32     645   677     703      48        15.0
+	  one per call    565   524     659      47        12.2
+	  batch of 32     572   645     743      48        13.3
+
+A wash. The upload is up eight per cent at the median and the loss is up two
+points; the download columns go both ways by less than the rounds differ
+from each other. Every AmneziaWG file written before 1.1.0 says
+`send_batch = 32`, which the carrier had always ignored, so honouring the key
+now would switch all of them to batching at upgrade - for this. It stays at
+one per call, and the file does not carry the key.
 
 # How to measure, so the numbers mean something
 
@@ -838,3 +1260,35 @@ These cost as much time as the findings did.
 
 - **A profile of an idle process says nothing.** Check that it caught the
   work: two per cent of samples is a transfer that had already finished.
+
+- **A latency measurement is only as good as the idlest machine at either end.**
+  On a one core server the load generator and the probe are the same queue.
+  Move the clock to the other end, and if that end is also busy, do not report
+  a tail at all.
+
+- **Prove the load was running under the probe, in the output.** Two servers
+  started from two clocks cannot be shown afterwards to have overlapped, and
+  `date` on one minus `date` on the other measures the ssh round trip - it read
+  +6 seconds one minute and -6 the next.
+
+- **Do not put the probe in the same interpreter as the load.** Eight sender
+  threads and one timing thread share a lock, and the timing thread reports it.
+
+- **Read the loss, not just the rate.** A transfer that loses a tenth of its
+  packets can still post a good number, because the TCP inside resends them.
+  The carrier counts what never arrived; ask it.
+
+- **One measurement at a time.** Two scripts sharing a lab will restart each
+  other's tunnels and stop each other's sources, and neither will say so.
+
+- **A probe that gives up at the first stall reports "no data" where it
+  should report the stall.** Record the timeout as a sample and carry on.
+
+- **When a number is impossible, suspect the harness before the tunnel.**
+  8,575 Mbit/s over an internet path is not a measurement, it is a parsing
+  bug, and the tunnel's own counters had said 950 all along.
+
+- **An analogy is a hypothesis, not a result.** fq was worth twenty per cent to
+  every carrier that had been measured, so giving it to the one that had not
+  looked like tidying up. It was worth nothing there, for a reason that was
+  obvious afterwards. Measure the one you are about to change.

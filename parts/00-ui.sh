@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.0.2"
+PINGIFY_VERSION="1.1.0"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -691,6 +691,25 @@ v_mtu() {
     case $1 in '' | *[!0-9]*) echo "an mtu is a number"; return 1 ;; esac
     { [ "$1" -ge 576 ] && [ "$1" -le 9000 ]; } ||
         { echo "the core takes 576 to 9000; 1320 is what works on most paths"; return 1; }
+}
+
+# The AmneziaWG link this core runs inside. One number, in one place: the
+# link MTU written into the file, and the tun MTU derived from it. On the awg
+# device every packet is 20 of IP, 8 of UDP and 12 of framer over what the
+# tun device hands up - and 4 more when parity is on, which can be switched on
+# later without anybody revisiting the MTU. So the tun MTU is the link less
+# 44, always. It was a literal 1280 beside a literal 1320, right by 4 bytes
+# of luck and unchecked against anything.
+AWG_LINK_MTU=1320
+awg_tun_mtu() { echo $((AWG_LINK_MTU - 44)); }
+# The wizard writes the cautious number, which holds with parity on or off.
+# What is accepted is the real ceiling with parity off, because every
+# AmneziaWG tunnel from before 1.1.0 runs at exactly that; turning parity on
+# for one of those is refused by the core with the number to set instead.
+v_mtu_awg() {
+    v_mtu "$1" || return 1
+    [ "$1" -le "$((AWG_LINK_MTU - 40))" ] ||
+        { echo "inside AmneziaWG the link is $AWG_LINK_MTU, so this is at most $((AWG_LINK_MTU - 40)), or $(awg_tun_mtu) with parity"; return 1; }
 }
 
 v_token() {

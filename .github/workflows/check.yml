@@ -1,0 +1,97 @@
+name: check
+
+# The same tests the release runs, run on every push and every pull request.
+#
+# Before this, nothing was tested until a tag was pushed - and a tag is public
+# the moment it exists, so the first thing that told anybody the build was
+# broken was a broken release. This workflow is the release's own steps with
+# the publishing taken off the end, in two jobs that run beside each other.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # What a server extracts and compiles, tested as the server would get it.
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # From go.mod, not a number typed here: the module says go 1.24.0 and a
+      # workflow pinned to an older toolchain fails before it tests anything.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: The script must parse before anything is taken out of it
+        run: bash -n Pingify.sh
+
+      - name: Take the engine out of the script
+        run: |
+          PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
+          test -f go.mod && test -d internal && test -d vendor
+
+      - name: Lay the engine's tests over it
+        run: |
+          cp -r tests/_engine/internal tests/_engine/cmd . 2>/dev/null || true
+          n=$(find cmd internal -name '*_test.go' | wc -l)
+          [ "$n" -gt 0 ] || { echo "no engine tests were laid down"; exit 1; }
+          echo "$n test files"
+
+      - name: Test the engine
+        run: go test -count=1 -race -timeout 300s ./...
+
+      - name: Test the manager
+        run: bash tests/run.sh
+
+      - name: It must still compile for both architectures, offline
+        run: |
+          for arch in amd64 arm64; do
+            GOPROXY=off GOOS=linux GOARCH="$arch" CGO_ENABLED=0 \
+              go build -o /dev/null ./cmd/pingify
+          done
+
+  # Pingify.sh is the product and it is built from parts/ by hand, so a commit
+  # that changes a part without rebuilding ships the old manager - which
+  # nobody notices until a server has it. The build is deterministic, so the
+  # committed file and a fresh build are compared byte for byte.
+  script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Two files carry the version by hand and both must say the same
+        run: |
+          a="$(grep -m1 '^PINGIFY_VERSION=' parts/00-ui.sh | cut -d'"' -f2)"
+          b="$(grep -m1 '^const version = ' cmd/pingify/main.go | cut -d'"' -f2)"
+          [ "$a" = "$b" ] || { echo "manager $a, engine $b"; exit 1; }
+          echo "both say $a"
+
+      # The engine's sources are gitignored - Pingify.sh is the only copy in
+      # the repository - so a bare checkout has no cmd/ or internal/ and
+      # build.sh cannot run at all. They are taken back out of the committed
+      # script first, with the tests laid over them, exactly as the release
+      # does. What that leaves this job proving is that the shell half of
+      # Pingify.sh matches parts/, which is the half a person edits by hand
+      # and the one that gets committed without a rebuild.
+      - name: The committed script must be what parts/ builds
+        run: |
+          PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
+          cp -r tests/_engine/internal tests/_engine/cmd . 2>/dev/null || true
+          cp Pingify.sh /tmp/committed.sh
+          bash build.sh >/dev/null
+          if ! cmp -s /tmp/committed.sh Pingify.sh; then
+            echo "Pingify.sh is not what parts/ builds - run build.sh and commit the result"
+            diff <(head -c 200000 /tmp/committed.sh) <(head -c 200000 Pingify.sh) | head -40
+            exit 1
+          fi
+          echo "the committed script is a byte for byte rebuild of parts/"

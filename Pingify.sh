@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.0.2"
+PINGIFY_VERSION="1.1.0"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -691,6 +691,25 @@ v_mtu() {
     case $1 in '' | *[!0-9]*) echo "an mtu is a number"; return 1 ;; esac
     { [ "$1" -ge 576 ] && [ "$1" -le 9000 ]; } ||
         { echo "the core takes 576 to 9000; 1320 is what works on most paths"; return 1; }
+}
+
+# The AmneziaWG link this core runs inside. One number, in one place: the
+# link MTU written into the file, and the tun MTU derived from it. On the awg
+# device every packet is 20 of IP, 8 of UDP and 12 of framer over what the
+# tun device hands up - and 4 more when parity is on, which can be switched on
+# later without anybody revisiting the MTU. So the tun MTU is the link less
+# 44, always. It was a literal 1280 beside a literal 1320, right by 4 bytes
+# of luck and unchecked against anything.
+AWG_LINK_MTU=1320
+awg_tun_mtu() { echo $((AWG_LINK_MTU - 44)); }
+# The wizard writes the cautious number, which holds with parity on or off.
+# What is accepted is the real ceiling with parity off, because every
+# AmneziaWG tunnel from before 1.1.0 runs at exactly that; turning parity on
+# for one of those is refused by the core with the number to set instead.
+v_mtu_awg() {
+    v_mtu "$1" || return 1
+    [ "$1" -le "$((AWG_LINK_MTU - 40))" ] ||
+        { echo "inside AmneziaWG the link is $AWG_LINK_MTU, so this is at most $((AWG_LINK_MTU - 40)), or $(awg_tun_mtu) with parity"; return 1; }
 }
 
 v_token() {
@@ -1642,7 +1661,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "1.0.2"
+const version = "1.1.0"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -1696,6 +1715,11 @@ func main() {
 		}
 		fmt.Printf("%s: good - %s side, %s mode, %s transport\n",
 			*cfgPath, cfg.Side, cfg.Mode, cfg.Transport.Type)
+		// Accepted, and worth a word: a key nothing reads for this transport
+		// is not an error, but somebody wrote it expecting something.
+		for _, k := range cfg.Inert() {
+			fmt.Println("  note: " + k + " is in the file, and nothing reads it for " + cfg.Transport.Type)
+		}
 		return
 	}
 	logging.SetLevel(cfg.Level)
@@ -1707,6 +1731,16 @@ func main() {
 	// and the bytes never come up here. All that is left to do is answer for
 	// it. See internal/kernel.
 	if cfg.Transport.Type == "grefou" {
+		// And it does not get fq on the way out, which every other transport
+		// asks for. That looked like an oversight and was measured before
+		// being fixed: on the pair, eight streams over a GRE FOU link,
+		// fq_codel carried 951, 928 and 955 Mbit/s against fq's 945, 494 and
+		// 903, with the round trip identical to a tenth of a millisecond
+		// either way. fq is worth twenty per cent to a carrier this process
+		// writes packets from, because it spaces out bursts this process
+		// makes. Nothing here makes a burst: the kernel moves the packets and
+		// the TCP inside the tunnel has already paced them. See
+		// docs/measured.md section 36.
 		watchKernel(cfg)
 		return
 	}
@@ -2196,11 +2230,18 @@ const (
 	//	      64             2.870%               129.8 Mbit/s
 	//	       1             0.000%               170.6
 	//
-	// That measurement was taken before fq went on the way out. fq spaces a
-	// socket's packets for us, so a batch of thirty-two is no longer thirty-two
-	// packets at line rate - it is thirty-two packets handed to a queue that
-	// releases them evenly. The burst the path was policing does not reach the
-	// path any more, and what a batch of one was buying is gone with it.
+	// That measurement was taken before fq went on the way out, and the one
+	// below after it - with no loss at a batch of thirty-two where sixty-four
+	// had lost nearly three per cent. What changed between them is measured.
+	// Why is not.
+	//
+	// This comment used to say why: fq spaces a socket's packets, so a batch
+	// is released evenly and the burst never reaches the path. fq does that
+	// only for a socket with a pacing rate, and with tuning.pace_mbit at 0 -
+	// which is what every config writes - these sockets have none, so fq
+	// sends one flow's batch out back to back. Thirty-two against sixty-four
+	// is a smaller burst; the path may be different; fq's queue may absorb
+	// what the policer used to catch. Any of those, not the evenness.
 	//
 	// What it was costing was the download. A batch of one is one read from the
 	// device and one sendmmsg of a single packet, thirty-five thousand times a
@@ -2293,7 +2334,16 @@ func (r *batchReader) read(rc syscall.RawConn) (int, error) {
 }
 
 // packet returns the i'th datagram of the batch and the address it came from.
+//
+// A datagram larger than the buffer arrives cut short, with MSG_TRUNC in its
+// flags and msg_len saying only what fitted. Handed on as it was, the part
+// that fitted looked like a whole packet - and whatever read it next would
+// take a torn one for a real one. It comes back empty instead, which every
+// handler already refuses as too short to be anything.
 func (r *batchReader) packet(i int) ([]byte, [4]byte) {
+	if r.msgs[i].hdr.Flags&syscall.MSG_TRUNC != 0 {
+		return r.bufs[i][:0], r.sas[i].Addr
+	}
 	return r.bufs[i][:r.msgs[i].len], r.sas[i].Addr
 }
 
@@ -2323,13 +2373,26 @@ func newBatchWriter() *batchWriter {
 // write sends the given packets to one address, and reports how many the
 // kernel took. A short count is not an error: the caller keeps the rest for
 // the next crossing rather than throwing them away.
+//
+// The port is left at zero, which is what a raw socket - GRE, ICMP, raw TCP -
+// expects: the kernel ignores it there. A UDP socket does not, and uses
+// writeTo.
 func (w *batchWriter) write(rc syscall.RawConn, pkts [][]byte, to [4]byte) (int, error) {
+	return w.writeTo(rc, pkts, to, 0)
+}
+
+// writeTo is write with a port, for a socket where the port is part of the
+// address. sockaddr_in keeps it in network byte order, and both
+// architectures this file builds for are little-endian, so it is swapped.
+func (w *batchWriter) writeTo(rc syscall.RawConn, pkts [][]byte, to [4]byte, port int) (int, error) {
 	n := len(pkts)
 	if n > len(w.msgs) {
 		n = len(w.msgs)
 	}
+	be := uint16(port)<<8 | uint16(port)>>8
 	for i := 0; i < n; i++ {
 		w.sas[i].Addr = to
+		w.sas[i].Port = be
 		w.iovs[i].Base = &pkts[i][0]
 		w.iovs[i].Len = uint64(len(pkts[i]))
 	}
@@ -2417,6 +2480,10 @@ type batchWriter struct{}
 func newBatchWriter() *batchWriter { return &batchWriter{} }
 
 func (w *batchWriter) write(rc syscall.RawConn, pkts [][]byte, to [4]byte) (int, error) {
+	return 0, errNoBatch
+}
+
+func (w *batchWriter) writeTo(rc syscall.RawConn, pkts [][]byte, to [4]byte, port int) (int, error) {
 	return 0, errNoBatch
 }
 PINGIFY_GO_SOURCE_EOF
@@ -3540,7 +3607,7 @@ func newFallbackCarrier(cfg *config.Config) (*streamCarrier, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		prepStream(nc)
+		prepStream(nc, notsentLowat(cfg))
 		// The connect had a timeout; the handshake needs one of its own.
 		_ = nc.SetDeadline(time.Now().Add(streamDialWait))
 		u, err := f.hello(nc)
@@ -4588,6 +4655,7 @@ type greCarrier struct {
 	seq atomic.Uint32
 	// The window is fed by every reader and read by the status goroutine.
 	seenMu sync.Mutex
+	peerMu sync.Mutex // around a change of peer; see learnPeer
 	learn  bool
 	seen   *buf.ReplayWindow
 
@@ -4602,6 +4670,7 @@ type greCarrier struct {
 
 	rc      syscall.RawConn
 	batched bool
+	readers int // goroutines reading the socket, one per core up to four
 
 	sawIPHeader sync.Once
 	done        chan struct{}
@@ -4659,20 +4728,49 @@ func newGRECarrier(cfg *config.Config) (*greCarrier, error) {
 	if canBatch {
 		if rc, err := pc.SyscallConn(); err == nil {
 			c.rc, c.batched = rc, true
-			logging.Info("carrier: packet i/o, up to %d in and %d out per crossing into the kernel",
-				recvBatch, sendBatch)
+			c.readers = readerCount()
+			// What this carrier will actually send in one call, which is
+			// its burst and not the most the batch writer could hold.
+			logging.Info("carrier: packet i/o, up to %d in and %d out per crossing into the kernel, %d reading",
+				recvBatch, min(c.burst, sendBatch), c.readers)
 		}
 	}
 	return c, nil
 }
 
 func (c *greCarrier) setPeer(ip net.IP) {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	c.storePeer(ip)
+}
+
+// storePeer is setPeer for a caller that already holds peerMu.
+func (c *greCarrier) storePeer(ip net.IP) {
 	v4 := ip.To4()
 	if v4 == nil {
 		return
 	}
 	c.peer.Store(&net.IPAddr{IP: append(net.IP(nil), v4...)})
 	c.peer4.Store(binary.BigEndian.Uint32(v4))
+}
+
+// learnPeer moves the peer to where a packet came from, if it is not there
+// already, and says whether it moved.
+//
+// The check and the two stores happen under one lock. With one reader they
+// never raced. With one per core reading the same socket, two packets from two
+// addresses could each find the old peer, and the two stores below could
+// interleave into peer from one of them and peer4 from the other - so the
+// carrier would compare against one address and send to another. The fast
+// path in handle still checks without the lock; only a change takes it.
+func (c *greCarrier) learnPeer(from [4]byte, v uint32) bool {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	if c.peer4.Load() == v {
+		return false
+	}
+	c.storePeer(net.IPv4(from[0], from[1], from[2], from[3]))
+	return true
 }
 
 func (c *greCarrier) Burst() int      { return c.burst }
@@ -4804,7 +4902,54 @@ func (s *grePlainSender) Send(bps []*[]byte) {
 	}
 }
 
+// Run reads the socket until it closes, in batches, the way ICMP does: until
+// 1.1.0 this read one packet per call although the batched path was set up.
+//
+// One reader per core, up to four, on the one socket. They do not make the
+// system call at the same time - Go takes the descriptor's read lock inside
+// RawConn.Read, so the recvmmsg calls happen one after another - but what
+// each does with its batch afterwards, the tag, the replay window and the
+// write towards the device, overlaps with the next reader's call. That is the
+// part that was one core's worth on its own. recvmmsg hands each caller its
+// own datagrams, so nothing is read twice, and handle is safe from all of them:
+// the replay window has its lock, a change of peer has another, and the rest
+// is atomic.
 func (c *greCarrier) Run() {
+	if c.batched {
+		var wg sync.WaitGroup
+		for i := 0; i < c.readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				c.runBatched()
+			}()
+		}
+		wg.Wait()
+		return
+	}
+	c.runPlain()
+}
+
+func (c *greCarrier) runBatched() {
+	r := newBatchReader(greReadBuf)
+	for {
+		n, err := r.read(c.rc)
+		for i := 0; i < n; i++ {
+			b, from := r.packet(i)
+			c.handle(b, from)
+		}
+		if err != nil {
+			select {
+			case <-c.done:
+			default:
+				logging.Warn("carrier: gre read: %v", err)
+			}
+			return
+		}
+	}
+}
+
+func (c *greCarrier) runPlain() {
 	buf := make([]byte, greReadBuf)
 	for {
 		n, from, err := c.pc.ReadFromIP(buf)
@@ -4866,8 +5011,7 @@ func (c *greCarrier) handle(b []byte, from [4]byte) {
 	// and nowhere else, and the side that dials never moves off the address
 	// it was given: one forged packet must not redirect the tunnel.
 	v := binary.BigEndian.Uint32(from[:])
-	if c.learn && v != 0 && c.peer4.Load() != v {
-		c.setPeer(net.IPv4(from[0], from[1], from[2], from[3]))
+	if c.learn && v != 0 && c.peer4.Load() != v && c.learnPeer(from, v) {
 		logging.Info("carrier: the far end is at %d.%d.%d.%d", from[0], from[1], from[2], from[3])
 	}
 
@@ -4942,9 +5086,10 @@ import (
 // ICMP: the transport that works on the path this tunnel was built for.
 //
 // Not the fallback. On the route between the Iran server and Frankfurt, UDP
-// gets six packets back and then nothing - on every port, from every source
-// port, for ever. ICMP gets all of them. That is the whole reason this exists
-// and the reason it is worth being careful with.
+// got six packets back and then nothing - on every port, from every source
+// port (docs/measured.md section 15). ICMP got all of them. That is the whole
+// reason this exists and the reason it is worth being careful with. UDP
+// carries on that route now (section 21); nothing says it will keep doing so.
 //
 // Both ends send echo *requests*, type 8, and both accept either type. This is
 // the single fact that took longest to find, and it is worth writing down
@@ -4998,6 +5143,7 @@ type icmpCarrier struct {
 	// the name to look up again; empty on the side that waits
 	dialName string
 	peer4    atomic.Uint32 // the same address as a number, to compare per packet
+	peerMu   sync.Mutex    // around a change of peer; see learnPeer
 
 	onPacket atomic.Pointer[func([]byte)]
 
@@ -5070,8 +5216,10 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 		if rc, err := pc.SyscallConn(); err == nil {
 			c.rc, c.batched = rc, true
 			c.readers = readerCount()
+			// What this carrier will actually send in one call, which is
+			// its burst and not the most the batch writer could hold.
 			logging.Info("carrier: packet i/o, up to %d in and %d out per crossing into the kernel, %d reading",
-				recvBatch, sendBatch, c.readers)
+				recvBatch, min(c.burst, sendBatch), c.readers)
 		} else {
 			logging.Warn("carrier: no raw access to the socket (%v): one call per packet", err)
 		}
@@ -5082,12 +5230,38 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 }
 
 func (c *icmpCarrier) setPeer(ip net.IP) {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	c.storePeer(ip)
+}
+
+// storePeer is setPeer for a caller that already holds peerMu.
+func (c *icmpCarrier) storePeer(ip net.IP) {
 	v4 := ip.To4()
 	if v4 == nil {
 		return
 	}
 	c.peer.Store(&net.IPAddr{IP: append(net.IP(nil), v4...)})
 	c.peer4.Store(uint32(v4[0])<<24 | uint32(v4[1])<<16 | uint32(v4[2])<<8 | uint32(v4[3]))
+}
+
+// learnPeer moves the peer to where a packet came from, if it is not there
+// already, and says whether it moved.
+//
+// The check and the two stores happen under one lock. With one reader they
+// never raced. With one per core reading the same socket, two packets from two
+// addresses could each find the old peer, and the two stores below could
+// interleave into peer from one of them and peer4 from the other - so the
+// carrier would compare against one address and send to another. The fast
+// path in handle still checks without the lock; only a change takes it.
+func (c *icmpCarrier) learnPeer(from [4]byte, v uint32) bool {
+	c.peerMu.Lock()
+	defer c.peerMu.Unlock()
+	if c.peer4.Load() == v {
+		return false
+	}
+	c.storePeer(net.IPv4(from[0], from[1], from[2], from[3]))
+	return true
 }
 
 func (c *icmpCarrier) Burst() int      { return c.burst }
@@ -5327,8 +5501,7 @@ func (c *icmpCarrier) handle(b []byte, from [4]byte) {
 	// The tag was right, so this is the far end, wherever it is speaking from.
 	// The side that waits learns the address here and nowhere else.
 	v := uint32(from[0])<<24 | uint32(from[1])<<16 | uint32(from[2])<<8 | uint32(from[3])
-	if v != 0 && c.peer4.Load() != v {
-		c.setPeer(net.IPv4(from[0], from[1], from[2], from[3]))
+	if v != 0 && c.peer4.Load() != v && c.learnPeer(from, v) {
 		logging.Info("carrier: the far end is at %d.%d.%d.%d", from[0], from[1], from[2], from[3])
 	}
 
@@ -5586,7 +5759,6 @@ import (
 
 	kcp "github.com/xtaci/kcp-go/v5"
 
-	"pingify/internal/buf"
 	"pingify/internal/config"
 	"pingify/internal/logging"
 )
@@ -5629,6 +5801,14 @@ const (
 	// limit instead - no idle time left - and 8192 only spent memory it did
 	// not have. Acknowledging every packet at once instead of once per tick
 	// took four streams from 807 to 411 and started dropping, so it is off.
+	//
+	// Neither is a profile's to move, and that was considered and turned
+	// down on this table rather than measured again: the window is a ceiling
+	// on one stream's rate, so a "gaming" window of 1536 would hold a single
+	// download to about 130 Mbit/s for a queue that section 35 of
+	// docs/measured.md found does not form; and acknowledging at once is the
+	// row above. What a profile moves on KCP is the receive buffer's floor
+	// and parity, and nothing else.
 	kcpInterval = 10
 	kcpWindow   = 4096
 
@@ -5638,25 +5818,8 @@ const (
 	// and eight megabytes dropped none.
 	kcpRcvBufKB = 8192
 
-	// The largest frame on a KCP connection, eight times TCP's.
-	//
-	// What a KCP connection costs is not the bytes but the writes. kcp-go
-	// flushes on every one, and a flush walks the whole window of in-flight
-	// segments under the session's lock - profiled on the sending server
-	// during one download, seventy per cent of the process was that walk,
-	// once per two kilobyte record. The path was not the limit: of 473,872
-	// packets sent, 473,435 arrived. A record eight times the size is an
-	// eighth of the flushes for the same bytes. Measured against each other,
-	// run in turn, fifteen seconds each:
-	//
-	//	              one download   four at once   upload   iran memory
-	//	2 KB records    256 Mbit/s     680            212      88 MB
-	//	16 KB           297            795            198      71
-	//
-	// Time to first byte did not move (81 ms either way), because a record is
-	// only as large as what the local socket had to give when it was read.
-	// 32 KB was no better than 16, and the buffer pool has a size for 16.
-	kcpFrame = buf.BigSize
+	// The record size is streamMaxFrame, the same as every stream carrier's;
+	// the measurement that moved it to 16 KB is beside that constant.
 
 	kcpGreetLen = 8
 )
@@ -5704,7 +5867,6 @@ func newKCPCarrier(cfg *config.Config) (*streamCarrier, error) {
 		}
 		return nil, err
 	}
-	c.frame = kcpFrame
 
 	if !cfg.Dials() {
 		// The answer to a keepalive is what lets the side that dials tell a
@@ -5940,11 +6102,16 @@ import (
 // fq on its own needs no number and cannot be set too low.
 const soMaxPacingRate = 47
 
-// fqFlowFactor turns the profile's queue depth into fq's per-flow limit. The
-// profile is written for one tunnel's queue; fq counts one flow, and the whole
-// tunnel is that one flow. Ten times over is past anything measured here and
-// still a bounded queue - at the balanced profile it is nine thousand packets,
-// about twelve megabytes, which the tunnel never reaches.
+// fqFlowFactor turns tuning.queue_packets into fq's per-flow limit. The key is
+// written for one tunnel's queue; fq counts one flow, and the whole tunnel is
+// that one flow. Ten times over is past anything measured here and still a
+// bounded queue - at the shipped depth it is nine thousand packets, about
+// twelve megabytes, which the tunnel never reaches.
+//
+// "Never reaches" is measured, not assumed: sixteen streams at 621 Mbit/s put
+// 2.68 GB past this qdisc and it dropped none of it. The factor stays because
+// without it the depth was 900, and at 900 this qdisc threw away 8799 of our
+// own packets and the health check blamed the path for them.
 const fqFlowFactor = 10
 
 // egressInterface is the one the default route leaves by, read from the
@@ -6000,8 +6167,43 @@ func smoothTheWire(cfg *config.Config) {
 
 var smoothOnce sync.Once
 
+// egressFor is the interface this tunnel's packets leave by: the route to
+// the far end, and the default route only when that cannot be found. The two
+// differ on exactly the topology this manager was built around - a server
+// that reaches its peer over another tunnel - and fq on the wrong one is the
+// whole machine's queue changed for a tunnel that leaves somewhere else. Not
+// for AmneziaWG: its packets go into the awg device and leave the machine as
+// that device's traffic, on the default route.
+func egressFor(cfg *config.Config) string {
+	if cfg.Transport.Type != "awg" {
+		if dev := routeTo(cfg.PeerHost()); dev != "" {
+			return dev
+		}
+	}
+	return egressInterface()
+}
+
+// routeTo asks the kernel which interface a packet to host would leave by.
+func routeTo(host string) string {
+	ip, err := net.ResolveIPAddr("ip4", host)
+	if err != nil || ip == nil || ip.IP == nil {
+		return ""
+	}
+	out, err := exec.Command("ip", "-o", "route", "get", ip.IP.String()).Output()
+	if err != nil {
+		return ""
+	}
+	f := strings.Fields(string(out))
+	for i, w := range f {
+		if w == "dev" && i+1 < len(f) {
+			return f[i+1]
+		}
+	}
+	return ""
+}
+
 func smoothTheWireNow(cfg *config.Config) {
-	dev := egressInterface()
+	dev := egressFor(cfg)
 	if dev == "" {
 		logging.Debug("could not tell which interface leaves this machine; not touching the queue")
 		return
@@ -6033,6 +6235,27 @@ func smoothTheWireNow(cfg *config.Config) {
 		logging.Info("carrier: %s already spaces packets the way this wants", dev)
 		return
 	}
+	// Only over a queue nobody chose.
+	//
+	// This replaced whatever it found. On a machine that is only a tunnel that
+	// is what you want - the distribution's default is not a decision anybody
+	// made. But an operator who has built an HTB or a cake tree on this
+	// interface has made one, and `tc qdisc replace ... root fq` takes every
+	// class and filter hanging under it away without an error, on a core
+	// restart, months after they set it up. A multiqueue card's `mq` root is
+	// the same kind of loss in a different shape: replacing it collapses the
+	// per-hardware-queue qdiscs onto one lock, on exactly the busy server most
+	// likely to have other work on it.
+	//
+	// So: replace a default, and never a choice. Anything unrecognised is
+	// somebody's, and gets a line in the journal saying what would have been
+	// done instead - which is also how they turn it on deliberately.
+	if !defaultQdisc(was) {
+		logging.Warn("carrier: %s already has a queue somebody chose (%s) - leaving it alone."+
+			" For fq, which is worth about twenty per cent here, set it yourself:"+
+			" tc qdisc replace dev %s root fq flow_limit %s", dev, qdiscKind(was), dev, limit)
+		return
+	}
 
 	// What the depth is worth, measured at the profile's own numbers when
 	// this was the flow limit directly and the tunnel was hitting it:
@@ -6043,8 +6266,14 @@ func smoothTheWireNow(cfg *config.Config) {
 	//	  1200      461.6        251.0       104.2 / 127.7
 	//	  1500      451.5        254.3       111.6 / 127.3
 	//
-	// tuning.queue_packets still moves it, ten times over, and the profile
-	// still means what that table says about latency against throughput.
+	// That table no longer describes what ships, and this comment used to say
+	// it did. Every profile sets the same depth now, because measured again on
+	// the same pair in September 2026 fq dropped none of 2.68 GB at any of
+	// them - and at the download profile the limit asked for was 15000 on a
+	// qdisc whose own limit is 10000, which cannot be reached at all. The
+	// table above is kept because it is the evidence for the one end of the
+	// range that still matters: too shallow and fq throws away the burst it
+	// was put here to space out. docs/measured.md section 35.
 	args := []string{"qdisc", "replace", "dev", dev, "root", "fq", "flow_limit", limit}
 	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
 		logging.Warn("carrier: could not put fq on %s (%v: %s) - packets will leave in bursts"+
@@ -6131,6 +6360,46 @@ import "net"
 
 func attachPortFilter(net.PacketConn, uint16) error { return errNoFilter }
 PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/qdisc.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package carrier
+
+import "strings"
+
+// Reading what is already on an interface, so that smoothTheWireNow can
+// replace a default and never a choice. No build tag: these are two string
+// functions, and the rule they encode is worth a test that runs everywhere
+// rather than only where tc exists.
+
+// qdiscKind is the first word after "qdisc" - the name of the discipline, with
+// none of the parameters after it.
+func qdiscKind(line string) string {
+	f := strings.Fields(line)
+	for i, w := range f {
+		if w == "qdisc" && i+1 < len(f) {
+			return f[i+1]
+		}
+	}
+	return "something this does not recognise"
+}
+
+// defaultQdisc reports whether what is on the interface is a default rather
+// than a decision. fq_codel is what systemd sets on most distributions,
+// pfifo_fast is what the kernel sets without it, noqueue is a device with no
+// queue of its own, and fq is either ours from an earlier start or the default
+// on a host somebody tuned for BBR.
+//
+// mq is missing from that list on purpose. It is a default too - a multiqueue
+// card gets it without anyone asking - but replacing it is not free: it
+// collapses one qdisc per hardware queue onto a single root and its lock. So
+// it is treated as a choice, and left alone.
+func defaultQdisc(line string) bool {
+	switch qdiscKind(line) {
+	case "fq_codel", "pfifo_fast", "noqueue", "fq":
+		return true
+	}
+	return false
+}
+PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/rawtcp.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 package carrier
 
@@ -6178,6 +6447,12 @@ const (
 	rawTCPHdrLen = 20   // no options: a plain header, which is what a data segment carries
 	rawTCPMax    = 1480 // 1500 on the path, less the outer IP header
 	rawTCPRead   = 2048
+
+	// How far back a segment may be and still count as reordered rather than
+	// as the far end starting over. Sixteen megabytes: the path reorders
+	// within a handful of packets, and a restart lands anywhere in four
+	// gigabytes of sequence space.
+	rawTCPAckWindow = 1 << 24
 
 	tcpFlagACK = 0x10
 	tcpFlagPSH = 0x08
@@ -6271,6 +6546,8 @@ func newRawTCPCarrier(cfg *config.Config) (*rawTCPCarrier, error) {
 	if canBatch {
 		if rc, err := pc.SyscallConn(); err == nil {
 			c.rc, c.batched = rc, true
+			logging.Info("carrier: packet i/o, up to %d in and %d out per crossing into the kernel, one reading",
+				recvBatch, min(c.burst, sendBatch))
 		}
 	}
 	return c, nil
@@ -6471,7 +6748,40 @@ func (s *rawTCPPlain) Send(bps []*[]byte) {
 	}
 }
 
+// Run reads the socket until it closes - in batches where the platform has
+// recvmmsg, which is the path this carrier set up from the start and never
+// used for reading.
+//
+// One reader, where ICMP and GRE have one per core. The acknowledgement
+// number in the header this carrier makes up is taken from the last segment
+// read, and two readers finishing out of order would send it backwards. On
+// most transports that would be nothing; on this one it is the thing a
+// stateful box in the middle looks at, and looking like ordinary TCP to that
+// box is the whole reason the transport exists.
 func (c *rawTCPCarrier) Run() {
+	if !c.batched {
+		c.runPlain()
+		return
+	}
+	r := newBatchReader(rawTCPRead)
+	for {
+		n, err := r.read(c.rc)
+		for i := 0; i < n; i++ {
+			b, from := r.packet(i)
+			c.handle(b, from)
+		}
+		if err != nil {
+			select {
+			case <-c.done:
+			default:
+				logging.Warn("carrier: raw tcp read: %v", err)
+			}
+			return
+		}
+	}
+}
+
+func (c *rawTCPCarrier) runPlain() {
 	b := make([]byte, rawTCPRead)
 	for {
 		n, from, err := c.pc.ReadFromIP(b)
@@ -6491,6 +6801,15 @@ func (c *rawTCPCarrier) Run() {
 			return
 		}
 	}
+}
+
+// ackAfter is what to acknowledge once a segment ending at next has arrived,
+// given what is acknowledged now. See handle for why each case is what it is.
+func ackAfter(was, next uint32) uint32 {
+	if d := int32(next - was); was != 0 && d <= 0 && d > -rawTCPAckWindow {
+		return was // reordered: keep acknowledging the later one
+	}
+	return next
 }
 
 func (c *rawTCPCarrier) handle(b []byte, from [4]byte) {
@@ -6517,14 +6836,34 @@ func (c *rawTCPCarrier) handle(b []byte, from [4]byte) {
 		return
 	}
 
-	// Their sequence plus what they sent is what we acknowledge next, which
-	// keeps the numbers in a capture consistent with each other.
-	their := binary.BigEndian.Uint32(b[4:8])
-	c.ack.Store(their + uint32(len(b)-off))
-
 	body, ok := c.fr.open(b[off:])
 	if !ok {
 		return
+	}
+
+	// Their sequence plus what they sent is what we acknowledge next, which
+	// keeps the numbers in a capture consistent with each other.
+	//
+	// Only after the frame has proved it is ours. This used to come first, so
+	// any segment on the right pair of ports - forged, or a stray from a
+	// scanner - set the number every one of our packets then carried. And only
+	// forwards: a segment the path reordered used to move it back, which is
+	// the one thing a box in the middle that tracks TCP is sure to notice.
+	//
+	// "Forwards" in sequence space, where numbers wrap. Two cases are not
+	// moving backwards even though the arithmetic says so: nothing stored yet
+	// - the far end's first sequence number is random, and half of them read
+	// as negative against zero - and a far end that restarted, whose numbers
+	// start again somewhere else entirely. A step back of less than a window
+	// is a reordered segment; anything further is a new sequence space.
+	their := binary.BigEndian.Uint32(b[4:8])
+	next := their + uint32(len(b)-off)
+	for {
+		was := c.ack.Load()
+		want := ackAfter(was, next)
+		if want == was || c.ack.CompareAndSwap(was, want) {
+			break
+		}
 	}
 	v := binary.BigEndian.Uint32(from[:])
 	if v != 0 && c.peer4.Load() != v {
@@ -6732,6 +7071,36 @@ func setUserTimeout(tc *net.TCPConn, d time.Duration) {
 	})
 }
 
+// setNotsentLowat is TCP_NOTSENT_LOWAT: how much this writer may leave sitting
+// in the socket unsent before the kernel stops taking more from it.
+//
+// It is not the send buffer cap, which was tried here and taken out again. That
+// one bounded sk_wmem_queued, which counts the retransmit queue too, so it
+// throttled what may be in flight. This counts only write_seq minus snd_nxt -
+// the part still waiting its turn on this machine. The congestion window is
+// untouched; only the queue standing in front of it is bounded.
+//
+// It matters because a forward tunnel pins each of its streams to one carrier
+// connection. What a small interactive record waits behind is whatever the
+// bulk stream sharing that connection has already parked, and left alone that
+// is a whole window - one round trip of that connection's share of the path,
+// eighty milliseconds here. This is the only queue in forward mode that a
+// profile can shorten: the socket buffers cannot be touched without turning
+// off the window auto-tuning this path needs (see prep, stream.go).
+func setNotsentLowat(tc *net.TCPConn, bytes int) {
+	if bytes <= 0 {
+		return
+	}
+	raw, err := tc.SyscallConn()
+	if err != nil {
+		return
+	}
+	const tcpNotsentLowat = 25 // TCP_NOTSENT_LOWAT
+	_ = raw.Control(func(fd uintptr) {
+		_ = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpNotsentLowat, bytes)
+	})
+}
+
 // markDSCP puts the configured mark on one TCP connection's packets. The
 // stream carriers hand their connections in wrapped - a TLS connection, a
 // WebSocket - so the socket underneath is asked for through NetConn where
@@ -6779,6 +7148,8 @@ func attachICMPFilter(pc net.PacketConn, id uint16) error { return errNoFilter }
 
 func setUserTimeout(tc *net.TCPConn, d time.Duration) {}
 
+func setNotsentLowat(tc *net.TCPConn, bytes int) {}
+
 func markDSCP(c net.Conn, dscp int) {}
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/stream.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
@@ -6820,7 +7191,30 @@ import (
 // inner one to a loss the outer one is already repairing. That is why UDP and
 // ICMP come first. A stream is for the path that carries nothing else.
 const (
-	streamMaxFrame = 2048 // an IP packet, the tun's headroom and ours
+	// The largest record on a stream connection, KCP's included.
+	//
+	// It was 2048 - an IP packet, the tun's headroom and ours - which is the
+	// right size for a private link and the wrong one for a stream of
+	// records, where what a record costs is not the bytes but the writes.
+	// KCP found that first: kcp-go flushes on every write and a flush walks
+	// the whole window under the session's lock, seventy per cent of the
+	// sending process in a profile. Measured against each other, run in turn,
+	// fifteen seconds each:
+	//
+	//	              one download   four at once   upload   iran memory
+	//	2 KB records    256 Mbit/s     680            212      88 MB
+	//	16 KB           297            795            198      71
+	//
+	// Time to first byte did not move (81 ms either way), because a record is
+	// only as large as what the local socket had to give when it was read.
+	// 32 KB was no better than 16, and the buffer pool has a size for 16.
+	//
+	// KCP took 16 KB for itself and the other five stayed at 2 KB, and that
+	// split had a cost of its own: failover takes the smallest MaxPayload of
+	// its members, so one 2 KB member put KCP's records back to 2 KB in
+	// exactly the group the menu builds. One number now, for all six. The
+	// TCP carriers' own figure is docs/measured.md section 39.
+	streamMaxFrame = buf.BigSize
 
 	streamRedialMin = 500 * time.Millisecond
 	streamRedialMax = 8 * time.Second
@@ -6840,6 +7234,44 @@ const (
 
 	helloLen = 4
 )
+
+// How much a writer may leave unsent on one carrier connection, by profile.
+//
+// Every stream of a forward tunnel is pinned to one connection, so this is the
+// queue a small record waits behind when a bulk one shares its slot. Left
+// alone the bound is the window: about four megabytes on this path, which at
+// four hundred megabits is eighty milliseconds of somebody else's download in
+// front of a keystroke.
+//
+// This is the whole of what a profile moves on the five transports that are
+// TCP underneath - tcp, ws, wss, utls, fallback. The socket buffers are not
+// available: naming a size turns off the receive window auto-tuning this path
+// needs, see prep below. fq's flow limit counts one TCP flow, which a forward
+// tunnel's eight connections never come near - and on the real pair fq dropped
+// none of 2.68 GB at any profile depth, so it was never a lever anyway. KCP is
+// not covered here: it is UDP underneath and never reaches prepStream.
+//
+// Balanced is 131072 because that is the number parts/70-host.sh already
+// writes as net.ipv4.tcp_notsent_lowat, so a server whose operator never
+// opened the Optimize screen now behaves like one who did. The per-socket
+// value wins over the sysctl, which is the point: it no longer depends on
+// somebody having found that screen.
+//
+// Measured, in docs/measured.md section 39, with a small request timed
+// through the tunnel while eight streams saturated it. 64 KB was the least
+// bad of three, 128 next, and 512 KB - which was going to be the download
+// profile's - left the small stream stalled past the probe's five second
+// limit in every round, for no throughput at all over 128. So download gets
+// 128 too: a profile that stalls every keystroke for nothing is not a
+// profile, whatever it is called. What this bounds is only the unsent queue,
+// never what is in flight; the writer is woken again at half of it, a third
+// of a millisecond of data at this path's rate, so 64 KB does not underfill.
+func notsentLowat(cfg *config.Config) int {
+	if cfg.Tuning.Profile == config.ProfileGaming {
+		return 64 << 10
+	}
+	return 128 << 10
+}
 
 // The first frame a dialler sends says which slot it is filling.
 //
@@ -7024,7 +7456,7 @@ func tcpOf(c net.Conn) *net.TCPConn {
 	return nil
 }
 
-func prepStream(c net.Conn) {
+func prepStream(c net.Conn, lowat int) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
 		return
@@ -7039,6 +7471,10 @@ func prepStream(c net.Conn) {
 	// it. Twenty seconds without an acknowledgement is long past anything
 	// this path does when it is working.
 	setUserTimeout(tc, streamUserTimeout)
+	// What a bulk stream may park in front of a small one on the connection
+	// they share. Without it the bound is the window, and a stream that is
+	// busy makes the one beside it wait for the whole of it.
+	setNotsentLowat(tc, lowat)
 }
 
 func (c *streamCarrier) Headroom() int   { return c.head + c.fr.headroom() }
@@ -7321,7 +7757,7 @@ func (c *streamCarrier) acceptForever() {
 // WebSocket handshake, a TLS handshake - and one silent client would
 // otherwise hold up every connection behind it.
 func (c *streamCarrier) take(nc net.Conn, seq uint64) {
-	prepStream(nc)
+	prepStream(nc, notsentLowat(c.cfg))
 	markDSCP(nc, c.cfg.Tuning.DSCP)
 	_ = nc.SetDeadline(time.Now().Add(streamDialWait))
 	up, fm, err := c.accept(nc)
@@ -7576,7 +8012,7 @@ func newTCPCarrier(cfg *config.Config) (*streamCarrier, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		prepStream(nc)
+		prepStream(nc, notsentLowat(cfg))
 		return nc, lenFraming{}, nil
 	}
 	c.accept = func(nc net.Conn) (net.Conn, framing, error) {
@@ -7729,6 +8165,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"pingify/internal/buf"
@@ -7765,9 +8202,14 @@ import (
 // WireGuard, an AmneziaWG, this carrier - gets its handshake through and then
 // stops.
 //
-// So UDP is not a slow transport on this path. It is an unusable one, and no
-// amount of tuning here changes that - which is why ICMP is the transport
-// worth making good rather than the fallback.
+// So UDP was not a slow transport on this path. It was an unusable one, and
+// no amount of tuning here would have changed that - which is why ICMP is the
+// transport this core was built around rather than the fallback.
+//
+// It did not stay that way. By 2026-09-16 the same pair carried UDP cleanly
+// (docs/measured.md section 21), and in September this carrier moved 600
+// Mbit/s between them. Nothing here says what stopped counting to six, or
+// whether it will start again - which is the other reason ICMP stays.
 //
 // This carrier stays anyway. It is what proved the shape the framer and the
 // private link now share, it is the one place to test a carrier without a raw
@@ -7791,6 +8233,11 @@ type udpCarrier struct {
 
 	done chan struct{}
 	once sync.Once
+
+	// The raw socket, for sendmmsg, and how many packets go in one crossing.
+	rc      syscall.RawConn
+	batched bool
+	burst   int
 
 	rxBytes, txBytes uint64
 	sendErrs         uint64
@@ -7821,9 +8268,7 @@ func newUDPCarrier(cfg *config.Config) (*udpCarrier, error) {
 		if config.IsName(cfg.DialHost()) {
 			c.dialName = net.JoinHostPort(cfg.DialHost(), fmt.Sprint(cfg.Transport.Port))
 		}
-		tuneSocket(pc, cfg)
-		smoothTheWire(cfg)
-		pace(pc, cfg)
+		c.prepare(cfg)
 		logging.Info("carrier: dialling %s over udp", raddr)
 		return c, nil
 	}
@@ -7833,16 +8278,58 @@ func newUDPCarrier(cfg *config.Config) (*udpCarrier, error) {
 		return nil, fmt.Errorf("listen on udp/%d: %v", cfg.Transport.Port, err)
 	}
 	c.pc = pc
-	tuneSocket(pc, cfg)
-	smoothTheWire(cfg)
-	pace(pc, cfg)
+	c.prepare(cfg)
 	logging.Info("carrier: waiting on udp/%d", cfg.Transport.Port)
 	return c, nil
 }
 
-// Burst is one: this carrier sends a packet per call, so there is nothing to
-// be gained by collecting them first.
-func (c *udpCarrier) Burst() int      { return 1 }
+// prepare does what both ends do to the socket once it exists: size it, put
+// fq on the way out, pace it, and get hold of the descriptor for sendmmsg.
+func (c *udpCarrier) prepare(cfg *config.Config) {
+	tuneSocket(c.pc, cfg)
+	smoothTheWire(cfg)
+	pace(c.pc, cfg)
+
+	c.burst = cfg.Tuning.SendBatch
+	if c.burst <= 0 {
+		c.burst = defaultSendBatch
+	}
+	// Not over AmneziaWG, whatever the file says. The first thing this
+	// carrier's packets meet there is the awg device, which has no fq on it,
+	// so a batch enters it as a burst at line rate - and it was measured, in
+	// docs/measured.md section 40: three rounds of batched against not, the
+	// upload up eight per cent at the median and the loss up two points, the
+	// rest within the noise. Not a reason to switch every AmneziaWG file from
+	// before 1.1.0 - all of which say send_batch = 32, which this carrier had
+	// always ignored - to batching at upgrade. One per call stays.
+	if cfg.Transport.Type == "awg" {
+		c.burst = 1
+	}
+	if c.burst > sendBatch {
+		c.burst = sendBatch
+	}
+	if !canBatch || c.burst <= 1 {
+		c.burst = 1
+		// Said either way, so the journal always shows which path this
+		// tunnel is on: the two are measured against each other, and a
+		// silent default is a reading nobody can check afterwards.
+		logging.Info("carrier: udp, one packet per crossing into the kernel")
+		return
+	}
+	rc, err := c.pc.SyscallConn()
+	if err != nil {
+		c.burst = 1
+		logging.Warn("carrier: no raw access to the udp socket (%v) - one packet per call", err)
+		return
+	}
+	c.rc, c.batched = rc, true
+	logging.Info("carrier: udp, up to %d out per crossing into the kernel", c.burst)
+}
+
+// Burst is how many packets the layer above may hand over at once. It only
+// ever hands over what is already waiting - a lone packet still goes the
+// moment it arrives - so a larger number costs no delay; see readQueue.
+func (c *udpCarrier) Burst() int      { return c.burst }
 func (c *udpCarrier) Headroom() int   { return c.fr.headroom() }
 func (c *udpCarrier) MaxPayload() int { return udpMaxDgram - c.fr.headroom() }
 
@@ -7869,16 +8356,89 @@ func (c *udpCarrier) lookAgain() {
 	}
 }
 
-// udpSender sends a batch one packet at a time. There is no sendmmsg here
-// because there is no point: this carrier is for paths where UDP works, and
-// those are not the paths where the last ten percent is being fought over.
+// udpSender sends a batch one packet at a time.
+//
+// This used to be the only sender, on the reasoning that UDP was for paths
+// where it worked and those were not the paths where the last ten per cent is
+// fought over. Both halves stopped being true: UDP carried 600 Mbit/s on the
+// Tehran pair in September 2026, and AmneziaWG runs this very carrier.
+//
+// It is still what a batch of one gets, and it is measured against the batch
+// sender below in docs/measured.md section 37: batching carried more on the
+// download in four pairs of four, on the upload in three of four, and lost
+// fewer packets in every pair that could be read.
 type udpSender struct{ c *udpCarrier }
 
-func (c *udpCarrier) NewSender() Sender { return &udpSender{c: c} }
+func (c *udpCarrier) NewSender() Sender {
+	if !c.batched {
+		return &udpSender{c: c}
+	}
+	return &udpBatchSender{c: c, w: newBatchWriter(), bufs: make([][]byte, 0, c.burst)}
+}
 
 func (s *udpSender) Send(bps []*[]byte) {
 	for _, bp := range bps {
 		_ = s.c.Send(bp)
+	}
+}
+
+// udpBatchSender puts a batch on the wire in one sendmmsg. It is the GRE
+// sender's shape with a port in the address, because on a UDP socket the
+// port is part of where a datagram goes.
+type udpBatchSender struct {
+	c    *udpCarrier
+	w    *batchWriter
+	bufs [][]byte
+}
+
+func (s *udpBatchSender) Send(bps []*[]byte) {
+	c := s.c
+	peer := c.peer.Load()
+	var to [4]byte
+	v4 := []byte(nil)
+	if peer != nil {
+		v4 = peer.IP.To4()
+	}
+	if v4 == nil {
+		// No peer yet, or one this socket cannot batch to. Nothing is lost by
+		// taking the slow way for it: the plain path knows what to do.
+		for _, bp := range bps {
+			_ = c.Send(bp)
+		}
+		return
+	}
+	copy(to[:], v4)
+
+	s.bufs = s.bufs[:0]
+	for _, bp := range bps {
+		b := *bp
+		if len(b) < c.fr.headroom() {
+			continue
+		}
+		c.fr.seal(b)
+		s.bufs = append(s.bufs, b)
+	}
+
+	// sendmmsg may take fewer than it was offered. What it did not take has
+	// not been sent, so it goes round again rather than being let go quietly.
+	out := s.bufs
+	for len(out) > 0 {
+		n, err := s.w.writeTo(c.rc, out, to, peer.Port)
+		if err != nil {
+			atomic.AddUint64(&c.sendErrs, 1)
+			logging.Debug("udp send batch: %v", err)
+			break
+		}
+		if n <= 0 {
+			break
+		}
+		for i := 0; i < n; i++ {
+			atomic.AddUint64(&c.txBytes, uint64(len(out[i])))
+		}
+		out = out[n:]
+	}
+	for _, bp := range bps {
+		buf.Put(bp)
 	}
 }
 
@@ -8076,7 +8636,7 @@ func newUTLSCarrier(cfg *config.Config) (*streamCarrier, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		prepStream(nc)
+		prepStream(nc, notsentLowat(cfg))
 		// The connect had a timeout; the handshake needs one of its own. A
 		// path that lets the SYN through and eats the TLS that follows -
 		// which is what these transports exist for - leaves a socket with
@@ -8254,7 +8814,7 @@ func newWebSocketCarrier(cfg *config.Config, kind string,
 		if err != nil {
 			return nil, nil, err
 		}
-		prepStream(nc)
+		prepStream(nc, notsentLowat(cfg))
 		// The connect had a timeout; the TLS and WebSocket handshakes that
 		// follow need one too, or a path that eats them holds this slot for
 		// ever with nothing for the kernel's timers to notice.
@@ -8680,9 +9240,20 @@ const (
 	// A single flow is shaped to nothing and sixteen together are not shaped
 	// at all, so a stream carrier that opens one connection carries 6 Mbit/s
 	// on a path that will carry seven hundred. This is the whole reason the
-	// old core had "carriers", and the number is what it is because that is
-	// where the measurement stopped improving.
-	DefaultConnections = 8
+	// old core had "carriers", and why the default is not one.
+	//
+	// Sixteen and not eight, since 1.1.0, for a different reason - and this
+	// one was measured, docs/measured.md section 39. A forward tunnel pins
+	// each stream to one connection, so eight bulk streams on eight
+	// connections leave none free, and a small stream that lands beside a
+	// bulk one waits behind everything that connection holds. Timed under
+	// eight saturating streams: with eight connections a small request
+	// answered in 280 to 340 ms at the median, in seconds at the ninetieth,
+	// and stalled outright in one round of three; with sixteen it answered
+	// in 151 to 166 ms in every round, with the ninetieth under 170 and the
+	// jitter under fifteen. The download over eight streams did not move.
+	// Sixteen is what eight bulk streams cannot fill.
+	DefaultConnections = 16
 
 	// The port the far end is asked on, over the private link. Fixed rather
 	// than configured, because both servers have to agree on it and there is
@@ -8802,6 +9373,11 @@ type Config struct {
 
 	Level string
 
+	// Every "table.key" the file had. So that -check can say which of them
+	// nothing reads for this transport - a line that is accepted and ignored
+	// is the same trap as a typo, only quieter.
+	seen map[string]bool
+
 	// AmneziaWG, when that is the transport.
 	//
 	// The core does not speak it and does not want to: it is obfuscated
@@ -8916,6 +9492,57 @@ func IsName(s string) bool { return isName(s) }
 // Over AmneziaWG it is neither: the carrier runs inside that link, so the far
 // end is its address on the link and the public addresses are the business of
 // awg-quick rather than of this.
+// PeerHost is the other server's public address: the one this tunnel's
+// packets go to, whichever end dials.
+func (c *Config) PeerHost() string {
+	if c.Side == SideIran {
+		return c.Transport.Kharej
+	}
+	return c.Transport.Iran
+}
+
+// Inert lists the keys the file has that nothing reads for its transport.
+// The file's promise is that what the tunnel runs with is what the file
+// says; a key the manager stopped writing can still arrive by hand, or from
+// a file written before it stopped, and this is how it is noticed. Only the
+// cases that were checked against the carriers are here - a wrong entry in
+// this table is worse than a missing one.
+func (c *Config) Inert() []string {
+	var out []string
+	inert := func(keys ...string) {
+		for _, k := range keys {
+			if c.seen[k] {
+				out = append(out, k)
+			}
+		}
+	}
+	t := c.Transport.Type
+	if t != "wss" && t != "utls" {
+		inert("transport.cert", "transport.key", "transport.insecure")
+	}
+	if t != "ws" && t != "wss" {
+		inert("transport.path")
+	}
+	if c.Mode == "tun" {
+		inert("transport.connections", "transport.listen_port")
+	}
+	switch t {
+	case "grefou":
+		inert("transport.keepalive_sec", "tuning.queue_packets", "tuning.rcvbuf_kb",
+			"tuning.sndbuf_kb", "tuning.send_batch", "tuning.pace", "tuning.pace_mbit",
+			"tuning.dscp", "tuning.fec", "tun.write_workers", "tun.queues")
+	case "tcp", "ws", "wss", "utls", "fallback":
+		inert("tuning.rcvbuf_kb", "tuning.sndbuf_kb", "tuning.send_batch", "tuning.pace_mbit", "tuning.fec")
+	case "kcp":
+		inert("tuning.send_batch", "tuning.pace_mbit")
+	case "gre":
+		inert("tuning.fec")
+	case "awg":
+		inert("tuning.send_batch")
+	}
+	return out
+}
+
 func (c *Config) DialHost() string {
 	if c.Transport.Type == "awg" {
 		if c.DialSide() == SideIran {
@@ -9030,6 +9657,10 @@ func parseTOML(text string, c *Config) error {
 // than a shrug: a typo in a config file that is silently ignored is a tunnel
 // that comes up with the wrong settings and no way to tell.
 func assign(c *Config, table, key, raw string) error {
+	if c.seen == nil {
+		c.seen = map[string]bool{}
+	}
+	c.seen[table+"."+key] = true
 	str := func() (string, error) { return unquote(raw) }
 	num := func() (int, error) { return strconv.Atoi(strings.Trim(raw, `"' `)) }
 	// A TOML array of strings: ["443", "udp:500"]. One line, quoted items,
@@ -9200,56 +9831,84 @@ func assign(c *Config, table, key, raw string) error {
 	return err
 }
 
-// The profiles, and the one number they move.
+// The profiles, and what is left for them to move.
 //
-// Everything else this tunnel tunes was measured to have one right answer
-// whatever it is carrying - the socket buffers, one packet per crossing into
-// the kernel, a pacing rate it works out for itself - so a profile that
-// changed those would be changing them for show.
+// They were built on one idea: a shallow queue is emptier when a small packet
+// arrives, so that packet waits less, and a deep one absorbs bursts and
+// carries more. The table that idea was measured on is in docs/measured.md
+// section 19, and it was true when it was taken.
 //
-// What genuinely trades is how deep a queue the kernel may hold for us. A deep
-// one absorbs bursts and carries more; a shallow one is emptier when a small
-// packet arrives, so that packet waits less. Measured on the real path,
-// restarted fresh at each depth:
+// It is not true now, and nothing went back to check when it stopped being.
+// Measured again on the same pair, September 2026 - the whole of it is in
+// docs/measured.md section 35:
 //
-//	profile     queue    16 streams   one stream   under load
-//	gaming        600     397 Mbit/s   167 Mbit/s   84.5 / 92.5 ms
-//	balanced      900     448          254          93.3 / 106.5
-//	download     1500     466          253         115.8 / 139.3
+//   - queue_packets reaches one place, fq's per-flow limit, ten times over.
+//     At the download profile that asks fq for 15000 packets on a qdisc whose
+//     own limit is 10000: `limit 10000p flow_limit 15000p`, read off the
+//     server. Unreachable by arithmetic, not by luck.
+//   - No depth drops anything. Sixteen streams at 621 Mbit/s put 1,949,990
+//     packets through a tun device set to txqueuelen 500, and it dropped none
+//     of them; fq dropped none of 2.68 GB. Both extremes, both loads, zero.
+//   - Under an eight stream download the round trip does not move: 74.6 ms
+//     quiet, 74.6 at the median and 75.7 at the ninety-ninth under load, with
+//     0.3 ms of jitter. There is no queue standing between a small packet and
+//     the wire for a profile to shorten.
 //
-// Gaming gives up a third of a single stream for nine milliseconds at the
-// median and fourteen at the ninetieth, which is the right trade when what
-// crosses the link is a game and the wrong one when it is a film. Download
-// buys eighteen megabits of aggregate for twenty-three milliseconds. Balanced
-// is not the average of the other two: it carries a single stream faster than
-// either and answers under load faster than flagtun does.
+// So the depth knobs are kept at one value each - deep enough that neither
+// queue drops, which is what the measurements say they already are - and the
+// profile no longer pretends to move them.
 //
-// The quiet round trip does not move at all - 81.0, 81.1, 81.2 - because an
-// empty queue is an empty queue however deep it was allowed to get. What a
-// profile changes is what happens when the link is busy, which is the only
-// time any of it is felt.
+// What a profile does move:
+//
+//   - On a private link, the receive queue: 3072 KB for download against
+//     256 KB for the other two. This one is kept on its old evidence - 458 and
+//     552 Mbit/s with a p90 of 125/156 ms, against 432 and 475 at 93/106 -
+//     because the attempt to measure it again could not settle it either way.
+//     Four harnesses, all with the transfer proved to be running under the
+//     probe, put the same tunnel at the same load anywhere between a p90 of
+//     75 ms and one of 225. What moved was where the probe's client ran and
+//     what else was on that processor, not the setting. Section 35 says what
+//     that rules out and what it does not.
+//   - On the five transports that are TCP underneath, how much a bulk stream
+//     may park in front of a small one on the connection they share - see
+//     notsentLowat in carrier/stream.go. That queue does exist, on every path,
+//     because a forward tunnel pins each of its streams to one connection.
+//
+// What it does not move, and why, so this is not re-litigated: tuning.dscp,
+// because twelve packets marked expedited left Frankfurt as 0xb8 and arrived
+// in Tehran as 0x18, every one of them re-marked.
 const (
 	ProfileGaming   = "gaming"
 	ProfileBalanced = "balanced"
 	ProfileDownload = "download"
 )
 
+// DefaultQueuePkts is how deep fq may let this tunnel's flow get, before the
+// factor of ten in carrier/pace_linux.go. It is one number for every profile
+// now: measured on the pair, fq dropped none of 2.68 GB at any of the three
+// depths the profiles used to set, so the depth was not a trade being made -
+// it was three numbers all safely past where anything happens. What it still
+// guards against is the other end of the range, where fq's own default of a
+// hundred packets would throw away the burst it was put there to space out.
+const DefaultQueuePkts = 900
+
 func (c *Config) profile() error {
-	depth, rcv := 0, 0
+	rcv := 0
 	switch strings.ToLower(strings.TrimSpace(c.Tuning.Profile)) {
 	case "":
 		c.Tuning.Profile = ProfileBalanced
-		depth, rcv = 900, 256
+		rcv = 256
 	case ProfileGaming:
-		depth, rcv = 600, 256
+		rcv = 256
 	case ProfileBalanced:
-		depth, rcv = 900, 256
+		rcv = 256
 	case ProfileDownload:
-		depth, rcv = 1500, 3072
+		rcv = 3072
 	default:
 		return fmt.Errorf("tuning.profile %q: it is %q, %q or %q",
 			c.Tuning.Profile, ProfileGaming, ProfileBalanced, ProfileDownload)
 	}
+	depth := DefaultQueuePkts
 
 	// The second thing a profile moves: how much the receiving socket may
 	// hold. It was three megabytes for every profile, on the grounds that the
@@ -9277,12 +9936,25 @@ func (c *Config) profile() error {
 	// the congestion signal arriving on time instead of a queue hiding it and
 	// charging fifty milliseconds for the favour. See tuneSocket for why the
 	// old reading of that counter no longer holds.
+	//
+	// An attempt to measure this again in September 2026 did not settle it.
+	// One harness had every depth answering under load exactly as fast as it
+	// answered quiet, to a tenth of a millisecond; another had the same tunnel
+	// at the same load three times worse at the ninetieth. The difference
+	// between harnesses was larger than the difference between 256 KB and
+	// 3072, so neither reading is evidence about the setting. The socket's own
+	// drop counter did stay at zero throughout.
+	//
+	// So this keeps the value the older table earned. What can be said without
+	// a timer: the core prints which buffer it got on every start, so anyone
+	// can check their own path rather than taking either table's word for it.
 	if c.Tuning.RcvBufKB == 0 {
 		c.Tuning.RcvBufKB = rcv
 	}
 
-	// An explicit depth wins. The profiles are three points on a line, and
-	// somebody measuring their own path may want a fourth.
+	// An explicit depth still wins. The profile no longer sets three of these
+	// - see DefaultQueuePkts - but somebody whose own path makes fq drop can
+	// still say so in the file.
 	if c.Tuning.QueuePkts == 0 {
 		c.Tuning.QueuePkts = depth
 		return nil
@@ -9376,14 +10048,20 @@ func (c *Config) check() error {
 			return fmt.Errorf("forward.bind_addr %q is not an address", c.Forward.BindAddr)
 		}
 	}
+	// The rule kcp had on its own, which was true of all six of them. A
+	// private link is datagrams, and datagrams on a reliable stream is TCP
+	// inside TCP: every loss the connection inside has to see arrives late
+	// instead of not at all, which is worse than losing it. Only kcp was
+	// refused; the other five came up and carried badly.
+	//
+	// Forwarding() rather than a second list, because a copy of "these carry
+	// streams" is the thing that drifts away from the original.
+	if c.Mode == "tun" && Forwarding(c.Transport.Type) {
+		return fmt.Errorf("transport.type %s carries streams, so it forwards ports:"+
+			" set tunnel.mode = \"forward\"", c.Transport.Type)
+	}
 	switch c.Transport.Type {
-	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp", "utls", "fallback":
-	case "kcp":
-		// A stream of streams, so it forwards ports; carrying a private link
-		// over it would be TCP inside a reliable stream again.
-		if c.Mode != "forward" {
-			return fmt.Errorf("transport.type kcp carries forwarded ports: set tunnel.mode = \"forward\"")
-		}
+	case "udp", "icmp", "tcp", "ws", "wss", "gre", "rawtcp", "utls", "fallback", "kcp":
 	case "grefou":
 		// The kernel's own GRE device, wrapped in UDP, which this process
 		// watches rather than carries. It is a private link and nothing else:
@@ -9423,6 +10101,28 @@ func (c *Config) check() error {
 	}
 	if c.Transport.Path != "" && !strings.HasPrefix(c.Transport.Path, "/") {
 		return fmt.Errorf("transport.path %q has to start with a slash", c.Transport.Path)
+	}
+	// A certificate is not opened until the carrier starts, and by then the
+	// only reader is the journal. -check is what the manager gates an edit on
+	// and what the health pass prints "the config is valid" from, so a
+	// certificate that a renewal moved away stayed invisible here until the
+	// tunnel would not come up.
+	if c.Transport.Cert != "" {
+		if c.Transport.Key == "" {
+			return fmt.Errorf("transport.cert is set with no transport.key: a certificate is served with its private key")
+		}
+		// Only the side that waits loads it, and only its absence is
+		// evidence. A live certbot directory is 0700, so a permission error
+		// is what a check run as anyone but root gets from a certificate that
+		// is perfectly fine - which is why this asks whether the file is
+		// there and not whether it can be read.
+		if !c.Dials() {
+			for _, f := range []string{c.Transport.Cert, c.Transport.Key} {
+				if _, err := os.Stat(f); os.IsNotExist(err) {
+					return fmt.Errorf("transport: %s is not there", f)
+				}
+			}
+		}
 	}
 	// Two of them have no ports at all: one rides in echo requests and the
 	// other is its own IP protocol. There is nothing to listen on and nothing
@@ -9483,6 +10183,27 @@ func (c *Config) check() error {
 	}
 	if c.TUN.MTU < 576 || c.TUN.MTU > 9000 {
 		return fmt.Errorf("tun.mtu %d is outside anything that works", c.TUN.MTU)
+	}
+	// Inside AmneziaWG every packet the tun device hands up gains 20 of IP,
+	// 8 of UDP and 12 of framer on the awg device, and 4 more with parity
+	// on. A tun MTU past that budget fragments on the link, silently, on
+	// every large packet. The manager derives the number; this is the
+	// backstop for a file that arrived some other way.
+	//
+	// The budget is the real one, not the cautious one the wizard writes.
+	// Every AmneziaWG file from before 1.1.0 says tun.mtu = 1280 inside a
+	// 1320 link, which fits exactly with parity off - and the first version
+	// of this check applied the parity bytes unconditionally and refused all
+	// of them at start. Caught on a lab tunnel the old wizard had built.
+	if c.Transport.Type == "awg" && c.AWG.MTU > 0 {
+		budget := 40
+		if c.Tuning.FEC > 0 {
+			budget += 4
+		}
+		if c.TUN.MTU > c.AWG.MTU-budget {
+			return fmt.Errorf("tun.mtu %d does not fit inside awg.mtu %d with parity %s: at most %d",
+				c.TUN.MTU, c.AWG.MTU, map[bool]string{true: "on", false: "off"}[c.Tuning.FEC > 0], c.AWG.MTU-budget)
+		}
 	}
 	if c.TUN.WriteWorkers < -1 || c.TUN.WriteWorkers > 8 {
 		return fmt.Errorf("tun.write_workers %d is outside -1..8", c.TUN.WriteWorkers)
@@ -9851,9 +10572,20 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 	if n < 1 {
 		n = 1
 	}
+	// In bytes, said in records. Sixty-four was measured at 2 KB records; a
+	// carrier with 16 KB ones would hold eight times as much in front of a
+	// small packet, and that is the 1.2 seconds above come back - measured
+	// again in 1.1.0, at 1185 ms, before this scaled. docs/measured.md 39.
+	depth := outDepth * 2048 / (car.MaxPayload() - hdrLen - offLen)
+	if depth > outDepth {
+		depth = outDepth
+	}
+	if depth < 4 {
+		depth = 4
+	}
 	f.out = make([]chan outRec, n)
 	for i := range f.out {
-		f.out[i] = make(chan outRec, outDepth)
+		f.out[i] = make(chan outRec, depth)
 	}
 	car.OnPacket(f.onRecord)
 	// A stream carrier says when one of its connections ends. A datagram
@@ -10425,7 +11157,7 @@ type stream struct {
 	// its window and waited for credit that was itself stuck behind the data
 	// it was meant to clear. TCP already does this correctly; doing it again
 	// above TCP only invents a way to get it wrong.
-	in     chan []byte
+	in     chan *[]byte
 	inEOF  chan struct{}
 	inOnce sync.Once
 
@@ -10481,7 +11213,7 @@ func (f *Forwarder) depth() int {
 func (f *Forwarder) newStream(id uint32, local net.Conn) *stream {
 	s := &stream{
 		id: id, f: f, local: local,
-		in:    make(chan []byte, f.depth()),
+		in:    make(chan *[]byte, f.depth()),
 		inEOF: make(chan struct{}),
 		done:  make(chan struct{}),
 	}
@@ -10492,16 +11224,22 @@ func (f *Forwarder) newStream(id uint32, local net.Conn) *stream {
 }
 
 // deliver is a record from the wire. The copy is not optional: the carrier
-// owns the buffer it handed us and reuses it the moment this returns. The
-// send blocks when the stream is backed up, which is the flow control - see
-// the note on stream.in.
+// owns the buffer it handed us and reuses it the moment this returns. It is
+// taken from the pool rather than allocated, because this runs on the
+// carrier's read goroutine and a full-rate download is tens of thousands of
+// records a second - each one used to be a fresh allocation for the
+// collector to find. No headroom: this buffer never goes back to the wire,
+// only to the local socket. The send blocks when the stream is backed up,
+// which is the flow control - see the note on stream.in.
 func (s *stream) deliver(b []byte) {
-	c := make([]byte, len(b))
-	copy(c, b)
+	bp := buf.Take(0, len(b))
+	copy(*bp, b)
 	select {
-	case s.in <- c:
+	case s.in <- bp:
 	case <-s.done:
+		buf.Put(bp)
 	case <-s.f.closing:
+		buf.Put(bp)
 	}
 }
 
@@ -10553,9 +11291,12 @@ func (s *stream) pumpOut() {
 // pumpIn writes what arrived into the local socket, in order, until the far
 // end half-closes or the stream ends.
 func (s *stream) pumpIn() {
-	writeOne := func(b []byte) bool {
+	// The one place a delivered buffer is given back, on both outcomes.
+	writeOne := func(bp *[]byte) bool {
 		_ = s.local.SetWriteDeadline(time.Now().Add(localWriteWait))
-		if _, err := s.local.Write(b); err != nil {
+		_, err := s.local.Write(*bp)
+		buf.Put(bp)
+		if err != nil {
 			s.f.record(cmdRST, s.id, []byte("local write failed"))
 			s.kill()
 			return false
@@ -10564,16 +11305,16 @@ func (s *stream) pumpIn() {
 	}
 	for {
 		select {
-		case b := <-s.in:
-			if !writeOne(b) {
+		case bp := <-s.in:
+			if !writeOne(bp) {
 				return
 			}
 		case <-s.inEOF:
 			// Whatever is still queued is ordered before the FIN it follows.
 			for {
 				select {
-				case b := <-s.in:
-					if !writeOne(b) {
+				case bp := <-s.in:
+					if !writeOne(bp) {
 						return
 					}
 					continue
@@ -12044,6 +12785,14 @@ func configureDevice(name, addr string, mtu, txqueuelen int) error {
 	// with an end to it, and the TCP inside reads a drop as the signal it is
 	// for, which is what keeps the queue short. tun.txqueuelen moves it, for
 	// a path that measures differently.
+	//
+	// Measured again in September 2026 and the device no longer drops at all:
+	// sixteen streams at 621 Mbit/s put 1,949,990 packets through it at
+	// txqueuelen 500, and 1,789,354 at 10000, with nothing dropped at either.
+	// The read path has become fast enough that the queue stops building, so
+	// this is one value for every profile now and not a thing a profile
+	// trades. The table stays because it is why the value is a thousand and
+	// not ten. docs/measured.md section 35.
 	if err := run("link", "set", "dev", name, "mtu", fmt.Sprint(mtu),
 		"txqueuelen", fmt.Sprint(txqueuelen), "up"); err != nil {
 		return err
@@ -34394,11 +35143,13 @@ grefou_key() {
 # grefou_up NAME - the device, the listener, the offload setting and the clamp.
 # A tunnel that is already up comes up again: the device is remade, and any route somebody put on it by hand goes with it.
 grefou_up() {
-    local name=$1 f dev port local_ip peer mtu addr ul
+    local name=$1 f dev port local_ip peer mtu qlen addr ul
     f=$(cfg_file "$name")
     dev=$(toml_get "$f" tun name)
     port=$(toml_get "$f" transport port)
     mtu=$(toml_get "$f" tun mtu)
+    qlen=$(toml_get "$f" tun txqueuelen)
+    case $qlen in '' | *[!0-9]*) qlen=1000 ;; esac
     [ -n "$mtu" ] || mtu=1400
     if [ "$(toml_get "$f" tunnel side)" = iran ]; then
         local_ip=$(toml_get "$f" transport iran)
@@ -34446,7 +35197,11 @@ grefou_up() {
         return 1
     fi
     ip addr add "$addr" dev "$dev" 2>/dev/null
-    ip link set "$dev" mtu "$mtu" up || {
+    # The file states a device queue; before this nothing applied it, so a
+    # GRE FOU tunnel was the one place the number in the file was not the
+    # number the device had. A thousand is what the kernel gives a gre device
+    # anyway, so this makes the file true without moving anything.
+    ip link set "$dev" mtu "$mtu" txqueuelen "$qlen" up || {
         fail "$dev would not come up"
         return 1
     }
@@ -34494,6 +35249,17 @@ grefou_dev_in_use() {
     return 1
 }
 
+# grefou_gro_owner DEV - the GRE FOU tunnel that has GRO off on DEV, so the
+# other tunnels on that interface can name it in their own health check.
+grefou_gro_owner() {
+    local dev=$1 n f
+    for n in $(grefou_tunnels); do
+        f=$STATE_DIR/$GREFOU_STATE_PREFIX.ul.$n
+        [ -f "$f" ] && [ "$(cat "$f" 2>/dev/null)" = "$dev" ] && { printf '%s' "$n"; return 0; }
+    done
+    return 0
+}
+
 # grefou_down NAME - undo all of it, and leave the interface as it was found.
 grefou_down() {
     local name=$1 f dev port peer ul
@@ -34531,9 +35297,10 @@ grefou_note() {
     dim "There is no token on the wire. The tunnel's key is there, in the clear,"
     dim "and it only tells two tunnels apart - anything that can forge the other"
     dim "server's address and knows the port is inside the tunnel. It also turns"
-    dim "generic receive offload off on this server's interface - everything"
-    dim "else here pays a little for that - and turns it back on when the"
-    dim "tunnel is deleted."
+    dim "generic receive offload off on this server's interface, and every other"
+    dim "tunnel here pays for that: measured on the test pair, an AmneziaWG link"
+    dim "on the same interface fell from 439 to 224 Mbit/s. It goes back on when"
+    dim "the last GRE FOU tunnel here is deleted."
 }
 
 # tunnel_boot NAME - what the unit runs before the core starts: whatever
@@ -34974,7 +35741,7 @@ cfg_reset() {
     # on this tool's own test pair. Ports still live on IRAN either way.
     T_DIALS=iran
     T_PUBLIC_IP= T_PEER_IP= T_IRAN= T_KHAREJ=
-    T_PORT=8443 T_PATH= T_CONNS=8
+    T_PORT=8443 T_PATH= T_CONNS=16
     T_TOKEN= T_PRESET=balanced T_LOG=info
     T_STATUS= T_HEALTH=
     T_FORWARDS=
@@ -35114,18 +35881,44 @@ token_print() {
 # ---------------------------------------------------------------------------
 # performance presets
 #
-# Everything the tunnel tunes was measured to have one right answer whatever
-# it carries - the socket buffers, the batching, a pacing rate it works out
-# for itself. What trades is how deep the queues may get: a deep one absorbs
-# bursts and carries more; a shallow one is emptier when a small packet
-# arrives, so that packet waits less. Measured on the real path, Tehran to
-# Frankfurt, restarted fresh at each depth:
+# A profile used to pick a queue depth, on the reasoning that a shallow queue
+# is emptier when a small packet arrives and a deep one absorbs bursts. That
+# was measured, and it was true; it is not true now, and it took four
+# measurements on the pair to establish that. The whole of it is in
+# docs/measured.md section 35, and the short of it is:
 #
-#   profile     queue    16 streams   one stream   under load
-#   gaming        600     397 Mbit/s   167 Mbit/s   84.5 / 92.5 ms
-#   balanced      900     448          254          93.3 / 106.5
-#   download     1500     466          253         115.8 / 139.3
+#   - fq never dropped a packet at any of the three depths. Sixteen streams at
+#     621 Mbit/s, 1,949,990 packets through the device, none dropped by either
+#     queue. A queue that never drops is not shaping anything.
+#   - At the download profile the depth asked fq for 15000 packets on a qdisc
+#     whose own limit is 10000. Unreachable by arithmetic.
+#   - Under an eight stream download the round trip did not move from its quiet
+#     figure at all.
+#
+# So the depth is one number now - deep enough that neither queue drops, which
+# is where all three already were - and a profile no longer claims to move it.
+#
+# What a profile does move:
+#
+#   private link    the receive queue, 3072 KB for download against 256 for
+#                   the other two. Kept on its older measurement: the attempt
+#                   to take it again could not separate the setting from the
+#                   machine the probe ran on.
+#   tcp ws wss      how much a bulk stream may park in front of a small one on
+#   utls fallback   the connection they share - 64 KB for gaming, 128 for the
+#                   other two. That queue exists on every path, because a
+#                   forward tunnel pins each of its streams to one connection.
+#                   512 was measured to stall the small one for nothing, so
+#                   download does not get it. See notsentLowat in the core's
+#                   carrier/stream.go, and docs/measured.md section 39.
+#
+# Not DSCP: twelve packets marked expedited left Frankfurt as 0xb8 and arrived
+# in Tehran as 0x18, every one re-marked.
 # ---------------------------------------------------------------------------
+
+# How deep fq may let this tunnel's flow get, before the factor of ten the core
+# applies. One number for every profile - see above.
+QUEUE_PACKETS=900
 
 preset_rcvbuf() {
     case $1 in
@@ -35134,22 +35927,24 @@ preset_rcvbuf() {
     esac
 }
 
-preset_queue() {
-    case $1 in
-    gaming) printf '600' ;;
-    download) printf '1500' ;;
-    *) printf '900' ;;
-    esac
-}
-
 preset_menu() {
     CHOICE_DEF=2
-    choice 1 "Gaming" "shallow queues - lowest delay under load"
+    choice 1 "Gaming" "a small packet waits behind less of a big one"
     choice 2 "Balanced" "the one to pick if unsure"
-    choice 3 "Download" "deep queues - most throughput for many streams"
+    choice 3 "Download" "deeper queues, for many streams at once"
     CHOICE_DEF=
     blank
-    dim "Deeper queues carry more; shallower ones answer faster. Changeable later."
+    # Said differently for the two modes, because it genuinely is a different
+    # queue - and on a private link it is one this pair can no longer measure,
+    # which the operator is better off knowing than guessing at.
+    if [ "${T_MODE:-forward}" = tun ]; then
+        dim "On a private link this sets the receive queue. On a fast, quiet"
+        dim "path all three measure the same; it tells on a busy or slow one."
+    else
+        dim "This sets how much a large transfer may park in front of a small"
+        dim "one on the connection they share."
+    fi
+    dim "Changeable later, on both servers."
     blank
     local n
     pick n "select" 2 3 || return 1
@@ -35187,7 +35982,7 @@ cfg_load() {
     T_PORT=$(toml_get "$f" transport port)
     T_PATH=$(toml_get "$f" transport path)
     T_CONNS=$(toml_get "$f" transport connections)
-    [ -n "$T_CONNS" ] || T_CONNS=8
+    [ -n "$T_CONNS" ] || T_CONNS=16
     T_TOKEN=$(toml_get "$f" security token)
     T_PRESET=$(toml_get "$f" tuning profile)
     [ -n "$T_PRESET" ] || T_PRESET=balanced
@@ -35271,20 +36066,45 @@ cfg_render() {
     icmp | gre) ;;
     *) kv port "$T_PORT" ;;
     esac
+    # Which port the waiting end really binds, where that is not the port the
+    # other end asks for. Behind a name on one of the HTTPS ports, a CDN's
+    # flexible mode ends the TLS at the edge and comes to the origin in plain
+    # HTTP on 80. The core works this out when the key is absent, and did so
+    # from a different address than the manager's own copy of the rule - so it
+    # is settled once, here, and written down.
+    case $T_TRANSPORT in
+    ws | wss) kv listen_port "$(cfg_listen_port)" ;;
+    esac
     kv dials "$(q "$T_DIALS")"
     case $T_TRANSPORT in
-    tcp | ws | wss | utls | fallback | kcp) kv connections "${T_CONNS:-8}" ;;
+    # Sixteen, not eight: eight bulk streams fill eight connections and a
+    # small one then waits behind a big one; with sixteen it answered in
+    # 160 ms under full load where eight stalled. docs/measured.md 39.
+    tcp | ws | wss | utls | fallback | kcp) kv connections "${T_CONNS:-16}" ;;
     esac
-    kv keepalive_sec 10
+    # GRE FOU has no connection and nothing that sends a keepalive: the kernel
+    # carries it and this core only watches. There is no right number, so
+    # there is no line.
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv keepalive_sec 10 ;;
+    esac
     case $T_TRANSPORT in
     ws | wss) kv path "$(q "$T_PATH")" ;;
     esac
+    # Read by wss and utls only. Decoy TLS presents the name of a site it is
+    # pretending to be, so there is nothing to vouch for and nothing to
+    # configure - it skips verification outright, and a line saying otherwise
+    # in its file was simply wrong.
     case $T_TRANSPORT in
-    wss | utls | fallback)
+    wss | utls)
         kv cert '""'
         kv key '""'
-        kv insecure false
         ;;
+    esac
+    case $T_TRANSPORT in
+    utls) kv insecure 'true   # the far end makes its own certificate, so there is nothing to vouch for it' ;;
+    wss) kv insecure 'false  # and off anyway between two bare addresses, where nobody vouches for one' ;;
     esac
 
     if [ "$T_TRANSPORT" = awg ]; then
@@ -35292,7 +36112,7 @@ cfg_render() {
         kv name "$(q "$T_AWG_IFACE")"
         kv iran "$(q "10.$T_OCTET.20.1/24")"
         kv kharej "$(q "10.$T_OCTET.20.2/24")"
-        kv mtu 1320
+        kv mtu "$AWG_LINK_MTU"
         kv port "$T_AWG_PORT"
         kv iran_key "$(q "$T_AWG_IKEY")"
         kv iran_pub "$(q "$T_AWG_IPUB")"
@@ -35314,18 +36134,68 @@ cfg_render() {
 
     printf '\n[tuning]\n'
     kv profile "$(q "$T_PRESET")"
-    kv queue_packets "${T_QUEUE:-$(preset_queue "$T_PRESET")}"
-    kv rcvbuf_kb "$(preset_rcvbuf "$T_PRESET")"
-    kv sndbuf_kb 16384
-    if [ "$mode" = tun ]; then
-        kv send_batch 32
-        kv pace true
-        kv pace_mbit 0
-    fi
-    kv dscp 0
-    if [ "$mode" = tun ] && [ "$T_TRANSPORT" != gre ]; then
-        kv fec "${T_FEC:-0}"
-    fi
+    # This table is dead for GRE FOU: the kernel moves the packets, this core
+    # returns before a carrier is opened, and nothing set on a socket or a
+    # qdisc ever happens for it. Giving it fq on the way out was tried and
+    # measured away - section 36 - so not even that. Only the profile stays,
+    # because the status report and the health check compare it between the
+    # two ends.
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv queue_packets "${T_QUEUE:-$QUEUE_PACKETS}" ;;
+    esac
+    # Only where a socket gets them. tuneSocket takes a packet connection and
+    # the core forbids it on TCP - naming a size there turns off the receive
+    # window auto-tuning this path needs about four megabytes of - so on the
+    # five stream transports these two lines were a number in a file that
+    # never reached anything. KCP raises whatever it is given to its own floor,
+    # so its file says the floor. GRE FOU opens no carrier in this process at
+    # all; the kernel moves it.
+    case $T_TRANSPORT in
+    tcp | ws | wss | utls | fallback | grefou) ;;
+    kcp)
+        kv rcvbuf_kb 8192
+        kv sndbuf_kb 16384
+        ;;
+    *)
+        kv rcvbuf_kb "$(preset_rcvbuf "$T_PRESET")"
+        kv sndbuf_kb 16384
+        ;;
+    esac
+    # How many packets go into the kernel in one crossing. udp joined the
+    # carriers that read it in 1.1.0. Not awg, which runs the same carrier
+    # and was measured batched - a wash, docs/measured.md section 40 - so it
+    # sends one per call and the core ignores the key for it; and not grefou,
+    # whose packets the kernel sends.
+    case $T_TRANSPORT in
+    gre | icmp | rawtcp | udp) kv send_batch 32 ;;
+    esac
+    # fq on the way out is not a private-link thing - every stream carrier asks
+    # for it too - so the file says so in both modes. It changes the queue for
+    # everything on that interface, which an operator should be able to read in
+    # the file rather than discover in the journal. GRE FOU is the exception
+    # and it is a measured one: it makes no bursts for fq to space out.
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv pace true ;;
+    esac
+    # The rate cap is set on a socket, so it reaches only the carriers with one.
+    case $T_TRANSPORT in
+    gre | icmp | rawtcp | udp | awg) kv pace_mbit 0 ;;
+    esac
+    case $T_TRANSPORT in
+    grefou) ;;
+    *) kv dscp 0 ;;
+    esac
+    # Parity where a carrier can rebuild a lost packet from it. Not gre: ours
+    # carries a bare IP packet, and with parity in front of it not a single
+    # packet crossed the Tehran path in either direction. Not grefou, whose
+    # bytes this core never touches. KCP is here because its own FEC reads the
+    # same key - it was the one transport that could use it and had no way of
+    # being told.
+    case $T_TRANSPORT in
+    udp | icmp | rawtcp | awg | kcp) kv fec "${T_FEC:-0}" ;;
+    esac
 
     printf '\n[forward]\n'
     # shellcheck disable=SC2086
@@ -35353,8 +36223,16 @@ cfg_render() {
         kv kharej "$(q "10.$T_OCTET.10.2/24")"
         kv mtu "${T_TUNMTU:-1320}"
         kv txqueuelen 1000
-        kv write_workers 0
-        kv queues 1
+        # A tun device this core opens and reads. GRE FOU's is a kernel gre
+        # device that no goroutine of ours ever touches, so these two would be
+        # settings for a thing that is not there.
+        case $T_TRANSPORT in
+        grefou) ;;
+        *)
+            kv write_workers 0
+            kv queues 1
+            ;;
+        esac
     fi
 
     printf '\n[logging]\n'
@@ -35548,7 +36426,7 @@ setup_token_read() {
     T_IRAN=$(tok_dec "$ir") || { setup_token_bad "the address field is damaged"; return 1; }
     T_PORT=$port
     T_PATH=$(tok_dec "$path") || T_PATH=
-    T_CONNS=${conns:-8}
+    T_CONNS=${conns:-16}
     T_TOKEN=$(tok_dec "$tok") || { setup_token_bad "the security field is damaged"; return 1; }
     T_PRESET=${preset:-balanced} T_LOG=${lg:-info} T_HEALTH=$health
     T_OCTET=$oct T_TUNIF=$tunif T_TUNMTU=${mtu:-1320}
@@ -35626,6 +36504,7 @@ setup_token_check() {
         [ -n "$T_AWG_IKEY" ] && [ -n "$T_AWG_KKEY" ] && [ -n "$T_AWG_IPUB" ] && [ -n "$T_AWG_KPUB" ] ||
             { setup_token_bad "the AmneziaWG key material is incomplete"; return 1; }
         v_port "$T_AWG_PORT" >/dev/null 2>&1 || { setup_token_bad "the AmneziaWG port is invalid"; return 1; }
+        v_mtu_awg "$T_TUNMTU" >/dev/null 2>&1 || { setup_token_bad "the private MTU does not fit inside AmneziaWG"; return 1; }
     fi
     local b
     for b in $T_BACKUPS; do
@@ -35925,6 +36804,18 @@ cdn_listen_port() {
     case $1 in 443 | 2053 | 2083 | 2087 | 2096 | 8443) printf '80' ;; *) printf '%s' "$1" ;; esac
 }
 
+# cfg_listen_port is the same rule read from the host that gets dialled rather
+# than from this server's own address, which is how the core reads it. Which
+# port the waiting end binds is a fact about the tunnel, not about the side
+# that happens to be writing the file, so both files say the same number - and
+# the rule stops being implemented twice from two different addresses.
+cfg_listen_port() {
+    local host
+    if [ "${T_DIALS:-kharej}" = iran ]; then host=$T_KHAREJ; else host=$T_IRAN; fi
+    is_name "$host" || { printf '%s' "$T_PORT"; return; }
+    case $T_PORT in 443 | 2053 | 2083 | 2087 | 2096 | 8443) printf '80' ;; *) printf '%s' "$T_PORT" ;; esac
+}
+
 v_awg_port() {
     v_port "$1" || return 1
     if ! port_free "$1" udp; then
@@ -36145,12 +37036,15 @@ ask_link() {
     blank
     ask T_TUNIF "device name" "$(free_tun_iface)" v_wiz_iface || return 1
     case $T_TRANSPORT in
-    awg) T_TUNMTU=1280 ;;
+    awg) T_TUNMTU=$(awg_tun_mtu) ;;
     # What Golden GRE uses, and what the kernel's own encapsulation fits.
     grefou) T_TUNMTU=1400 ;;
     *) T_TUNMTU=1320 ;;
     esac
-    ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu || return 1
+    case $T_TRANSPORT in
+    awg) ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu_awg || return 1 ;;
+    *) ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu || return 1 ;;
+    esac
     return 0
 }
 
@@ -36241,7 +37135,7 @@ review_panel() {
     fi
     [ -n "$T_FORWARDS" ] && panel_field "Ports" "$T_FORWARDS"
     panel_field "Token" "$(token_print "$T_TOKEN")"
-    panel_field "Tuning" "${T_PRESET^}, queue $(preset_queue "$T_PRESET") packets"
+    panel_field "Tuning" "${T_PRESET^}"
     panel_field "Logging" "$T_LOG"
     panel_end
 }
@@ -36260,6 +37154,26 @@ wiz_create() {
     rm -f "$tmp"
     enable_watchdog quiet
     dim "$(cfg_file "$T_NAME")"
+
+    # The host's kernel is the other half of a fast tunnel, and until now only
+    # the Optimize screen ever touched it - so a server whose operator never
+    # found that screen ran the distribution's settings under every tunnel.
+    # Asked, not assumed: this file is the whole machine's, not this
+    # tunnel's, and a second tunnel must not pull a host already tuned for
+    # download down to its own profile. Both servers of a pair come through
+    # here, so both are asked, which is what the health check used to tell
+    # people to go and do by hand.
+    if [ ! -f "$HOST_SYSCTL" ]; then
+        blank
+        dim "This server still runs the distribution's kernel network settings."
+        if confirm_yes "apply Pingify's $T_PRESET host tuning as well?"; then
+            apply_tuning "$T_PRESET"
+            case $T_TRANSPORT in
+            tcp | ws | wss | utls | fallback)
+                host_bbr_available && confirm_yes "and BBR, for this tcp carrier?" && enable_bbr ;;
+            esac
+        fi
+    fi
     return 0
 }
 
@@ -36815,13 +37729,20 @@ live_log() {
 # to match, and the ones that are nobody's business but this machine's.
 # ---------------------------------------------------------------------------
 
-# A profile is three lines in the file, not one: the depth and the receive
-# queue it chooses are written as numbers, and an explicit number wins over
-# the profile in the core, so changing the word alone would change nothing.
+# A profile is two lines in the file, not one: the receive queue it chooses is
+# written as a number, and an explicit number wins over the profile in the
+# core, so changing the word alone would leave the queue where it was. The
+# depth is no longer one of them - every profile ships the same one, and why is
+# beside QUEUE_PACKETS.
 _edit_profile() {
-    toml_set "$1" tuning profile "$PROFILE_WANT" &&
-        toml_set "$1" tuning queue_packets "$(preset_queue "$PROFILE_WANT")" &&
-        toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
+    toml_set "$1" tuning profile "$PROFILE_WANT" || return 1
+    # The receive queue is only in the file where a socket gets it - see the
+    # same list in cfg_render. Writing it back here for a transport that omits
+    # it would put the key into a file that had correctly left it out.
+    case $T_TRANSPORT in
+    tcp | ws | wss | utls | fallback | grefou | kcp) return 0 ;;
+    esac
+    toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
 }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
@@ -37026,9 +37947,16 @@ tuning_menu() {
         panel_end
         blank
         panel "PERFORMANCE - KEEP BOTH SERVERS THE SAME"
-        panel_field "Profile" "$T_PRESET" "Queue" "${T_QUEUE:-$(preset_queue "$T_PRESET")} packets"
+        if [ "$T_TRANSPORT" = grefou ]; then
+            panel_field "Profile" "$T_PRESET"
+        else
+            panel_field "Profile" "$T_PRESET" "Queue" "${T_QUEUE:-$QUEUE_PACKETS} packets"
+        fi
         if [ "$T_MODE" = tun ]; then
-            panel_field "MTU" "$T_TUNMTU" "Parity" "$(fec_label "$f")"
+            case $T_TRANSPORT in
+            gre | grefou) panel_field "MTU" "$T_TUNMTU" ;;
+            *) panel_field "MTU" "$T_TUNMTU" "Parity" "$(fec_label "$f")" ;;
+            esac
         else
             panel_field "Connections" "$T_CONNS" "Keepalive" "$(toml_get "$f" transport keepalive_sec | sed 's/^$/10/') s"
         fi
@@ -37054,17 +37982,28 @@ tuning_menu() {
         # so the list never reads 5, 7, 8, 10.
         local -a keys=()
         tm() { keys+=("$1"); item "${#keys[@]}" "$2" "${3:-}"; }
-        tm profile "Profile" "$T_PRESET - the shape of the queues"
-        tm queue "Queue depth" "${T_QUEUE:-$(preset_queue "$T_PRESET")} packets - what the profile chose; change it only if you measured your path"
+        tm profile "Profile" "$T_PRESET - the shape of the queues, see the manual for what it moves"
+        case $T_TRANSPORT in
+        grefou) ;;
+        *) tm queue "Queue depth" "${T_QUEUE:-$QUEUE_PACKETS} packets - fq's cap; change it only if you measured your own path dropping" ;;
+        esac
         if [ "$T_MODE" = tun ]; then
             tm mtu "MTU" "$T_TUNMTU - Find the MTU under Diagnostics measures it"
+            # gre because parity in front of its header stops it dead, grefou
+            # because this core never touches its bytes. Offering the item for
+            # either was offering a switch with nothing behind it.
             case $T_TRANSPORT in
-            gre) ;;
+            gre | grefou) ;;
             *) tm parity "Parity" "$(fec_label "$f") - repairs a lost packet without a round trip" ;;
             esac
         else
             tm conns "Connections" "$T_CONNS parallel connections, 1 to 32"
             tm keepalive "Keepalive" "seconds between keepalives on every connection"
+            # KCP rebuilds a lost packet below its own stream instead of
+            # resending it, and reads the same key. It was the one forward
+            # transport that could use parity and had no way of being told.
+            [ "$T_TRANSPORT" = kcp ] &&
+                tm parity "Parity" "$(fec_label "$f") - KCP rebuilds a lost packet instead of resending it; set it the same on both servers"
         fi
         case $T_TRANSPORT in icmp | gre | awg | grefou) ;; *) tm dials "Link direction" "$(dials_text)" ;; esac
         case $T_TRANSPORT in ws | wss) tm path "Web path" "$T_PATH - must match" ;; esac
@@ -37093,12 +38032,13 @@ tuning_menu() {
         case ${keys[c - 1]} in
         profile) blank; preset_menu && { PROFILE_WANT=$T_PRESET; cfg_apply "$name" _edit_profile yes; }; pause ;;
         queue) blank
-            dim "This comes from the profile and is the one number a profile moves."
-            dim "gaming 600, balanced 900, download 1500."
-            ask v "packets" "${T_QUEUE:-$(preset_queue "$T_PRESET")}" v_queue && { QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; }
+            dim "fq's cap on this tunnel's flow, ten times over. No profile moves it:"
+            dim "measured on the pair, fq dropped none of 2.68 GB at any depth."
+            ask v "packets" "${T_QUEUE:-$QUEUE_PACKETS}" v_queue && { QUEUE_WANT=$v; cfg_apply "$name" _edit_queue yes; }
             pause ;;
         mtu) blank
-            ask v "mtu" "$T_TUNMTU" v_mtu && { MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes && dim "set the same on the other server"; }
+            if [ "$T_TRANSPORT" = awg ]; then _vm=v_mtu_awg; else _vm=v_mtu; fi
+            ask v "mtu" "$T_TUNMTU" $_vm && { MTU_WANT=$v; cfg_apply "$name" _edit_mtu yes && dim "set the same on the other server"; }
             pause ;;
         conns) blank
             ask v "parallel connections" "$T_CONNS" v_conns && { CONNS_WANT=$v; cfg_apply "$name" _edit_conns yes; }
@@ -37256,6 +38196,29 @@ tunnel_remove() {
     rm -f "$f" "$f.bak" "$STATE_DIR/$name.forwards" "$STATE_DIR/$name.fail" \
         "$STATE_DIR/$name.heard" "$STATE_DIR/$name.stopped"
     systemctl daemon-reload >/dev/null 2>&1
+    qdisc_put_back
+    return 0
+}
+
+# qdisc_put_back - the core puts fq on the egress interface for its own
+# tunnels and never takes it off, so a machine whose last tunnel was deleted
+# kept a queue nobody had chosen. This puts the distribution's default back
+# when nothing of ours is left to want fq - unless the operator chose fq for
+# the whole host under Optimize, in which case it is theirs and stays.
+qdisc_put_back() {
+    [ -z "$(cfg_list)" ] || return 0
+    [ ! -f "$HOST_SYSCTL" ] || return 0
+    have tc || return 0
+    local dev
+    dev=$(ip -o route get 1.1.1.1 2>/dev/null | grep -oE 'dev [^ ]+' | cut -d' ' -f2)
+    [ -n "$dev" ] || return 0
+    case $(tc qdisc show dev "$dev" root 2>/dev/null) in
+    "qdisc fq "*)
+        if tc qdisc replace dev "$dev" root fq_codel >/dev/null 2>&1; then
+            dim "the last tunnel is gone, so $dev has its default queue (fq_codel) back"
+        fi
+        ;;
+    esac
     return 0
 }
 #!/usr/bin/env bash
@@ -37733,6 +38696,18 @@ health_check() {
             elif [ -n "$gul" ] && [ "$ggro" = off ]; then
                 chk_add ok gro "generic receive offload is off on $gul, which this transport needs"
             fi
+        else
+            # GRO is the interface's setting, not this tunnel's. A GRE FOU
+            # tunnel here turned it off for everyone leaving by that
+            # interface, and this is the only screen that can tell the tunnel
+            # paying for it who to look at: measured, an AmneziaWG link on the
+            # same interface fell from 439 to 224 Mbit/s.
+            local odev oowner
+            odev=$(grefou_underlay "$(peer_public "$name")")
+            if [ -n "$odev" ] && [ "$(gro_state "$odev")" = off ]; then
+                oowner=$(grefou_gro_owner "$odev")
+                [ -n "$oowner" ] && chk_add note gro                     "generic receive offload is off on $odev because $oowner (GRE FOU) needs it off - this tunnel is slower for it"                     "it goes back on when the last GRE FOU tunnel here is deleted"
+            fi
         fi
 
         if [ "$CK_TRANSPORT" = awg ]; then
@@ -37794,9 +38769,14 @@ health_check() {
         case $lpm in
         early) chk_add note loss "too early to say anything about loss yet" ;;
         *)
+            # Advise parity only where turning it on would do something. The
+            # list was the wrong way round in two places: it offered parity for
+            # grefou, whose bytes this core never touches, and withheld it from
+            # kcp, which is the one forward transport that rebuilds a lost
+            # packet from it instead of resending.
             local fec_advice=
             case $CK_TRANSPORT in
-            tcp | ws | wss | kcp | utls | fallback | gre) ;;
+            tcp | ws | wss | utls | fallback | gre | grefou) ;;
             *) [ "$(toml_get "$CK_FILE" tuning fec)" -gt 0 ] 2>/dev/null ||
                 fec_advice="turn on Parity: Manage ${BX_ARR} $name ${BX_ARR} Tuning" ;;
             esac
@@ -38176,7 +39156,7 @@ speed_listen() {
 }
 
 speed_test() {
-    local name=$1 out rc ref target
+    local name=$1 out rc target
     # Shadowed: the forwarded port picked below must not become the
     # port the iperf3 listener on this server binds afterwards.
     local IPERF_PORT=$IPERF_PORT
@@ -38235,13 +39215,14 @@ speed_test() {
         esac
         return 1
     fi
-    case ${ST_PROFILE:-$(toml_get "$CK_FILE" tuning profile)} in
-    gaming) ref="gaming measured 397 Mbit/s over 16 streams" ;;
-    download) ref="download measured 466 Mbit/s over 16 streams" ;;
-    *) ref="balanced measured 448 Mbit/s over 16 streams" ;;
-    esac
     ok "done"
-    dim "$ref on the reference path, Tehran to Frankfurt."
+    # One figure, not three. The per-profile numbers that were here came from
+    # the queue-depth table the profiles no longer set - see QUEUE_PACKETS in
+    # the wizard, and docs/measured.md section 35. Quoting them against a
+    # profile that no longer produces them told the operator their tunnel was
+    # slow when it was doing exactly what the reference path does.
+    dim "The reference path, Tehran to Frankfurt, carries about 600 Mbit/s over these"
+    dim "sixteen streams on a private link, and about 950 on a kernel-carried GRE FOU one."
     dim "A slower path abroad reads lower; that is the path. Take it more than once."
     return 0
 }
@@ -40137,9 +41118,15 @@ blocking_menu() {
 # whatever lands at that offset.
 install_self() {
     local src=${BASH_SOURCE[0]} dir tmp stamp
+    # Run as bash <(wget -qO- ...) this is /dev/fd/63, a pipe, and there is no
+    # file to copy to /usr/local/bin. Every systemd unit written afterwards
+    # names that path - ExecStartPre sources it, ConditionPathExists guards on
+    # it - so a run that gets past here leaves a server whose tunnels cannot
+    # start. It stops instead, and says the one thing that fixes it.
     if [ ! -f "$src" ]; then
-        warn "the pingify command was not installed - this script has no file on disk"
-        fix "save it first:  curl -fsSLo Pingify.sh <url> && bash Pingify.sh"
+        fail "this script has no file on disk, so the pingify command cannot be installed"
+        fix "save it first, then run it:"
+        fix "  wget -O Pingify.sh https://github.com/GreatTeejay/Pingify/releases/latest/download/Pingify.sh && bash Pingify.sh"
         return 1
     fi
     SCRIPT_CHANGED=0
@@ -40428,7 +41415,10 @@ main() {
 
     ensure_deps
     migrate_layout
-    install_self
+    # Nothing below works without /usr/local/bin/pingify: the units source it
+    # at every start. A failure here is the end of the run, not a warning at
+    # the top of a screen that is about to be wiped.
+    install_self || exit 1
     srv_info
     first_run || exit 1
     ensure_core_current

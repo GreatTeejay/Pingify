@@ -142,11 +142,23 @@ section "parity is not offered where the core ignores it"
 
 # Measured, on the Tehran path: a GRE tunnel with parity turned on carries
 # nothing at all in either direction, because our GRE payload is a bare IP
-# packet and four bytes of parity header in front of it is not one. The core
-# refuses the setting; these two screens must not go on offering it, and the
-# check must never advise turning it on.
-check_contains "the Tuning screen leaves gre out of Parity" "$(grep -c 'gre) ;;' parts/40-manage.sh)" "1"
-check_contains "and the check does not advise it on gre" "$(grep -B4 'turn on Parity' parts/45-health.sh)" "utls | fallback | gre"
+# packet and four bytes of parity header in front of it is not one. GRE FOU is
+# the other one: the kernel carries it and this core never touches its bytes,
+# so parity there is a switch with nothing behind it. The core ignores both;
+# these two screens must not go on offering them, and the check must never
+# advise turning it on for either.
+# Both places the screen mentions parity: the menu item, which must not exist
+# for either, and the panel above it, which must not print a Parity field.
+check_contains "the Tuning menu leaves gre and grefou out of Parity"     "$(grep -c 'gre | grefou) ;;' parts/40-manage.sh)" "1"
+check_contains "and so does the panel above it"     "$(grep -c 'gre | grefou) panel_field' parts/40-manage.sh)" "1"
+check_contains "and the check does not advise it on either"     "$(grep -B4 'turn on Parity' parts/45-health.sh)" "gre | grefou"
+
+# The other half of the same rule: KCP rebuilds a lost packet from parity
+# below its own stream instead of resending it, and reads the very same key.
+# It was the one forward transport that could use it and had no way of being
+# told - the wizard wrote no fec line and the screen offered no item.
+check_contains "the wizard writes fec for kcp"     "$(grep -A2 'udp | icmp | rawtcp | awg | kcp' parts/30-tunnel.sh)" "kv fec"
+check_contains "and the Tuning screen offers it"     "$(grep -A2 'T_TRANSPORT" = kcp' parts/40-manage.sh)" "tm parity"
 
 section "the machine gets its pings back, and not a moment sooner"
 
