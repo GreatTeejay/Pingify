@@ -2712,6 +2712,15 @@ type failover struct {
 	switchAfter, returnAfter, probeEvery time.Duration
 	prefer                               string
 
+	// The package's probe and hunt clocks, copied when the carrier is made
+	// and read only from here afterwards. Its goroutines read them for as
+	// long as the tunnel lives, and a test that shortens the variables puts
+	// them back when it ends - which, read straight from the variables, was
+	// a write racing a probe still winding down. The race detector caught it
+	// on GitHub, the first time 1.1.0 ran under it. The forwarder's grace is
+	// held the same way, for the same reason.
+	probeKeepalive, probePatience, huntWait, huntGrace time.Duration
+
 	// A member's counters go with it when it closes, and a total that went
 	// backwards would read to the status page as the path taking bytes back.
 	retired struct {
@@ -2766,6 +2775,11 @@ func newFailover(cfg *config.Config) (*failover, error) {
 		probeEvery:  time.Duration(cfg.Failover.ProbeEvery) * time.Second,
 		prefer:      cfg.Failover.Prefer,
 		done:        make(chan struct{}),
+
+		probeKeepalive: probeKeepalive,
+		probePatience:  probePatience,
+		huntWait:       huntWait,
+		huntGrace:      huntGrace,
 	}
 	c.carrying.Store(-1)
 	var kinds []string
@@ -3160,7 +3174,7 @@ func (c *failover) decide() {
 		if now.Sub(since) > c.switchAfter {
 			stopProbes()
 			why := fmt.Sprintf("nothing has arrived on %s for %s", m.kind, c.switchAfter.Round(time.Second))
-			if j := c.hunt(i, huntWait); j >= 0 {
+			if j := c.hunt(i, c.huntWait); j >= 0 {
 				c.switchTo(j, why, false)
 			} else {
 				logging.Warn("failover: %s, and no other member answers either", why)
@@ -3317,7 +3331,7 @@ func (c *failover) hunt(except int, wait time.Duration) int {
 			if first.IsZero() {
 				first = now
 			}
-			if (c.prefer == preferOrder && best.m.idx == c.bestRank(except)) || now.Sub(first) >= huntGrace {
+			if (c.prefer == preferOrder && best.m.idx == c.bestRank(except)) || now.Sub(first) >= c.huntGrace {
 				return best.m.idx
 			}
 		}
@@ -3464,11 +3478,13 @@ type probe struct {
 	m       *member
 	car     *streamCarrier
 	started time.Time
-	heard   atomic.Int64 // unix nanos of the last answer
-	best    atomic.Int64 // the least round trip seen, in nanos; zero is none
-	answers atomic.Uint64
-	done    chan struct{}
-	once    sync.Once
+
+	keepalive, patience time.Duration // the failover's, copied
+	heard               atomic.Int64  // unix nanos of the last answer
+	best                atomic.Int64  // the least round trip seen, in nanos; zero is none
+	answers             atomic.Uint64
+	done                chan struct{}
+	once                sync.Once
 }
 
 type probeResult int
@@ -3487,19 +3503,20 @@ func (c *failover) newProbe(m *member) *probe {
 		logging.Debug("failover: could not try %s: %v", m.kind, err)
 		return nil
 	}
-	p := &probe{m: m, car: car, started: time.Now(), done: make(chan struct{})}
+	p := &probe{m: m, car: car, started: time.Now(), done: make(chan struct{}),
+		keepalive: c.probeKeepalive, patience: c.probePatience}
 	go car.Run()
 	go p.run()
 	logging.Debug("failover: trying %s", m.kind)
 	return p
 }
 
-// run sends a keepalive every probeKeepalive and times the answer to it. The
+// run sends a keepalive every p.keepalive and times the answer to it. The
 // side that waits answers every keepalive on a member with backups, and
 // nothing else ever arrives on a probe's connection, so a byte in is an
 // answer to the byte last sent.
 func (p *probe) run() {
-	tk := time.NewTicker(probeKeepalive)
+	tk := time.NewTicker(p.keepalive)
 	defer tk.Stop()
 	for {
 		select {
@@ -3515,7 +3532,7 @@ func (p *probe) run() {
 		if err := p.car.Send(buf.Take(p.car.Headroom(), 0)); err != nil {
 			continue
 		}
-		for time.Now().Before(sent.Add(probeKeepalive)) {
+		for time.Now().Before(sent.Add(p.keepalive)) {
 			select {
 			case <-p.done:
 				return
@@ -3544,7 +3561,7 @@ func (p *probe) state(now time.Time, healthyFor time.Duration) probeResult {
 	if p.answers.Load() == 0 {
 		heard = p.started
 	}
-	if now.Sub(heard) > probePatience {
+	if now.Sub(heard) > p.patience {
 		return probeFailed
 	}
 	if p.answers.Load() > 0 && now.Sub(p.started) >= healthyFor {
