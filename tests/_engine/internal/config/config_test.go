@@ -41,7 +41,7 @@ kharej = "10.9.0.2/24"
 // that a fourth attempt at a queue-depth profile has to argue with a
 // measurement first: see docs/measured.md section 35.
 func TestTheProfileNoLongerPretendsToMoveTheQueue(t *testing.T) {
-	for _, p := range []string{"gaming", "balanced", "download"} {
+	for _, p := range []string{"gaming", "balanced", "throughput", "stable", "max"} {
 		got := load(t, `
 [tuning]
 profile = "`+p+`"
@@ -66,14 +66,15 @@ func TestTheQueueIsNeverLeftAtSomethingFqWouldDrop(t *testing.T) {
 	}
 }
 
-func TestOnlyTheDownloadProfileKeepsADeepReceiveQueue(t *testing.T) {
+func TestOnlyTheThroughputProfileKeepsADeepReceiveQueue(t *testing.T) {
 	// Three megabytes on the receiving socket is fifty milliseconds at the
 	// rate this carries, and everything arriving waits behind it. That is the
-	// trade the download profile exists to make and the other two do not.
+	// trade the throughput profile exists to make and gaming and balanced do
+	// not.
 	for _, c := range []struct {
 		profile string
 		rcv     int
-	}{{"gaming", 256}, {"balanced", 256}, {"download", 3072}} {
+	}{{"gaming", 256}, {"balanced", 256}, {"throughput", 3072}} {
 		got := load(t, "[tuning]\nprofile = \""+c.profile+"\"\n")
 		if got.Tuning.RcvBufKB != c.rcv {
 			t.Errorf("%s asked for %d KB of receive queue, got %d",
@@ -289,9 +290,10 @@ func TestAnOldAmneziaWGFileStillFitsItsLink(t *testing.T) {
 		fec, mtu int
 		ok       bool
 	}{
-		{0, 1280, true},  // what every 1.0.x file says
-		{0, 1281, false}, // one past the link
-		{10, 1276, true}, // what the wizard writes, with parity on
+		{0, 1280, true},   // what every 1.0.x file says
+		{0, 1281, false},  // one past the link
+		{10, 1274, true},  // what the wizard writes: room for the parity packet too
+		{10, 1276, false}, // room for the data, two bytes short for its parity
 		{10, 1280, false},
 	} {
 		cfg := &Config{}
@@ -306,3 +308,57 @@ func TestAnOldAmneziaWGFileStillFitsItsLink(t *testing.T) {
 }
 
 func itoa(n int) string { return fmt.Sprint(n) }
+
+// The two profiles added in 1.1.0 set three things a file that names them
+// and nothing else must get: the receive queue, the connection count and,
+// for the lossy path, parity. Each was measured (docs/measured.md 39-41);
+// this pins what the name means.
+func TestTheStableAndMaxProfilesSetWhatTheyPromise(t *testing.T) {
+	for _, c := range []struct {
+		profile string
+		rcv     int
+		conns   int
+		fec     int
+	}{
+		{ProfileGaming, 256, 16, 0},
+		{ProfileStable, 256, 24, 10},
+		{ProfileBalanced, 256, 16, 0},
+		{ProfileThroughput, 3072, 16, 0},
+		{ProfileMax, 3072, 32, 0},
+	} {
+		got := load(t, `
+[tuning]
+profile = "`+c.profile+`"
+`)
+		if got.Tuning.RcvBufKB != c.rcv || got.Transport.Connections != c.conns || got.Tuning.FEC != c.fec {
+			t.Errorf("%s: receive %d, connections %d, parity %d - expected %d, %d, %d",
+				c.profile, got.Tuning.RcvBufKB, got.Transport.Connections, got.Tuning.FEC, c.rcv, c.conns, c.fec)
+		}
+	}
+}
+
+// A file that says fec = 0 under the stable profile means it: the profile
+// is a default, not an order.
+func TestAFileMaySwitchTheStableProfilesParityOff(t *testing.T) {
+	got := load(t, `
+[tuning]
+profile = "stable"
+fec = 0
+`)
+	if got.Tuning.FEC != 0 {
+		t.Fatalf("fec = 0 was overruled by the profile: got %d", got.Tuning.FEC)
+	}
+}
+
+// Every file written before 1.1.0 that chose the deep queue says "download".
+// It is read as throughput, so an upgrade changes nothing until the manager
+// rewrites the file - and the name it comes back as is the new one.
+func TestAFileFrom10xStillSayingDownloadIsThroughput(t *testing.T) {
+	got := load(t, `
+[tuning]
+profile = "Download"
+`)
+	if got.Tuning.Profile != ProfileThroughput || got.Tuning.RcvBufKB != 3072 {
+		t.Fatalf("download came back as %q with a %d KB queue", got.Tuning.Profile, got.Tuning.RcvBufKB)
+	}
+}

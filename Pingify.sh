@@ -696,12 +696,14 @@ v_mtu() {
 # The AmneziaWG link this core runs inside. One number, in one place: the
 # link MTU written into the file, and the tun MTU derived from it. On the awg
 # device every packet is 20 of IP, 8 of UDP and 12 of framer over what the
-# tun device hands up - and 4 more when parity is on, which can be switched on
-# later without anybody revisiting the MTU. So the tun MTU is the link less
-# 44, always. It was a literal 1280 beside a literal 1320, right by 4 bytes
-# of luck and unchecked against anything.
+# tun device hands up - and with parity on, which can be switched on later
+# without anybody revisiting the MTU, 4 more in front of every packet and 2
+# more in the parity packet, which carries each payload's length. So the tun
+# MTU is the link less 46, always. It was a literal 1280 beside a literal
+# 1320, right by 4 bytes of luck and unchecked against anything; then 44,
+# which left every parity packet 2 bytes over the link.
 AWG_LINK_MTU=1320
-awg_tun_mtu() { echo $((AWG_LINK_MTU - 44)); }
+awg_tun_mtu() { echo $((AWG_LINK_MTU - 46)); }
 # The wizard writes the cautious number, which holds with parity on or off.
 # What is accepted is the real ceiling with parity off, because every
 # AmneziaWG tunnel from before 1.1.0 runs at exactly that; turning parity on
@@ -710,6 +712,44 @@ v_mtu_awg() {
     v_mtu "$1" || return 1
     [ "$1" -le "$((AWG_LINK_MTU - 40))" ] ||
         { echo "inside AmneziaWG the link is $AWG_LINK_MTU, so this is at most $((AWG_LINK_MTU - 40)), or $(awg_tun_mtu) with parity"; return 1; }
+}
+
+# tun_overhead TRANSPORT [FEC] - what a private link puts around each packet
+# on the wire, over the packet itself: the outer IP header and whatever the
+# transport adds. The link's MTU plus this has to fit the interface it rides,
+# or every full packet is too big for it - which is what a GRE FOU link at
+# 1400 did on an Iranian server whose interface is 1400: 36 bytes over on
+# every one (docs/measured.md section 42). With parity on (FEC above 0) a
+# packet carries 4 more in front, and a parity packet 2 more again, for the
+# length it carries (carrier/fec.go): 6 in all, on the transports that have
+# parity at all.
+tun_overhead() {
+    local o
+    case $1 in
+    grefou) o=36 ;; # IP 20, UDP 8, GRE 4, key 4
+    gre) o=32 ;;    # IP 20, and a GRE header of 12 that holds the key and
+    #                 the sequence itself: this carrier has no framer
+    rawtcp) o=52 ;; # IP 20, TCP 20, frame 12
+    awg) o=100 ;;   # tun to awg link 40, awg link to wire 60
+    *) o=40 ;;      # udp, icmp: IP 20, UDP or ICMP 8, frame 12
+    esac
+    case $1 in
+    udp | icmp | rawtcp | awg)
+        case ${2:-0} in '' | 0 | *[!0-9]*) ;; *) o=$((o + 6)) ;; esac ;;
+    esac
+    echo "$o"
+}
+
+# tun_mtu_fit TRANSPORT PEER WANT [FEC] - WANT, or less if the interface
+# packets to PEER leave by cannot carry WANT plus the transport's overhead.
+# Where the interface cannot be found, WANT as it is.
+tun_mtu_fit() {
+    local dev m
+    dev=$(grefou_underlay "$2")
+    m=$(cat "${SYSFS_NET:-/sys/class/net}/${dev:-none}/mtu" 2>/dev/null)
+    case $m in '' | *[!0-9]*) echo "$3"; return 0 ;; esac
+    m=$((m - $(tun_overhead "$1" "${4:-0}")))
+    if [ "$m" -lt "$3" ]; then echo "$m"; else echo "$3"; fi
 }
 
 v_token() {
@@ -1238,6 +1278,7 @@ tun_stats() {
     ST_UP= ST_IN= ST_OUT= ST_LOST= ST_GAPS= ST_LATE= ST_UPTIME= ST_DROPPED=
     ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB= ST_OUTB= ST_MODE= ST_FAR_RTT= ST_FAR_SEEN=
     ST_VERSION= ST_TOWIRE= ST_TODEV= ST_NOTOURS= ST_SENDERR= ST_ACTIVE=
+    ST_BLOCKED= ST_PROBE_SEEN=
 
     have curl || return 1
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
@@ -1262,6 +1303,8 @@ tun_stats() {
     ST_MODE=$(json_field "$json" mode)
     ST_FAR_RTT=$(json_field "$json" far_rtt_ms)
     ST_FAR_SEEN=$(json_field "$json" far_seen_sec)
+    ST_BLOCKED=$(json_field "$json" data_blocked)
+    ST_PROBE_SEEN=$(json_field "$json" probe_seen_sec)
     ST_TOWIRE=$(json_field "$json" to_wire)
     ST_TODEV=$(json_field "$json" to_device)
     ST_NOTOURS=$(json_field "$json" not_ours)
@@ -1464,7 +1507,12 @@ migrate_layout() {
 # The compiler ensure_go settled on. Empty until it has run.
 GO_BIN=
 
-GO_DL_BASE=https://go.dev/dl
+# Where the Go tarball comes from. go.dev is Google's, and from an Iranian
+# server it is often unreachable or throttled to nothing; PINGIFY_GO_URL names
+# another place to fetch the same file - a mirror, or a copy on a server of
+# your own - and the sha256 of whatever arrived is printed so it can be
+# checked against https://go.dev/dl/ from anywhere.
+GO_DL_BASE=${PINGIFY_GO_URL:-https://go.dev/dl}
 
 # --------------------------------------------------------------------------
 # the sources
@@ -4142,8 +4190,14 @@ func WrapFEC(c Full, n int, blocked bool) Full {
 	return f
 }
 
-func (f *fecCarrier) Headroom() int   { return f.Full.Headroom() + fecHdr }
-func (f *fecCarrier) MaxPayload() int { return f.Full.MaxPayload() - fecHdr }
+func (f *fecCarrier) Headroom() int { return f.Full.Headroom() + fecHdr }
+
+// MaxPayload leaves room for the parity packet as well as the data: it
+// carries each payload's length in two bytes in front of the XOR (foldIn),
+// so it is two bytes longer than the longest packet of its group. Leaving
+// only fecHdr let a link at the ceiling send every parity packet two bytes
+// over what the carrier below takes.
+func (f *fecCarrier) MaxPayload() int { return f.Full.MaxPayload() - fecHdr - 2 }
 
 func (f *fecCarrier) OnPacket(fn func([]byte)) { f.onPacket.Store(&fn) }
 
@@ -5758,6 +5812,7 @@ import (
 	"time"
 
 	kcp "github.com/xtaci/kcp-go/v5"
+	"golang.org/x/crypto/chacha20poly1305"
 
 	"pingify/internal/config"
 	"pingify/internal/logging"
@@ -5852,7 +5907,7 @@ func newKCPCarrier(cfg *config.Config) (*streamCarrier, error) {
 		if cfg.Transport.ListenPort > 0 {
 			port = cfg.Transport.ListenPort
 		}
-		l, err := kcp.ListenWithOptions(fmt.Sprintf("0.0.0.0:%d", port), nil, data, parity)
+		l, err := kcp.ListenWithOptions(fmt.Sprintf("0.0.0.0:%d", port), kcpCrypt(cfg.Token), data, parity)
 		if err != nil {
 			return nil, fmt.Errorf("listen on udp/%d: %v", port, err)
 		}
@@ -5895,7 +5950,7 @@ func newKCPCarrier(cfg *config.Config) (*streamCarrier, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		s, err := kcp.DialWithOptions(ua.String(), nil, data, parity)
+		s, err := kcp.DialWithOptions(ua.String(), kcpCrypt(cfg.Token), data, parity)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -5961,6 +6016,34 @@ func kcpIdle(cfg *config.Config) time.Duration {
 // the two owns one. say is whether to log what the kernel gave: the side
 // that dials opens a socket per connection and per redial, and one line
 // about it is enough.
+// kcpCrypt is the cipher every KCP packet leaves under: XChaCha20-Poly1305,
+// keyed from the token, which both ends already share.
+//
+// Until 1.1.0 this was nil, and every packet went out with kcp-go's own
+// header in the clear - conversation id, command, fragment, window, two
+// timestamps and two sequence numbers in fixed places - which is the most
+// recognisable thing a middlebox could ask for on a UDP port. Nothing else
+// in this core encrypts, and does not want to: what the tunnel carries is
+// already TLS. This is not about secrecy either. It is that KCP's header
+// pattern, unlike a framed IP packet's, identifies the protocol by itself.
+// Both ends must be 1.1.0: it is a wire change.
+//
+// XChaCha20 rather than AES-GCM because of the nonce. kcp-go draws one at
+// random for every packet, and a random 96-bit nonce is safe for 2^32
+// packets under one key - which at the rate this carries is a day and a
+// half, and the key is the token's for as long as the tunnel exists. A
+// 192-bit nonce drawn at random does not repeat in any tunnel's lifetime.
+// The cost is twelve more bytes a packet, which kcp-go takes off its MTU.
+func kcpCrypt(token string) kcp.BlockCrypt {
+	key := sha256.Sum256([]byte("pingify kcp crypt v1|" + token))
+	aead, err := chacha20poly1305.NewX(key[:])
+	if err != nil {
+		// Only a wrong key length does this, and this one is not wrong.
+		panic("kcp crypt: " + err.Error())
+	}
+	return kcp.NewAEADCrypt(aead)
+}
+
 func kcpSocket(s interface {
 	Control(func(net.PacketConn) error) error
 }, cfg *config.Config, say bool) {
@@ -7259,15 +7342,16 @@ const (
 //
 // Measured, in docs/measured.md section 39, with a small request timed
 // through the tunnel while eight streams saturated it. 64 KB was the least
-// bad of three, 128 next, and 512 KB - which was going to be the download
+// bad of three, 128 next, and 512 KB - which was going to be the throughput
 // profile's - left the small stream stalled past the probe's five second
-// limit in every round, for no throughput at all over 128. So download gets
+// limit in every round, for no throughput at all over 128. So throughput gets
 // 128 too: a profile that stalls every keystroke for nothing is not a
 // profile, whatever it is called. What this bounds is only the unsent queue,
 // never what is in flight; the writer is woken again at half of it, a third
 // of a millisecond of data at this path's rate, so 64 KB does not underfill.
 func notsentLowat(cfg *config.Config) int {
-	if cfg.Tuning.Profile == config.ProfileGaming {
+	switch cfg.Tuning.Profile {
+	case config.ProfileGaming, config.ProfileStable:
 		return 64 << 10
 	}
 	return 128 << 10
@@ -9332,7 +9416,7 @@ type Config struct {
 		SendBatch int    // packets per crossing into the kernel; 0 means choose
 		Pace      bool   // put fq on the way out, so bursts leave as a stream
 		PaceMbit  int    // and cap the rate; unset means the tunnel works it out
-		Profile   string // gaming | balanced | download
+		Profile   string // gaming | stable | balanced | throughput | max
 		QueuePkts int    // how deep that queue may get; the profile sets it
 
 		// A DSCP mark on every packet the carrier sends, 0 to 63. Zero is
@@ -9350,6 +9434,7 @@ type Config struct {
 		// from a deliberate zero.
 		PaceSet     bool
 		PaceMbitSet bool
+		fecSet      bool
 	}
 
 	TUN struct {
@@ -9742,6 +9827,7 @@ func assign(c *Config, table, key, raw string) error {
 		c.Tuning.DSCP, err = num()
 	case "tuning.fec":
 		c.Tuning.FEC, err = num()
+		c.Tuning.fecSet = true
 
 	case "tun.name":
 		c.TUN.Name, err = str()
@@ -9860,7 +9946,7 @@ func assign(c *Config, table, key, raw string) error {
 //
 // What a profile does move:
 //
-//   - On a private link, the receive queue: 3072 KB for download against
+//   - On a private link, the receive queue: 3072 KB for throughput against
 //     256 KB for the other two. This one is kept on its old evidence - 458 and
 //     552 Mbit/s with a p90 of 125/156 ms, against 432 and 475 at 93/106 -
 //     because the attempt to measure it again could not settle it either way.
@@ -9878,10 +9964,42 @@ func assign(c *Config, table, key, raw string) error {
 // because twelve packets marked expedited left Frankfurt as 0xb8 and arrived
 // in Tehran as 0x18, every one of them re-marked.
 const (
-	ProfileGaming   = "gaming"
-	ProfileBalanced = "balanced"
-	ProfileDownload = "download"
+	ProfileGaming     = "gaming"
+	ProfileStable     = "stable"     // a path that loses packets
+	ProfileBalanced   = "balanced"   // the default
+	ProfileThroughput = "throughput" // many streams at once
+	ProfileMax        = "max"        // a server with many users at once
+
+	// What 1.0.x called throughput. A file that still says so is read as
+	// throughput, and the manager rewrites it at upgrade.
+	profileDownloadOld = "download"
 )
+
+// What each profile sets, all of it measured on the Tehran-Frankfurt pair
+// (docs/measured.md sections 35 to 41). Balanced is the default and the
+// right choice unless one of the other four names the situation exactly.
+//
+//	profile      receive queue   unsent (TCP)   connections   parity
+//	gaming          256 KB          64 KB           16          off
+//	stable          256              64             24          1 in 10
+//	balanced        256             128             16          off
+//	throughput     3072             128             16          off
+//	max            3072             128             32          off
+//
+// The receive queue reaches the datagram carriers; the unsent bound reaches
+// the five TCP carriers (carrier/stream.go); parity reaches udp, icmp,
+// rawtcp, awg and kcp. Every one of these is written into the file by the
+// manager, so what the file says is what runs; these are the defaults for a
+// file that names a profile and nothing else.
+func profileConnections(p string) int {
+	switch p {
+	case ProfileMax:
+		return 32
+	case ProfileStable:
+		return 24
+	}
+	return DefaultConnections
+}
 
 // DefaultQueuePkts is how deep fq may let this tunnel's flow get, before the
 // factor of ten in carrier/pace_linux.go. It is one number for every profile
@@ -9894,19 +10012,27 @@ const DefaultQueuePkts = 900
 
 func (c *Config) profile() error {
 	rcv := 0
-	switch strings.ToLower(strings.TrimSpace(c.Tuning.Profile)) {
+	c.Tuning.Profile = strings.ToLower(strings.TrimSpace(c.Tuning.Profile))
+	switch c.Tuning.Profile {
 	case "":
 		c.Tuning.Profile = ProfileBalanced
 		rcv = 256
-	case ProfileGaming:
+	case ProfileGaming, ProfileBalanced, ProfileStable:
 		rcv = 256
-	case ProfileBalanced:
-		rcv = 256
-	case ProfileDownload:
+	case ProfileThroughput, ProfileMax:
+		rcv = 3072
+	case profileDownloadOld:
+		c.Tuning.Profile = ProfileThroughput
 		rcv = 3072
 	default:
-		return fmt.Errorf("tuning.profile %q: it is %q, %q or %q",
-			c.Tuning.Profile, ProfileGaming, ProfileBalanced, ProfileDownload)
+		return fmt.Errorf("tuning.profile %q: it is %q, %q, %q, %q or %q",
+			c.Tuning.Profile, ProfileGaming, ProfileBalanced, ProfileThroughput, ProfileStable, ProfileMax)
+	}
+	// Parity for the path that loses packets, unless the file says otherwise.
+	// The health check has advised it on such a path since 1.0; stable is
+	// that advice as a default.
+	if !c.Tuning.fecSet && c.Tuning.Profile == ProfileStable {
+		c.Tuning.FEC = 10
 	}
 	depth := DefaultQueuePkts
 
@@ -9929,8 +10055,8 @@ func (c *Config) profile() error {
 	// The tail is a third to a half better and a single stream does not move,
 	// which is what one person downloading actually has. What it costs is the
 	// aggregate of many streams at once, and that is the whole of what the
-	// download profile is for - so that profile keeps the deep queue and the
-	// other two do not. tuning.rcvbuf_kb still overrides either way.
+	// throughput profile is for - so that profile keeps the deep queue and
+	// gaming and balanced do not. tuning.rcvbuf_kb still overrides either way.
 	//
 	// The socket drops more this way, and those drops are the point: they are
 	// the congestion signal arriving on time instead of a queue hiding it and
@@ -10149,7 +10275,7 @@ func (c *Config) check() error {
 		return fmt.Errorf("logging.level %q: error, warn, info or debug", c.Level)
 	}
 	if c.Transport.Connections == 0 {
-		c.Transport.Connections = DefaultConnections
+		c.Transport.Connections = profileConnections(c.Tuning.Profile)
 	}
 	if c.Transport.Connections < 1 || c.Transport.Connections > 32 {
 		return fmt.Errorf("transport.connections %d: between 1 and 32", c.Transport.Connections)
@@ -10185,8 +10311,9 @@ func (c *Config) check() error {
 		return fmt.Errorf("tun.mtu %d is outside anything that works", c.TUN.MTU)
 	}
 	// Inside AmneziaWG every packet the tun device hands up gains 20 of IP,
-	// 8 of UDP and 12 of framer on the awg device, and 4 more with parity
-	// on. A tun MTU past that budget fragments on the link, silently, on
+	// 8 of UDP and 12 of framer on the awg device, and with parity on 4 more
+	// in front of it and 2 more in the parity packet, which carries each
+	// payload's length (carrier/fec.go). A tun MTU past that budget fragments on the link, silently, on
 	// every large packet. The manager derives the number; this is the
 	// backstop for a file that arrived some other way.
 	//
@@ -10198,7 +10325,7 @@ func (c *Config) check() error {
 	if c.Transport.Type == "awg" && c.AWG.MTU > 0 {
 		budget := 40
 		if c.Tuning.FEC > 0 {
-			budget += 4
+			budget += 6
 		}
 		if c.TUN.MTU > c.AWG.MTU-budget {
 			return fmt.Errorf("tun.mtu %d does not fit inside awg.mtu %d with parity %s: at most %d",
@@ -10463,6 +10590,43 @@ const (
 	udpIDBit  = 0x80000000
 	udpIdle   = 90 * time.Second
 	pingEvery = 10 * time.Second
+
+	// Every third ping has a companion, a probe: a ping padded to probeSize
+	// bytes, which the far end echoes whole the way it echoes any ping, so
+	// it needs nothing new.
+	//
+	// It is there for one kind of path. On 2026-09-26 Iran blocked the Turkey
+	// server's address in a way that let every carrier connect and let the
+	// ten-second heartbeat through, and stopped what was bigger: full-size
+	// segments were retransmitted until the connection gave up, while the
+	// tiny pings kept arriving. Six forward transports said up, the health
+	// check said nothing was wrong, and they carried nothing
+	// (docs/measured.md 43). A heartbeat cannot see that; a heartbeat the
+	// size of real data can. A path that drops full-size packets for the
+	// other reason - a black hole under the interface's MTU - looks the
+	// same, and is reported the same.
+	probeEvery = 3
+	// Big enough to need a full-size segment on any path. Small enough that
+	// a 1.0.2 far end, whose records stop at 2048 bytes with their framing,
+	// takes it and echoes it.
+	probeSize = 1800
+	// The probe rides an id of its own and with it a carrier connection of
+	// its own: a record's id picks its connection, and every stream carrier
+	// delivers in order, so a probe the path stops holds up everything
+	// queued behind it on that connection. Sharing the heartbeat's would
+	// stall the heartbeat - the very thing that has to keep crossing for a
+	// stopped probe to mean anything - and drag the connection down with it.
+	// A tunnel of one connection has nowhere else to put it, and is not
+	// probed.
+	probeID = 1
+	// A probe is missed when the next one leaves and it still has not come
+	// back - a whole probe period, thirty seconds. After probeMisses of them
+	// in a row, ninety seconds, with less than probeDataMin of data arriving
+	// meanwhile, the tunnel says its data is being stopped. Data arriving at
+	// all means it is not: a busy tunnel can lose a probe's echo to a full
+	// queue (recordNB drops), but it cannot be carrying and blocked at once.
+	probeMisses  = 3
+	probeDataMin = 64 << 10
 	// How long a local socket may refuse a write before its stream is
 	// given up. A client that vanished without a reset would otherwise hold
 	// the write for the kernel's quarter of an hour - and with it the
@@ -10504,6 +10668,17 @@ type Forwarder struct {
 	rtt                                int64         // nanos, from the last pong
 	tooBig                             uint64        // datagrams bigger than one record will hold
 	epoch                              atomic.Uint64 // the far end's run, from its pings
+
+	// The data probe (see probeEvery). pingGap is pingEvery, held in a field
+	// for the same reason as grace below: a test shortens it for its own
+	// forwarder without racing anyone else's.
+	pingGap     time.Duration
+	probeOut    atomic.Bool   // a probe has left and not come back
+	probeSeen   atomic.Int64  // unix nanos of the last probe answered
+	probeMissed atomic.Int32  // probes in a row a whole period did not bring back
+	dataIn      atomic.Uint64 // payload bytes received, streams and datagrams
+	probeData   atomic.Uint64 // dataIn when the probe now out was sent
+	dataAtProbe atomic.Uint64 // dataIn when the first missed one was sent
 
 	// How long this tunnel's carrier may be away, copied from carrierGrace
 	// when the forwarder is made. A field and not the variable itself because
@@ -10553,6 +10728,7 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 		udpEdge: map[string]*udpSess{},
 		closing: make(chan struct{}),
 		grace:   carrierGrace,
+		pingGap: pingEvery,
 		acks:    make(chan uint32, 4096),
 	}
 	if f.edge {
@@ -10897,6 +11073,50 @@ func (f *Forwarder) Packets() (toWire, toDevice uint64) {
 	return atomic.LoadUint64(&f.toWire), atomic.LoadUint64(&f.fromWire)
 }
 
+// probe sends a ping padded to size bytes, on its own connection. If the
+// one sent last time is still out, a whole probe period has not brought it
+// back: that is a miss, and the first of a run notes how much data had
+// arrived when the missed probe left, so DataBlocked can ask how much has
+// arrived since.
+func (f *Forwarder) probe(size int) {
+	if f.probeOut.Swap(true) {
+		if f.probeMissed.Add(1) == 1 {
+			f.dataAtProbe.Store(f.probeData.Load())
+		}
+	}
+	f.probeData.Store(f.dataIn.Load())
+	body := make([]byte, size)
+	binary.BigEndian.PutUint64(body[:8], uint64(time.Since(processStart)))
+	binary.BigEndian.PutUint64(body[8:16], uint64(processStart.UnixNano()))
+	f.record(cmdPing, probeID, body)
+}
+
+// DataBlocked says the far end answers the heartbeat and nothing larger: the
+// last probeMisses probes each went a whole probe period unanswered, the far
+// end was heard from within three heartbeats all the same, and less than
+// probeDataMin of data arrived in that time. That is a path that lets a
+// connection live and stops what it carries - a filter, or full-size
+// packets falling into a hole under the MTU - and no restart changes it.
+func (f *Forwarder) DataBlocked() bool {
+	if f.probeMissed.Load() < probeMisses {
+		return false
+	}
+	seen := atomic.LoadInt64(&f.farSeen)
+	if seen == 0 || time.Since(time.Unix(0, seen)) > 3*f.pingGap {
+		return false // silent altogether: that is the other check's
+	}
+	return f.dataIn.Load()-f.dataAtProbe.Load() < probeDataMin
+}
+
+// ProbeSeen is when a probe last came back.
+func (f *Forwarder) ProbeSeen() time.Time {
+	n := f.probeSeen.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
 // FarSeen is when the far end last said anything, and RTT the last measured
 // round trip - the two things a forward tunnel can say about its health,
 // having no address to be pinged on.
@@ -10996,6 +11216,14 @@ func (f *Forwarder) onRecord(b []byte) {
 			f.farEpoch(binary.BigEndian.Uint64(body[8:16]))
 		}
 	case cmdPong:
+		if len(body) > pingLen {
+			// A probe's answer. Its round trip is the time to carry two
+			// kilobytes, not the path's, so it is not the one reported.
+			f.probeSeen.Store(time.Now().UnixNano())
+			f.probeOut.Store(false)
+			f.probeMissed.Store(0)
+			return
+		}
 		if len(body) >= 8 {
 			sent := int64(binary.BigEndian.Uint64(body))
 			if rtt := int64(time.Since(processStart)) - sent; rtt >= 0 {
@@ -11012,6 +11240,7 @@ func (f *Forwarder) onRecord(b []byte) {
 			return
 		}
 		off, payload := binary.BigEndian.Uint64(body[:offLen]), body[offLen:]
+		f.dataIn.Add(uint64(len(payload)))
 		if s := f.stream(id); s != nil {
 			payload = s.got.accept(off, payload)
 			if len(payload) == 0 {
@@ -11048,6 +11277,7 @@ func (f *Forwarder) onRecord(b []byte) {
 			f.openUDP(id, string(body))
 		}
 	case cmdUDP:
+		f.dataIn.Add(uint64(len(body)))
 		f.mu.Lock()
 		s := f.udp[id]
 		f.mu.Unlock()
@@ -11108,9 +11338,21 @@ func (f *Forwarder) owed(id uint32) {
 // which only echoes it.
 var processStart = time.Now()
 
+// pingLen is what a plain ping carries: the stamp and the epoch.
+const pingLen = 16
+
 func (f *Forwarder) pinger() {
-	tk := time.NewTicker(pingEvery)
+	tk := time.NewTicker(f.pingGap)
 	defer tk.Stop()
+	// The largest body one record holds on this carrier, less a margin. A
+	// carrier too small for a probe worth the name, or with one connection
+	// and so nowhere to put it but in front of the heartbeat, has none.
+	size := probeSize
+	if max := f.car.MaxPayload() - hdrLen - 64; size > max {
+		size = max
+	}
+	probing := len(f.out) > 1 && size > 4*pingLen
+	tick := 0
 	for {
 		select {
 		case <-f.closing:
@@ -11119,6 +11361,7 @@ func (f *Forwarder) pinger() {
 			if !f.car.Up() {
 				continue
 			}
+			tick++
 			// The stamp is this process's own clock, not the wall's: a
 			// clock step at the far end, or here, would otherwise read as a
 			// negative or a ten-second round trip for the next ten seconds.
@@ -11129,6 +11372,9 @@ func (f *Forwarder) pinger() {
 			binary.BigEndian.PutUint64(stamp[:8], uint64(time.Since(processStart)))
 			binary.BigEndian.PutUint64(stamp[8:], uint64(processStart.UnixNano()))
 			f.record(cmdPing, 0, stamp[:])
+			if probing && tick%probeEvery == 1 {
+				f.probe(size)
+			}
 		}
 	}
 }
@@ -11406,7 +11652,10 @@ func (f *Forwarder) open(c net.Conn, r Rule) {
 }
 
 // freshID is a stream id no live stream holds, and never 0, which is the
-// ping's. The counter wraps after two billion connections - weeks, on a busy
+// ping's, or probeID, which is the probe's: a record carrying a stream's id
+// marks that stream as having ridden its connection, and a probe that did so
+// would get a stream that never sent a byte reset for a connection it never
+// rode. The counter wraps after two billion connections - weeks, on a busy
 // edge - and a wrapped id handed to a stream still running would have put
 // one user's bytes into another's socket.
 func (f *Forwarder) freshID() uint32 {
@@ -11414,7 +11663,7 @@ func (f *Forwarder) freshID() uint32 {
 	defer f.mu.Unlock()
 	for {
 		id := atomic.AddUint32(&f.nextID, 1) & 0x7fffffff
-		if id == 0 {
+		if id == 0 || id == probeID {
 			continue
 		}
 		if _, live := f.streams[id]; !live {
@@ -12984,6 +13233,11 @@ type Report struct {
 	// says when the far end last spoke. Absent on a private link.
 	FarRTTms   float64 `json:"far_rtt_ms,omitempty"`
 	FarSeenSec float64 `json:"far_seen_sec,omitempty"`
+
+	// Whether a record the size of real data still crosses, where the
+	// heartbeat alone would say all is well. See forward.probeEvery.
+	DataBlocked  bool    `json:"data_blocked,omitempty"`
+	ProbeSeenSec float64 `json:"probe_seen_sec,omitempty"`
 }
 
 type Server struct {
@@ -13146,6 +13400,8 @@ func (s *Server) Report() Report {
 		Repaired:        s.repaired(),
 		FarRTTms:        s.farRTT(),
 		FarSeenSec:      s.farSeen(),
+		DataBlocked:     s.dataBlocked(),
+		ProbeSeenSec:    s.probeSeen(),
 	}
 }
 
@@ -13235,6 +13491,29 @@ func maxU64(a, b uint64) uint64 {
 type farEnd interface {
 	RTT() time.Duration
 	FarSeen() time.Time
+}
+
+// A forward tunnel also probes with records the size of data; asked for,
+// like the rest, so anything without the probe simply reports nothing.
+type prober interface {
+	DataBlocked() bool
+	ProbeSeen() time.Time
+}
+
+func (s *Server) dataBlocked() bool {
+	if p, ok := s.link.(prober); ok {
+		return p.DataBlocked()
+	}
+	return false
+}
+
+func (s *Server) probeSeen() float64 {
+	if p, ok := s.link.(prober); ok {
+		if t := p.ProbeSeen(); !t.IsZero() {
+			return time.Since(t).Seconds()
+		}
+	}
+	return 0
 }
 
 func (s *Server) farRTT() float64 {
@@ -34544,6 +34823,7 @@ ensure_go() {
     tar_ver=$want
     case $want in *.*.*) ;; *) tar_ver=$want.0 ;; esac
     url=$GO_DL_BASE/go$tar_ver.linux-$arch.tar.gz
+    GO_TARBALL=go$tar_ver.linux-$arch.tar.gz
 
     blank
     if [ -n "$found" ]; then
@@ -34557,10 +34837,18 @@ ensure_go() {
     field "size" "about 80 MB, roughly 250 MB unpacked"
     field "into" "/usr/local/go, deleting whatever is there now"
     blank
-    dim "Nothing verifies it beyond TLS to go.dev: this script carries no"
-    dim "checksum, and one fetched from the same place as the tarball would"
-    dim "prove nothing. If that is not good enough, install Go by hand and run"
-    dim "this again - it wants a compiler, not that compiler."
+    dim "Nothing verifies it beyond TLS to the server it comes from: this script"
+    dim "carries no checksum, and one fetched from the same place would prove"
+    dim "nothing. The sha256 of what arrives is printed, to check against"
+    dim "https://go.dev/dl/ from any machine that can see it."
+    blank
+    if [ -n "${PINGIFY_GO_URL:-}" ]; then
+        dim "PINGIFY_GO_URL is set, so the fetch goes to $PINGIFY_GO_URL"
+    else
+        dim "If go.dev cannot be reached from here: PINGIFY_GO_URL=https://<mirror>/dl"
+    fi
+    dim "Or skip the compiler altogether: build the core on the other server and"
+    dim "carry it here with  pingify core export  /  pingify core import FILE"
     blank
 
     if ! confirm "fetch it?" y; then
@@ -34611,6 +34899,9 @@ ensure_go() {
         fix "run this again, or unpack it by hand into /usr/local"
         return 1
     fi
+    if have sha256sum; then
+        dim "sha256 of $GO_TARBALL: $(sha256sum "$tmp" | cut -c1-64)"
+    fi
     rm -f "$tmp"
     if [ ! -x /usr/local/go.new/bin/go ]; then
         rm -rf /usr/local/go.new
@@ -34634,6 +34925,78 @@ ensure_go() {
 # --------------------------------------------------------------------------
 # building
 # --------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# a core carried over
+#
+# The server in Iran is usually the one that cannot build: too small, or
+# cut off from go.dev, or both. The other server can. So a core built there
+# is exported with its hash and version beside it, carried over by whatever
+# means the operator has (scp, a USB key, a pasted base64), and imported
+# here - checked against the hash, asked its version, and refused unless it
+# is this script's. This is the only way a binary enters a server without
+# being compiled on it, and it enters through the operator's hands.
+# ---------------------------------------------------------------------------
+
+core_export() {
+    require_root
+    [ -x "$CORE_BIN" ] || { fail "there is no core here to export - build one first"; return 1; }
+    core_matches_script || { fail "the core here is $(core_version), not this script's $PINGIFY_VERSION"; return 1; }
+    local arch out
+    arch=$(arch_go) || arch=unknown
+    out=${CORE_EXPORT_DIR:-/root}/pingify-core-$PINGIFY_VERSION-linux-$arch
+    cp -f "$CORE_BIN" "$out" || { fail "could not write $out"; return 1; }
+    chmod 0755 "$out"
+    sha256sum "$out" | cut -c1-64 > "$out.sha256"
+    ok "exported $out"
+    dim "sha256 $(cat "$out.sha256")"
+    blank
+    dim "carry both files to the other server, then there:"
+    dim "  pingify core import $out"
+    return 0
+}
+
+core_import() {
+    require_root
+    ensure_dirs
+    local f=$1 want got arch v
+    [ -f "$f" ] || { fail "$f is not there"; return 1; }
+    [ -f "$f.sha256" ] || { fail "$f.sha256 is not beside it - export writes both, carry both"; return 1; }
+    want=$(cut -c1-64 < "$f.sha256")
+    got=$(sha256sum "$f" | cut -c1-64)
+    if [ "$want" != "$got" ]; then
+        fail "the hash does not match: the file changed on the way"
+        dim "expected $want"
+        dim "got      $got"
+        return 1
+    fi
+    arch=$(arch_go)
+    case $f in
+    *-linux-$arch) ;;
+    *) fail "this is a $(printf '%s' "$f" | sed 's/.*-linux-//') core and this machine is $arch"; return 1 ;;
+    esac
+    chmod 0755 "$f"
+    v=$("$f" -version 2>/dev/null | awk '{print $2}')
+    if [ "$v" != "$PINGIFY_VERSION" ]; then
+        fail "that core says it is ${v:-nothing}, and this script is $PINGIFY_VERSION - they have to match"
+        return 1
+    fi
+    # Beside, then renamed over: a running core keeps its old file until the
+    # rename, and a copy that fails half way leaves the old one in place.
+    if ! { cp -f "$f" "$CORE_BIN.new" && mv -f "$CORE_BIN.new" "$CORE_BIN"; }; then
+        rm -f "$CORE_BIN.new"
+        fail "could not install to $CORE_BIN"
+        return 1
+    fi
+    ok "core $v installed at $CORE_BIN, hash checked"
+    unit_write
+    # The same tail as a core built here: every file in the current shape,
+    # every tunnel restarted onto the new core. Without this the tunnels
+    # would keep running the old core in memory, matching nothing on disk.
+    cfg_modernise
+    restart_all "the core was updated"
+    return 0
+}
 
 build_core() {
     require_root
@@ -35164,7 +35527,6 @@ grefou_up() {
         fail "$name: the file does not say enough to build the link"
         return 1
     }
-
     modprobe fou 2>/dev/null
     modprobe ip_gre 2>/dev/null
     case " $(ip fou show 2>/dev/null) " in *" port $port "*) ;; *)
@@ -35218,6 +35580,17 @@ grefou_up() {
         ul=$(grefou_underlay "$peer")
     done
     if [ -n "$ul" ]; then
+        # A link bigger than the interface it rides less GRE FOU's 36 bytes
+        # puts every full packet over the edge: refused where DF is set,
+        # split in two where it is not. Here and not before the device is
+        # made, because only now is there a route to ask which interface
+        # that is - at boot there is none for several seconds. Run at what
+        # fits and say so; the health check names the number for the file.
+        local fit
+        fit=$(tun_mtu_fit grefou "$peer" "$mtu")
+        if [ "$fit" -lt "$mtu" ] && ip link set "$dev" mtu "$fit" 2>/dev/null; then
+            warn "$name: mtu $mtu does not fit $ul, so the link runs at $fit"
+        fi
         # Written down per tunnel: the delete puts the interface the link
         # was made on back, not whichever one the route names by then.
         mkdir -p "$STATE_DIR" 2>/dev/null
@@ -35742,7 +36115,7 @@ cfg_reset() {
     T_DIALS=iran
     T_PUBLIC_IP= T_PEER_IP= T_IRAN= T_KHAREJ=
     T_PORT=8443 T_PATH= T_CONNS=16
-    T_TOKEN= T_PRESET=balanced T_LOG=info
+    T_TOKEN= T_PRESET=balanced T_LOG=info T_INSECURE=
     T_STATUS= T_HEALTH=
     T_FORWARDS=
     T_OCTET= T_TUNIF= T_TUNLOCAL= T_TUNPEER= T_TUNMTU=1320
@@ -35900,7 +36273,7 @@ token_print() {
 #
 # What a profile does move:
 #
-#   private link    the receive queue, 3072 KB for download against 256 for
+#   private link    the receive queue, 3072 KB for throughput against 256 for
 #                   the other two. Kept on its older measurement: the attempt
 #                   to take it again could not separate the setting from the
 #                   machine the probe ran on.
@@ -35909,7 +36282,7 @@ token_print() {
 #                   other two. That queue exists on every path, because a
 #                   forward tunnel pins each of its streams to one connection.
 #                   512 was measured to stall the small one for nothing, so
-#                   download does not get it. See notsentLowat in the core's
+#                   throughput does not get it. See notsentLowat in the core's
 #                   carrier/stream.go, and docs/measured.md section 39.
 #
 # Not DSCP: twelve packets marked expedited left Frankfurt as 0xb8 and arrived
@@ -35920,18 +36293,44 @@ token_print() {
 # applies. One number for every profile - see above.
 QUEUE_PACKETS=900
 
+# The five, and what each one sets - measured, docs/measured.md 35 to 41:
+#
+#   profile      receive queue   unsent (TCP)   connections   parity
+#   gaming          256 KB          64 KB           16          off
+#   stable          256              64             24          1 in 10
+#   balanced        256             128             16          off
+#   throughput     3072             128             16          off
+#   max            3072             128             32          off
+#
+# The unsent bound lives in the core (notsentLowat); the other three are
+# written here so the file says what runs.
 preset_rcvbuf() {
     case $1 in
-    download) printf '3072' ;;
+    throughput | max) printf '3072' ;;
     *) printf '256' ;;
+    esac
+}
+preset_conns() {
+    case $1 in
+    max) printf '32' ;;
+    stable) printf '24' ;;
+    *) printf '16' ;;
+    esac
+}
+preset_fec() {
+    case $1 in
+    stable) printf '10' ;;
+    *) printf '0' ;;
     esac
 }
 
 preset_menu() {
-    CHOICE_DEF=2
-    choice 1 "Gaming" "a small packet waits behind less of a big one"
-    choice 2 "Balanced" "the one to pick if unsure"
-    choice 3 "Download" "deeper queues, for many streams at once"
+    CHOICE_DEF=3
+    choice 1 "gaming" "lowest lag for a small packet, 64 KB unsent bound"
+    choice 2 "stable" "a path that loses packets: parity 1 in 10, 24 connections"
+    choice 3 "balanced" "sensible mix - the one to pick"
+    choice 4 "throughput" "many streams at once, 3 MB receive queue"
+    choice 5 "max" "a server with many users: 32 connections, 3 MB queue"
     CHOICE_DEF=
     blank
     # Said differently for the two modes, because it genuinely is a different
@@ -35947,10 +36346,12 @@ preset_menu() {
     dim "Changeable later, on both servers."
     blank
     local n
-    pick n "select" 2 3 || return 1
+    pick n "select" 3 5 || return 1
     case $n in
     1) T_PRESET=gaming ;;
-    3) T_PRESET=download ;;
+    2) T_PRESET=stable ;;
+    4) T_PRESET=throughput ;;
+    5) T_PRESET=max ;;
     *) T_PRESET=balanced ;;
     esac
     return 0
@@ -35983,9 +36384,11 @@ cfg_load() {
     T_PATH=$(toml_get "$f" transport path)
     T_CONNS=$(toml_get "$f" transport connections)
     [ -n "$T_CONNS" ] || T_CONNS=16
+    T_INSECURE=$(toml_get "$f" transport insecure)
     T_TOKEN=$(toml_get "$f" security token)
     T_PRESET=$(toml_get "$f" tuning profile)
     [ -n "$T_PRESET" ] || T_PRESET=balanced
+    [ "$T_PRESET" != download ] || T_PRESET=throughput # what 1.0.x called it
     T_FEC=$(toml_get "$f" tuning fec)
     T_QUEUE=$(toml_get "$f" tuning queue_packets)
     T_LOG=$(toml_get "$f" logging level)
@@ -36102,10 +36505,33 @@ cfg_render() {
         kv key '""'
         ;;
     esac
+    # utls is true because the far end makes its own certificate and there is
+    # nothing to vouch for it; wss is false, and off anyway between two bare
+    # addresses where nobody vouches for one. Said here and not in the file:
+    # the file is two columns.
     case $T_TRANSPORT in
-    utls) kv insecure 'true   # the far end makes its own certificate, so there is nothing to vouch for it' ;;
-    wss) kv insecure 'false  # and off anyway between two bare addresses, where nobody vouches for one' ;;
+    utls) kv insecure true ;;
+    wss) kv insecure "${T_INSECURE:-false}" ;; # kept from the file: a self-made pair says true
     esac
+
+    if [ "$mode" = tun ]; then
+        printf '\n[tun]\n'
+        kv name "$(q "$T_TUNIF")"
+        kv iran "$(q "10.$T_OCTET.10.1/24")"
+        kv kharej "$(q "10.$T_OCTET.10.2/24")"
+        kv mtu "${T_TUNMTU:-1320}"
+        kv txqueuelen 1000
+        # A tun device this core opens and reads. GRE FOU's is a kernel gre
+        # device that no goroutine of ours ever touches, so these two would be
+        # settings for a thing that is not there.
+        case $T_TRANSPORT in
+        grefou) ;;
+        *)
+            kv write_workers 0
+            kv queues 1
+            ;;
+        esac
+    fi
 
     if [ "$T_TRANSPORT" = awg ]; then
         printf '\n[awg]\n'
@@ -36133,6 +36559,7 @@ cfg_render() {
     kv token "$(q "$T_TOKEN")"
 
     printf '\n[tuning]\n'
+    printf '# chosen by the profile - change them from Manage > Tuning, on both servers\n'
     kv profile "$(q "$T_PRESET")"
     # This table is dead for GRE FOU: the kernel moves the packets, this core
     # returns before a carrier is opened, and nothing set on a socket or a
@@ -36194,7 +36621,7 @@ cfg_render() {
     # same key - it was the one transport that could use it and had no way of
     # being told.
     case $T_TRANSPORT in
-    udp | icmp | rawtcp | awg | kcp) kv fec "${T_FEC:-0}" ;;
+    udp | icmp | rawtcp | awg | kcp) kv fec "${T_FEC:-$(preset_fec "$T_PRESET")}" ;;
     esac
 
     printf '\n[forward]\n'
@@ -36216,25 +36643,6 @@ cfg_render() {
         kv probe_every_sec 60
     fi
 
-    if [ "$mode" = tun ]; then
-        printf '\n[tun]\n'
-        kv name "$(q "$T_TUNIF")"
-        kv iran "$(q "10.$T_OCTET.10.1/24")"
-        kv kharej "$(q "10.$T_OCTET.10.2/24")"
-        kv mtu "${T_TUNMTU:-1320}"
-        kv txqueuelen 1000
-        # A tun device this core opens and reads. GRE FOU's is a kernel gre
-        # device that no goroutine of ours ever touches, so these two would be
-        # settings for a thing that is not there.
-        case $T_TRANSPORT in
-        grefou) ;;
-        *)
-            kv write_workers 0
-            kv queues 1
-            ;;
-        esac
-    fi
-
     printf '\n[logging]\n'
     kv level "$(q "${T_LOG:-info}")"
 
@@ -36245,6 +36653,51 @@ cfg_render() {
     else
         kv health_port "${T_HEALTH:-$HEALTH_PORT}"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# a file from before, brought to the shape the renderer writes now
+#
+# Files written by 2.x carried a header and a note beside every key, and a
+# key left at its default was a commented-out line. Nothing rewrote them, so
+# a server that had been upgraded three times still showed the old shape
+# beside the new. On upgrade every file that is not in the current shape is
+# read back into the wizard's variables and written out again - two columns,
+# no notes, each key only where its transport reads it - through the same
+# gate as any edit, so a rewrite the core would not accept changes nothing.
+# ---------------------------------------------------------------------------
+
+# cfg_old FILE - not in the shape cfg_render writes: a header, or a note
+# after a value.
+cfg_old() { grep -qE '^# Pingify|^[a-z_]+ *=.*[^"]#' "$1" 2>/dev/null; }
+
+_edit_modernise() {
+    cfg_load "$MODERNISE_NAME" || return 1
+    # A file from before the status port existed has none; the renderer
+    # would give every such file the base port. status_port derives the one
+    # this tunnel has been answering on since, by its place in the list.
+    [ -n "$T_STATUS" ] || T_STATUS=$(status_port "$MODERNISE_NAME")
+    cfg_render > "$1"
+}
+
+# cfg_modernise - every old-shape file, rewritten. The caller restarts the
+# tunnels; this only changes the files.
+cfg_modernise() {
+    local n f done=0
+    for n in $(cfg_list); do
+        f=$(cfg_file "$n")
+        cfg_old "$f" || continue
+        cp -f "$f" "$f.old" 2>/dev/null
+        MODERNISE_NAME=$n
+        if cfg_apply "$n" _edit_modernise no >/dev/null 2>&1; then
+            done=$((done + 1))
+        else
+            rm -f "$f.old"
+            warn "$n could not be rewritten and was left as it was"
+        fi
+    done
+    [ "$done" = 0 ] || info "$done config file(s) rewritten in the current shape; the old ones are kept as .toml.old"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -36512,7 +36965,11 @@ setup_token_check() {
         forwarding_transport "${b%%:*}" || { setup_token_bad "unknown backup transport ${b%%:*}"; return 1; }
         v_port "${b#*:}" >/dev/null 2>&1 || { setup_token_bad "a backup port is invalid"; return 1; }
     done
-    case $T_PRESET in gaming | balanced | download) ;; *) T_PRESET=balanced ;; esac
+    case $T_PRESET in
+    gaming | stable | balanced | throughput | max) ;;
+    download) T_PRESET=throughput ;; # what 1.0.x called it
+    *) T_PRESET=balanced ;;
+    esac
     case $T_LOG in debug | info | warn | error) ;; *) T_LOG=info ;; esac
     return 0
 }
@@ -36589,9 +37046,9 @@ ask_side() {
 ask_transport() {
     wiz "Transport"
     group "FORWARDING - your ports, carried over a connection"
-    choice 1 "TCP MUX" "plain TCP, every stream across eight connections"
+    choice 1 "TCP MUX" "plain TCP, every stream across sixteen connections"
     choice 2 "WS MUX" "WebSocket on port 80 - a CDN can front it"
-    choice 3 "WSS MUX" "WebSocket inside TLS - a domain or Cloudflare"
+    choice 3 "WSS MUX" "TLS via Cloudflare - good for filtered Iran"
     choice 4 "Chrome TLS MUX" "TLS whose handshake is Chrome's"
     choice 5 "Decoy TLS MUX" "Chrome TLS, and a website for anyone probing"
     choice 6 "KCP MUX" "reliable streams over UDP, for when TCP is throttled"
@@ -36605,7 +37062,7 @@ ask_transport() {
     choice 9 "UDP" "plain UDP on one port"
     choice 10 "AmneziaWG" "obfuscated WireGuard over UDP - encrypted"
     choice 11 "Fake TCP" "TCP-shaped packets, no connection to throttle"
-    choice 12 "ICMP" "inside ping packets - no port at all"
+    choice 12 "ICMP" "inside ping packets - no port, passes some filters"
     blank
     local proto
     pick proto "select" "" 12 || return 1
@@ -36651,16 +37108,20 @@ ask_transport() {
 transport_needs() {
     blank
     case $T_TRANSPORT in
-    tcp) dim "Needs nothing. Eight plain connections; start here on a clean route." ;;
+    tcp) dim "Needs nothing. Sixteen plain connections; start here on a clean route." ;;
     ws) dim "Needs HTTP to cross, usually on port 80. A CDN can sit in front of the end"
         dim "that waits, given a domain. Unencrypted by itself." ;;
     wss) dim "Needs a domain on the end that waits, or a bare address with a made-up"
-        dim "certificate. A real certificate can be set later under Tuning." ;;
+        dim "certificate. A real certificate can be set later under Tuning."
+        dim "Good for filtered Iran: with Reverse and a Cloudflare domain that fronts"
+        dim "the IRAN server, Iran only ever talks to Cloudflare - which is how a"
+        dim "tunnel kept carrying when Iran blocked the foreign server's address." ;;
     utls | fallback)
         dim "Needs TLS to cross. The handshake is Chrome's; the end that waits serves a"
         dim "made-up certificate unless one is set later under Tuning." ;;
     kcp) dim "Needs UDP to cross both ways. More CPU and memory than TCP; the one to"
-        dim "reach for when TCP is throttled and UDP is not." ;;
+        dim "reach for when TCP is throttled and UDP is not. Every packet is sealed"
+        dim "under a cipher keyed from the token, so nothing on the wire says KCP." ;;
     gre) dim "Needs IP protocol 47 to cross. No port, no disguise." ;;
     grefou) dim "Needs UDP to cross, ethtool here, and the fou and ip_gre kernel modules." ;;
     udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
@@ -37035,11 +37496,18 @@ ask_link() {
     field "KHAREJ" "$(addr_tint "10.$T_OCTET.10.2/24")"
     blank
     ask T_TUNIF "device name" "$(free_tun_iface)" v_wiz_iface || return 1
+    # 1400 for GRE FOU and 1320 for the rest fit a 1500 interface with room
+    # to spare. Iranian servers are handed 1400 and 1450 as often as 1500,
+    # so where the interface to the other server is smaller, the default is
+    # what fits it.
+    # The transports that can carry parity leave room for it whether it is
+    # on or not: the stable preset turns it on, and so can Tuning later, and
+    # neither comes back to the MTU. GRE and GRE FOU never carry it.
     case $T_TRANSPORT in
     awg) T_TUNMTU=$(awg_tun_mtu) ;;
-    # What Golden GRE uses, and what the kernel's own encapsulation fits.
-    grefou) T_TUNMTU=1400 ;;
-    *) T_TUNMTU=1320 ;;
+    grefou) T_TUNMTU=$(tun_mtu_fit grefou "$T_PEER_IP" 1400) ;;
+    gre) T_TUNMTU=$(tun_mtu_fit gre "$T_PEER_IP" 1320) ;;
+    *) T_TUNMTU=$(tun_mtu_fit "$T_TRANSPORT" "$T_PEER_IP" 1320 1) ;;
     esac
     case $T_TRANSPORT in
     awg) ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu_awg || return 1 ;;
@@ -37080,7 +37548,10 @@ v_forwards_needed() {
 
 ask_preset() {
     wiz "Performance" "The shape of your traffic. You can change it later."
-    preset_menu
+    preset_menu || return 1
+    # The wizard never asks for these two; the profile chooses them.
+    T_CONNS=$(preset_conns "$T_PRESET")
+    T_FEC=$(preset_fec "$T_PRESET")
 }
 
 ask_logging() {
@@ -37312,6 +37783,11 @@ import_tunnel() {
     T_NAME=$(name_for_side "$T_NAME" "$T_SIDE")
     if [ "$T_SIDE" = iran ]; then T_PUBLIC_IP=$T_IRAN T_PEER_IP=$T_KHAREJ
     else T_PUBLIC_IP=$T_KHAREJ T_PEER_IP=$T_IRAN; fi
+    # The MTU in the token fits the server that made it. GRE FOU is carried
+    # by the kernel, which takes a packet of any size in, so each end may
+    # send at what fits its own interface; the other private links share a
+    # buffer size with the far core and keep the number they were given.
+    [ "$T_TRANSPORT" = grefou ] && T_TUNMTU=$(tun_mtu_fit grefou "$T_PEER_IP" "$T_TUNMTU")
     if cfg_needs_link; then
         if [ "$T_SIDE" = iran ]; then T_TUNLOCAL="10.$T_OCTET.10.1/24" T_TUNPEER="10.$T_OCTET.10.2/24"
         else T_TUNLOCAL="10.$T_OCTET.10.2/24" T_TUNPEER="10.$T_OCTET.10.1/24"; fi
@@ -37736,13 +38212,22 @@ live_log() {
 # beside QUEUE_PACKETS.
 _edit_profile() {
     toml_set "$1" tuning profile "$PROFILE_WANT" || return 1
-    # The receive queue is only in the file where a socket gets it - see the
-    # same list in cfg_render. Writing it back here for a transport that omits
-    # it would put the key into a file that had correctly left it out.
+    # Each value the profile chooses, written back only where the file has
+    # it - the same lists as cfg_render. Writing one into a file that had
+    # correctly left it out would put a key there that nothing reads.
     case $T_TRANSPORT in
-    tcp | ws | wss | utls | fallback | grefou | kcp) return 0 ;;
+    tcp | ws | wss | utls | fallback | kcp)
+        toml_set "$1" transport connections "$(preset_conns "$PROFILE_WANT")" || return 1 ;;
     esac
-    toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
+    case $T_TRANSPORT in
+    udp | gre | icmp | rawtcp | awg)
+        toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")" || return 1 ;;
+    esac
+    case $T_TRANSPORT in
+    udp | icmp | rawtcp | awg | kcp)
+        toml_set "$1" tuning fec "$(preset_fec "$PROFILE_WANT")" || return 1 ;;
+    esac
+    return 0
 }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }
@@ -38590,7 +39075,29 @@ health_check() {
         else
             chk_add ok link "private link $CK_DEV is up, $addr, mtu ${live_mtu:-?}"
         fi
-        if [ -n "$live_mtu" ] && [ "$live_mtu" != "$CK_MTU" ]; then
+        # Whether a full packet, with what the transport puts around it, fits
+        # the interface it leaves by. A GRE FOU link at 1400 on a server
+        # whose interface is 1400 had every full packet 36 bytes over it.
+        # What is judged is what runs: GRE FOU cuts a link down to what fits
+        # when it starts, and then the file's number is only the file's.
+        local farpub ul ulmtu over run
+        if [ "$CK_SIDE" = iran ]; then farpub=$CK_KHAREJ; else farpub=$CK_IRAN; fi
+        ul=$(grefou_underlay "$farpub")
+        ulmtu=$(cat "${SYSFS_NET:-/sys/class/net}/${ul:-none}/mtu" 2>/dev/null)
+        case $ulmtu in '' | *[!0-9]*) ulmtu= ;; esac
+        # A number the shell cannot add, step 2 has already reported; the
+        # arithmetic below would end the whole check on it instead.
+        case $CK_MTU in '' | *[!0-9]*) ulmtu= ;; esac
+        run=$live_mtu
+        case $run in '' | *[!0-9]*) run=$CK_MTU ;; esac
+        over=$(tun_overhead "$CK_TRANSPORT" "$(toml_get "$CK_FILE" tuning fec)")
+        if [ -n "$ulmtu" ] && [ "$((run + over))" -gt "$ulmtu" ]; then
+            chk_add bad mtu "mtu $run does not fit $ul: with $over bytes of $(transport_label "$CK_TRANSPORT") a full packet is $((run + over)), and $ul takes $ulmtu" \
+                "set MTU to $((ulmtu - over)) on both servers: Manage ${BX_ARR} $name ${BX_ARR} Tuning ${BX_ARR} MTU"
+        elif [ -n "$ulmtu" ] && [ "$((CK_MTU + over))" -gt "$ulmtu" ]; then
+            chk_add warn mtu "the config says mtu $CK_MTU, which does not fit $ul; the link runs at $run, cut down when it started" \
+                "set MTU to $((ulmtu - over)) on both servers: Manage ${BX_ARR} $name ${BX_ARR} Tuning ${BX_ARR} MTU"
+        elif [ -n "$live_mtu" ] && [ "$live_mtu" != "$CK_MTU" ]; then
             chk_add warn mtu "device mtu $live_mtu, the config says $CK_MTU" \
                 "a hand-set mtu is lost on the next restart" "put the number in the config instead"
         fi
@@ -38613,6 +39120,17 @@ health_check() {
                 chk_add note peer "started $(human_secs "$ST_UPTIME") ago; nothing back yet"
             else
                 chk_add ok peer "the other server has been heard from - this tunnel has run $(human_secs "$ST_UPTIME")"
+            fi
+            # The heartbeat crosses and data does not: what Iran did to the
+            # Turkey server on 2026-09-26, when six transports said up and
+            # this check said nothing was wrong (docs/measured.md 43).
+            if [ "$ST_BLOCKED" = true ]; then
+                local since="since it started"
+                [ -n "$ST_PROBE_SEEN" ] && since="for $(human_secs "${ST_PROBE_SEEN%%.*}")"
+                chk_add bad data "the other server answers the heartbeat, and nothing the size of data has crossed $since" \
+                    "something on the path lets small packets through and stops full-size ones; a restart will not change it" \
+                    "a filter on the foreign address: go through Cloudflare - WSS MUX, Reverse, a name that fronts IRAN (README: When Iran filters the foreign server) - or try ICMP" \
+                    "a path smaller than the interface: turn on MTU probing with Optimize, on both servers"
             fi
             if [ -n "$ST_ACTIVE" ] && [ "$ST_ACTIVE" != "$CK_TRANSPORT" ]; then
                 chk_add warn failover "running on the backup $(transport_label "$ST_ACTIVE"): $(transport_label "$CK_TRANSPORT") stopped carrying" \
@@ -40242,6 +40760,7 @@ rebuild_core() {
     local n
     unit_write
     if ensure_core; then
+        cfg_modernise
         while IFS= read -r n; do
             systemctl is-enabled --quiet "pingify@$n" 2>/dev/null && svc_do restart "$n"
         done < <(cfg_list)
@@ -40643,12 +41162,12 @@ choose_tuning_profile() {
     CHOICE_DEF=1
     choice 1 "Balanced" "recommended - video, browsing and games together"
     choice 2 "Gaming" "smaller queues and shorter NIC work cycles"
-    choice 3 "Download" "large packet batches and a 128 MB socket ceiling"
+    choice 3 "Throughput" "large packet batches and a 128 MB socket ceiling"
     CHOICE_DEF=
     blank
     dim "This sets the kernel's socket buffer sizes and backlog, for everything"
-    dim "this server does. A tunnel's own profile is a different thing with the"
-    dim "same three names; it lives on that tunnel's Tuning screen."
+    dim "this server does. A tunnel's own profile is a different thing, with"
+    dim "names of its own; it lives on that tunnel's Tuning screen."
     blank
     local c
     pick c "select" 1 3 || return 1
@@ -40776,7 +41295,7 @@ optimize_menu() {
         panel_field "BBR" "$(state_badge "$(host_bbr_state)")" "Forwarding" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null | sed 's/^1$/on/; s/^0$/off/')"
         panel_end
         blank
-        item 1 "Apply host tuning" "Balanced, Gaming or Download"
+        item 1 "Apply host tuning" "Balanced, Gaming or Throughput"
         item 2 "Enable BBR" "congestion control and fq - measured: 348 Mbit/s where cubic carried 31"
         item 3 "Disable BBR" "back to the kernel default"
         blank
@@ -41166,6 +41685,8 @@ Pingify $PINGIFY_VERSION - tunnel manager for Iran <-> Kharej server pairs
   pingify --new              straight to building a tunnel
   pingify --status [name]    print tunnel status and exit
   pingify --check name       health check; exits 0 clean, 1 warnings, 2 problems
+  pingify core export        write the core beside its hash, to carry to a server that cannot build
+  pingify core import FILE   install a core carried over, hash and version checked
   pingify --json             with --status or --check, machine readable
   pingify --health-check     run the watchdog pass once (used by the timer)
   pingify --apply-firewall   re-apply the forwarding and blocking rules (used at boot)
@@ -41242,7 +41763,10 @@ first_run() {
     fi
     blank
     fail "the core could not be built"
-    dim "it needs a Go toolchain, which this script offers to fetch when it is missing"
+    dim "it needs a Go toolchain, which this script offers to fetch when it is missing."
+    dim "A server that cannot fetch it, or is too small to compile, can take the"
+    dim "core from the other server instead:"
+    dim "  there:  pingify core export      here:  pingify core import FILE"
     pause
     return 1
 }
@@ -41258,6 +41782,7 @@ ensure_core_current() {
     dim "they have to match - the config format is shared between them"
     blank
     if build_core; then
+        cfg_modernise
         restart_all "the core was updated"
     else
         blank
@@ -41372,6 +41897,15 @@ argv() {
         --apply-firewall) ARG_MODE=firewall ;;
         --version | -v) ARG_MODE=version ;;
         --help | -h) ARG_MODE=help ;;
+        core)
+            # A word, not a flag, and its own words follow it - export, or
+            # import and a file - which main reads where they stand. Without
+            # this every "pingify core ..." died here as an unknown option,
+            # and the tests never saw it: they called the two functions
+            # directly.
+            ARG_MODE=core
+            shift "$(($# > 2 ? 2 : $# - 1))"
+            ;;
         *)
             usage >&2
             die "$1 is not an option this script has"
@@ -41410,6 +41944,12 @@ main() {
         ;;
     update) update_pingify; exit $? ;;
     install) ensure_deps; install_self && ok "installed"; exit $? ;;
+    core)
+        case ${2:-} in
+        export) core_export; exit $? ;;
+        import) [ -n "${3:-}" ] || { fail "pingify core import FILE"; exit 1; }; core_import "$3"; exit $? ;;
+        *) fail "pingify core export | pingify core import FILE"; exit 1 ;;
+        esac ;;
     rebuild) rebuild_core; exit $? ;;
     esac
 

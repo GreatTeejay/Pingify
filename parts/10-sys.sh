@@ -486,6 +486,7 @@ tun_stats() {
     ST_UP= ST_IN= ST_OUT= ST_LOST= ST_GAPS= ST_LATE= ST_UPTIME= ST_DROPPED=
     ST_TRANSPORT= ST_PROFILE= ST_SIDE= ST_INB= ST_OUTB= ST_MODE= ST_FAR_RTT= ST_FAR_SEEN=
     ST_VERSION= ST_TOWIRE= ST_TODEV= ST_NOTOURS= ST_SENDERR= ST_ACTIVE=
+    ST_BLOCKED= ST_PROBE_SEEN=
 
     have curl || return 1
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
@@ -510,6 +511,8 @@ tun_stats() {
     ST_MODE=$(json_field "$json" mode)
     ST_FAR_RTT=$(json_field "$json" far_rtt_ms)
     ST_FAR_SEEN=$(json_field "$json" far_seen_sec)
+    ST_BLOCKED=$(json_field "$json" data_blocked)
+    ST_PROBE_SEEN=$(json_field "$json" probe_seen_sec)
     ST_TOWIRE=$(json_field "$json" to_wire)
     ST_TODEV=$(json_field "$json" to_device)
     ST_NOTOURS=$(json_field "$json" not_ours)

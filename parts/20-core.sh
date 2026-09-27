@@ -21,7 +21,12 @@
 # The compiler ensure_go settled on. Empty until it has run.
 GO_BIN=
 
-GO_DL_BASE=https://go.dev/dl
+# Where the Go tarball comes from. go.dev is Google's, and from an Iranian
+# server it is often unreachable or throttled to nothing; PINGIFY_GO_URL names
+# another place to fetch the same file - a mirror, or a copy on a server of
+# your own - and the sha256 of whatever arrived is printed so it can be
+# checked against https://go.dev/dl/ from anywhere.
+GO_DL_BASE=${PINGIFY_GO_URL:-https://go.dev/dl}
 
 # --------------------------------------------------------------------------
 # the sources
@@ -138,6 +143,7 @@ ensure_go() {
     tar_ver=$want
     case $want in *.*.*) ;; *) tar_ver=$want.0 ;; esac
     url=$GO_DL_BASE/go$tar_ver.linux-$arch.tar.gz
+    GO_TARBALL=go$tar_ver.linux-$arch.tar.gz
 
     blank
     if [ -n "$found" ]; then
@@ -151,10 +157,18 @@ ensure_go() {
     field "size" "about 80 MB, roughly 250 MB unpacked"
     field "into" "/usr/local/go, deleting whatever is there now"
     blank
-    dim "Nothing verifies it beyond TLS to go.dev: this script carries no"
-    dim "checksum, and one fetched from the same place as the tarball would"
-    dim "prove nothing. If that is not good enough, install Go by hand and run"
-    dim "this again - it wants a compiler, not that compiler."
+    dim "Nothing verifies it beyond TLS to the server it comes from: this script"
+    dim "carries no checksum, and one fetched from the same place would prove"
+    dim "nothing. The sha256 of what arrives is printed, to check against"
+    dim "https://go.dev/dl/ from any machine that can see it."
+    blank
+    if [ -n "${PINGIFY_GO_URL:-}" ]; then
+        dim "PINGIFY_GO_URL is set, so the fetch goes to $PINGIFY_GO_URL"
+    else
+        dim "If go.dev cannot be reached from here: PINGIFY_GO_URL=https://<mirror>/dl"
+    fi
+    dim "Or skip the compiler altogether: build the core on the other server and"
+    dim "carry it here with  pingify core export  /  pingify core import FILE"
     blank
 
     if ! confirm "fetch it?" y; then
@@ -205,6 +219,9 @@ ensure_go() {
         fix "run this again, or unpack it by hand into /usr/local"
         return 1
     fi
+    if have sha256sum; then
+        dim "sha256 of $GO_TARBALL: $(sha256sum "$tmp" | cut -c1-64)"
+    fi
     rm -f "$tmp"
     if [ ! -x /usr/local/go.new/bin/go ]; then
         rm -rf /usr/local/go.new
@@ -228,6 +245,78 @@ ensure_go() {
 # --------------------------------------------------------------------------
 # building
 # --------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# a core carried over
+#
+# The server in Iran is usually the one that cannot build: too small, or
+# cut off from go.dev, or both. The other server can. So a core built there
+# is exported with its hash and version beside it, carried over by whatever
+# means the operator has (scp, a USB key, a pasted base64), and imported
+# here - checked against the hash, asked its version, and refused unless it
+# is this script's. This is the only way a binary enters a server without
+# being compiled on it, and it enters through the operator's hands.
+# ---------------------------------------------------------------------------
+
+core_export() {
+    require_root
+    [ -x "$CORE_BIN" ] || { fail "there is no core here to export - build one first"; return 1; }
+    core_matches_script || { fail "the core here is $(core_version), not this script's $PINGIFY_VERSION"; return 1; }
+    local arch out
+    arch=$(arch_go) || arch=unknown
+    out=${CORE_EXPORT_DIR:-/root}/pingify-core-$PINGIFY_VERSION-linux-$arch
+    cp -f "$CORE_BIN" "$out" || { fail "could not write $out"; return 1; }
+    chmod 0755 "$out"
+    sha256sum "$out" | cut -c1-64 > "$out.sha256"
+    ok "exported $out"
+    dim "sha256 $(cat "$out.sha256")"
+    blank
+    dim "carry both files to the other server, then there:"
+    dim "  pingify core import $out"
+    return 0
+}
+
+core_import() {
+    require_root
+    ensure_dirs
+    local f=$1 want got arch v
+    [ -f "$f" ] || { fail "$f is not there"; return 1; }
+    [ -f "$f.sha256" ] || { fail "$f.sha256 is not beside it - export writes both, carry both"; return 1; }
+    want=$(cut -c1-64 < "$f.sha256")
+    got=$(sha256sum "$f" | cut -c1-64)
+    if [ "$want" != "$got" ]; then
+        fail "the hash does not match: the file changed on the way"
+        dim "expected $want"
+        dim "got      $got"
+        return 1
+    fi
+    arch=$(arch_go)
+    case $f in
+    *-linux-$arch) ;;
+    *) fail "this is a $(printf '%s' "$f" | sed 's/.*-linux-//') core and this machine is $arch"; return 1 ;;
+    esac
+    chmod 0755 "$f"
+    v=$("$f" -version 2>/dev/null | awk '{print $2}')
+    if [ "$v" != "$PINGIFY_VERSION" ]; then
+        fail "that core says it is ${v:-nothing}, and this script is $PINGIFY_VERSION - they have to match"
+        return 1
+    fi
+    # Beside, then renamed over: a running core keeps its old file until the
+    # rename, and a copy that fails half way leaves the old one in place.
+    if ! { cp -f "$f" "$CORE_BIN.new" && mv -f "$CORE_BIN.new" "$CORE_BIN"; }; then
+        rm -f "$CORE_BIN.new"
+        fail "could not install to $CORE_BIN"
+        return 1
+    fi
+    ok "core $v installed at $CORE_BIN, hash checked"
+    unit_write
+    # The same tail as a core built here: every file in the current shape,
+    # every tunnel restarted onto the new core. Without this the tunnels
+    # would keep running the old core in memory, matching nothing on disk.
+    cfg_modernise
+    restart_all "the core was updated"
+    return 0
+}
 
 build_core() {
     require_root

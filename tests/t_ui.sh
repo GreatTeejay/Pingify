@@ -186,4 +186,31 @@ bare=$(grep -hn 'ask [A-Za-z_]' parts/*.sh |
     awk '{ n = gsub(/"/, "\""); if (NF < 5) print }' | head -5)
 check "no ask call omits its validator" "$bare" ""
 
+
+section "a private link's MTU fits the interface it rides"
+
+# Measured on the Iran-Turkey pair: a GRE FOU link at 1400 on a server whose
+# interface is 1400 put 36 bytes too many on every full packet. The default
+# is now what fits; where nothing can be read, the number asked for.
+_sys=$(mktemp -d)
+mkdir -p "$_sys/eth0" "$_sys/ens3"
+ip() { case "$*" in "route get 198.51.100.1") echo "198.51.100.1 via 10.0.0.1 dev eth0 src 10.0.0.2" ;; "route get 203.0.113.1") echo "203.0.113.1 via 10.0.0.1 dev ens3 src 10.0.0.2" ;; esac; }
+SYSFS_NET=$_sys
+echo 1400 > "$_sys/eth0/mtu"; echo 1500 > "$_sys/ens3/mtu"
+check "GRE FOU on a 1400 interface gets 1364" "$(tun_mtu_fit grefou 198.51.100.1 1400)" "1364"
+check "and on a 1500 one keeps 1400" "$(tun_mtu_fit grefou 203.0.113.1 1400)" "1400"
+check "UDP's 1320 already fits 1400" "$(tun_mtu_fit udp 198.51.100.1 1320)" "1320"
+check "Fake TCP's 1320 fits too, with 52 of header" "$(tun_mtu_fit rawtcp 198.51.100.1 1320)" "1320"
+check "the core's GRE has 32 of header, not 36: 1368 fits 1400 exactly" "$(tun_mtu_fit gre 198.51.100.1 1400)" "1368"
+check "parity needs 6 more on UDP: 1354 on 1400" "$(tun_mtu_fit udp 198.51.100.1 1400 10)" "1354"
+check "and nothing more for GRE FOU, which never carries it" "$(tun_mtu_fit grefou 198.51.100.1 1400 10)" "1364"
+check "the AmneziaWG default leaves room for parity packets" "$(awg_tun_mtu)" "1274"
+echo 1280 > "$_sys/eth0/mtu"
+check "on a 1280 interface UDP comes down to 1240" "$(tun_mtu_fit udp 198.51.100.1 1320)" "1240"
+check "and to 1234 with room for parity" "$(tun_mtu_fit udp 198.51.100.1 1320 1)" "1234"
+check "an interface that cannot be read leaves the number alone" "$(tun_mtu_fit grefou 192.0.2.9 1400)" "1400"
+unset -f ip
+unset SYSFS_NET
+rm -rf "$_sys"
+
 report

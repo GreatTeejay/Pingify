@@ -25,9 +25,13 @@ type pipeCarrier struct {
 	on         atomic.Pointer[func([]byte)]
 	q          chan []byte
 	sent       uint64
-	down       atomic.Bool // the carrier away, as a test sees fit
-	lose       atomic.Bool // and swallowing what is handed to it, as one does
-	lost       uint64      // how many records that swallowed
+	down       atomic.Bool  // the carrier away, as a test sees fit
+	lose       atomic.Bool  // and swallowing what is handed to it, as one does
+	lost       uint64       // how many records that swallowed
+	dropOver   atomic.Int64 // a filter: a record longer than this vanishes
+	slots      int          // carrier connections, as the forwarder counts them
+	stalled    [64]atomic.Bool
+	bigFlow    atomic.Int64 // 1 + the flow of the last record over dropOver
 	onLinkDown atomic.Pointer[func(int)]
 }
 
@@ -114,12 +118,68 @@ func (p *pipeCarrier) Send(bp *[]byte) error {
 	return nil
 }
 
-func (p *pipeCarrier) SendFlow(_ uint32, bp *[]byte) error {
+func (p *pipeCarrier) SendFlow(flow uint32, bp *[]byte) error {
 	if p.down.Load() {
 		buf.Put(bp)
 		return carrier.ErrNoPeer
 	}
+	if d := p.dropOver.Load(); d > 0 {
+		slot := 0
+		if p.slots > 1 {
+			slot = int(flow % uint32(p.slots))
+		}
+		n := int64(len(*bp) - p.head)
+		if n > d {
+			p.bigFlow.Store(int64(flow) + 1)
+		}
+		// Every stream carrier delivers in order. Once a record on a
+		// connection is stopped, nothing queued behind it on that
+		// connection arrives either, whatever its size - which is what the
+		// first version of this filter left out, and with it the one bug
+		// that mattered: a probe sharing the heartbeat's connection.
+		if n > d || p.stalled[slot].Load() {
+			p.stalled[slot].Store(true)
+			buf.Put(bp)
+			atomic.AddUint64(&p.lost, 1)
+			return nil
+		}
+	}
 	return p.Send(bp)
+}
+
+// pairConns is a pair on n carrier connections, which is what the probe
+// needs: it rides a connection other than the heartbeat's.
+func pairConns(t *testing.T, n int, opts ...func(*Forwarder)) (*Forwarder, *Forwarder) {
+	t.Helper()
+	ca, cb := pipePairQ(4096)
+	ca.slots, cb.slots = n, n
+	edge := &config.Config{Side: config.SideIran}
+	edge.Transport.Type = "tcp"
+	edge.Transport.Connections = n
+	edge.Forward.BindAddr = "127.0.0.1"
+	origin := &config.Config{Side: config.SideKharej}
+	origin.Transport.Type = "tcp"
+	origin.Transport.Connections = n
+	e, err := New(edge, ca)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, err := New(origin, cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, opt := range opts {
+		opt(e)
+		opt(o)
+	}
+	if err := e.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := o.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close(); o.Close() })
+	return e, o
 }
 
 func pair(t *testing.T, ports []string, opts ...func(*Forwarder)) (*Forwarder, *Forwarder) {
@@ -656,5 +716,154 @@ func TestAStreamOutlivesTheConnectionItWasRiding(t *testing.T) {
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("the far end never saw the end of the stream")
+	}
+}
+
+// fastPings is a forwarder whose heartbeat, and so its probe, comes every
+// twenty milliseconds instead of every ten seconds.
+func fastPings(f *Forwarder) { f.pingGap = 20 * time.Millisecond }
+
+// What Iran did to the Turkey server on 2026-09-26: the tunnel connected, the
+// heartbeat came and went, and anything the size of data was stopped. The
+// health check said nothing was wrong. The probe has to say it - on a wire
+// that holds up a connection behind whatever it stopped, as a real one does.
+func TestAPathThatPassesOnlyTheHeartbeatIsCalledBlocked(t *testing.T) {
+	e, o := pairConns(t, 2, fastPings)
+	e.car.(*pipeCarrier).dropOver.Store(200)
+	o.car.(*pipeCarrier).dropOver.Store(200)
+	deadline := time.Now().Add(5 * time.Second)
+	for !e.DataBlocked() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !e.DataBlocked() {
+		t.Fatal("probes vanished and the heartbeat did not, and nothing was said")
+	}
+	if seen := e.FarSeen(); seen.IsZero() || time.Since(seen) > time.Second {
+		t.Fatalf("the heartbeat should still be crossing: last heard %v", seen)
+	}
+}
+
+// The probe's own connection is not the heartbeat's. On one they shared, a
+// stopped probe held the heartbeat up behind it, the far end went quiet, and
+// the tunnel read as silent - the very misreading this is here to end.
+func TestTheProbeNeverRidesTheHeartbeatsConnection(t *testing.T) {
+	e, _ := pairConns(t, 4, fastPings)
+	ca := e.car.(*pipeCarrier)
+	ca.dropOver.Store(200)
+	deadline := time.Now().Add(2 * time.Second)
+	for ca.bigFlow.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	flow := ca.bigFlow.Load() - 1
+	if flow < 0 {
+		t.Fatal("no probe was ever sent")
+	}
+	if flow%4 == 0 {
+		t.Fatalf("the probe went on flow %d, the heartbeat's connection", flow)
+	}
+	if ca.stalled[0].Load() {
+		t.Fatal("the heartbeat's connection was held up behind a probe")
+	}
+}
+
+// And the other side of it: a path that carries everything never says so,
+// and says when a probe last came back.
+func TestAHealthyTunnelIsNeverCalledBlocked(t *testing.T) {
+	e, _ := pairConns(t, 2, fastPings)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if e.DataBlocked() {
+			t.Fatal("a tunnel that answers its probes was called blocked")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if e.ProbeSeen().IsZero() {
+		t.Fatal("no probe ever came back on a path that loses nothing")
+	}
+}
+
+// With one connection there is nowhere to put a probe but in front of the
+// heartbeat, so there is none.
+func TestAOneConnectionTunnelIsNotProbed(t *testing.T) {
+	e, _ := pair(t, nil, fastPings)
+	ca := e.car.(*pipeCarrier)
+	ca.dropOver.Store(200)
+	time.Sleep(400 * time.Millisecond)
+	if ca.bigFlow.Load() != 0 {
+		t.Fatal("a probe went out on a tunnel of one connection")
+	}
+	if e.DataBlocked() {
+		t.Fatal("a tunnel that was never probed was called blocked")
+	}
+}
+
+// A probe is missed when its period is up without it, not when it leaves.
+// Counting at the send called the tunnel blocked the moment the third probe
+// went out, before it could possibly have come back.
+func TestAProbeIsMissedOnlyWhenItsPeriodIsUp(t *testing.T) {
+	e, _ := pairConns(t, 2)
+	e.car.(*pipeCarrier).dropOver.Store(200)
+	atomic.StoreInt64(&e.farSeen, time.Now().UnixNano())
+	for i := 0; i < probeMisses; i++ {
+		e.probe(1000)
+	}
+	if got := e.probeMissed.Load(); got != probeMisses-1 {
+		t.Fatalf("%d probes out, the last one still in its period: %d missed, expected %d",
+			probeMisses, got, probeMisses-1)
+	}
+	if e.DataBlocked() {
+		t.Fatal("called blocked while the last probe could still come back")
+	}
+	e.probe(1000)
+	if !e.DataBlocked() {
+		t.Fatalf("%d whole periods without a probe back, and not blocked", probeMisses)
+	}
+}
+
+// A busy tunnel can lose a probe's answer to a full queue. If data is
+// arriving, it is not blocked, however many answers went missing.
+func TestDataArrivingMeansNotBlocked(t *testing.T) {
+	e, _ := pairConns(t, 2)
+	atomic.StoreInt64(&e.farSeen, time.Now().UnixNano())
+	e.probeMissed.Store(probeMisses + 2)
+	e.dataAtProbe.Store(0)
+	e.dataIn.Store(probeDataMin * 4)
+	if e.DataBlocked() {
+		t.Fatal("a tunnel receiving data was called blocked")
+	}
+	e.dataIn.Store(probeDataMin / 8)
+	if !e.DataBlocked() {
+		t.Fatal("missed probes, a live heartbeat and no data should be blocked")
+	}
+	atomic.StoreInt64(&e.farSeen, time.Now().Add(-time.Hour).UnixNano())
+	if e.DataBlocked() {
+		t.Fatal("a far end that has gone silent is the silence check's, not this one's")
+	}
+}
+
+// Forwarded datagrams are data as much as a stream's bytes are: a tunnel
+// carrying nothing but a WireGuard session must not read as blocked because
+// the far end's full queue dropped a probe's echo.
+func TestADatagramCountsAsData(t *testing.T) {
+	e, _ := pairConns(t, 2)
+	rec := make([]byte, hdrLen+1000)
+	rec[0] = cmdUDP
+	binary.BigEndian.PutUint32(rec[1:5], udpIDBit|7)
+	before := e.dataIn.Load()
+	e.onRecord(rec)
+	if got := e.dataIn.Load() - before; got != 1000 {
+		t.Fatalf("a 1000-byte datagram added %d to what has arrived", got)
+	}
+}
+
+// No stream is ever given the probe's id. A record with a stream's id marks
+// that stream as having ridden its connection, so a probe sharing one would
+// have a stream that never sent a byte reset when that connection died.
+func TestNoStreamIsGivenTheProbesID(t *testing.T) {
+	e, _ := pairConns(t, 2)
+	for i := 0; i < 5; i++ {
+		if id := e.freshID(); id == 0 || id == probeID {
+			t.Fatalf("stream id %d handed out: it belongs to the heartbeat or the probe", id)
+		}
 	}
 }

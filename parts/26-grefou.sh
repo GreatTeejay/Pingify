@@ -170,7 +170,6 @@ grefou_up() {
         fail "$name: the file does not say enough to build the link"
         return 1
     }
-
     modprobe fou 2>/dev/null
     modprobe ip_gre 2>/dev/null
     case " $(ip fou show 2>/dev/null) " in *" port $port "*) ;; *)
@@ -224,6 +223,17 @@ grefou_up() {
         ul=$(grefou_underlay "$peer")
     done
     if [ -n "$ul" ]; then
+        # A link bigger than the interface it rides less GRE FOU's 36 bytes
+        # puts every full packet over the edge: refused where DF is set,
+        # split in two where it is not. Here and not before the device is
+        # made, because only now is there a route to ask which interface
+        # that is - at boot there is none for several seconds. Run at what
+        # fits and say so; the health check names the number for the file.
+        local fit
+        fit=$(tun_mtu_fit grefou "$peer" "$mtu")
+        if [ "$fit" -lt "$mtu" ] && ip link set "$dev" mtu "$fit" 2>/dev/null; then
+            warn "$name: mtu $mtu does not fit $ul, so the link runs at $fit"
+        fi
         # Written down per tunnel: the delete puts the interface the link
         # was made on back, not whichever one the route names by then.
         mkdir -p "$STATE_DIR" 2>/dev/null

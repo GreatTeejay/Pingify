@@ -26,7 +26,7 @@ cfg_reset() {
     T_DIALS=iran
     T_PUBLIC_IP= T_PEER_IP= T_IRAN= T_KHAREJ=
     T_PORT=8443 T_PATH= T_CONNS=16
-    T_TOKEN= T_PRESET=balanced T_LOG=info
+    T_TOKEN= T_PRESET=balanced T_LOG=info T_INSECURE=
     T_STATUS= T_HEALTH=
     T_FORWARDS=
     T_OCTET= T_TUNIF= T_TUNLOCAL= T_TUNPEER= T_TUNMTU=1320
@@ -184,7 +184,7 @@ token_print() {
 #
 # What a profile does move:
 #
-#   private link    the receive queue, 3072 KB for download against 256 for
+#   private link    the receive queue, 3072 KB for throughput against 256 for
 #                   the other two. Kept on its older measurement: the attempt
 #                   to take it again could not separate the setting from the
 #                   machine the probe ran on.
@@ -193,7 +193,7 @@ token_print() {
 #                   other two. That queue exists on every path, because a
 #                   forward tunnel pins each of its streams to one connection.
 #                   512 was measured to stall the small one for nothing, so
-#                   download does not get it. See notsentLowat in the core's
+#                   throughput does not get it. See notsentLowat in the core's
 #                   carrier/stream.go, and docs/measured.md section 39.
 #
 # Not DSCP: twelve packets marked expedited left Frankfurt as 0xb8 and arrived
@@ -204,18 +204,44 @@ token_print() {
 # applies. One number for every profile - see above.
 QUEUE_PACKETS=900
 
+# The five, and what each one sets - measured, docs/measured.md 35 to 41:
+#
+#   profile      receive queue   unsent (TCP)   connections   parity
+#   gaming          256 KB          64 KB           16          off
+#   stable          256              64             24          1 in 10
+#   balanced        256             128             16          off
+#   throughput     3072             128             16          off
+#   max            3072             128             32          off
+#
+# The unsent bound lives in the core (notsentLowat); the other three are
+# written here so the file says what runs.
 preset_rcvbuf() {
     case $1 in
-    download) printf '3072' ;;
+    throughput | max) printf '3072' ;;
     *) printf '256' ;;
+    esac
+}
+preset_conns() {
+    case $1 in
+    max) printf '32' ;;
+    stable) printf '24' ;;
+    *) printf '16' ;;
+    esac
+}
+preset_fec() {
+    case $1 in
+    stable) printf '10' ;;
+    *) printf '0' ;;
     esac
 }
 
 preset_menu() {
-    CHOICE_DEF=2
-    choice 1 "Gaming" "a small packet waits behind less of a big one"
-    choice 2 "Balanced" "the one to pick if unsure"
-    choice 3 "Download" "deeper queues, for many streams at once"
+    CHOICE_DEF=3
+    choice 1 "gaming" "lowest lag for a small packet, 64 KB unsent bound"
+    choice 2 "stable" "a path that loses packets: parity 1 in 10, 24 connections"
+    choice 3 "balanced" "sensible mix - the one to pick"
+    choice 4 "throughput" "many streams at once, 3 MB receive queue"
+    choice 5 "max" "a server with many users: 32 connections, 3 MB queue"
     CHOICE_DEF=
     blank
     # Said differently for the two modes, because it genuinely is a different
@@ -231,10 +257,12 @@ preset_menu() {
     dim "Changeable later, on both servers."
     blank
     local n
-    pick n "select" 2 3 || return 1
+    pick n "select" 3 5 || return 1
     case $n in
     1) T_PRESET=gaming ;;
-    3) T_PRESET=download ;;
+    2) T_PRESET=stable ;;
+    4) T_PRESET=throughput ;;
+    5) T_PRESET=max ;;
     *) T_PRESET=balanced ;;
     esac
     return 0
@@ -267,9 +295,11 @@ cfg_load() {
     T_PATH=$(toml_get "$f" transport path)
     T_CONNS=$(toml_get "$f" transport connections)
     [ -n "$T_CONNS" ] || T_CONNS=16
+    T_INSECURE=$(toml_get "$f" transport insecure)
     T_TOKEN=$(toml_get "$f" security token)
     T_PRESET=$(toml_get "$f" tuning profile)
     [ -n "$T_PRESET" ] || T_PRESET=balanced
+    [ "$T_PRESET" != download ] || T_PRESET=throughput # what 1.0.x called it
     T_FEC=$(toml_get "$f" tuning fec)
     T_QUEUE=$(toml_get "$f" tuning queue_packets)
     T_LOG=$(toml_get "$f" logging level)
@@ -386,10 +416,33 @@ cfg_render() {
         kv key '""'
         ;;
     esac
+    # utls is true because the far end makes its own certificate and there is
+    # nothing to vouch for it; wss is false, and off anyway between two bare
+    # addresses where nobody vouches for one. Said here and not in the file:
+    # the file is two columns.
     case $T_TRANSPORT in
-    utls) kv insecure 'true   # the far end makes its own certificate, so there is nothing to vouch for it' ;;
-    wss) kv insecure 'false  # and off anyway between two bare addresses, where nobody vouches for one' ;;
+    utls) kv insecure true ;;
+    wss) kv insecure "${T_INSECURE:-false}" ;; # kept from the file: a self-made pair says true
     esac
+
+    if [ "$mode" = tun ]; then
+        printf '\n[tun]\n'
+        kv name "$(q "$T_TUNIF")"
+        kv iran "$(q "10.$T_OCTET.10.1/24")"
+        kv kharej "$(q "10.$T_OCTET.10.2/24")"
+        kv mtu "${T_TUNMTU:-1320}"
+        kv txqueuelen 1000
+        # A tun device this core opens and reads. GRE FOU's is a kernel gre
+        # device that no goroutine of ours ever touches, so these two would be
+        # settings for a thing that is not there.
+        case $T_TRANSPORT in
+        grefou) ;;
+        *)
+            kv write_workers 0
+            kv queues 1
+            ;;
+        esac
+    fi
 
     if [ "$T_TRANSPORT" = awg ]; then
         printf '\n[awg]\n'
@@ -417,6 +470,7 @@ cfg_render() {
     kv token "$(q "$T_TOKEN")"
 
     printf '\n[tuning]\n'
+    printf '# chosen by the profile - change them from Manage > Tuning, on both servers\n'
     kv profile "$(q "$T_PRESET")"
     # This table is dead for GRE FOU: the kernel moves the packets, this core
     # returns before a carrier is opened, and nothing set on a socket or a
@@ -478,7 +532,7 @@ cfg_render() {
     # same key - it was the one transport that could use it and had no way of
     # being told.
     case $T_TRANSPORT in
-    udp | icmp | rawtcp | awg | kcp) kv fec "${T_FEC:-0}" ;;
+    udp | icmp | rawtcp | awg | kcp) kv fec "${T_FEC:-$(preset_fec "$T_PRESET")}" ;;
     esac
 
     printf '\n[forward]\n'
@@ -500,25 +554,6 @@ cfg_render() {
         kv probe_every_sec 60
     fi
 
-    if [ "$mode" = tun ]; then
-        printf '\n[tun]\n'
-        kv name "$(q "$T_TUNIF")"
-        kv iran "$(q "10.$T_OCTET.10.1/24")"
-        kv kharej "$(q "10.$T_OCTET.10.2/24")"
-        kv mtu "${T_TUNMTU:-1320}"
-        kv txqueuelen 1000
-        # A tun device this core opens and reads. GRE FOU's is a kernel gre
-        # device that no goroutine of ours ever touches, so these two would be
-        # settings for a thing that is not there.
-        case $T_TRANSPORT in
-        grefou) ;;
-        *)
-            kv write_workers 0
-            kv queues 1
-            ;;
-        esac
-    fi
-
     printf '\n[logging]\n'
     kv level "$(q "${T_LOG:-info}")"
 
@@ -529,6 +564,51 @@ cfg_render() {
     else
         kv health_port "${T_HEALTH:-$HEALTH_PORT}"
     fi
+}
+
+# ---------------------------------------------------------------------------
+# a file from before, brought to the shape the renderer writes now
+#
+# Files written by 2.x carried a header and a note beside every key, and a
+# key left at its default was a commented-out line. Nothing rewrote them, so
+# a server that had been upgraded three times still showed the old shape
+# beside the new. On upgrade every file that is not in the current shape is
+# read back into the wizard's variables and written out again - two columns,
+# no notes, each key only where its transport reads it - through the same
+# gate as any edit, so a rewrite the core would not accept changes nothing.
+# ---------------------------------------------------------------------------
+
+# cfg_old FILE - not in the shape cfg_render writes: a header, or a note
+# after a value.
+cfg_old() { grep -qE '^# Pingify|^[a-z_]+ *=.*[^"]#' "$1" 2>/dev/null; }
+
+_edit_modernise() {
+    cfg_load "$MODERNISE_NAME" || return 1
+    # A file from before the status port existed has none; the renderer
+    # would give every such file the base port. status_port derives the one
+    # this tunnel has been answering on since, by its place in the list.
+    [ -n "$T_STATUS" ] || T_STATUS=$(status_port "$MODERNISE_NAME")
+    cfg_render > "$1"
+}
+
+# cfg_modernise - every old-shape file, rewritten. The caller restarts the
+# tunnels; this only changes the files.
+cfg_modernise() {
+    local n f done=0
+    for n in $(cfg_list); do
+        f=$(cfg_file "$n")
+        cfg_old "$f" || continue
+        cp -f "$f" "$f.old" 2>/dev/null
+        MODERNISE_NAME=$n
+        if cfg_apply "$n" _edit_modernise no >/dev/null 2>&1; then
+            done=$((done + 1))
+        else
+            rm -f "$f.old"
+            warn "$n could not be rewritten and was left as it was"
+        fi
+    done
+    [ "$done" = 0 ] || info "$done config file(s) rewritten in the current shape; the old ones are kept as .toml.old"
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -796,7 +876,11 @@ setup_token_check() {
         forwarding_transport "${b%%:*}" || { setup_token_bad "unknown backup transport ${b%%:*}"; return 1; }
         v_port "${b#*:}" >/dev/null 2>&1 || { setup_token_bad "a backup port is invalid"; return 1; }
     done
-    case $T_PRESET in gaming | balanced | download) ;; *) T_PRESET=balanced ;; esac
+    case $T_PRESET in
+    gaming | stable | balanced | throughput | max) ;;
+    download) T_PRESET=throughput ;; # what 1.0.x called it
+    *) T_PRESET=balanced ;;
+    esac
     case $T_LOG in debug | info | warn | error) ;; *) T_LOG=info ;; esac
     return 0
 }
@@ -873,9 +957,9 @@ ask_side() {
 ask_transport() {
     wiz "Transport"
     group "FORWARDING - your ports, carried over a connection"
-    choice 1 "TCP MUX" "plain TCP, every stream across eight connections"
+    choice 1 "TCP MUX" "plain TCP, every stream across sixteen connections"
     choice 2 "WS MUX" "WebSocket on port 80 - a CDN can front it"
-    choice 3 "WSS MUX" "WebSocket inside TLS - a domain or Cloudflare"
+    choice 3 "WSS MUX" "TLS via Cloudflare - good for filtered Iran"
     choice 4 "Chrome TLS MUX" "TLS whose handshake is Chrome's"
     choice 5 "Decoy TLS MUX" "Chrome TLS, and a website for anyone probing"
     choice 6 "KCP MUX" "reliable streams over UDP, for when TCP is throttled"
@@ -889,7 +973,7 @@ ask_transport() {
     choice 9 "UDP" "plain UDP on one port"
     choice 10 "AmneziaWG" "obfuscated WireGuard over UDP - encrypted"
     choice 11 "Fake TCP" "TCP-shaped packets, no connection to throttle"
-    choice 12 "ICMP" "inside ping packets - no port at all"
+    choice 12 "ICMP" "inside ping packets - no port, passes some filters"
     blank
     local proto
     pick proto "select" "" 12 || return 1
@@ -935,16 +1019,20 @@ ask_transport() {
 transport_needs() {
     blank
     case $T_TRANSPORT in
-    tcp) dim "Needs nothing. Eight plain connections; start here on a clean route." ;;
+    tcp) dim "Needs nothing. Sixteen plain connections; start here on a clean route." ;;
     ws) dim "Needs HTTP to cross, usually on port 80. A CDN can sit in front of the end"
         dim "that waits, given a domain. Unencrypted by itself." ;;
     wss) dim "Needs a domain on the end that waits, or a bare address with a made-up"
-        dim "certificate. A real certificate can be set later under Tuning." ;;
+        dim "certificate. A real certificate can be set later under Tuning."
+        dim "Good for filtered Iran: with Reverse and a Cloudflare domain that fronts"
+        dim "the IRAN server, Iran only ever talks to Cloudflare - which is how a"
+        dim "tunnel kept carrying when Iran blocked the foreign server's address." ;;
     utls | fallback)
         dim "Needs TLS to cross. The handshake is Chrome's; the end that waits serves a"
         dim "made-up certificate unless one is set later under Tuning." ;;
     kcp) dim "Needs UDP to cross both ways. More CPU and memory than TCP; the one to"
-        dim "reach for when TCP is throttled and UDP is not." ;;
+        dim "reach for when TCP is throttled and UDP is not. Every packet is sealed"
+        dim "under a cipher keyed from the token, so nothing on the wire says KCP." ;;
     gre) dim "Needs IP protocol 47 to cross. No port, no disguise." ;;
     grefou) dim "Needs UDP to cross, ethtool here, and the fou and ip_gre kernel modules." ;;
     udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
@@ -1319,11 +1407,18 @@ ask_link() {
     field "KHAREJ" "$(addr_tint "10.$T_OCTET.10.2/24")"
     blank
     ask T_TUNIF "device name" "$(free_tun_iface)" v_wiz_iface || return 1
+    # 1400 for GRE FOU and 1320 for the rest fit a 1500 interface with room
+    # to spare. Iranian servers are handed 1400 and 1450 as often as 1500,
+    # so where the interface to the other server is smaller, the default is
+    # what fits it.
+    # The transports that can carry parity leave room for it whether it is
+    # on or not: the stable preset turns it on, and so can Tuning later, and
+    # neither comes back to the MTU. GRE and GRE FOU never carry it.
     case $T_TRANSPORT in
     awg) T_TUNMTU=$(awg_tun_mtu) ;;
-    # What Golden GRE uses, and what the kernel's own encapsulation fits.
-    grefou) T_TUNMTU=1400 ;;
-    *) T_TUNMTU=1320 ;;
+    grefou) T_TUNMTU=$(tun_mtu_fit grefou "$T_PEER_IP" 1400) ;;
+    gre) T_TUNMTU=$(tun_mtu_fit gre "$T_PEER_IP" 1320) ;;
+    *) T_TUNMTU=$(tun_mtu_fit "$T_TRANSPORT" "$T_PEER_IP" 1320 1) ;;
     esac
     case $T_TRANSPORT in
     awg) ask T_TUNMTU "MTU" "$T_TUNMTU" v_mtu_awg || return 1 ;;
@@ -1364,7 +1459,10 @@ v_forwards_needed() {
 
 ask_preset() {
     wiz "Performance" "The shape of your traffic. You can change it later."
-    preset_menu
+    preset_menu || return 1
+    # The wizard never asks for these two; the profile chooses them.
+    T_CONNS=$(preset_conns "$T_PRESET")
+    T_FEC=$(preset_fec "$T_PRESET")
 }
 
 ask_logging() {
@@ -1596,6 +1694,11 @@ import_tunnel() {
     T_NAME=$(name_for_side "$T_NAME" "$T_SIDE")
     if [ "$T_SIDE" = iran ]; then T_PUBLIC_IP=$T_IRAN T_PEER_IP=$T_KHAREJ
     else T_PUBLIC_IP=$T_KHAREJ T_PEER_IP=$T_IRAN; fi
+    # The MTU in the token fits the server that made it. GRE FOU is carried
+    # by the kernel, which takes a packet of any size in, so each end may
+    # send at what fits its own interface; the other private links share a
+    # buffer size with the far core and keep the number they were given.
+    [ "$T_TRANSPORT" = grefou ] && T_TUNMTU=$(tun_mtu_fit grefou "$T_PEER_IP" "$T_TUNMTU")
     if cfg_needs_link; then
         if [ "$T_SIDE" = iran ]; then T_TUNLOCAL="10.$T_OCTET.10.1/24" T_TUNPEER="10.$T_OCTET.10.2/24"
         else T_TUNLOCAL="10.$T_OCTET.10.2/24" T_TUNPEER="10.$T_OCTET.10.1/24"; fi

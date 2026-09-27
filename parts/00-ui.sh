@@ -696,12 +696,14 @@ v_mtu() {
 # The AmneziaWG link this core runs inside. One number, in one place: the
 # link MTU written into the file, and the tun MTU derived from it. On the awg
 # device every packet is 20 of IP, 8 of UDP and 12 of framer over what the
-# tun device hands up - and 4 more when parity is on, which can be switched on
-# later without anybody revisiting the MTU. So the tun MTU is the link less
-# 44, always. It was a literal 1280 beside a literal 1320, right by 4 bytes
-# of luck and unchecked against anything.
+# tun device hands up - and with parity on, which can be switched on later
+# without anybody revisiting the MTU, 4 more in front of every packet and 2
+# more in the parity packet, which carries each payload's length. So the tun
+# MTU is the link less 46, always. It was a literal 1280 beside a literal
+# 1320, right by 4 bytes of luck and unchecked against anything; then 44,
+# which left every parity packet 2 bytes over the link.
 AWG_LINK_MTU=1320
-awg_tun_mtu() { echo $((AWG_LINK_MTU - 44)); }
+awg_tun_mtu() { echo $((AWG_LINK_MTU - 46)); }
 # The wizard writes the cautious number, which holds with parity on or off.
 # What is accepted is the real ceiling with parity off, because every
 # AmneziaWG tunnel from before 1.1.0 runs at exactly that; turning parity on
@@ -710,6 +712,44 @@ v_mtu_awg() {
     v_mtu "$1" || return 1
     [ "$1" -le "$((AWG_LINK_MTU - 40))" ] ||
         { echo "inside AmneziaWG the link is $AWG_LINK_MTU, so this is at most $((AWG_LINK_MTU - 40)), or $(awg_tun_mtu) with parity"; return 1; }
+}
+
+# tun_overhead TRANSPORT [FEC] - what a private link puts around each packet
+# on the wire, over the packet itself: the outer IP header and whatever the
+# transport adds. The link's MTU plus this has to fit the interface it rides,
+# or every full packet is too big for it - which is what a GRE FOU link at
+# 1400 did on an Iranian server whose interface is 1400: 36 bytes over on
+# every one (docs/measured.md section 42). With parity on (FEC above 0) a
+# packet carries 4 more in front, and a parity packet 2 more again, for the
+# length it carries (carrier/fec.go): 6 in all, on the transports that have
+# parity at all.
+tun_overhead() {
+    local o
+    case $1 in
+    grefou) o=36 ;; # IP 20, UDP 8, GRE 4, key 4
+    gre) o=32 ;;    # IP 20, and a GRE header of 12 that holds the key and
+    #                 the sequence itself: this carrier has no framer
+    rawtcp) o=52 ;; # IP 20, TCP 20, frame 12
+    awg) o=100 ;;   # tun to awg link 40, awg link to wire 60
+    *) o=40 ;;      # udp, icmp: IP 20, UDP or ICMP 8, frame 12
+    esac
+    case $1 in
+    udp | icmp | rawtcp | awg)
+        case ${2:-0} in '' | 0 | *[!0-9]*) ;; *) o=$((o + 6)) ;; esac ;;
+    esac
+    echo "$o"
+}
+
+# tun_mtu_fit TRANSPORT PEER WANT [FEC] - WANT, or less if the interface
+# packets to PEER leave by cannot carry WANT plus the transport's overhead.
+# Where the interface cannot be found, WANT as it is.
+tun_mtu_fit() {
+    local dev m
+    dev=$(grefou_underlay "$2")
+    m=$(cat "${SYSFS_NET:-/sys/class/net}/${dev:-none}/mtu" 2>/dev/null)
+    case $m in '' | *[!0-9]*) echo "$3"; return 0 ;; esac
+    m=$((m - $(tun_overhead "$1" "${4:-0}")))
+    if [ "$m" -lt "$3" ]; then echo "$m"; else echo "$3"; fi
 }
 
 v_token() {

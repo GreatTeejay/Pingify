@@ -146,12 +146,12 @@ choose_tuning_profile() {
     CHOICE_DEF=1
     choice 1 "Balanced" "recommended - video, browsing and games together"
     choice 2 "Gaming" "smaller queues and shorter NIC work cycles"
-    choice 3 "Download" "large packet batches and a 128 MB socket ceiling"
+    choice 3 "Throughput" "large packet batches and a 128 MB socket ceiling"
     CHOICE_DEF=
     blank
     dim "This sets the kernel's socket buffer sizes and backlog, for everything"
-    dim "this server does. A tunnel's own profile is a different thing with the"
-    dim "same three names; it lives on that tunnel's Tuning screen."
+    dim "this server does. A tunnel's own profile is a different thing, with"
+    dim "names of its own; it lives on that tunnel's Tuning screen."
     blank
     local c
     pick c "select" 1 3 || return 1
@@ -279,7 +279,7 @@ optimize_menu() {
         panel_field "BBR" "$(state_badge "$(host_bbr_state)")" "Forwarding" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null | sed 's/^1$/on/; s/^0$/off/')"
         panel_end
         blank
-        item 1 "Apply host tuning" "Balanced, Gaming or Download"
+        item 1 "Apply host tuning" "Balanced, Gaming or Throughput"
         item 2 "Enable BBR" "congestion control and fq - measured: 348 Mbit/s where cubic carried 31"
         item 3 "Disable BBR" "back to the kernel default"
         blank

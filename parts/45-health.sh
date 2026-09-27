@@ -367,7 +367,29 @@ health_check() {
         else
             chk_add ok link "private link $CK_DEV is up, $addr, mtu ${live_mtu:-?}"
         fi
-        if [ -n "$live_mtu" ] && [ "$live_mtu" != "$CK_MTU" ]; then
+        # Whether a full packet, with what the transport puts around it, fits
+        # the interface it leaves by. A GRE FOU link at 1400 on a server
+        # whose interface is 1400 had every full packet 36 bytes over it.
+        # What is judged is what runs: GRE FOU cuts a link down to what fits
+        # when it starts, and then the file's number is only the file's.
+        local farpub ul ulmtu over run
+        if [ "$CK_SIDE" = iran ]; then farpub=$CK_KHAREJ; else farpub=$CK_IRAN; fi
+        ul=$(grefou_underlay "$farpub")
+        ulmtu=$(cat "${SYSFS_NET:-/sys/class/net}/${ul:-none}/mtu" 2>/dev/null)
+        case $ulmtu in '' | *[!0-9]*) ulmtu= ;; esac
+        # A number the shell cannot add, step 2 has already reported; the
+        # arithmetic below would end the whole check on it instead.
+        case $CK_MTU in '' | *[!0-9]*) ulmtu= ;; esac
+        run=$live_mtu
+        case $run in '' | *[!0-9]*) run=$CK_MTU ;; esac
+        over=$(tun_overhead "$CK_TRANSPORT" "$(toml_get "$CK_FILE" tuning fec)")
+        if [ -n "$ulmtu" ] && [ "$((run + over))" -gt "$ulmtu" ]; then
+            chk_add bad mtu "mtu $run does not fit $ul: with $over bytes of $(transport_label "$CK_TRANSPORT") a full packet is $((run + over)), and $ul takes $ulmtu" \
+                "set MTU to $((ulmtu - over)) on both servers: Manage ${BX_ARR} $name ${BX_ARR} Tuning ${BX_ARR} MTU"
+        elif [ -n "$ulmtu" ] && [ "$((CK_MTU + over))" -gt "$ulmtu" ]; then
+            chk_add warn mtu "the config says mtu $CK_MTU, which does not fit $ul; the link runs at $run, cut down when it started" \
+                "set MTU to $((ulmtu - over)) on both servers: Manage ${BX_ARR} $name ${BX_ARR} Tuning ${BX_ARR} MTU"
+        elif [ -n "$live_mtu" ] && [ "$live_mtu" != "$CK_MTU" ]; then
             chk_add warn mtu "device mtu $live_mtu, the config says $CK_MTU" \
                 "a hand-set mtu is lost on the next restart" "put the number in the config instead"
         fi
@@ -390,6 +412,17 @@ health_check() {
                 chk_add note peer "started $(human_secs "$ST_UPTIME") ago; nothing back yet"
             else
                 chk_add ok peer "the other server has been heard from - this tunnel has run $(human_secs "$ST_UPTIME")"
+            fi
+            # The heartbeat crosses and data does not: what Iran did to the
+            # Turkey server on 2026-09-26, when six transports said up and
+            # this check said nothing was wrong (docs/measured.md 43).
+            if [ "$ST_BLOCKED" = true ]; then
+                local since="since it started"
+                [ -n "$ST_PROBE_SEEN" ] && since="for $(human_secs "${ST_PROBE_SEEN%%.*}")"
+                chk_add bad data "the other server answers the heartbeat, and nothing the size of data has crossed $since" \
+                    "something on the path lets small packets through and stops full-size ones; a restart will not change it" \
+                    "a filter on the foreign address: go through Cloudflare - WSS MUX, Reverse, a name that fronts IRAN (README: When Iran filters the foreign server) - or try ICMP" \
+                    "a path smaller than the interface: turn on MTU probing with Optimize, on both servers"
             fi
             if [ -n "$ST_ACTIVE" ] && [ "$ST_ACTIVE" != "$CK_TRANSPORT" ]; then
                 chk_add warn failover "running on the backup $(transport_label "$ST_ACTIVE"): $(transport_label "$CK_TRANSPORT") stopped carrying" \

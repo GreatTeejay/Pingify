@@ -20,7 +20,9 @@ func TestTheProfileMovesWhatAStreamMayPark(t *testing.T) {
 		{config.ProfileBalanced, 128 << 10},
 		// Not 512: measured to stall a small stream past five seconds for
 		// no throughput (docs/measured.md section 39).
-		{config.ProfileDownload, 128 << 10},
+		{config.ProfileThroughput, 128 << 10},
+		{config.ProfileStable, 64 << 10}, // a lossy path: the small stream first
+		{config.ProfileMax, 128 << 10},
 		{"", 128 << 10}, // an unnamed profile is balanced
 	} {
 		cfg := &config.Config{}
@@ -34,7 +36,7 @@ func TestTheProfileMovesWhatAStreamMayPark(t *testing.T) {
 // Every profile has to leave more than one packet's worth, or a writer is
 // woken for each one and the connection spends its time in system calls.
 func TestNoProfileParksLessThanAWindowWorthOfPackets(t *testing.T) {
-	for _, p := range []string{config.ProfileGaming, config.ProfileBalanced, config.ProfileDownload} {
+	for _, p := range []string{config.ProfileGaming, config.ProfileBalanced, config.ProfileThroughput, config.ProfileStable, config.ProfileMax} {
 		cfg := &config.Config{}
 		cfg.Tuning.Profile = p
 		if got := notsentLowat(cfg); got < 32<<10 {

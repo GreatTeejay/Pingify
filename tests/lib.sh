@@ -135,6 +135,12 @@ sandbox() {
     CORE_DIR=$PINGIFY_CORE_DIR
     mkdir -p "$CFG_DIR" "$STATE_DIR" "$SRC_DIR" "$UNIT_DIR" "$CORE_DIR"
     export PINGIFY_CFG_DIR PINGIFY_STATE_DIR PINGIFY_SRC_DIR PINGIFY_UNIT_DIR PINGIFY_CORE_DIR
+    # And an interface: the wizard sizes a private link from the MTU of the
+    # card the route names, and the machine running the tests may have one of
+    # 1400, or 1280 under a VPN. The stubbed route says eth0; this is it.
+    mkdir -p "$SANDBOX/sys/eth0"
+    echo 1500 >"$SANDBOX/sys/eth0/mtu"
+    SYSFS_NET=$SANDBOX/sys
 }
 
 sandbox_clean() { [ -n "${SANDBOX:-}" ] && rm -rf "$SANDBOX"; }

@@ -305,13 +305,22 @@ live_log() {
 # beside QUEUE_PACKETS.
 _edit_profile() {
     toml_set "$1" tuning profile "$PROFILE_WANT" || return 1
-    # The receive queue is only in the file where a socket gets it - see the
-    # same list in cfg_render. Writing it back here for a transport that omits
-    # it would put the key into a file that had correctly left it out.
+    # Each value the profile chooses, written back only where the file has
+    # it - the same lists as cfg_render. Writing one into a file that had
+    # correctly left it out would put a key there that nothing reads.
     case $T_TRANSPORT in
-    tcp | ws | wss | utls | fallback | grefou | kcp) return 0 ;;
+    tcp | ws | wss | utls | fallback | kcp)
+        toml_set "$1" transport connections "$(preset_conns "$PROFILE_WANT")" || return 1 ;;
     esac
-    toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")"
+    case $T_TRANSPORT in
+    udp | gre | icmp | rawtcp | awg)
+        toml_set "$1" tuning rcvbuf_kb "$(preset_rcvbuf "$PROFILE_WANT")" || return 1 ;;
+    esac
+    case $T_TRANSPORT in
+    udp | icmp | rawtcp | awg | kcp)
+        toml_set "$1" tuning fec "$(preset_fec "$PROFILE_WANT")" || return 1 ;;
+    esac
+    return 0
 }
 _edit_queue() { toml_set "$1" tuning queue_packets "$QUEUE_WANT"; }
 _edit_mtu() { toml_set "$1" tun mtu "$MTU_WANT"; }

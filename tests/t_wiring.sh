@@ -160,6 +160,75 @@ check_contains "and the check does not advise it on either"     "$(grep -B4 'tur
 check_contains "the wizard writes fec for kcp"     "$(grep -A2 'udp | icmp | rawtcp | awg | kcp' parts/30-tunnel.sh)" "kv fec"
 check_contains "and the Tuning screen offers it"     "$(grep -A2 'T_TRANSPORT" = kcp' parts/40-manage.sh)" "tm parity"
 
+section "a core carried over is checked before it is installed"
+
+# The server in Iran is the one that cannot build - too small, or cut off
+# from go.dev - and until 1.1.0 the only way a core got there without a
+# compiler was scp by hand, over a running binary. Export writes the hash
+# beside the file; import refuses anything that is not that file, not this
+# architecture or not this script's version, and installs beside then over.
+_cd=$(mktemp -d)
+_old_core=$CORE_BIN _old_unit=$UNIT_DIR _old_cfgd=$CFG_DIR _old_cored=$CORE_DIR _old_src=$SRC_DIR _old_state=$STATE_DIR
+CORE_BIN=$_cd/core/pingify-core UNIT_DIR=$_cd/units CFG_DIR=$_cd/cfg CORE_DIR=$_cd/core SRC_DIR=$_cd/src STATE_DIR=$_cd/state CORE_EXPORT_DIR=$_cd
+mkdir -p "$_cd/core" "$_cd/units"
+require_root() { :; }
+systemctl() { :; }
+_fake() { printf '#!/bin/sh\n[ "$1" = -version ] && echo "pingify-core %s"\n' "$2" > "$1"; chmod +x "$1"; }
+_arch=$(arch_go)
+_fake "$CORE_BIN" "$PINGIFY_VERSION"
+# Through the command line, as a person types it: the parser used to refuse
+# the word outright, and nothing noticed because these tests called the
+# functions directly.
+argv core import /root/pingify-core-x-linux-amd64
+check "the command line takes: pingify core import FILE" "$ARG_MODE" "core"
+argv core export
+check "and: pingify core export" "$ARG_MODE" "core"
+argv --status
+check "and still reads a flag after it is fixed" "$ARG_MODE" "status"
+check_rc "export writes the core beside its hash" 0 core_export
+_exp=$_cd/pingify-core-$PINGIFY_VERSION-linux-$_arch
+check "and the hash is the file's" "$(cut -c1-64 < "$_exp.sha256" 2>/dev/null)" "$(sha256sum "$_exp" 2>/dev/null | cut -c1-64)"
+rm -f "$CORE_BIN"
+check_rc "import refuses a file that is not there" 1 core_import "$_cd/nowhere"
+cp "$_exp" "$_cd/bare-linux-$_arch"
+check_rc "and one without its hash beside it" 1 core_import "$_cd/bare-linux-$_arch"
+cp "$_exp" "$_cd/changed-linux-$_arch"; cp "$_exp.sha256" "$_cd/changed-linux-$_arch.sha256"; echo tampered >> "$_cd/changed-linux-$_arch"
+check_rc "and one whose hash does not match" 1 core_import "$_cd/changed-linux-$_arch"
+cp "$_exp" "$_cd/other-linux-mips"; sha256sum "$_cd/other-linux-mips" | cut -c1-64 > "$_cd/other-linux-mips.sha256"
+check_rc "and one built for another architecture" 1 core_import "$_cd/other-linux-mips"
+_fake "$_cd/old-linux-$_arch" "1.0.2"; sha256sum "$_cd/old-linux-$_arch" | cut -c1-64 > "$_cd/old-linux-$_arch.sha256"
+check_rc "and one of another version" 1 core_import "$_cd/old-linux-$_arch"
+check "nothing was installed by the refusals" "$([ -e "$CORE_BIN" ] && echo installed || echo nothing)" "nothing"
+check_rc "the exported one installs" 0 core_import "$_exp"
+check "and is the core now" "$(core_version)" "$PINGIFY_VERSION"
+check "and the unit was written for it" "$(grep -c "$CORE_BIN " "$UNIT_DIR/pingify@.service" 2>/dev/null)" "1"
+CORE_BIN=$_old_core UNIT_DIR=$_old_unit CFG_DIR=$_old_cfgd CORE_DIR=$_old_cored SRC_DIR=$_old_src STATE_DIR=$_old_state
+unset CORE_EXPORT_DIR
+unset -f require_root systemctl _fake
+rm -rf "$_cd"
+
+section "what the core says about a filter reaches the health check"
+
+# On 2026-09-26 six transports to a filtered server said up and the check
+# said nothing was wrong while they carried nothing. The core now probes with
+# records the size of data and reports data_blocked; the shell has to read
+# the same name, or the verdict never reaches anybody.
+if [ -f internal/status/status.go ]; then
+    check_contains "the core reports data_blocked" "$(cat internal/status/status.go)" 'json:"data_blocked'
+else
+    skip "the core reports data_blocked" "no engine sources here"
+fi
+check "the shell reads that name" "$(grep -c 'json_field "$json" data_blocked' parts/10-sys.sh)" "1"
+_rep='{
+  "up": true,
+  "far_seen_sec": 2.1,
+  "data_blocked": true,
+  "probe_seen_sec": 95.5
+}'
+check "a report saying so is read as true" "$(json_field "$_rep" data_blocked)" "true"
+check "and how long since a probe came back" "$(json_field "$_rep" probe_seen_sec)" "95.5"
+check "and the check turns it into a verdict" "$(grep -c '"$ST_BLOCKED" = true' parts/45-health.sh)" "1"
+
 section "the machine gets its pings back, and not a moment sooner"
 
 # The core mutes echo replies while an ICMP tunnel runs, and has to. Giving

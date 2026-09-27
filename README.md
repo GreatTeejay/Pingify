@@ -22,6 +22,15 @@ curl -fsSLo Pingify.sh https://github.com/GreatTeejay/Pingify/releases/latest/do
 
 The script installs the `pingify` command, builds the core and writes the systemd units. It carries its own Go sources and vendored modules, so the build works on a server that cannot reach `proxy.golang.org` — which is most Iranian servers. Only the Go toolchain itself has to be fetched, and the script offers to do that when it is missing.
 
+If `go.dev` cannot be reached from the server, point the fetch at a mirror — `PINGIFY_GO_URL=https://<mirror>/dl bash Pingify.sh` — and the script prints the sha256 of what arrived, to check against go.dev from any machine that can see it. A server that cannot build at all, too small or cut off, takes the core from the other one:
+
+```bash
+pingify core export            # on the server that built it: the binary, and its hash beside it
+pingify core import FILE       # on the other: hash, architecture and version checked, then installed
+```
+
+**Upgrading to 1.1.0 is a both-ends change.** A 1.0.x core refuses any record over 2 KB on TCP MUX, WS MUX, WSS MUX, Chrome TLS MUX and Decoy TLS MUX, and 1.1.0 sends up to 16 KB; KCP MUX packets are sealed and a 1.0.x core cannot read them. Upgrade the two servers of a pair within minutes of each other, the far end first, and expect the forwarding tunnels between them to be down in between. Private links (GRE, GRE FOU, UDP, AmneziaWG, Fake TCP, ICMP) carry across versions unchanged. A server that also has forwarding tunnels to a third server has to upgrade that one too, or keep its shared core at 1.0.x until it can.
+
 Run `pingify` again at any time for the menu.
 
 <p align="center"><img src="assets/pingify-cover.png" alt="Pingify multi-transport tunnel" width="100%"></p>
@@ -55,10 +64,10 @@ The config stores the short slug (`tcp`, `ws`, `wss`, `utls`, `fallback`, `kcp`,
 |---|---|---|---|
 | **TCP MUX** | Sixteen plain TCP connections with every stream multiplexed across them by id. A stall on one does not hold up the rest. | The route is clean and you want the fewest moving parts. **Start here.** | TCP inside TCP on a lossy link: both stacks retransmit the same loss. |
 | **WS MUX** | An HTTP request that becomes a WebSocket, then RFC 6455 frames. Usually port 80, so a CDN can front it. | Only HTTP crosses, or something in front already terminates TLS. | No TLS of its own. Proxy idle limits apply. |
-| **WSS MUX** | The same inside TLS, with the tunnel's domain in SNI, Host and Origin. Behind Cloudflare the origin address never appears on the wire. | You have a domain, or you want to sit behind a CDN. | TLS and CDN overhead, and whatever the CDN's policy allows. |
+| **WSS MUX** | The same inside TLS, with the tunnel's domain in SNI, Host and Origin. Behind Cloudflare the origin address never appears on the wire. | **Good for filtered Iran.** You have a domain, or you want to sit behind a CDN — and above all when Iran blocks the foreign server's address: with a Cloudflare domain fronting the Iran server, Iran only ever talks to Cloudflare. | TLS and CDN overhead, and whatever the CDN's policy allows. Through Cloudflare the round trip was 111 ms where the direct path is 40. |
 | **Chrome TLS MUX** | TLS whose handshake is shaped like Chrome's, so a fingerprint check sees a browser. | Plain TCP is throttled or reset, and TLS still passes. | A little more setup on the wire; nothing on the host. |
 | **Decoy TLS MUX** | Chrome TLS MUX, and a real website served to anyone who probes the port instead of speaking the protocol. | The port will be scanned and you want it to look like a website. | The same as Chrome TLS MUX. |
-| **KCP MUX** | The same streams as TCP MUX, over eight [KCP](https://github.com/xtaci/kcp-go) sessions on UDP: reliable and ordered, with a retransmit timer of its own instead of the kernel's. | TCP is throttled or reset and UDP still crosses. | UDP must pass. More CPU and memory than TCP; on a clean path TCP MUX with BBR is faster. |
+| **KCP MUX** | The same streams as TCP MUX, over sixteen [KCP](https://github.com/xtaci/kcp-go) sessions on UDP: reliable and ordered, with a retransmit timer of its own instead of the kernel's. Since 1.1.0 every packet is sealed under XChaCha20-Poly1305 keyed from the token, so nothing on the wire says KCP. | TCP is throttled or reset and UDP still crosses. | UDP must pass. More CPU and memory than TCP; on a clean path TCP MUX with BBR is faster. |
 
 ### TUN — a private link the kernel routes over
 
@@ -69,13 +78,30 @@ The config stores the short slug (`tcp`, `ws`, `wss`, `utls`, `fallback`, `kcp`,
 | **UDP** | Plain UDP on one port. | UDP crosses cleanly in both directions. | Many Iranian lines drop or throttle inbound UDP. |
 | **AmneziaWG** | Obfuscated WireGuard: kernel speed, encrypted, and deliberately shaped not to look like WireGuard. | You want a full encrypted link with kernel performance. | The AmneziaWG tooling must install, and UDP must pass. |
 | **Fake TCP** | TCP-shaped packets built and read on the device itself, above conntrack and every netfilter chain. There is no kernel socket to throttle. | A plain TCP tunnel connects and then stalls or dies for no reason the logs explain. | Linux, IPv4 and root on **both** ends. Installs a narrow RST-drop rule and removes it again. |
-| **ICMP** | Packets carried inside pings. No port exists at all; each tunnel takes a session tag from its token, so several can share a host. | TCP and UDP are filtered but ping still answers. | **The server stops answering ordinary pings while it runs**, and ICMP rate limits apply on the path. |
+| **ICMP** | Packets carried inside pings. No port exists at all; each tunnel takes a session tag from its token, so several can share a host. | TCP and UDP are filtered but ping still answers. When Iran blocked the Turkey server's address, it was the one direct transport that still carried. | **The server stops answering ordinary pings while it runs**, and ICMP rate limits apply on the path. |
 
 ### Choosing one
 
-No table knows your route. Start with **TCP MUX**: it needs nothing and works on most paths. If the port is scanned or reset, move to **Chrome TLS MUX** or **Decoy TLS MUX**. If only web traffic crosses, use **WSS MUX** with a domain, and **WS MUX** on port 80 only when TLS is genuinely unavailable. If TCP is throttled in a way no log explains, try **Fake TCP**, or **KCP MUX** when UDP crosses; if everything but ping is filtered, **ICMP**. If protocol 47 is dropped and raw speed matters more than a token on the wire, **GRE FOU**.
+No table knows your route. Start with **TCP MUX**: it needs nothing and works on most paths. **If Iran blocks the foreign server's address** — tunnels that connect and say they are up carry nothing, and the health check says nothing the size of data crosses — use **WSS MUX** (or WS MUX) in the Reverse direction through a Cloudflare name that fronts the Iran server (see [When Iran filters the foreign server](#when-iran-filters-the-foreign-server)), or **ICMP**. On the day it happened those were the only ones that carried (measurements, section 43). If the port is scanned or reset, move to **Chrome TLS MUX** or **Decoy TLS MUX**. If only web traffic crosses, use **WSS MUX** with a domain, and **WS MUX** on port 80 only when TLS is genuinely unavailable. If TCP is throttled in a way no log explains, try **Fake TCP**, or **KCP MUX** when UDP crosses; if everything but ping is filtered, **ICMP**. If protocol 47 is dropped and raw speed matters more than a token on the wire, **GRE FOU**.
 
 Measure the same pair at the same hour and compare throughput, loss and jitter — not average ping alone. Numbers from real pairs are in [what was measured](docs/measured.md).
+
+### On the wire
+
+What each transport shows to something reading the path. This is what the code sends, not a claim about what any filter does with it.
+
+| Transport | What a watcher sees | Readable |
+|---|---|---|
+| **AmneziaWG** | UDP whose handshake is preceded by junk packets and padded, with WireGuard's message types rewritten; every packet encrypted by the kernel. | nothing |
+| **Chrome TLS MUX**, **Decoy TLS MUX** | A TLS 1.3 session whose ClientHello is Chrome's, to the name you chose. The decoy serves a real website to anyone who probes the port. | the SNI and the certificate |
+| **WSS MUX** | TLS to your domain. Behind a CDN the origin's address never appears. | the domain |
+| **KCP MUX** | UDP packets sealed under XChaCha20-Poly1305 keyed from the token: no KCP header, no lengths, random bytes and their timing. | nothing |
+| **TCP MUX** | Plain TCP: a four-byte hello, then two bytes of length in front of each record. The records are your panel's TLS. Not a known protocol, and not hidden. | the framing |
+| **WS MUX** | An HTTP Upgrade with Host and Origin, then WebSocket frames. | the handshake and the framing |
+| **UDP**, **ICMP**, **Fake TCP** | Twelve bytes of tag and counter, then the IP packet as it left the device: its addresses, ports and TCP headers in the clear. ICMP puts that in a ping; Fake TCP puts a TCP header in front of it. | the inner packet's headers |
+| **GRE**, **GRE FOU** | The kernel's GRE, bare or inside UDP. GRE FOU carries no tag at all. | everything |
+
+For a link that has to survive inspection rather than throttling, take them in this order: **AmneziaWG** where UDP passes; **Chrome TLS MUX** or **Decoy TLS MUX** where it does not; **WSS MUX** behind a CDN where only web traffic crosses; **KCP MUX** where UDP passes but the AmneziaWG tooling will not install. The rest are for paths that are throttled rather than read: they are the fastest things here (GRE FOU measured 933 Mbit/s) and they hide nothing. Plain UDP is also policed by packet count on many Iranian lines whatever it carries (measurements, section 15). Two things no transport changes: the volume and timing of the traffic, and the fact that one address in Iran exchanges a great deal with one abroad.
 
 ### What the carrier count means
 
@@ -115,17 +141,21 @@ The tunnel's own port and the ports your users connect to are separate things. A
 
 ## Presets and tuning
 
-| Preset | Goal | Private link (GRE, UDP, ICMP, Fake TCP, AmneziaWG) | TCP carriers (TCP, WS, WSS, Chrome TLS, Decoy TLS) |
-|---|---|---|---|
-| **Gaming** | A small packet waits behind less of a big one | 256 KB receive queue | a bulk stream may park 64 KB in front of a small one |
-| **Balanced** | Daily use — the one to pick if unsure | 256 KB receive queue | 128 KB |
-| **Download** | Many streams at once | 3 MB receive queue | 128 KB |
+| Preset | For | Receive queue (private links) | Unsent bound (TCP carriers) | Connections | Parity |
+|---|---|---|---|---|---|
+| **gaming** | lowest lag for a small packet | 256 KB | 64 KB | 16 | off |
+| **stable** | a path that loses packets | 256 KB | 64 KB | 24 | 1 in 10 |
+| **balanced** | sensible mix — the one to pick, and the default | 256 KB | 128 KB | 16 | off |
+| **throughput** | many streams at once | 3 MB | 128 KB | 16 | off |
+| **max** | a server with many users | 3 MB | 128 KB | 32 | off |
+
+Every one of these numbers was measured on the reference pair (sections 35 to 41 of the measurements). The receive queue reaches the private links, the unsent bound the five TCP carriers, parity the transports that can rebuild a lost packet from it (UDP, ICMP, Fake TCP, AmneziaWG, KCP). Pick balanced unless one of the other four describes your situation exactly. A file from 1.0.x that says `download` is read as throughput and rewritten at upgrade.
 
 The presets used to set three queue depths as well. In September 2026 that was measured on the reference pair and neither queue ever filled at any depth — sixteen streams at 621 Mbit/s put two million packets through with none dropped — so every preset now ships the same depth and the file says so. The whole of it is in [docs/measured.md](docs/measured.md), section 35.
 
 Every setting the core reads is written into the `.toml` with the value it runs with, and only where something reads it: a TCP carrier's file carries no socket buffers, because naming one would turn off the kernel's window auto-tuning; a GRE FOU file carries no tuning at all, because the kernel moves it. `pingify-core -check` says which lines, if any, nothing reads. The Tuning screen edits the rest in place: profile, MTU, carrier count, keepalive, direction, log level, status and health ports.
 
-GRE FOU and KCP are not shaped by the preset. GRE FOU is carried by the kernel; KCP's window is a ceiling on one stream's rate, not a queue to shorten.
+GRE FOU is not shaped by the preset: the kernel carries it. KCP takes the connection count and parity from it, not a queue depth: its window is a ceiling on one stream's rate, not a queue to shorten.
 
 **Optimize** changes the whole machine: socket ceilings, backlog, scheduler budget, MTU probing, and BBR with the `fq` queue discipline. The wizard offers it once, when the first tunnel is created on a server that still runs the distribution's settings; it is on the menu after that.
 
@@ -133,12 +163,23 @@ GRE FOU and KCP are not shaped by the preset. GRE FOU is carried by the kernel; 
 
 **WS MUX** is a plain WebSocket for a direct path or a proxy that already handles `Upgrade: websocket`. **WSS MUX** adds TLS and suits a domain or a CDN.
 
-| Origin certificate | Cloudflare proxy | SSL/TLS mode | WebSockets |
+| The fronted side | Listens on | Cloudflare SSL/TLS mode | WebSockets |
 |---|---|---|---|
-| Valid trusted or origin cert | Orange cloud if desired | **Full (strict)** | Enabled |
-| Self-signed cert | Orange cloud if desired | **Full** | Enabled |
+| No certificate — the default | 80, plain WebSocket | **Flexible** | Enabled |
+| A self-signed certificate, and `listen_port = 443` | 443, TLS | **Full** | Enabled |
+| A valid or Origin certificate, and `listen_port = 443` | 443, TLS | **Full (strict)** | Enabled |
 
-Behind Cloudflare, the fronted side listens on **80** and the CDN's edges connect to it, so the wizard asks for the domain rather than an address on that side. Use a Cloudflare-supported HTTPS port on the other end, normally 443. **DNS only** is for a direct path or for diagnosing the proxy. Occasional TLS scanner errors in the log are harmless while the carrier is healthy.
+Behind Cloudflare the fronted side has no certificate by default: it listens on **80** in plain WebSocket and the CDN's edges connect to it there, so Cloudflare's mode is **Flexible**, and the wizard asks for the domain rather than an address on that side. To encrypt the edge-to-origin leg as well, set a certificate under **Tuning ▸ Certificate** and `listen_port = 443` in the file; the mode is then Full, or Full (strict) with a certificate Cloudflare trusts. Use a Cloudflare-supported HTTPS port on the other end, normally 443. **DNS only** is for a direct path or for diagnosing the proxy. Occasional TLS scanner errors in the log are harmless while the carrier is healthy.
+
+### When Iran filters the foreign server
+
+Iran sometimes blocks a foreign server's address. Tunnels to it still connect and keep their heartbeat, but what the Iran server sends there over TCP stops, UDP flows die after a few packets, and connections opened from the foreign side carry nothing — while the same Iran server still reaches Cloudflare at full speed. Put the Iran server behind Cloudflare and let the foreign server come to it:
+
+1. In Cloudflare, a DNS record for a name of yours pointing at the **Iran** server's address, **Proxied** (orange cloud), SSL/TLS mode **Flexible**, WebSockets on.
+2. On the Iran server: **WSS MUX**, direction **Reverse**, this server's address = that name, the other = the foreign server's address, port **443**, and your ports.
+3. Paste the token on the foreign server. It dials the name; Cloudflare carries it to the Iran server on port 80, and the Iran server never exchanges a packet with the blocked address.
+
+Measured on 2026-09-26 with the Turkey server blocked: this carried 9.5 Mbit/s (the Turkey server's own ceiling) and dropped no carrier connection in its first minute and a half, where every direct transport but ICMP carried nothing.
 
 ## Operations
 
@@ -152,6 +193,7 @@ journalctl -u pingify@iran-tcp-8443 -n 100 --no-pager
 
 A timer runs the health check every 30 seconds and restarts a tunnel that has stopped hearing from the far end three times in a row. The menu also carries live logs, the ports screen, tuning, diagnostics, the blocking rules, update and uninstall.
 
+- **Up, heard, and carrying nothing** — the check says the other server answers the heartbeat and nothing the size of data crosses. Something on the path lets small packets through and stops full-size ones: a filter on the foreign server's address (see [When Iran filters the foreign server](#when-iran-filters-the-foreign-server)), or a path smaller than the interface, which MTU probing under **Optimize** fixes.
 - **Carrier up but nothing answers** — the tunnel carried the probe and the far service refused it. Check that something is really listening on that port on Kharej.
 - **Ports changed and traffic vanished** — run **Apply firewall**. A stale redirect swallows every packet for that port and looks exactly like a broken tunnel.
 - **A TUN tunnel is up but ping does not work** — that is deliberate for ICMP: the kernel must not answer echoes while the tunnel uses them. Use `pingify --check`, not `ping`, to test.
@@ -162,7 +204,7 @@ Read this before deciding what to run through it.
 
 **The tunnel does not encrypt.** Every record carries an authentication tag derived from the tunnel's token, and a replayed packet is rejected, so nothing that does not hold the token can inject or replay traffic. What it does not do is hide the bytes: what crosses is expected to be TLS already, which is what a panel's traffic is.
 
-Where encryption does exist, it comes from a layer around the tunnel: **WSS MUX** adds TLS, **AmneziaWG** is an encrypted kernel tunnel of its own. **GRE, GRE FOU, ICMP, UDP, KCP MUX, Fake TCP and TCP MUX are not encrypted and not disguised.** GRE FOU carries no authentication tag either: the kernel moves its packets and the core never sees them.
+Where encryption does exist, it comes from a layer around the tunnel: **WSS MUX**, **Chrome TLS MUX** and **Decoy TLS MUX** add TLS, **KCP MUX** seals every packet under XChaCha20-Poly1305 keyed from the token (since 1.1.0), and **AmneziaWG** is an encrypted kernel tunnel of its own. **GRE, GRE FOU, ICMP, UDP, Fake TCP, WS MUX and TCP MUX are not encrypted and not disguised.** GRE FOU carries no authentication tag either: the kernel moves its packets and the core never sees them. What each one shows the path is in [On the wire](#on-the-wire).
 
 Protect the setup token, the `.toml` files and `/root/pingify`; the configs are written `rw-------` and the token never appears in a log.
 

@@ -91,6 +91,7 @@ rebuild_core() {
     local n
     unit_write
     if ensure_core; then
+        cfg_modernise
         while IFS= read -r n; do
             systemctl is-enabled --quiet "pingify@$n" 2>/dev/null && svc_do restart "$n"
         done < <(cfg_list)

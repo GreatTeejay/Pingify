@@ -141,3 +141,35 @@ func TestKCPDoesNotConnectToAnotherTunnel(t *testing.T) {
 		t.Fatal("two tunnels with different tokens connected")
 	}
 }
+
+// Every KCP packet is sealed under a key made from the token, with a nonce
+// wide enough that kcp-go's random choice of one never repeats in a tunnel's
+// life: 192 bits, not AES-GCM's 96, which at the rate this carries would be
+// back at the birthday bound inside two days on one key.
+func TestKCPPacketsAreSealedUnderTheToken(t *testing.T) {
+	type aead interface {
+		Seal(dst, nonce, plaintext, additionalData []byte) []byte
+		Open(dst, nonce, ciphertext, additionalData []byte) ([]byte, error)
+		NonceSize() int
+	}
+	one, ok := kcpCrypt("one").(aead)
+	if !ok {
+		t.Fatal("the KCP cipher is not an AEAD")
+	}
+	if one.NonceSize() != 24 {
+		t.Fatalf("the nonce is %d bytes; one drawn at random needs 24 to never repeat", one.NonceSize())
+	}
+	two := kcpCrypt("two").(aead)
+	nonce := make([]byte, one.NonceSize())
+	sealed := one.Seal(make([]byte, 0, 64), nonce, []byte("hello"), nil)
+	if bytes.Contains(sealed, []byte("hello")) {
+		t.Fatal("the plaintext is on the wire")
+	}
+	if _, err := two.Open(nil, nonce, sealed, nil); err == nil {
+		t.Fatal("a packet sealed under one token opened under another")
+	}
+	got, err := one.Open(nil, nonce, sealed, nil)
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("the same token did not open it: %v %q", err, got)
+	}
+}

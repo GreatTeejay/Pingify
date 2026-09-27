@@ -64,6 +64,8 @@ Pingify $PINGIFY_VERSION - tunnel manager for Iran <-> Kharej server pairs
   pingify --new              straight to building a tunnel
   pingify --status [name]    print tunnel status and exit
   pingify --check name       health check; exits 0 clean, 1 warnings, 2 problems
+  pingify core export        write the core beside its hash, to carry to a server that cannot build
+  pingify core import FILE   install a core carried over, hash and version checked
   pingify --json             with --status or --check, machine readable
   pingify --health-check     run the watchdog pass once (used by the timer)
   pingify --apply-firewall   re-apply the forwarding and blocking rules (used at boot)
@@ -140,7 +142,10 @@ first_run() {
     fi
     blank
     fail "the core could not be built"
-    dim "it needs a Go toolchain, which this script offers to fetch when it is missing"
+    dim "it needs a Go toolchain, which this script offers to fetch when it is missing."
+    dim "A server that cannot fetch it, or is too small to compile, can take the"
+    dim "core from the other server instead:"
+    dim "  there:  pingify core export      here:  pingify core import FILE"
     pause
     return 1
 }
@@ -156,6 +161,7 @@ ensure_core_current() {
     dim "they have to match - the config format is shared between them"
     blank
     if build_core; then
+        cfg_modernise
         restart_all "the core was updated"
     else
         blank
@@ -270,6 +276,15 @@ argv() {
         --apply-firewall) ARG_MODE=firewall ;;
         --version | -v) ARG_MODE=version ;;
         --help | -h) ARG_MODE=help ;;
+        core)
+            # A word, not a flag, and its own words follow it - export, or
+            # import and a file - which main reads where they stand. Without
+            # this every "pingify core ..." died here as an unknown option,
+            # and the tests never saw it: they called the two functions
+            # directly.
+            ARG_MODE=core
+            shift "$(($# > 2 ? 2 : $# - 1))"
+            ;;
         *)
             usage >&2
             die "$1 is not an option this script has"
@@ -308,6 +323,12 @@ main() {
         ;;
     update) update_pingify; exit $? ;;
     install) ensure_deps; install_self && ok "installed"; exit $? ;;
+    core)
+        case ${2:-} in
+        export) core_export; exit $? ;;
+        import) [ -n "${3:-}" ] || { fail "pingify core import FILE"; exit 1; }; core_import "$3"; exit $? ;;
+        *) fail "pingify core export | pingify core import FILE"; exit 1 ;;
+        esac ;;
     rebuild) rebuild_core; exit $? ;;
     esac
 

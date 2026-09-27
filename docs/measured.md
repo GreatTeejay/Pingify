@@ -1227,6 +1227,303 @@ from each other. Every AmneziaWG file written before 1.1.0 says
 now would switch all of them to batching at upgrade - for this. It stays at
 one per call, and the file does not carry the key.
 
+## 41. The five presets measured where they differ, and KCP under its cipher
+
+2026-09-24, 02:30 to 03:45 Tehran time, the same lab pairs as sections 37
+to 40, the arm's core under the tunnel's own unit, rounds interleaved. Three
+questions: what the five presets of 1.1.0 do on a TCP carrier, what they do
+on a private link, and what sealing every KCP packet costs. A fourth came
+out of the first and was measured on its own.
+
+The presets were still called gaming, balanced, download, unstable and
+crowded when this ran; they are gaming, stable, balanced, throughput and max
+now, and the numbers are the numbers.
+
+**TCP MUX, forward mode.** The only levers a preset has on a TCP carrier are
+the unsent bound (64 KB for gaming and stable, 128 for the rest) and the
+connection count (16, 24 for stable, 32 for max). Eight streams pulled from
+Iran while a small request went back and forth on a second forwarded port;
+three rounds:
+
+	                      down 8 / 1     lag under load p50 / p90 / p99   jitter
+	  gaming      64 KB  16  596   620      166   167   173                0.6
+	  balanced   128 KB  16  615   359      166   167   170                0.5
+	  throughput 128 KB  16  515   564      171   172   181                0.8
+	  stable      64 KB  24  650   106      164   164   454                7.4
+	  max        128 KB  32  573   481      164   165   168                0.6
+
+	  gaming                 515   598      162   162   165                0.4
+	  balanced               640   218      159   160   170                0.7
+	  throughput             611   600     5005  5005  5005                0.1
+	  stable                 586   499      157   158   160                0.3
+	  max                    582   125      164   165   166                0.4
+
+	  gaming                 361   310      160   161   173                0.7
+	  balanced               591   560     5005  5005  5005                1.7
+	  throughput             605   736      157   158   159                0.3
+	  stable                 676   588      156   157   159                0.5
+	  max                    652   516      168   168   169                0.4
+
+Throughput does not separate them: 515 to 676 Mbit/s with the rounds
+differing more than the presets. Neither does the lag when it answers: 156
+to 171 ms at the median for all five, jitter under a millisecond. What
+separates them is the two rows that did not answer at all. A 5005 is the
+probe's whole window with nothing back - the small stream stalled for five
+seconds - and both of them fell on 128 KB arms, none on the six 64 KB arms.
+Two of nine against none of six is not a measurement; it is a reason to
+make one. That is the fourth question, below.
+
+**UDP, tun mode.** Here a preset's levers are the receive queue (256 KB or
+3072) and parity (1 in 10 for stable). Gaming, balanced and an unstable line
+without its parity are the same file on a private link, and so are
+throughput and max, so three arms cover the five. IRAN pulled eight streams
+and one from KHAREJ, KHAREJ pulled eight back, the receiving core's CPU and
+the download's loss from IRAN's counters:
+
+	                      down 8 / 1     up 8    rx cpu    lost      loss
+	  256 KB              853   678      806     69 %     222149    15.4 %
+	  3072 KB             845   748      761     71       133656    10.0
+	  256 KB, parity 10   800   550      660     77        97805     7.8
+
+	  256 KB              897   525      841     74       158318    10.8
+	  3072 KB             799   666      763     69       120708     9.6
+	  256 KB, parity 10   740   450      696     69       113826     9.7
+
+	  256 KB              875   666      769     66       117029     8.4
+	  3072 KB             931   571      784     77       112289     7.6
+	  256 KB, parity 10   798   387      688     76       103406     8.1
+
+The queue depth is the wash section 35 said it was: 853, 897, 875 against
+845, 799, 931 on eight streams, and the deep queue's fewer gaps are the
+socket absorbing what the shallow one dropped, which is what section 35
+argued is the congestion signal arriving late. Parity is not free. One in
+ten costs eight to ten per cent on the aggregate, twenty on the upload, and
+the single stream drops from the six hundreds to the four hundreds, because
+every eleventh packet is now overhead and the encoder runs on the same one
+core in Tehran that is already at seventy per cent. What it buys on this
+path is nothing visible, because this path does not lose packets on its
+own: every loss in these columns is the download's own saturation, which
+parity cannot repair. That is why stable is a preset for a line that loses
+packets and not the default: on a clean line it is a tax.
+
+**KCP under its cipher.** Section 39's forward harness on the KCP pair, 16
+connections, the core with kcp-go's cipher left nil against the same core
+sealing every packet under XChaCha20-Poly1305 keyed from the token:
+
+	                    down 8 / 1     lag under load p50 / p90 / p99   jitter
+	  in the clear     783   249      257   328   405               45.7
+	  sealed           756   256      228   300   357               37.3
+	  in the clear     803   250      225   268   303               31.0
+	  sealed           747   223      245   313   373               38.9
+	  in the clear     810   242      235   273   318               32.4
+	  sealed           760   266      243   332   449               41.4
+
+Five per cent of the aggregate - 783, 803, 810 against 756, 747, 760 - and
+nothing on the lag: the medians land on both sides of each other. That is
+the cipher's whole price, and what it buys is that the packet on the wire
+no longer carries kcp-go's header in fixed places. It stays. The same table
+says something about KCP itself: on this clean path its lag under load is
+225 to 260 ms where TCP MUX's, in the first table, is 160, because eight
+bulk streams over sixteen KCP sessions are paced by KCP's own retransmit
+timer and window, not the kernel's BBR. KCP is for the path that throttles
+TCP, not this one.
+
+**The unsent bound on its own.** Gaming and balanced differ on a TCP carrier
+in exactly one thing, 64 KB against 128 KB of unsent bytes a bulk stream may
+park in front of a small one, so those two files are that A/B. Five rounds,
+the same harness:
+
+	                 down 8 / 1     lag under load p50 / p90 / p99   jitter
+	  64 KB          584   403      169   169   195                1.1
+	  128 KB         603   610      166   167   172                0.5
+	  64 KB          515   515      163   163   164                0.3
+	  128 KB         546   487      166   166   169                0.4
+	  64 KB          634   473      165   165   166                0.3
+	  128 KB         554   526      165   166   169                0.6
+	  64 KB          488   493     5005  5005  5005                0.4
+	  128 KB         617   559      168   169   171                0.4
+	  64 KB          543   418      166   166   168                0.3
+	  128 KB         532   345      165   165   166                0.2
+
+The stall fell on the 64 KB arm this time. Ten rounds, one stall, on the
+bound the earlier two had spared: the bound is not what stalls the small
+stream, and the two of nine above were the path having a moment. Everything
+else is equal to the round's noise - 163 to 169 ms at the median on both,
+throughput both ways. So balanced keeps 128 KB, gaming and stable keep 64,
+and the difference between them is what section 39 measured, a bulk
+stream's worth of parking, not a stall. What does stall a small stream for
+five seconds about once in ten probe windows on this harness - it did it
+once to the fixed 16 KB arm in section 39 as well - is not the profile, is
+not the connection count at sixteen, and is not settled here.
+
+## 42. The Turkey tunnel is slow because the Turkey server cannot send
+
+2026-09-25, 11:50 to 12:30 Tehran time, the live GRE FOU pair between Iran
+and Turkey (`iran-grefou-8466` / `kharej-grefou-8466`) with the users on it.
+The operator's words were that the tunnel was worth nothing and that they
+could not tell whether the server was the reason. It is the server.
+
+**What was wrong first, and is not the reason.** Both ends of the link were
+MTU 1400. GRE FOU puts 36 bytes around every packet - 20 of IP, 8 of UDP, 4
+of GRE, 4 of key - and the Iran server's own interface is 1400, so every
+full packet Iran sent was 1436 on an interface that takes 1400. The wizard
+wrote 1400 because it assumed a 1500 interface. Turkey's counters since
+boot held 16 million packets refused for size and 87 thousand fragments
+that never reassembled. Three rounds against the same path with nothing of
+ours in it, Turkey serving and Iran pulling and pushing:
+
+	                   down 1 / 4      up 1      first byte
+	  raw path          2    5        1483         80 ms
+	  link at 1400      1    1        1458         97
+	  link at 1364      1    2        1391        194
+	  raw path          2    6        1499         79
+	  link at 1400      0    1        1519         97
+	  link at 1364      1    2        1574         81
+	  raw path          2    5        1637         81
+	  link at 1400      1    2        1244        116
+	  link at 1364      1    2        1397        111
+
+Turkey refused no packet for size in any of the nine arms and Iran one, so
+the 16 million were history, not today. 1364 is right for a server whose interface is 1400
+and it stays - both files say so now, and the wizard, the token paste and
+the boot hook derive it from the interface since this section - but it
+moves nothing here. What the table does say is the direction: 1.4 Gbit/s
+from Iran to Turkey, and from Turkey to Iran two to six megabits on the raw
+path and nought to two through the tunnel, which was carrying the users'
+nine at the same time.
+
+**Not the port.** TCP pulled from Turkey on four ports, one stream and
+four, two rounds:
+
+	  tcp/443     3 5   3 5      tcp/8443    3 5   3 5
+	  tcp/80      2 5   2 5      tcp/29085   3 6   2 5
+
+UDP was another matter in the same minutes. A steady stream of datagrams
+from Iran to an echo on Turkey, on udp/443 and udp/29500 alike, at 300 a
+second and at 830, brought 6 back each time. A fresh flow of UDP between
+these two servers already stopped after its sixth datagram that morning,
+while the GRE FOU flow the users rode, which was not fresh, carried them
+all day. Section 43 is what happened when that stopped too.
+
+**The Turkey server, to everywhere.** Each server against public endpoints
+in the same minutes:
+
+	                    download        upload
+	  Turkey            1062 Mbit/s     3.2 Mbit/s    (Cloudflare)
+	                     174            -             (OVH)
+	  Iran               224            94            (Cloudflare)
+
+and Turkey's interface, read over ten seconds with the users on it: 11
+Mbit/s out, 8 in, on a 10 Gbit/s virtual NIC. The machine takes a gigabit
+in and sends about ten megabits out, in total, to anywhere. The users'
+traffic comes in from the internet and has to go out to Iran, so every one
+of them shares those ten megabits, and no transport can carry more than the
+server sends. Section 32 read this route as about three megabits each way
+and blamed the route; that was the same ceiling seen from inside it.
+
+It was not always so. The interface has sent 3.1 TB in the 19 days since
+boot, 15 Mbit/s on average, which ten megabits could not have done - the
+shape of a provider that throttles a machine after a monthly traffic
+allowance. The fix is at the provider or a different server, and this is
+how to tell, in two commands, on the next one:
+
+	curl -s -o /dev/null -w '%{speed_download}\n' 'https://speed.cloudflare.com/__down?bytes=50000000'
+	head -c 20000000 /dev/urandom | curl -s -o /dev/null -w '%{speed_upload}\n' --data-binary @- https://speed.cloudflare.com/__up
+
+Both are bytes per second; a server for this job needs the second one to be
+at least what the users should get.
+
+## 43. When Iran blocks the foreign server: what still carries
+
+At 22:13 UTC on 2026-09-25 (01:43 in Tehran) the users' GRE FOU tunnel to
+Turkey stopped, and both watchdogs began restarting it every two minutes and
+a quarter. Nothing on either server had changed. Both were up, Iran answered
+SSH from inside the country, and each still reached the rest of the world.
+What had changed was what Iran let through between it and one address,
+92.249.61.49. The same things that morning (section 42) and that night,
+23:50 to 00:40 UTC:
+
+	                                          that morning      that night
+	  TCP, Iran pulling from Turkey           2 to 6 *          10 Mbit/s
+	  TCP, Iran pushing to Turkey             1483 to 1637      0
+	  TCP opened by Turkey into Iran          -                 0, either way
+	  a stream of fresh UDP datagrams         6 came back       6 arrived, each way
+	  the users' GRE FOU flow                 carrying          stopped
+	  Iran to Cloudflare, down / up           224 / 94          196 / 112
+	  * the users were taking the rest of Turkey's ten megabits
+
+A fresh UDP flow was stopped after six datagrams that morning already; what
+changed at 22:13 is that the established one stopped as well, and that TCP
+from Iran to that address carried nothing any more - neither what Iran sent
+on its own connections, nor anything on a connection Turkey opened. A
+download still crossed, Turkey answering what Iran asked for, at the ten
+megabits that are the Turkey server's own ceiling (section 42).
+
+Every transport, built through the 1.0.2 wizard between the two servers,
+given twenty seconds after it first said up, then measured from Iran - a
+pull through the tunnel from a source on Turkey, which is the users'
+direction, and a push the other way:
+
+	                      says up   carried to Iran   health check
+	  TCP MUX               yes           0             nothing wrong
+	  WS MUX                yes           0             nothing wrong
+	  WSS MUX               yes           0             nothing wrong
+	  Chrome TLS MUX        yes           0             nothing wrong
+	  Decoy TLS MUX         yes           0             nothing wrong
+	  KCP MUX               yes           0             nothing wrong
+	  GRE                   yes           0             15 to 70 % lost
+	  GRE FOU               yes           0             nothing wrong
+	  UDP                   yes           0             silent after the first packets
+	  AmneziaWG             no            0             never completed a handshake
+	  Fake TCP              no            0             never seen
+	  ICMP                  yes           9 Mbit/s      12 to 29 % lost under load
+	  WS via Cloudflare     yes           9 Mbit/s      nothing wrong, no drops
+	  WSS via Cloudflare    yes         9.5 Mbit/s      nothing wrong (the users' own)
+
+Two ways through. One is ICMP, which the filter did not touch. The other is
+not to talk to the blocked address from Iran at all: a Cloudflare name that
+fronts the Iran server, and the foreign server dialling it. Iran then only
+exchanges packets with Cloudflare, which it reaches at full speed, and
+Cloudflare carries it to Turkey. That is what the users run on now
+(`iran-wss-443` / `kharej-wss-443`, Iran listening on 80 behind
+a Cloudflare name of the operator's): 9.5 Mbit/s, the whole of what Turkey can send, and not
+one carrier connection dropped in its first minute and a half. The round
+trip is 111 ms against the 40 of the direct path; that is the price.
+
+The worst lines in the table are the first six and GRE FOU. Each of those
+tunnels connected, said it was up, and passed its health check, while
+carrying nothing. Two TCP tunnels built by hand the same night, Chrome TLS
+MUX on 443 and TCP MUX on 29446, showed how when their connections were read
+with ss: a congestion window of one, the same segments sent again and
+again, a few kilobytes through at most. The filter let the tiny heartbeat
+through and stopped the full-size segments behind it; KCP, over UDP, kept
+its heartbeat the same way and carried nothing. Nothing in a tunnel could
+see it, because everything it measured was small.
+
+So a forward tunnel now probes. Every third heartbeat has a companion padded
+to 1800 bytes - enough to need a full-size segment, and small enough that a
+1.0.2 far end, whose records stop at 2048 bytes, takes it and echoes it.
+The probe rides a carrier connection of its own. Every stream carrier
+delivers in order, so a probe the path stops holds up whatever is queued
+behind it on its connection; on the heartbeat's it would stall the
+heartbeat, which has to keep crossing for a stopped probe to mean anything.
+The first version did exactly that, and a review caught it before it ran
+anywhere: the test's wire had skipped the stopped record and delivered what
+came after it, which no stream carrier does, and now it does not either.
+
+A probe counts as missed when the next one leaves and it has not come back.
+After three misses in a row, ninety seconds, with the heartbeat still
+answering and less than 64 KB of data arriving meanwhile - streams and
+forwarded datagrams both - the status says `data_blocked`, and the health
+check says the other server answers the heartbeat and nothing the size of
+data crosses. The cause is a filter on the foreign address, for which this
+section is the way around, or a path smaller than the interface, for which
+it is MTU probing. Data arriving at all rules it out: a busy tunnel can lose
+a probe's echo to a full queue, but it cannot be carrying and blocked at
+once. A tunnel of one connection is not probed, and a private link has no
+forwarder to probe with: GRE FOU passed its check in this sweep while
+carrying nothing, and still would.
+
 # How to measure, so the numbers mean something
 
 These cost as much time as the findings did.
@@ -1240,6 +1537,12 @@ These cost as much time as the findings did.
 - **`scp` onto a running binary fails with "Text file busy".** If the error
   goes to /dev/null the measurement runs on the old binary and looks fine.
   Copy beside it and rename, and print the size that landed.
+
+- **Before blaming a route, ask each server what it can send to anywhere.**
+  Section 32 blamed the Iran to Turkey route for three megabits; section 42
+  found the Turkey server sent ten megabits in total, to Cloudflare as much
+  as to Iran, while taking a gigabit in. One upload to a public endpoint
+  from each end would have said so on the first day.
 
 - **Interleave.** Run A, then B, then A again. Never compare a number taken now
   against one taken an hour ago: the path changes, and so does the neighbours'

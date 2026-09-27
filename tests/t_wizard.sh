@@ -5,7 +5,7 @@
 # The questions, in the order they are asked:
 #
 #   side  transport  [direction]  this address  other address  [port]
-#   [octet  device  mtu]  [ports]  preset  logging  confirm
+#   [octet  device  mtu]  [ports]  preset (3 = balanced)  logging  confirm
 #
 # and on the second server: side 3, the token, confirm. Every test here
 # answers the real questions and reads the real file that came out, so a
@@ -63,7 +63,7 @@ val() { toml_get "$1" "$2" "$3"; }
 
 section "the questions come in the order they were designed in"
 
-out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 n | new_tunnel 2>&1)
+out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3030" 3 3 n | new_tunnel 2>&1)
 check_contains "which server comes first" "$out" "1 . Which server is this?"
 check_contains "then the transport" "$out" "2 . Transport"
 check_contains "an ICMP tunnel is not asked its direction" "$out" "3 . Addresses"
@@ -77,7 +77,7 @@ check "nothing was written on no" "$(ls "$CFG_DIR" | wc -l | tr -d ' ')" "0"
 
 section "a TCP tunnel is asked its direction and its port, and no link"
 
-out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "443,udp:500" 2 3 n | new_tunnel 2>&1)
+out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "443,udp:500" 3 3 n | new_tunnel 2>&1)
 check_contains "the direction question comes after the transport" "$out" "3 . Link direction"
 check_contains "then the addresses" "$out" "4 . Addresses"
 check_contains "then the port" "$out" "5 . Port"
@@ -95,7 +95,7 @@ section "the first server builds a [TUN] ICMP tunnel"
 if [ -z "$CORE" ]; then
     skip "the icmp wizard" "no core could be built"
 else
-    out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3030" 2 3 y | new_tunnel 2>&1)
+    out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3030" 3 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-icmp-1.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
@@ -167,25 +167,25 @@ if [ -z "$CORE" ]; then
 else
     # The octet 1 belongs to the tunnel above; the wizard must refuse it and
     # offer the next one as the default.
-    out=$(answers 1 9 "" 185.31.8.129 46.247.109.83 "" 1 "" "" "" "3031" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 9 "" 185.31.8.129 46.247.109.83 "" 1 "" "" "" "3031" 3 3 n | new_tunnel 2>&1)
     check_contains "a taken network is listed" "$out" "10.1.10.0/24"
     check_contains "and refused" "$out" "already belongs to iran-icmp-1"
     check_contains "the next free one is taken" "$out" "10.2.10.1/24"
     check_contains "a forwarded port is listed as taken" "$out" "3030"
 
     # A port already forwarded by another tunnel is refused at the Ports question.
-    out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "3030" "3031" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "3030" "3031" 3 3 n | new_tunnel 2>&1)
     check_contains "a port another tunnel forwards is refused" "$out" "already forwarded by the tunnel iran-icmp-1"
     check_contains "and the next answer is taken" "$out" "3031"
 
     # An empty ports answer is an error, not a tunnel with no ports.
-    out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "" "3032" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 1 1 185.31.8.129 46.247.109.83 "" "" "" "3032" 3 3 n | new_tunnel 2>&1)
     check_contains "no ports is refused" "$out" "at least one port is required"
 
     # A tunnel port another tunnel here waits on is refused for a second one.
-    answers 1 1 2 185.31.8.129 46.247.109.83 8443 "" "3040" 2 3 y | new_tunnel >/dev/null 2>&1
+    answers 1 1 2 185.31.8.129 46.247.109.83 8443 "" "3040" 3 3 y | new_tunnel >/dev/null 2>&1
     check "a tcp tunnel that waits here was built" "$(val "$CFG_DIR/iran-tcp-8443.toml" transport dials)" "kharej"
-    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 8443 8444 "" "3041" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 8443 8444 "" "3041" 3 3 n | new_tunnel 2>&1)
     check_contains "its port is listed as taken" "$out" "8443/tcp"
     check_contains "and refused for a second tunnel" "$out" "already the tunnel port of iran-tcp-8443"
 fi
@@ -236,7 +236,7 @@ section "a KCP tunnel forwards ports, and its port is a udp one"
 if [ -z "$CORE" ]; then
     skip "the kcp wizard" "no core could be built"
 else
-    out=$(answers 1 6 1 185.31.8.129 46.247.109.83 "" "" "3060" 2 3 y | new_tunnel 2>&1)
+    out=$(answers 1 6 1 185.31.8.129 46.247.109.83 "" "" "3060" 3 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-kcp-8443.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
@@ -266,7 +266,7 @@ section "a forward tunnel can be given backups, and they travel in the token"
 if [ -z "$CORE" ]; then
     skip "the failover wizard" "no core could be built"
 else
-    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 9443 "6,4" "3070" 2 3 y | new_tunnel 2>&1)
+    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 9443 "6,4" "3070" 3 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-tcp-9443.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
@@ -287,10 +287,10 @@ else
         check "the backups came back from the token" "$T_BACKUPS" "kcp:9443 utls:9444"
     fi
 
-    out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3071" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 12 185.31.8.129 46.247.109.83 "" "" "" "3071" 3 3 n | new_tunnel 2>&1)
     check_missing "a private link is not asked for backups" "$out" "Backups"
 
-    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 9543 "1" "6,6" "6" "3072" 2 3 n | new_tunnel 2>&1)
+    out=$(answers 1 1 2 185.31.8.129 46.247.109.83 9543 "1" "6,6" "6" "3072" 3 3 n | new_tunnel 2>&1)
     check_contains "the transport it already runs on is refused as a backup" "$out" "already runs on"
     check_contains "and so is a backup named twice" "$out" "in the list twice"
 fi
@@ -300,7 +300,7 @@ section "a kernel-carried GRE FOU tunnel"
 if [ -z "$CORE" ]; then
     skip "the grefou wizard" "no core could be built"
 else
-    out=$(answers 1 8 y 185.31.8.129 46.247.109.83 29501 "" "" "" "3080" 2 3 y | new_tunnel 2>&1)
+    out=$(answers 1 8 y 185.31.8.129 46.247.109.83 29501 "" "" "" "3080" 3 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-grefou-29501.toml
     if [ ! -f "$f" ]; then
         FAIL=$((FAIL + 1))
@@ -333,7 +333,7 @@ section "each key is written only where something reads it"
 # reasons are docs/measured.md sections 7, 35, 36 and 37.
 _render() {
     cfg_reset
-    T_NAME=t T_SIDE=iran T_TRANSPORT=$1 T_MODE=$(mode_of "$1") T_PRESET=download
+    T_NAME=t T_SIDE=iran T_TRANSPORT=$1 T_MODE=$(mode_of "$1") T_PRESET=throughput
     T_IRAN=198.51.100.7 T_KHAREJ=203.0.113.9 T_PORT=443 T_DIALS=iran T_PATH=/p
     T_TOKEN=t T_OCTET=9 T_TUNIF=pfy0 T_FORWARDS=443 T_LOG=info T_CONNS=16 T_AWG_PORT=20909
     cfg_render
@@ -351,7 +351,18 @@ for t in tcp ws wss utls fallback grefou; do
     check_missing "$t has no receive queue in its file" "$(_render $t)" "rcvbuf_kb"
 done
 check_contains "kcp's file says the floor it really gets" "$(_render kcp)" "8192"
-check_contains "udp's file says the download profile's queue" "$(_render udp)" "3072"
+check_contains "udp's file says the throughput profile's queue" "$(_render udp)" "3072"
+_renderw() { _render wss >/dev/null; T_INSECURE=true; cfg_render; }
+check_contains "a wss file that said insecure = true keeps it through a rewrite" "$(_renderw)" "insecure         = true"
+check_contains "and one that said nothing gets false" "$(_render wss)" "insecure         = false"
+# The two profiles of 1.1.0: what they choose is in the file, where read.
+_renderp() { local t=$1 pr=$2; T_PRESET_OVERRIDE=$pr; cfg_reset; T_NAME=t T_SIDE=iran T_TRANSPORT=$t T_MODE=$(mode_of "$t") T_PRESET=$pr T_CONNS=$(preset_conns "$pr") T_FEC=$(preset_fec "$pr") T_IRAN=198.51.100.7 T_KHAREJ=203.0.113.9 T_PORT=443 T_DIALS=iran T_TOKEN=t T_OCTET=9 T_TUNIF=pfy0 T_FORWARDS=443 T_LOG=info; cfg_render; }
+check_contains "max gives a TCP carrier 32 connections" "$(_renderp tcp max)" "connections      = 32"
+check_contains "stable gives it 24" "$(_renderp tcp stable)" "connections      = 24"
+check_contains "stable turns parity on for udp" "$(_renderp udp stable)" "fec              = 10"
+check_missing "but not for gre, where parity stops it dead" "$(_renderp gre stable)" "fec"
+check_contains "max gives a private link the deep receive queue" "$(_renderp udp max)" "rcvbuf_kb        = 3072"
+check_contains "balanced stays at 16 and 256" "$(_renderp udp balanced)" "rcvbuf_kb        = 256"
 # Parity where a carrier can rebuild from it: not gre, whose header parity
 # stops dead, not grefou, whose bytes this core never touches.
 for t in udp icmp rawtcp awg kcp; do
@@ -373,5 +384,78 @@ check_contains "utls says verification is off, which it is" "$(_render utls)" "i
 # Where a CDN can front it, the port the waiting end really binds.
 check_contains "ws writes the port it binds" "$(_render ws)" "listen_port"
 check_missing "tcp has no second port to state" "$(_render tcp)" "listen_port"
+
+section "a file from 2.x is rewritten in the current shape on upgrade"
+
+# The file in the operator's editor: a 2.3.0 header, a note beside every key,
+# the keys at their defaults commented out. Rewritten, it has to be two
+# columns and nothing else, with every value it carried still in it.
+if [ -z "$CORE" ]; then
+    skip "config rewrite" "no core could be built"
+else
+    _old=$CFG_DIR/kharej-icmp-1.toml
+    cat >"$_old" <<'TOML'
+# Pingify 2.3.0
+#
+# The same file runs on both servers; only side and name differ.
+
+[tunnel]
+name = "kharej-icmp-1"                # what the manager and the logs call this tunnel
+side = "kharej"                       # which server this file is on
+mode = "tun"                          # tun: a private network between the two servers
+
+[transport]
+type = "icmp"                         # forward: tcp ws wss utls fallback   tun: icmp gre udp rawtcp awg
+kharej = "144.31.63.245"              # the server abroad
+iran = "185.31.8.129"                 # the Iran server
+# port                    # none: this transport has no port and nothing to open
+dials = "iran"                        # which side opens the connection
+# keepalive_sec = 10                  # seconds between keepalives
+
+[security]
+token = "q7Wm2xRt9LpKc4Zv8NhBd3Ys"    # the same on both servers
+
+[tuning]
+profile = "balanced"                  # gaming | balanced | download
+queue_packets = 900 # the queue depth the profile chose
+rcvbuf_kb = 256 # the carrier socket's receive queue
+# sndbuf_kb = 16384                   # its send buffer
+# fec = 0                             # one parity packet per this many
+
+[forward]
+ports = ["3036"]
+
+[tun]
+name = "pfy0"                         # the device on this server
+iran = "10.1.10.1/24"                 # IRAN's address on the link
+kharej = "10.1.10.2/24"               # KHAREJ's
+mtu = 1320                            # inner packet size
+
+[logging]
+level = "info"                        # debug | info | warn | error
+TOML
+    check "it is recognised as the old shape" "$(cfg_old "$_old" && echo old || echo new)" "old"
+    # A second old file, the one profile whose name changed in 1.1.0.
+    _old2=$CFG_DIR/kharej-icmp-2.toml
+    sed 's/kharej-icmp-1/kharej-icmp-2/; s/profile = "balanced"/profile = "download"/' "$_old" > "$_old2"
+    cfg_modernise >/dev/null 2>&1
+    check "a file that said download now says throughput" "$(val "$_old2" tuning profile)" "throughput"
+    check "and got the deep queue that name means" "$(val "$_old2" tuning rcvbuf_kb)" "3072"
+    check "the old file is kept beside it" "$([ -f "$_old.old" ] && echo kept || echo gone)" "kept"
+    check "it is no longer the old shape" "$(cfg_old "$_old" && echo old || echo new)" "new"
+    check "the one note is the line under [tuning]" "$(grep -c '#' "$_old")" "1"
+    check "no value carries a note" "$(grep -cE '^[a-z_]+ *=.*#' "$_old")" "0"
+    check "[tun] sits under [transport]" "$(grep -nE '^\[(transport|tun|security)\]' "$_old" | cut -d: -f2 | tr '\n' ' ')" "[transport] [tun] [security] "
+    check "every value line is two columns" "$(grep -vE '^\[|^$|^#' "$_old" | grep -vcE '^[a-z_]+ += ')" "0"
+    check "the token is kept" "$(val "$_old" security token)" "q7Wm2xRt9LpKc4Zv8NhBd3Ys"
+    check "the side is kept" "$(val "$_old" tunnel side)" "kharej"
+    check "the ports are kept" "$(val "$_old" forward ports)" '["3036"]'
+    check "the link addresses are kept" "$(val "$_old" tun iran)/$(val "$_old" tun kharej)" "10.1.10.1/24/10.1.10.2/24"
+    check "the mtu is kept" "$(val "$_old" tun mtu)" "1320"
+    check "the direction is kept" "$(val "$_old" transport dials)" "iran"
+    check "a key nothing reads on icmp is not written" "$(val "$_old" transport connections)" ""
+    check "the core accepts what came out" "$("$CORE" -c "$_old" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+    check "a file already in the current shape is left alone" "$(cfg_old "$CFG_DIR/iran-icmp-1.toml" 2>/dev/null && echo old || echo new)" "new"
+fi
 
 report
