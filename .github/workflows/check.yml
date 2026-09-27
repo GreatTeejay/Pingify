@@ -45,10 +45,31 @@ jobs:
           echo "$n test files"
 
       - name: Test the engine
-        run: go test -count=1 -race -timeout 300s ./...
+        run: |
+          set -o pipefail
+          go test -count=1 -race -timeout 300s ./... 2>&1 | tee /tmp/engine-test.log
 
       - name: Test the manager
-        run: bash tests/run.sh
+        run: |
+          set -o pipefail
+          bash tests/run.sh 2>&1 | tee /tmp/manager-test.log
+
+      # A failure said only "exit code 1" to anyone who could not open the
+      # log, and the first run of this check failed in a way nobody could
+      # read. The lines that say what failed go up as an annotation, which
+      # the checks page and the API show to anybody.
+      - name: Say what failed
+        if: failure()
+        run: |
+          for f in /tmp/engine-test.log /tmp/manager-test.log; do
+            [ -s "$f" ] || continue
+            sed -r 's/\x1b\[[0-9;]*[A-Za-z]//g' "$f" |
+              grep -nE -- '--- FAIL|^FAIL|^panic|WARNING: DATA RACE|_test\.go:[0-9]+:|^      .+\.go:[0-9]+|^    x |wanted:|got:|looked for' |
+              head -n 60 > /tmp/why.txt || true
+            [ -s /tmp/why.txt ] || tail -n 40 "$f" > /tmp/why.txt
+            msg=$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' /tmp/why.txt | awk '{ printf "%s%%0A", $0 }')
+            echo "::error title=$(basename "$f" .log)::$msg"
+          done
 
       - name: It must still compile for both architectures, offline
         run: |
