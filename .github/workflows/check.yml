@@ -20,13 +20,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # From go.mod, not a number typed here: the module says go 1.24.0 and a
-      # workflow pinned to an older toolchain fails before it tests anything.
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: false
-
       - name: The script must parse before anything is taken out of it
         run: bash -n Pingify.sh
 
@@ -34,6 +27,15 @@ jobs:
         run: |
           PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
           test -f go.mod && test -d internal && test -d vendor
+
+      # From go.mod, not a number typed here - and so after the step that
+      # takes go.mod out of the script. go.mod is gitignored like the rest of
+      # the engine, and a setup-go that ran first failed on a checkout that
+      # had none, before anything was tested: the first run of this workflow.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
 
       - name: Lay the engine's tests over it
         run: |
@@ -64,6 +66,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The engine's sources are gitignored - Pingify.sh is the only copy in
+      # the repository - so a bare checkout has no cmd/, internal/ or go.mod.
+      # They are taken back out of the committed script first, with the tests
+      # laid over them, exactly as the release does.
+      - name: Take the engine out of the script
+        run: |
+          PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
+          cp -r tests/_engine/internal tests/_engine/cmd . 2>/dev/null || true
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -76,22 +87,31 @@ jobs:
           [ "$a" = "$b" ] || { echo "manager $a, engine $b"; exit 1; }
           echo "both say $a"
 
-      # The engine's sources are gitignored - Pingify.sh is the only copy in
-      # the repository - so a bare checkout has no cmd/ or internal/ and
-      # build.sh cannot run at all. They are taken back out of the committed
-      # script first, with the tests laid over them, exactly as the release
-      # does. What that leaves this job proving is that the shell half of
-      # Pingify.sh matches parts/, which is the half a person edits by hand
-      # and the one that gets committed without a rebuild.
+      # What this proves is that the shell half of Pingify.sh matches parts/,
+      # the half a person edits by hand and the one that gets committed
+      # without a rebuild. The engine in it cannot be checked this way: here
+      # it was taken out of the committed script a step ago, so rebuilding
+      # puts back what was there. The vendored modules are left out of the
+      # comparison for a second reason - they go in as a tar and gzip stream,
+      # which records file owners and directory order, and those are not the
+      # same on the machine that built the script and on this one. The
+      # comparison of the whole file failed on its first run for that alone.
       - name: The committed script must be what parts/ builds
         run: |
-          PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
-          cp -r tests/_engine/internal tests/_engine/cmd . 2>/dev/null || true
           cp Pingify.sh /tmp/committed.sh
           bash build.sh >/dev/null
-          if ! cmp -s /tmp/committed.sh Pingify.sh; then
+          mask() {
+            awk '/^    base64 -d <<.PINGIFY_GO_SOURCE_EOF. \| tar / { print "    [the vendored modules]"; skip = 1; next }
+                 skip && $0 == "PINGIFY_GO_SOURCE_EOF" { skip = 0; next }
+                 !skip' "$1"
+          }
+          mask /tmp/committed.sh > /tmp/committed.masked
+          mask Pingify.sh > /tmp/rebuilt.masked
+          grep -q '^    \[the vendored modules\]$' /tmp/committed.masked ||
+            { echo "the vendored modules were not found in the script"; exit 1; }
+          if ! cmp -s /tmp/committed.masked /tmp/rebuilt.masked; then
             echo "Pingify.sh is not what parts/ builds - run build.sh and commit the result"
-            diff <(head -c 200000 /tmp/committed.sh) <(head -c 200000 Pingify.sh) | head -40
+            diff /tmp/committed.masked /tmp/rebuilt.masked | head -40
             exit 1
           fi
-          echo "the committed script is a byte for byte rebuild of parts/"
+          echo "the committed script is what parts/ builds, the vendored modules aside"

@@ -23,13 +23,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # From go.mod, not a number typed here: the module says go 1.24.0 and a
-      # workflow pinned to an older toolchain fails before it tests anything.
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: false
-
       - name: The script must parse before anything is taken out of it
         run: bash -n Pingify.sh
 
@@ -38,6 +31,15 @@ jobs:
           PINGIFY_NO_MAIN=1 bash -c 'set -e; . ./Pingify.sh; write_core_sources .'
           test -f go.mod && test -d internal && test -d vendor
           echo "extracted $(find cmd internal -name '*.go' | wc -l) Go files"
+
+      # From go.mod, not a number typed here - and so after the step that
+      # takes go.mod out of the script. go.mod is gitignored like the rest of
+      # the engine, and a setup-go that ran first failed on a checkout that
+      # had none, before anything was tested: the first run of this workflow.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
 
       # The script carries every Go file except the tests, which would only be
       # weight on a server that is never going to run them. They are in the
