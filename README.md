@@ -31,6 +31,8 @@ pingify core import FILE       # on the other: hash, architecture and version ch
 
 **Upgrading to 1.1.0 is a both-ends change.** A 1.0.x core refuses any record over 2 KB on TCP MUX, WS MUX, WSS MUX, Chrome TLS MUX and Decoy TLS MUX, and 1.1.0 sends up to 16 KB; KCP MUX packets are sealed and a 1.0.x core cannot read them. Upgrade the two servers of a pair within minutes of each other, the far end first, and expect the forwarding tunnels between them to be down in between. Private links (GRE, GRE FOU, UDP, AmneziaWG, Fake TCP, ICMP) carry across versions unchanged. A server that also has forwarding tunnels to a third server has to upgrade that one too, or keep its shared core at 1.0.x until it can.
 
+**1.1.1 changes only the manager**: the wizard asks Reverse by default, says it in fewer words, and fixes what a domain behind Cloudflare got wrong. Nothing on the wire changed, so the two servers can be updated one at a time; each rebuilds its core under the new number and restarts its tunnels once.
+
 Run `pingify` again at any time for the menu.
 
 <p align="center"><img src="assets/pingify-cover.png" alt="Pingify multi-transport tunnel" width="100%"></p>
