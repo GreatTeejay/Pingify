@@ -116,6 +116,13 @@ fwd_port_ok() {
     return 1
 }
 
+# ports_help is how a list is written, the same on the Ports screen and in
+# the wizard. In words, not columns: the fold under dim closes up spaces.
+ports_help() {
+    dim "like 443, 8000-8010, or udp:500 for UDP - comma separated"
+    dim "443=8443 takes 443 here to 8443 on KHAREJ"
+}
+
 # --------------------------------------------------------------------------
 # the one parser
 # --------------------------------------------------------------------------
@@ -808,8 +815,8 @@ screen_ports_set() {
     cur=$(forwards_of "$name" | tr '\n' ' ')
     cur=${cur% }
     blank
-    dim "one port  443     a range  8000-8010     udp  udp:500"
-    dim "somewhere else  443=8443  or  443=10.99.10.5:443"
+    ports_help
+    dim "443=10.99.10.5:443 takes it to a machine behind KHAREJ"
     blank
     # The clash report is a re-ask, not a refusal: the answer is still on the
     # screen above and the next one is usually one character different.

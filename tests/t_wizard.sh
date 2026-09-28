@@ -108,7 +108,7 @@ else
         check "the transport is icmp" "$(val "$f" transport type)" "icmp"
         check "iran's address" "$(val "$f" transport iran)" "185.31.8.129"
         check "kharej's address" "$(val "$f" transport kharej)" "46.247.109.83"
-        check "IRAN dials out by default" "$(val "$f" transport dials)" "iran"
+        check "icmp is not asked its direction, and IRAN sends first" "$(val "$f" transport dials)" "iran"
         check "there is no port line for icmp" "$(val "$f" transport port)" ""
         check "the link addresses come from the octet" "$(val "$f" tun iran)" "10.1.10.1/24"
         check "on both sides" "$(val "$f" tun kharej)" "10.1.10.2/24"
@@ -229,6 +229,86 @@ else
     check "the forwards" "$T_FORWARDS" "3030"
     check "the health port" "$T_HEALTH" "19999"
     check "the public addresses by side" "$T_PUBLIC_IP/$T_PEER_IP" "185.31.8.129/46.247.109.83"
+fi
+
+section "enter takes Reverse, and only a transport with a direction is asked"
+
+if [ -z "$CORE" ]; then
+    skip "the direction default" "no core could be built"
+else
+    out=$(answers 1 1 "" 185.31.8.129 46.247.109.83 9643 "" "3090" 3 3 y | new_tunnel 2>&1)
+    f=$CFG_DIR/iran-tcp-9643.toml
+    check "enter at the direction question makes KHAREJ dial" "$(val "$f" transport dials)" "kharej"
+    check_contains "Reverse is the one marked as the default" "$out" "KHAREJ connects in to IRAN  (default)"
+    check_contains "the port question says who listens" "$out" "IRAN listens, KHAREJ connects"
+    check_contains "the review names the direction and what this end does" "$out" "Reverse - waits for 46.247.109.83"
+    check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+    TOKEN=$(printf '%s\n' "$out" | grep -o 'PFY3\.[A-Za-z0-9+/=]*' | head -1)
+    KEEP_CFG=$CFG_DIR KEEP_STATE=$STATE_DIR
+    mkdir -p "$SANDBOX/etc3" "$SANDBOX/var3"
+    CFG_DIR=$SANDBOX/etc3 STATE_DIR=$SANDBOX/var3
+    out=$(answers 3 "$TOKEN" y n | new_tunnel 2>&1)
+    check_contains "the other server says the same word for the same tunnel" "$out" "Reverse - connects to 185.31.8.129"
+    CFG_DIR=$KEEP_CFG STATE_DIR=$KEEP_STATE
+
+    out=$(answers 1 7 185.31.8.129 46.247.109.83 "" "" "" "3091" 3 3 n | new_tunnel 2>&1)
+    check_missing "GRE is not asked which end dials" "$out" "Link direction"
+
+    # The Tuning screen marks what runs as the default, so enter has to keep
+    # it - and keep it without the restart an applied change costs. Items on
+    # a TCP tunnel: 1 profile, 5 link direction, 0 back.
+    f=$CFG_DIR/iran-tcp-9643.toml
+    out=$(answers 1 5 "" 5 "" "" 1 "" "" 0 | tuning_menu iran-tcp-9643 2>&1)
+    check "a profile chosen under Tuning is applied" "$(val "$f" tuning profile)" "max"
+    check_contains "the direction is offered with the running one marked" "$out" "KHAREJ connects in to IRAN  (default)"
+    check "enter at the direction keeps Reverse" "$(val "$f" transport dials)" "kharej"
+    check "enter at the profile keeps max, rather than putting back balanced" "$(val "$f" tuning profile)" "max"
+    check "and both said nothing changed" "$(printf '%s\n' "$out" | grep -c 'unchanged')" "2"
+    answers 5 1 "" 0 | tuning_menu iran-tcp-9643 >/dev/null 2>&1
+    check "a direction chosen under Tuning is applied" "$(val "$f" transport dials)" "iran"
+fi
+
+section "a WSS tunnel behind a Cloudflare domain, either way round"
+
+if [ -z "$CORE" ]; then
+    skip "the domain wizard" "no core could be built"
+else
+    # Reverse: the domain fronts IRAN, which waits on 80 behind the edge.
+    out=$(answers 1 3 "" wd.example.com 46.247.109.83 "" "3092" 3 3 y | new_tunnel 2>&1)
+    f=$CFG_DIR/iran-wss-443.toml
+    check_contains "the addresses step says IRAN's may be the domain" "$out" "IRAN's may be a Cloudflare domain"
+    check_contains "and how Cloudflare has to be set" "$out" "SSL/TLS on Flexible"
+    check_contains "IRAN is told it listens on 80" "$out" "behind Cloudflare this end listens on 80"
+    check_contains "backups are left out behind a domain" "$out" "None behind a domain"
+    check "IRAN's address is the domain" "$(val "$f" transport iran)" "wd.example.com"
+    check "the waiting end listens on 80" "$(val "$f" transport listen_port)" "80"
+    check "KHAREJ dials" "$(val "$f" transport dials)" "kharej"
+    check "no backups were written" "$(toml_arr "$f" failover backups)" ""
+    check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+
+    # Direct: the domain fronts KHAREJ, which waits - and the paste there has
+    # to name 80, the port the core really binds, not the one dialled.
+    out=$(answers 1 3 1 185.31.8.129 wd2.example.com 2053 "3093" 3 3 y | new_tunnel 2>&1)
+    f=$CFG_DIR/iran-wss-2053.toml
+    check_contains "Direct says KHAREJ's may be the domain" "$out" "KHAREJ's may be a Cloudflare domain"
+    check "KHAREJ's address is the domain" "$(val "$f" transport kharej)" "wd2.example.com"
+    check "the waiting end listens on 80" "$(val "$f" transport listen_port)" "80"
+    check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+    TOKEN=$(printf '%s\n' "$out" | grep -o 'PFY3\.[A-Za-z0-9+/=]*' | head -1)
+    KEEP_CFG=$CFG_DIR KEEP_STATE=$STATE_DIR
+    mkdir -p "$SANDBOX/etc4" "$SANDBOX/var4"
+    CFG_DIR=$SANDBOX/etc4 STATE_DIR=$SANDBOX/var4
+    out=$(answers 3 "$TOKEN" y n | new_tunnel 2>&1)
+    check_contains "the KHAREJ paste says to open 80, where it listens" "$out" "leave 80/tcp open"
+    check_missing "and not the port dialled" "$out" "leave 2053/tcp open"
+    CFG_DIR=$KEEP_CFG STATE_DIR=$KEEP_STATE
+
+    out=$(answers 1 3 "" wd3.example.com 46.247.109.83 8080 "3094" 3 3 n | new_tunnel 2>&1)
+    check_contains "WSS on a port Cloudflare serves no TLS on is warned about" "$out" "Cloudflare does not carry WSS MUX on port 8080"
+    check_contains "with the ports that work" "$out" "use one of: 443 2053 2083 2087 2096 8443"
+    out=$(answers 1 3 "" 185.31.8.129 46.247.109.83 29443 "" "3095" 3 3 n | new_tunnel 2>&1)
+    check_missing "between bare addresses any port is fine" "$out" "Cloudflare does not carry"
+    check_contains "and backups are offered" "$out" "In the order to try them"
 fi
 
 section "a KCP tunnel forwards ports, and its port is a udp one"

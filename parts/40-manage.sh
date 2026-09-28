@@ -608,7 +608,17 @@ tuning_menu() {
             blank; warn "there is nothing on $c"; sleep 1; continue
         fi
         case ${keys[c - 1]} in
-        profile) blank; preset_menu && { PROFILE_WANT=$T_PRESET; cfg_apply "$name" _edit_profile yes; }; pause ;;
+        profile) blank
+            local _was=$T_PRESET
+            if preset_menu "$T_PRESET"; then
+                if [ "$T_PRESET" = "$_was" ]; then
+                    dim "unchanged"
+                else
+                    PROFILE_WANT=$T_PRESET
+                    cfg_apply "$name" _edit_profile yes
+                fi
+            fi
+            pause ;;
         queue) blank
             dim "fq's cap on this tunnel's flow, ten times over. No profile moves it:"
             dim "measured on the pair, fq dropped none of 2.68 GB at any depth."
@@ -631,16 +641,21 @@ tuning_menu() {
             ask v "keepalive seconds" "$(toml_get "$f" transport keepalive_sec | sed 's/^$/10/')" v_keepalive && { KEEPALIVE_WANT=$v; cfg_apply "$name" _edit_keepalive yes; }
             pause ;;
         dials) blank
-            CHOICE_DEF=$([ "$T_DIALS" = iran ] && printf 1 || printf 2)
-            choice 1 "Direct" "IRAN connects out to KHAREJ"
-            choice 2 "Reverse" "KHAREJ connects in - a CDN in front of IRAN, or NAT"
-            CHOICE_DEF=
-            blank
+            # Enter keeps what runs, as the mark beside it says; only a
+            # change is applied, since applying one restarts the tunnel.
+            local _dc
+            _dc=$([ "$T_DIALS" = iran ] && printf 1 || printf 2)
+            CHOICE_DEF=$_dc
+            direction_choices
             dim "Set the same on both servers."
             blank
-            if pick v "select" "" 2; then
-                DIALS_WANT=$([ "$v" = 1 ] && printf iran || printf kharej)
-                cfg_apply "$name" _edit_dials yes && dim "now set the same on the other server"
+            if pick v "select" "$_dc" 2; then
+                if [ "$v" = "$_dc" ]; then
+                    dim "unchanged"
+                else
+                    DIALS_WANT=$([ "$v" = 1 ] && printf iran || printf kharej)
+                    cfg_apply "$name" _edit_dials yes && dim "now set the same on the other server"
+                fi
             fi
             pause ;;
         path) blank

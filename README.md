@@ -50,7 +50,7 @@ There are two ways it crosses, and the transport decides which:
 - **Forward** — the core answers on the ports itself. Every user connection becomes a stream with its own id, multiplexed over a small set of carrier connections. Nothing is added to the routing table and no device is created.
 - **TUN** — the two servers get a private network of their own (`10.x.10.1` and `10.x.10.2`), and the kernel forwards the ports over it with a NAT rule the manager writes and re-applies at boot.
 
-By default **IRAN opens the connection** (Direct). Choose **Reverse** when a CDN sits in front of Iran or Iran is behind NAT, and Kharej connects in instead. Users and ports stay on Iran either way.
+By default **Kharej opens the connection** (Reverse) and Iran waits for it — which is also the only way a CDN can sit in front of Iran. **Direct** turns it round: Iran connects out to Kharej. Iran's lines disagree about which way works (one test pair blackholed connections into Iran, another stopped what Iran sent on connections it opened), so if one direction does not carry traffic, try the other; a server behind NAT has to be the one that connects. Users and ports stay on Iran either way. The kernel links and ICMP (GRE, GRE FOU, AmneziaWG, ICMP) are not asked: Iran sends first.
 
 ## Transports
 
@@ -113,7 +113,7 @@ So the number is not "how many connections the traffic needs". It is how many pl
 
 ## Failover
 
-A forward tunnel can be given backups: other forwarding transports to move to, by itself, when the one it runs on stops carrying — and to move back from once the first has been healthy again for a while. Choose them in the wizard's **Backups** step, or later under **Manage ▸ Tuning ▸ Failover**, in the order to try them.
+A forward tunnel can be given backups: other forwarding transports to move to, by itself, when the one it runs on stops carrying — and to move back from once the first has been healthy again for a while. Choose them in the wizard's **Backups** step, or later under **Manage ▸ Tuning ▸ Failover**, in the order to try them. Behind a Cloudflare domain the wizard offers none: a backup dials the same domain on a port of its own, and Cloudflare would not carry it.
 
 ```toml
 [failover]

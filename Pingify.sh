@@ -35683,14 +35683,9 @@ grefou_down() {
 # grefou_note is what the wizard and the health check both say about it, in
 # one place so they cannot disagree.
 grefou_note() {
-    dim "The kernel carries this one: fastest here, and the core only watches it."
-    dim "There is no token on the wire. The tunnel's key is there, in the clear,"
-    dim "and it only tells two tunnels apart - anything that can forge the other"
-    dim "server's address and knows the port is inside the tunnel. It also turns"
-    dim "generic receive offload off on this server's interface, and every other"
-    dim "tunnel here pays for that: measured on the test pair, an AmneziaWG link"
-    dim "on the same interface fell from 439 to 224 Mbit/s. It goes back on when"
-    dim "the last GRE FOU tunnel here is deleted."
+    dim "The kernel carries it - the fastest here."
+    dim "There is no token on the wire: anything that forges the other server's address and knows the port is inside."
+    dim "It turns generic receive offload off on this interface, which slows every other tunnel on it - an AmneziaWG link fell from 439 to 224 Mbit/s - until the last GRE FOU tunnel here is deleted."
 }
 
 # tunnel_boot NAME - what the unit runs before the core starts: whatever
@@ -36124,12 +36119,16 @@ free_health_port() {
 
 cfg_reset() {
     T_NAME= T_SIDE= T_TRANSPORT=tcp T_MODE=forward T_KIND=tcp
-    # Which end opens the connection. IRAN dials out by default, because on a
-    # real Iranian line that is the one that survives: a connection dialled
-    # INTO Iran is commonly allowed to complete, carry a few exchanges, and
-    # then be blackholed with no reset and no error - measured, repeatedly,
-    # on this tool's own test pair. Ports still live on IRAN either way.
-    T_DIALS=iran
+    # Which end opens the connection. KHAREJ dials in by default - Reverse,
+    # which is also what the core assumes of a file that does not say. Iran's
+    # lines disagree about direction: on the first test pair a connection
+    # dialled INTO Iran was blackholed after a few exchanges, and on the pair
+    # of 2026-09-28 it was the other way round - what Iran sent on
+    # connections it opened was stopped, while connections from Germany
+    # carried 700 Mbit/s. Reverse is also the only way a CDN can front IRAN,
+    # which is what kept a tunnel carrying when Iran blocked the foreign
+    # server's address. Ports live on IRAN either way.
+    T_DIALS=kharej
     T_PUBLIC_IP= T_PEER_IP= T_IRAN= T_KHAREJ=
     T_PORT=8443 T_PATH= T_CONNS=16
     T_TOKEN= T_PRESET=balanced T_LOG=info T_INSECURE=
@@ -36193,7 +36192,7 @@ kind_label() {
 }
 
 # The side that waits for the connection. A bound port only matters there.
-waits_side() { other_side "${T_DIALS:-iran}"; }
+waits_side() { other_side "${T_DIALS:-kharej}"; }
 this_side_waits() { [ "$T_SIDE" = "$(waits_side)" ]; }
 # binds_here is whether this server opens the tunnel port at all: the side
 # that waits, or either side of a link the kernel makes, which listens on
@@ -36341,29 +36340,32 @@ preset_fec() {
     esac
 }
 
+# preset_menu [CURRENT] - enter takes CURRENT, balanced when there is none:
+# the Tuning screen passes the profile that runs, so a look at the list and
+# an enter does not quietly put a tuned tunnel back on balanced.
 preset_menu() {
-    CHOICE_DEF=3
-    choice 1 "gaming" "lowest lag for a small packet, 64 KB unsent bound"
-    choice 2 "stable" "a path that loses packets: parity 1 in 10, 24 connections"
+    local d=3
+    case ${1:-} in gaming) d=1 ;; stable) d=2 ;; throughput) d=4 ;; max) d=5 ;; esac
+    CHOICE_DEF=$d
+    choice 1 "gaming" "lowest lag for small packets - games, calls"
+    choice 2 "stable" "a lossy path: parity 1 in 10, 24 connections"
     choice 3 "balanced" "sensible mix - the one to pick"
     choice 4 "throughput" "many streams at once, 3 MB receive queue"
-    choice 5 "max" "a server with many users: 32 connections, 3 MB queue"
+    choice 5 "max" "many users: 32 connections, 3 MB queue"
     CHOICE_DEF=
     blank
     # Said differently for the two modes, because it genuinely is a different
     # queue - and on a private link it is one this pair can no longer measure,
     # which the operator is better off knowing than guessing at.
     if [ "${T_MODE:-forward}" = tun ]; then
-        dim "On a private link this sets the receive queue. On a fast, quiet"
-        dim "path all three measure the same; it tells on a busy or slow one."
+        dim "On a private link this sets the receive queue; it tells on a busy or slow path, not a quiet one."
     else
-        dim "This sets how much a large transfer may park in front of a small"
-        dim "one on the connection they share."
+        dim "This sets how much a large transfer may park in front of a small one on the connection they share."
     fi
     dim "Changeable later, on both servers."
     blank
     local n
-    pick n "select" 3 5 || return 1
+    pick n "select" "$d" 5 || return 1
     case $n in
     1) T_PRESET=gaming ;;
     2) T_PRESET=stable ;;
@@ -37024,18 +37026,30 @@ wiz_path() {
     printf '/%s' "$h"
 }
 
-# Cloudflare proxies only a handful of ports; a WebSocket on any other one
-# is not behind the CDN at all.
-cdn_ports() { printf '80 8080 8880 2052 2082 2086 2095 443 2053 2083 2087 2096 8443'; }
+# Cloudflare proxies only a handful of ports: plain HTTP on some and TLS on
+# the others. WS dials the first kind and WSS the second, so a WSS tunnel on
+# 8080 reaches an edge that is not speaking TLS there. Between two bare
+# addresses there is no CDN and any port works.
+cdn_ports() {
+    case $1 in
+    wss) printf '443 2053 2083 2087 2096 8443' ;;
+    *) printf '80 8080 8880 2052 2082 2086 2095' ;;
+    esac
+}
 cdn_port_warn() {
     case $T_TRANSPORT in ws | wss) ;; *) return 0 ;; esac
-    local p ok=0
-    for p in $(cdn_ports); do [ "$p" = "$T_PORT" ] && ok=1; done
-    [ "$ok" = 1 ] && return 0
+    is_name "$(dial_host)" || return 0
+    local p
+    for p in $(cdn_ports "$T_TRANSPORT"); do [ "$p" = "$T_PORT" ] && return 0; done
     blank
-    warn "Cloudflare does not proxy port $T_PORT"
-    dim "behind the CDN, use one of: $(cdn_ports)"
-    dim "direct, without a CDN, any port works"
+    warn "Cloudflare does not carry $(transport_label "$T_TRANSPORT") on port $T_PORT"
+    dim "use one of: $(cdn_ports "$T_TRANSPORT")"
+}
+
+# dial_host is what the end that dials connects to: the address, or the
+# domain, of the end that waits.
+dial_host() {
+    if [ "${T_DIALS:-kharej}" = iran ]; then printf '%s' "$T_KHAREJ"; else printf '%s' "$T_IRAN"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -37063,23 +37077,23 @@ ask_side() {
 ask_transport() {
     wiz "Transport"
     group "FORWARDING - your ports, carried over a connection"
-    choice 1 "TCP MUX" "plain TCP, every stream across sixteen connections"
-    choice 2 "WS MUX" "WebSocket on port 80 - a CDN can front it"
-    choice 3 "WSS MUX" "TLS via Cloudflare - good for filtered Iran"
-    choice 4 "Chrome TLS MUX" "TLS whose handshake is Chrome's"
-    choice 5 "Decoy TLS MUX" "Chrome TLS, and a website for anyone probing"
-    choice 6 "KCP MUX" "reliable streams over UDP, for when TCP is throttled"
+    choice 1 "TCP MUX" "plain TCP - no disguise, least overhead"
+    choice 2 "WS MUX" "WebSocket - a CDN can front it"
+    choice 3 "WSS MUX" "WebSocket in TLS - a CDN can front it"
+    choice 4 "Chrome TLS MUX" "TLS that looks like Chrome's"
+    choice 5 "Decoy TLS MUX" "Chrome TLS, and a decoy site for probers"
+    choice 6 "KCP MUX" "over UDP - for when TCP is throttled"
     # The private links, in the order of what carries them on the wire:
     # protocol 47, the same inside UDP, UDP itself, UDP again with a
     # disguise, something TCP-shaped, and ping. Two of a kind sit
     # together, which is the whole reason for this order.
     group "TUN - a private link between the two servers"
     choice 7 "GRE" "IP protocol 47, nothing wrapping it"
-    choice 8 "GRE FOU" "the same inside UDP, carried by the kernel"
+    choice 8 "GRE FOU" "GRE inside UDP, run by the kernel"
     choice 9 "UDP" "plain UDP on one port"
-    choice 10 "AmneziaWG" "obfuscated WireGuard over UDP - encrypted"
+    choice 10 "AmneziaWG" "disguised WireGuard over UDP"
     choice 11 "Fake TCP" "TCP-shaped packets, no connection to throttle"
-    choice 12 "ICMP" "inside ping packets - no port, passes some filters"
+    choice 12 "ICMP" "inside ping - no port, passes some filters"
     blank
     local proto
     pick proto "select" "" 12 || return 1
@@ -37087,16 +37101,16 @@ ask_transport() {
     1) T_TRANSPORT=tcp ;;
     2) T_TRANSPORT=ws
         blank
-        warn "WS is not encrypted by itself - choose WSS when TLS or a CDN is available" ;;
+        warn "not encrypted - WSS is the same with TLS" ;;
     3) T_TRANSPORT=wss ;;
     4) T_TRANSPORT=utls ;;
     5) T_TRANSPORT=fallback ;;
     6) T_TRANSPORT=kcp
         blank
-        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
+        warn "needs UDP between the servers, which many Iranian lines stop" ;;
     7) T_TRANSPORT=gre
         blank
-        warn "GRE is not encrypted and not hidden - anything on the path can read it" ;;
+        warn "not encrypted and not hidden - the path can read it" ;;
     8) T_TRANSPORT=grefou
         blank
         grefou_note
@@ -37106,14 +37120,12 @@ ask_transport() {
         confirm_yes "use GRE FOU?" || return 1 ;;
     9) T_TRANSPORT=udp
         blank
-        warn "needs UDP to pass between the two servers, which many Iranian lines stop" ;;
+        warn "needs UDP between the servers, which many Iranian lines stop" ;;
     10) T_TRANSPORT=awg
         blank
-        warn "rides on UDP, which many Iranian lines stop" ;;
+        warn "needs UDP between the servers, which many Iranian lines stop" ;;
     11) T_TRANSPORT=rawtcp ;;
-    12) T_TRANSPORT=icmp
-        blank
-        dim "This server stops answering ordinary pings while the tunnel runs." ;;
+    12) T_TRANSPORT=icmp ;;
     esac
     cfg_mode
     transport_needs
@@ -37121,54 +37133,52 @@ ask_transport() {
 }
 
 # transport_needs is the one thing worth knowing about a transport before the
-# questions start: what it needs from the path and from the servers.
+# questions start: whether it is encrypted, and what it needs from the path.
+# One paragraph each, folded at the screen's width, so a narrow terminal
+# breaks it where it breaks and never leaves a word alone on a line.
 transport_needs() {
     blank
     case $T_TRANSPORT in
-    tcp) dim "Needs nothing. Sixteen plain connections; start here on a clean route." ;;
-    ws) dim "Needs HTTP to cross, usually on port 80. A CDN can sit in front of the end"
-        dim "that waits, given a domain. Unencrypted by itself." ;;
-    wss) dim "Needs a domain on the end that waits, or a bare address with a made-up"
-        dim "certificate. A real certificate can be set later under Tuning."
-        dim "Good for filtered Iran: with Reverse and a Cloudflare domain that fronts"
-        dim "the IRAN server, Iran only ever talks to Cloudflare - which is how a"
-        dim "tunnel kept carrying when Iran blocked the foreign server's address." ;;
-    utls | fallback)
-        dim "Needs TLS to cross. The handshake is Chrome's; the end that waits serves a"
-        dim "made-up certificate unless one is set later under Tuning." ;;
-    kcp) dim "Needs UDP to cross both ways. More CPU and memory than TCP; the one to"
-        dim "reach for when TCP is throttled and UDP is not. Every packet is sealed"
-        dim "under a cipher keyed from the token, so nothing on the wire says KCP." ;;
-    gre) dim "Needs IP protocol 47 to cross. No port, no disguise." ;;
-    grefou) dim "Needs UDP to cross, ethtool here, and the fou and ip_gre kernel modules." ;;
-    udp) dim "Needs UDP to cross both ways, which many Iranian lines stop." ;;
-    awg) dim "Needs the AmneziaWG tools installed here and UDP to cross." ;;
-    rawtcp) dim "Needs Linux, IPv4 and root on both servers. Adds one narrow firewall rule." ;;
-    icmp) dim "Needs ping to cross. No port at all." ;;
+    tcp) dim "Not encrypted. Needs nothing - the one to try first." ;;
+    ws) dim "Works on bare IPs, or behind Cloudflare: the domain points to IRAN on Reverse, to KHAREJ on Direct." ;;
+    wss) dim "Encrypted. Works on bare IPs, or behind Cloudflare: the domain points to IRAN on Reverse, to KHAREJ on Direct." ;;
+    utls | fallback) dim "Encrypted. Server to server - a CDN cannot front it." ;;
+    kcp) dim "Encrypted. More CPU and memory than the TCP ones." ;;
+    gre) dim "Needs IP protocol 47 to cross. No port." ;;
+    grefou) dim "Needs UDP to cross, ethtool, and the fou and ip_gre modules." ;;
+    udp) dim "Not encrypted. Fast where UDP passes both ways." ;;
+    awg) dim "Encrypted. Installs the AmneziaWG tools if they are missing." ;;
+    rawtcp) dim "Not encrypted. Adds one narrow firewall rule." ;;
+    icmp) dim "Needs ping to cross; no port. While it runs, this server stops answering ordinary pings." ;;
     esac
     return 0
 }
 
-# Only transports that bind a port have a direction to choose. ICMP has no
-# port to be reachable on, GRE is its own protocol, and AmneziaWG names both
-# ends itself; on all three IRAN sends first.
-# Only transports that bind a port have a direction to choose. ICMP has no
-# port to be reachable on, GRE is its own protocol, and AmneziaWG names both
-# ends itself; on all three IRAN sends first.
-ask_direction() {
-    T_DIALS=iran
-    case $T_TRANSPORT in icmp | gre | awg | grefou) return 0 ;; esac
-    wiz "Link direction"
-    CHOICE_DEF=1
+# direction_choices is the question the wizard and the Tuning screen both
+# ask, in one place so the two cannot drift. CHOICE_DEF marks the default.
+direction_choices() {
     choice 1 "Direct" "IRAN connects out to KHAREJ"
-    choice 2 "Reverse" "KHAREJ connects in - a CDN in front of IRAN, or NAT"
+    choice 2 "Reverse" "KHAREJ connects in to IRAN"
     CHOICE_DEF=
     blank
-    dim "Users and ports stay on IRAN either way; this is only who opens the connection."
+    dim "Only who opens the connection - users and ports stay on IRAN."
+    dim "If one direction does not carry traffic, try the other."
     blank
+}
+
+# Only transports that bind a port have a direction to choose. ICMP has no
+# port to be reachable on, the two GRE links are their own protocol and the
+# kernel's, and AmneziaWG names both ends itself; on all four IRAN sends
+# first. For the rest the default is Reverse - see cfg_reset.
+ask_direction() {
+    case $T_TRANSPORT in icmp | gre | awg | grefou) T_DIALS=iran; return 0 ;; esac
+    T_DIALS=kharej
+    wiz "Link direction"
+    CHOICE_DEF=2
+    direction_choices
     local dir
-    pick dir "select" 1 2 || return 1
-    [ "$dir" = 2 ] && T_DIALS=kharej
+    pick dir "select" 2 2 || return 1
+    [ "$dir" = 1 ] && T_DIALS=iran
     return 0
 }
 
@@ -37180,6 +37190,13 @@ ask_addresses() {
     local other n i=0 def= vh=v_host
     # The kernel link is built from two addresses; a name would not do.
     [ "$T_TRANSPORT" = grefou ] && vh=v_ip4
+    # A domain belongs to the end that waits: the other end dials it by that
+    # name, which is how a CDN gets in front. Nothing dials the end that
+    # dials, so it is asked for its IP.
+    local dom_here= dom_peer=
+    case $T_TRANSPORT in
+    ws | wss) if this_side_waits; then dom_here="domain or "; else dom_peer="domain or "; fi ;;
+    esac
     local -a addrs=()
     other=$(side_label "$(other_side "$T_SIDE")")
     wiz "Addresses"
@@ -37195,7 +37212,8 @@ ask_addresses() {
         blank
     fi
     case $T_TRANSPORT in
-    ws | wss) dim "The public IP of each server, or a domain for the end a CDN fronts." ;;
+    ws) dim "Each server's public IP. $(side_label "$(waits_side)")'s may be a Cloudflare domain instead, proxied." ;;
+    wss) dim "Each server's public IP. $(side_label "$(waits_side)")'s may be a Cloudflare domain instead: proxied, with SSL/TLS on Flexible." ;;
     *) dim "The public IP of each server." ;;
     esac
     blank
@@ -37206,7 +37224,11 @@ ask_addresses() {
             choice "$((i + 1))" "$(addr_tint "${addrs[i]}")"
             i=$((i + 1))
         done
-        choice "$((i + 1))" "Something else" "a domain, or one not listed"
+        if [ -n "$dom_here" ]; then
+            choice "$((i + 1))" "Something else" "a domain, or an IP not listed"
+        else
+            choice "$((i + 1))" "Something else" "an IP not listed"
+        fi
         blank
         pick n "select" "" $((i + 1)) || return 1
         [ "$n" -le "${#addrs[@]}" ] && T_PUBLIC_IP=${addrs[n - 1]}
@@ -37217,18 +37239,10 @@ ask_addresses() {
         blank
     fi
     if [ -z "$T_PUBLIC_IP" ]; then
-        if [ "$T_TRANSPORT" = wss ] || [ "$T_TRANSPORT" = ws ]; then
-            ask T_PUBLIC_IP "domain or address of this $(side_label "$T_SIDE") server" "$def" "$vh" || return 1
-        else
-            ask T_PUBLIC_IP "address of this $(side_label "$T_SIDE") server" "$def" "$vh" || return 1
-        fi
+        ask T_PUBLIC_IP "${dom_here}IP of this $(side_label "$T_SIDE") server" "$def" "$vh" || return 1
     fi
     blank
-    if [ "$T_TRANSPORT" = wss ] || [ "$T_TRANSPORT" = ws ]; then
-        ask T_PEER_IP "domain or address of the $other server" "$peer_def" "$vh" || return 1
-    else
-        ask T_PEER_IP "address of the $other server" "$peer_def" "$vh" || return 1
-    fi
+    ask T_PEER_IP "${dom_peer}IP of the $other server" "$peer_def" "$vh" || return 1
     if [ "$T_SIDE" = iran ]; then T_IRAN=$T_PUBLIC_IP T_KHAREJ=$T_PEER_IP
     else T_KHAREJ=$T_PUBLIC_IP T_IRAN=$T_PEER_IP; fi
     case $T_TRANSPORT in ws | wss) T_PATH=$(wiz_path) ;; esac
@@ -37265,7 +37279,13 @@ v_wiz_port() {
         bind=$(cdn_listen_port "$1")
         if ! port_free "$bind" "$fam"; then
             who=$(host_port_holder "$bind" "$fam")
-            echo "${who:-something} is already listening on $bind/$fam here - pick another"
+            # Behind Cloudflare every TLS port lands on 80 here, so another
+            # of them would clash the same way: 80 has to be freed.
+            if [ "$bind" != "$1" ]; then
+                echo "behind Cloudflare this end listens on $bind/$fam, and ${who:-something} already has it here"
+            else
+                echo "${who:-something} is already listening on $bind/$fam here - pick another"
+            fi
             return 1
         fi
     fi
@@ -37288,9 +37308,8 @@ cdn_listen_port() {
 # that happens to be writing the file, so both files say the same number - and
 # the rule stops being implemented twice from two different addresses.
 cfg_listen_port() {
-    local host
-    if [ "${T_DIALS:-kharej}" = iran ]; then host=$T_KHAREJ; else host=$T_IRAN; fi
-    is_name "$host" || { printf '%s' "$T_PORT"; return; }
+    case $T_TRANSPORT in ws | wss) ;; *) printf '%s' "$T_PORT"; return ;; esac
+    is_name "$(dial_host)" || { printf '%s' "$T_PORT"; return; }
     case $T_PORT in 443 | 2053 | 2083 | 2087 | 2096 | 8443) printf '80' ;; *) printf '%s' "$T_PORT" ;; esac
 }
 
@@ -37316,8 +37335,8 @@ ask_port() {
     esac
     fam=$(port_family "$T_TRANSPORT")
     case $T_TRANSPORT in
-    grefou) wiz "Port" "The UDP port the kernel wraps the link in. Both servers listen on it." ;;
-    *) wiz "Port" "The $fam port the two servers meet on. Only the end that waits binds it." ;;
+    grefou) wiz "Port" "The UDP port the kernel wraps the link in; both servers listen." ;;
+    *) wiz "Port" "The $fam port the tunnel runs on: $(side_label "$(waits_side)") listens, $(side_label "$T_DIALS") connects." ;;
     esac
     show_taken_tunnel_ports
     binds_here && show_host_listening "$fam"
@@ -37327,14 +37346,14 @@ ask_port() {
     *) def=8443 ;;
     esac
     while [ -n "$(tunnel_port_owner "$def" "$T_TRANSPORT")" ] ||
-        { this_side_waits && ! port_free "$def" "$fam"; }; do
+        { this_side_waits && ! port_free "$(cdn_listen_port "$def")" "$fam"; }; do
         def=$((def + 1))
         [ "$def" -gt 8500 ] && break
     done
     ask T_PORT "$fam port for the tunnel itself, same on both" "$def" v_wiz_port || return 1
     if this_side_waits; then
         if [ "$(cdn_listen_port "$T_PORT")" != "$T_PORT" ]; then
-            dim "behind the CDN this end listens on 80 in plain HTTP; leave 80/tcp open here"
+            dim "behind Cloudflare this end listens on 80: leave 80/tcp open"
         else
             dim "leave ${T_PORT}/${fam} open in this server's firewall"
         fi
@@ -37454,6 +37473,13 @@ ask_backups() {
     [ "$T_MODE" = forward ] || return 0
     local v
     wiz "Backups" "Where the tunnel moves if $(transport_label "$T_TRANSPORT") stops carrying."
+    # A backup dials the same host on a port of its own. Behind a domain that
+    # host is Cloudflare, which proxies a few HTTP ports and nothing else, so
+    # a backup there would never connect - and the move to it never happen.
+    if is_name "$(dial_host)"; then
+        dim "None behind a domain - Cloudflare would not carry a backup."
+        return 0
+    fi
     backups_menu
     blank
     dim "In the order to try them, like 6,4 - or press enter for none."
@@ -37542,7 +37568,7 @@ ask_forwards() {
     wiz "Ports" "The ports your clients will connect to, here on IRAN."
     show_taken_ports
     show_host_listening tcp
-    dim "one port 443   a range 8000-8010   udp udp:500   elsewhere 443=8443"
+    ports_help
     blank
     local raw clashes
     while :; do
@@ -37595,11 +37621,19 @@ ask_logging() {
 # the review, and the creation both entrances share
 # ---------------------------------------------------------------------------
 
+# dials_text names the tunnel's direction the way the wizard asked it, the
+# same word on both servers, and what this one does. It used to say "direct"
+# for the side that dials, so the far end of a Direct tunnel read "reverse".
 dials_text() {
+    local dir=Reverse
+    case $T_TRANSPORT in
+    icmp | gre | awg | grefou) printf 'with %s' "$(addr_tint "$T_PEER_IP")"; return ;;
+    esac
+    [ "$T_DIALS" = iran ] && dir=Direct
     if [ "$T_SIDE" = "$T_DIALS" ]; then
-        printf 'direct - connects to %s' "$(addr_tint "$T_PEER_IP")"
+        printf '%s - connects to %s' "$dir" "$(addr_tint "$T_PEER_IP")"
     else
-        printf 'reverse - accepts from %s' "$(addr_tint "$T_PEER_IP")"
+        printf '%s - waits for %s' "$dir" "$(addr_tint "$T_PEER_IP")"
     fi
 }
 
@@ -37653,7 +37687,7 @@ wiz_create() {
     # people to go and do by hand.
     if [ ! -f "$HOST_SYSCTL" ]; then
         blank
-        dim "This server still runs the distribution's kernel network settings."
+        dim "This server still runs the distribution's network settings."
         if confirm_yes "apply Pingify's $T_PRESET host tuning as well?"; then
             apply_tuning "$T_PRESET"
             case $T_TRANSPORT in
@@ -37774,8 +37808,7 @@ v_wiz_paste() {
 import_tunnel() {
     banner
     head2 "Paste the setup token"
-    dim "Printed by the other server when its tunnel was made. It carries the"
-    dim "whole config, so there is nothing left to answer."
+    dim "The PFY3 line the other server printed. It carries everything."
     blank
     local token
     ask token "token" "" v_wiz_paste || return 1
@@ -37785,7 +37818,7 @@ import_tunnel() {
     fi
     if [ -n "${TOKEN_VERSION:-}" ] && [ "$TOKEN_VERSION" != "$PINGIFY_VERSION" ]; then
         warn "that token came from Pingify $TOKEN_VERSION and this is $PINGIFY_VERSION"
-        dim "the two servers should run the same version; update the other one after this"
+        dim "run the same version on both - update the other one after this"
     fi
 
     # The side in the token is the other server's. This flip is the entire
@@ -37853,16 +37886,18 @@ import_tunnel() {
         fi
         T_AWG_IFACE=$(awg_free_iface) || { fail "no free awg device here"; clash=1; }
     elif [ -n "$T_PORT" ] && this_side_waits; then
-        local fam
+        # Behind a domain the core listens on 80, not on the port dialled.
+        local fam lport
         fam=$(port_family "$T_TRANSPORT")
+        lport=$(cfg_listen_port)
         own=$(tunnel_port_owner "$T_PORT" "$T_TRANSPORT")
         if [ -n "$own" ]; then
             fail "${T_PORT}/$fam is already $own's tunnel port here"
             dim "change the port on the first server, and paste again"
             clash=1
-        elif ! port_free "$T_PORT" "$fam"; then
-            fail "something here already listens on ${T_PORT}/$fam"
-            dim "ss -lnp | grep :$T_PORT   shows what has it"
+        elif ! port_free "$lport" "$fam"; then
+            fail "something here already listens on ${lport}/$fam"
+            dim "ss -lnp | grep :$lport  shows what has it"
             clash=1
         fi
         # The backups listen here too, every one of them at once.
@@ -37894,7 +37929,7 @@ import_tunnel() {
         pause; return 1
     fi
     if [ -n "$T_PORT" ] && this_side_waits; then
-        local open_ports="${T_PORT}/$(port_family "$T_TRANSPORT")" ob
+        local open_ports="$(cfg_listen_port)/$(port_family "$T_TRANSPORT")" ob
         for ob in $T_BACKUPS; do open_ports="$open_ports ${ob#*:}/$(port_family "${ob%%:*}")"; done
         dim "leave $open_ports open in this server's firewall"
     fi
@@ -37914,7 +37949,7 @@ import_tunnel() {
     wiz_create || { pause; return 1; }
     blank
     head2 "Both servers are set up"
-    dim "this end was built from the other server's token, so there is nothing to carry back"
+    dim "built from the other server's token - nothing to carry back"
     dim "give it a few seconds and look at it under Manage tunnels"
     blank
     tunnel_status_block "$T_NAME"
@@ -38532,7 +38567,17 @@ tuning_menu() {
             blank; warn "there is nothing on $c"; sleep 1; continue
         fi
         case ${keys[c - 1]} in
-        profile) blank; preset_menu && { PROFILE_WANT=$T_PRESET; cfg_apply "$name" _edit_profile yes; }; pause ;;
+        profile) blank
+            local _was=$T_PRESET
+            if preset_menu "$T_PRESET"; then
+                if [ "$T_PRESET" = "$_was" ]; then
+                    dim "unchanged"
+                else
+                    PROFILE_WANT=$T_PRESET
+                    cfg_apply "$name" _edit_profile yes
+                fi
+            fi
+            pause ;;
         queue) blank
             dim "fq's cap on this tunnel's flow, ten times over. No profile moves it:"
             dim "measured on the pair, fq dropped none of 2.68 GB at any depth."
@@ -38555,16 +38600,21 @@ tuning_menu() {
             ask v "keepalive seconds" "$(toml_get "$f" transport keepalive_sec | sed 's/^$/10/')" v_keepalive && { KEEPALIVE_WANT=$v; cfg_apply "$name" _edit_keepalive yes; }
             pause ;;
         dials) blank
-            CHOICE_DEF=$([ "$T_DIALS" = iran ] && printf 1 || printf 2)
-            choice 1 "Direct" "IRAN connects out to KHAREJ"
-            choice 2 "Reverse" "KHAREJ connects in - a CDN in front of IRAN, or NAT"
-            CHOICE_DEF=
-            blank
+            # Enter keeps what runs, as the mark beside it says; only a
+            # change is applied, since applying one restarts the tunnel.
+            local _dc
+            _dc=$([ "$T_DIALS" = iran ] && printf 1 || printf 2)
+            CHOICE_DEF=$_dc
+            direction_choices
             dim "Set the same on both servers."
             blank
-            if pick v "select" "" 2; then
-                DIALS_WANT=$([ "$v" = 1 ] && printf iran || printf kharej)
-                cfg_apply "$name" _edit_dials yes && dim "now set the same on the other server"
+            if pick v "select" "$_dc" 2; then
+                if [ "$v" = "$_dc" ]; then
+                    dim "unchanged"
+                else
+                    DIALS_WANT=$([ "$v" = 1 ] && printf iran || printf kharej)
+                    cfg_apply "$name" _edit_dials yes && dim "now set the same on the other server"
+                fi
             fi
             pause ;;
         path) blank
@@ -39948,6 +39998,13 @@ fwd_port_ok() {
     return 1
 }
 
+# ports_help is how a list is written, the same on the Ports screen and in
+# the wizard. In words, not columns: the fold under dim closes up spaces.
+ports_help() {
+    dim "like 443, 8000-8010, or udp:500 for UDP - comma separated"
+    dim "443=8443 takes 443 here to 8443 on KHAREJ"
+}
+
 # --------------------------------------------------------------------------
 # the one parser
 # --------------------------------------------------------------------------
@@ -40640,8 +40697,8 @@ screen_ports_set() {
     cur=$(forwards_of "$name" | tr '\n' ' ')
     cur=${cur% }
     blank
-    dim "one port  443     a range  8000-8010     udp  udp:500"
-    dim "somewhere else  443=8443  or  443=10.99.10.5:443"
+    ports_help
+    dim "443=10.99.10.5:443 takes it to a machine behind KHAREJ"
     blank
     # The clash report is a re-ask, not a refusal: the answer is still on the
     # screen above and the next one is usually one character different.

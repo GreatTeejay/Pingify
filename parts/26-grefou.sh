@@ -309,14 +309,9 @@ grefou_down() {
 # grefou_note is what the wizard and the health check both say about it, in
 # one place so they cannot disagree.
 grefou_note() {
-    dim "The kernel carries this one: fastest here, and the core only watches it."
-    dim "There is no token on the wire. The tunnel's key is there, in the clear,"
-    dim "and it only tells two tunnels apart - anything that can forge the other"
-    dim "server's address and knows the port is inside the tunnel. It also turns"
-    dim "generic receive offload off on this server's interface, and every other"
-    dim "tunnel here pays for that: measured on the test pair, an AmneziaWG link"
-    dim "on the same interface fell from 439 to 224 Mbit/s. It goes back on when"
-    dim "the last GRE FOU tunnel here is deleted."
+    dim "The kernel carries it - the fastest here."
+    dim "There is no token on the wire: anything that forges the other server's address and knows the port is inside."
+    dim "It turns generic receive offload off on this interface, which slows every other tunnel on it - an AmneziaWG link fell from 439 to 224 Mbit/s - until the last GRE FOU tunnel here is deleted."
 }
 
 # tunnel_boot NAME - what the unit runs before the core starts: whatever
