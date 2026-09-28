@@ -983,10 +983,6 @@ speed_test() {
         fix "run the Health check first"
         return 1
     fi
-    say "  What the link is carrying right now:"
-    field "in" "$(round1 "$ST_IN") Mbit/s"
-    field "out" "$(round1 "$ST_OUT") Mbit/s"
-    blank
     iperf_install || return 1
     if [ "$CK_MODE" = tun ]; then
         target=$CK_PEER
@@ -1040,6 +1036,7 @@ speed_test() {
 speed_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "iperf3"
         dim "Real bandwidth between your two servers. Sixteen parallel streams, six"
@@ -1067,6 +1064,7 @@ speed_menu() {
 health_menu() {
     local c n
     while :; do
+        ui_hold
         banner
         head2 "Health"
         list_tunnels

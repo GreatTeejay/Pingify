@@ -16,17 +16,101 @@
 #
 # The single step that can want the network is a Go toolchain, and only when
 # this machine has none or has one older than the module asks for. That
-# download is described in plain words and confirmed before it happens.
+# download is described in plain words, confirmed before it happens, and
+# checked against go.dev's own sha256 before anything is unpacked.
 
 # The compiler ensure_go settled on. Empty until it has run.
 GO_BIN=
 
-# Where the Go tarball comes from. go.dev is Google's, and from an Iranian
-# server it is often unreachable or throttled to nothing; PINGIFY_GO_URL names
-# another place to fetch the same file - a mirror, or a copy on a server of
-# your own - and the sha256 of whatever arrived is printed so it can be
-# checked against https://go.dev/dl/ from anywhere.
-GO_DL_BASE=${PINGIFY_GO_URL:-https://go.dev/dl}
+# Where the Go tarball comes from, in the order tried. go.dev first, which is
+# Google's - and to a server in Iran dl.google.com answers every request with
+# a 404, measured on 2026-09-28. Then the copy of the very same file that this
+# project's release carries, and two mirrors that did answer from Iran that
+# day. PINGIFY_GO_URL, when it is set, is tried before all of them: a mirror
+# of your own, or a copy on your other server.
+go_sources() {
+    [ -n "${PINGIFY_GO_URL:-}" ] && printf '%s\n' "${PINGIFY_GO_URL%/}"
+    printf '%s\n' \
+        https://go.dev/dl \
+        "https://github.com/$PINGIFY_REPO/releases/download/v$PINGIFY_VERSION" \
+        https://mirrors.nju.edu.cn/golang \
+        https://mirrors.aliyun.com/golang
+}
+
+# go_sum NAME - go.dev's own sha256 of a tarball ensure_go can ask for, so that
+# whichever of those places a server could reach, what it unpacks is the file
+# Google published: a mirror is a stranger, and with the sum here it does not
+# have to be trusted. The tests check there is one for every tarball the
+# embedded go.mod can ask for, so a new go directive cannot ship without them.
+go_sum() {
+    case $1 in
+    go1.24.0.linux-amd64.tar.gz) printf 'dea9ca38a0b852a74e81c26134671af7c0fbe65d81b0dc1c5bfe22cf7d4c8858' ;;
+    go1.24.0.linux-arm64.tar.gz) printf 'c3fa6d16ffa261091a5617145553c71d21435ce547e44cc6dfb7470865527cc7' ;;
+    *) return 1 ;;
+    esac
+}
+
+# go_tarball ARCH - the file ensure_go fetches. A released minor always has a
+# .0, so the name comes from the go directive rather than from a version
+# typed here that could drift from it.
+go_tarball() {
+    local want tar_ver
+    want=$(go_version_needed) || return 1
+    tar_ver=$want
+    case $want in *.*.*) ;; *) tar_ver=$want.0 ;; esac
+    printf 'go%s.linux-%s.tar.gz' "$tar_ver" "$1"
+}
+
+# go_fetch NAME DEST - the tarball into DEST from the first source that has it
+# and serves go.dev's own bytes. A source that fails, or serves anything else,
+# is named and passed over, and so is one that trickles: a throttled source
+# used to hold the install for as long as it pleased. GO_FROM is the one used.
+go_fetch() {
+    local name=$1 dest=$2 want src host got
+    GO_FROM=
+    want=$(go_sum "$name") || want=
+    while IFS= read -r src; do
+        [ -n "$src" ] || continue
+        host=${src#*://}
+        host=${host%%/*}
+        rm -f "$dest"
+        if ! spin "fetching $name from $host" go_fetch_one "$src/$name" "$dest"; then
+            warn "$host: $(go_fetch_why)"
+            continue
+        fi
+        got=$(wiz_sha256 <"$dest" 2>/dev/null) || got=
+        if [ -z "$want" ] || [ -z "$got" ]; then
+            # Nothing to check it against, or nothing here to check with: the
+            # one case left unverified, and it says so.
+            warn "$name from $host could not be checked against go.dev's sha256"
+            [ -n "$got" ] && dim "sha256 $got - compare it with https://go.dev/dl/"
+            GO_FROM=$host
+            return 0
+        fi
+        if [ "$got" = "$want" ]; then
+            ok "$name from $host, sha256 matches go.dev"
+            GO_FROM=$host
+            return 0
+        fi
+        warn "$host: what arrived is not go.dev's file (sha256 ${got:0:16}) - not used"
+    done < <(go_sources)
+    rm -f "$dest"
+    return 1
+}
+go_fetch_one() {
+    if have curl; then
+        curl -fSL --retry 1 --connect-timeout 15 --speed-limit 20000 --speed-time 45 \
+            -o "$2" "$1" >"$STATE_DIR/fetch.log" 2>&1
+    else
+        wget -T 45 -O "$2" "$1" >"$STATE_DIR/fetch.log" 2>&1
+    fi
+}
+# go_fetch_why is the line of the fetch log that says why it failed.
+go_fetch_why() {
+    local l
+    l=$(grep -v '^[[:space:]]*$' "$STATE_DIR/fetch.log" 2>/dev/null | tail -n 1)
+    printf '%s' "${l:-no answer}"
+}
 
 # --------------------------------------------------------------------------
 # the sources
@@ -106,7 +190,7 @@ ver_ge() {
 # ensure_go finds a Go new enough for the module or offers to fetch one, and
 # sets GO_BIN. It never installs anything without being asked.
 ensure_go() {
-    local want cand out v found= arch tar_ver url tmp pid rc
+    local want cand out v found= arch tar_ver tmp
 
     if ! want=$(go_version_needed); then
         bad "the embedded go.mod could not be read, so I cannot tell what Go this needs"
@@ -138,12 +222,9 @@ ensure_go() {
         return 1
     fi
 
-    # A released minor always has a .0, so deriving the tarball from the go
-    # directive keeps this from drifting the way a hardcoded GO_FALLBACK did.
-    tar_ver=$want
-    case $want in *.*.*) ;; *) tar_ver=$want.0 ;; esac
-    url=$GO_DL_BASE/go$tar_ver.linux-$arch.tar.gz
-    GO_TARBALL=go$tar_ver.linux-$arch.tar.gz
+    GO_TARBALL=$(go_tarball "$arch") || return 1
+    tar_ver=${GO_TARBALL#go}
+    tar_ver=${tar_ver%.linux-*}
 
     blank
     if [ -n "$found" ]; then
@@ -152,23 +233,10 @@ ensure_go() {
         warn "there is no Go on this machine, and the core is built here"
     fi
     blank
-    dim "This is the one step that wants the network. It would fetch:"
-    dim "  $url"
-    field "size" "about 80 MB, roughly 250 MB unpacked"
-    field "into" "/usr/local/go, deleting whatever is there now"
-    blank
-    dim "Nothing verifies it beyond TLS to the server it comes from: this script"
-    dim "carries no checksum, and one fetched from the same place would prove"
-    dim "nothing. The sha256 of what arrives is printed, to check against"
-    dim "https://go.dev/dl/ from any machine that can see it."
-    blank
-    if [ -n "${PINGIFY_GO_URL:-}" ]; then
-        dim "PINGIFY_GO_URL is set, so the fetch goes to $PINGIFY_GO_URL"
-    else
-        dim "If go.dev cannot be reached from here: PINGIFY_GO_URL=https://<mirror>/dl"
-    fi
-    dim "Or skip the compiler altogether: build the core on the other server and"
-    dim "carry it here with  pingify core export  /  pingify core import FILE"
+    dim "This is the one step that wants the network: Go $tar_ver for $arch, about 80 MB, unpacked into /usr/local/go in place of whatever is there."
+    dim "It comes from go.dev, or where go.dev is out of reach - as it is from Iran - from this project's GitHub release or a mirror, and is checked against go.dev's own sha256 before it is used."
+    [ -n "${PINGIFY_GO_URL:-}" ] && dim "PINGIFY_GO_URL is set, so $PINGIFY_GO_URL is tried first."
+    dim "Or skip the compiler: build the core on the other server and carry it here with  pingify core export  and  pingify core import FILE."
     blank
 
     if ! confirm "fetch it?" y; then
@@ -176,34 +244,21 @@ ensure_go() {
         fix "install Go $want or newer, then run this again"
         return 1
     fi
+    if ! have curl && ! have wget; then
+        bad "neither curl nor wget is installed, so nothing here can fetch it"
+        fix "apt install curl"
+        return 1
+    fi
 
     tmp=$(mktemp) || return 1
     # Eighty megabytes, and /tmp is a tmpfs on a small server. Ctrl-C in the
     # middle of the fetch, or of the unpack, used to leave both behind.
     trap 'rm -f "$tmp"; rm -rf /usr/local/go.new' INT TERM
-    go_fetch_now() {
-        if have curl; then
-            curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1
-        else
-            wget -O "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1
-        fi
-    }
-    if ! have curl && ! have wget; then
+    if ! go_fetch "$GO_TARBALL" "$tmp"; then
         rm -f "$tmp"
-        bad "neither curl nor wget is installed, so nothing here can fetch it"
-        fix "apt install curl   (or install Go yourself from $url)"
-        return 1
-    fi
-    spin "fetching go$tar_ver for $arch" go_fetch_now
-    rc=$?
-
-    if [ "$rc" != 0 ]; then
-        rm -f "$tmp"
-        bad "the download failed, exit $rc"
-        [ -s "$STATE_DIR/fetch.log" ] &&
-            tail -n 3 "$STATE_DIR/fetch.log" | sed 's/^/       /'
-        fix "from a machine that can reach it:  curl -fLO $url"
-        fix "copy it here, then:  tar -C /usr/local -xzf go$tar_ver.linux-$arch.tar.gz"
+        bad "no place this server can reach had go.dev's $GO_TARBALL"
+        fix "carry the core from the other server:  pingify core export  there, then  pingify core import FILE  here"
+        fix "or name a mirror that has it:  PINGIFY_GO_URL=https://<mirror>/golang bash Pingify.sh"
         return 1
     fi
 
@@ -218,9 +273,6 @@ ensure_go() {
         bad "the tarball would not unpack - it is probably a truncated download"
         fix "run this again, or unpack it by hand into /usr/local"
         return 1
-    fi
-    if have sha256sum; then
-        dim "sha256 of $GO_TARBALL: $(sha256sum "$tmp" | cut -c1-64)"
     fi
     rm -f "$tmp"
     if [ ! -x /usr/local/go.new/bin/go ]; then

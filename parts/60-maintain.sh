@@ -109,6 +109,7 @@ rebuild_core() {
 
 remove_menu() {
     local c n
+    ui_hold
     banner
     head2 "Remove"
     item 1 "Remove the core only" "tunnels and configs stay"
@@ -316,6 +317,7 @@ diag_system() {
 diagnostics_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "Diagnostics"
         group "Check"

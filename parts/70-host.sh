@@ -270,6 +270,7 @@ sync_clock() {
 optimize_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "Optimize"
         panel "CURRENT"
@@ -558,12 +559,16 @@ remove_blocking() {
 blocking_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "Blocking"
         panel "RULES"
-        panel_row "$(pad_to "${C_DIM}Ping / ICMP${C_OFF}" 22)$(state_badge "$(block_state icmp)")"
-        panel_row "$(pad_to "${C_DIM}Speedtest sites${C_OFF}" 22)$(state_badge "$(block_state speedtest)")"
-        panel_row "$(pad_to "${C_DIM}UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
+        _pad "${C_DIM}Ping / ICMP${C_OFF}" 22
+        panel_row "$PD$(state_badge "$(block_state icmp)")"
+        _pad "${C_DIM}Speedtest sites${C_OFF}" 22
+        panel_row "$PD$(state_badge "$(block_state speedtest)")"
+        _pad "${C_DIM}UDP 443${C_OFF}" 22
+        panel_row "$PD$(state_badge "$(block_state quic)")"
         panel_end
         blank
         item 1 "Ping / ICMP" "stop this server answering pings from the internet"

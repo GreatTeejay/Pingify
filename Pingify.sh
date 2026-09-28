@@ -28,7 +28,9 @@ ui_detect() {
     UI_GLYPH=ascii
     case "${TERM:-dumb}" in dumb | "") UI_COLOR=none ;; esac
     [ -n "${NO_COLOR:-}" ] && UI_COLOR=none
-    [ -t 1 ] || UI_COLOR=none
+    # A held screen is still going to the terminal: a window resized while
+    # one is drawn must not take the colour away for the rest of the session.
+    [ -t 1 ] || [ -n "${UI_HELD:-}" ] || UI_COLOR=none
     if [ "$UI_COLOR" != none ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 256 ]; then
         UI_COLOR=256
     fi
@@ -59,6 +61,11 @@ ui_detect() {
     [ "$UI_TERM" -lt 40 ] && UI_TERM=40
     UI_W=$UI_TERM
     [ "$UI_W" -gt 68 ] && UI_W=68
+    # Text folds wider than the frames: the sentences on these screens were
+    # written seventy-six columns to a line, and folded at the frames' 64
+    # every one of those left its last word alone on a line of its own.
+    UI_TX=$UI_TERM
+    [ "$UI_TX" -gt 80 ] && UI_TX=80
 
     ui_palette
     ui_glyphs
@@ -109,61 +116,78 @@ ui_glyphs() {
 # measuring and cutting text
 # ---------------------------------------------------------------------------
 
-rep() {
-    local out
+# rep GLYPH N - N of the glyph. _rep leaves them in RP instead.
+rep() { _rep "$1" "${2:-0}"; printf '%s' "$RP"; }
+_rep() {
+    RP=
     [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
-    printf -v out '%*s' "$2" ''
-    printf '%s' "${out// /$1}"
+    printf -v RP '%*s' "$2" ''
+    RP=${RP// /$1}
 }
 
 # vislen is how many columns a string occupies once the escape codes are
 # gone. Columns, not characters: a CJK glyph is two and a combining mark is
-# none. Parameter expansion rather than sed, because this runs once per cell
-# and a subprocess per cell is how a menu comes to take a second over ssh.
-vislen() {
-    local LC_ALL=${UI_CTYPE:-C} s=$1 out= n i ch cp
-    while [ -n "$s" ]; do
-        case $s in
-        $'['*)
-            s=${s#$'['}
-            s=${s#*m}
-            continue
-            ;;
-        esac
-        out=$out${s:0:1}
-        s=${s:1}
+# none.
+#
+# The measuring is in _vislen, which leaves the answer in VL, and so are the
+# cutting and the padding below: every cell of every menu line is measured,
+# and a subshell around each measure was most of what a screen cost - 45 ms
+# a menu line on a server busy with its users, over a second a screen, drawn
+# visibly from the top down. vislen, trunc_to and pad_to print the same
+# answers, for the callers that want them that way.
+vislen() { _vislen "$1"; printf '%s' "$VL"; }
+_vislen() {
+    local LC_ALL=${UI_CTYPE:-C} s=$1 out= ch cp
+    # The escape codes out a sequence at a time, not a character at a time.
+    while [[ $s == *$'\033['* ]]; do
+        out+=${s%%$'\033['*}
+        s=${s#*$'\033['}
+        s=${s#*m}
     done
-    n=${#out}
+    out+=$s
+    VL=${#out}
+    # Plain ASCII is a column a character, and that is nearly every string.
+    [[ $out == *[![:ascii:]]* ]] || return 0
     # Bash counts characters; correct for the ones that are not one column.
     # By code point rather than by a bracket range: in en_US.UTF-8 a range
     # is collated, not ordered, and a box-drawing glyph fell inside the CJK
     # range on a server abroad, so every frame there came out shredded.
-    for ((i = 0; i < ${#out}; i++)); do
-        ch=${out:i:1}
+    # Only the characters past ASCII are looked at, each taken off the
+    # front: indexing into a multibyte string walks it from its start every
+    # time, and the banner's six lines of blocks cost a tenth of a second.
+    out=${out//[[:ascii:]]/}
+    while [ -n "$out" ]; do
+        ch=${out:0:1}
+        out=${out:1}
         printf -v cp '%d' "'$ch" 2>/dev/null || cp=0
         [ "$cp" -lt 768 ] && continue
         if ((cp <= 879 || (cp >= 1611 && cp <= 1631) || (cp >= 8204 && cp <= 8207))); then
-            n=$((n - 1))
+            VL=$((VL - 1))
         elif (((cp >= 4352 && cp <= 4447) || (cp >= 11904 && cp <= 42191) || (cp >= 44032 && cp <= 55203) ||
             (cp >= 63744 && cp <= 64255) || (cp >= 65072 && cp <= 65103) || (cp >= 65280 && cp <= 65376) ||
             (cp >= 65504 && cp <= 65510) || (cp >= 127744 && cp <= 129791))); then
-            n=$((n + 1))
+            VL=$((VL + 1))
         fi
     done
-    printf '%s' "$n"
 }
 
-# trunc_to cuts a string to a width and marks that it did. A value that does
-# not fit and is printed anyway takes the next column's place.
-# trunc_to STRING WIDTH - the string cut to fit, with the cut marked. Colour
-# codes are carried through and never counted, and a cut string always ends
-# with the colour reset so what was bold or dim does not run on into the
-# next line.
-trunc_to() {
+# trunc_to STRING WIDTH - the string cut to fit, with the cut marked, so a
+# value that does not fit never takes the next column's place. Colour codes
+# are carried through and never counted, and a cut string always ends with
+# the colour reset so what was bold or dim does not run on into the next
+# line. _trunc leaves it in TR.
+trunc_to() { _trunc "$1" "$2"; printf '%s' "$TR"; }
+_trunc() {
     local LC_ALL=${UI_CTYPE:-C} s=$1 w=$2 cut out= n=0 seen=0
-    [ "$(vislen "$s")" -le "$w" ] && { printf '%s' "$s"; return; }
+    _vislen "$s"
+    [ "$VL" -le "$w" ] && { TR=$s; return 0; }
     cut=$((w - 1))
     [ "$cut" -lt 1 ] && cut=1
+    # No colour and nothing wider than a column: the cut is one expansion.
+    if [[ $s != *$'\033'* && $s != *[![:ascii:]]* ]]; then
+        TR=${s:0:cut}$G_CUT
+        return 0
+    fi
     while [ -n "$s" ] && [ "$n" -lt "$cut" ]; do
         case $s in
         $'\033['*)
@@ -178,14 +202,16 @@ trunc_to() {
         n=$((n + 1))
     done
     [ "$seen" = 1 ] && out=$out$C_OFF
-    printf '%s%s' "$out" "$G_CUT"
+    TR=$out$G_CUT
 }
 
-pad_to() {
-    local s n
-    s=$(trunc_to "$1" "$2")
-    n=$(vislen "$s")
-    printf '%s%*s' "$s" "$(($2 - n))" ''
+# pad_to STRING WIDTH - cut to the width if it must be, then filled to it.
+# _pad leaves it in PD.
+pad_to() { _pad "$1" "$2"; printf '%s' "$PD"; }
+_pad() {
+    _trunc "$1" "$2"
+    _vislen "$TR"
+    printf -v PD '%s%*s' "$TR" "$(($2 - VL))" ''
 }
 
 # ---------------------------------------------------------------------------
@@ -219,30 +245,35 @@ rtt_tint() { printf '%s%s%s' "$(rtt_colour "$1")" "$1" "$C_OFF"; }
 # every rule and every box edge is measured rather than counted.
 fill_to() {
     local text=$1 glyph=$2 tail=${3:-} n
-    n=$((UI_W - $(vislen "$text") - $(vislen "$tail")))
+    _vislen "$text"
+    n=$VL
+    _vislen "$tail"
+    n=$((UI_W - n - VL))
     [ "$n" -lt 0 ] && n=0
-    printf '%s%s%s%s%s' "$text" "$C_RULE" "$(rep "$glyph" "$n")" "$tail" "$C_OFF"
+    _rep "$glyph" "$n"
+    printf '%s%s%s%s%s' "$text" "$C_RULE" "$RP" "$tail" "$C_OFF"
 }
 
 # A panel carries its title in the top border, so a screen full of them reads
 # as a list of labelled blocks rather than a wall of rules.
 panel() {
     if [ -z "${1:-}" ]; then
-        printf '%s\n' "$(fill_to "  $C_RULE$BX_TL" "$BX_H" "$BX_TR")"
-        return
+        fill_to "  $C_RULE$BX_TL" "$BX_H" "$BX_TR"
+    else
+        fill_to "  $C_RULE$BX_TL$BX_H$C_OFF $C_CYN$C_B$1$C_OFF " "$BX_H" "$BX_TR"
     fi
-    printf '%s\n' "$(fill_to "  $C_RULE$BX_TL$BX_H$C_OFF $C_CYN$C_B$1$C_OFF " "$BX_H" "$BX_TR")"
+    printf '\n'
 }
 panel_open() { panel "$1"; }
-panel_end() { printf '%s\n' "$(fill_to "  $C_RULE$BX_BL" "$BX_H" "$BX_BR")"; }
+panel_end() { fill_to "  $C_RULE$BX_BL" "$BX_H" "$BX_BR"; printf '\n'; }
 panel_close() { panel_end; }
 
 # One line inside a box, cut to fit: a value that overran pushed the closing
 # bar off the end and shredded the panel.
 panel_row() {
-    local inner=$((UI_W - 6))
+    _pad "$1" $((UI_W - 6))
     printf '  %s%s%s %s %s%s%s\n' \
-        "$C_RULE" "$BX_V" "$C_OFF" "$(pad_to "$1" "$inner")" "$C_RULE" "$BX_V" "$C_OFF"
+        "$C_RULE" "$BX_V" "$C_OFF" "$PD" "$C_RULE" "$BX_V" "$C_OFF"
 }
 
 # panel_field <label> <value> [label2] [value2] - a boxed key and value, two
@@ -250,15 +281,20 @@ panel_row() {
 UI_PANELW=13
 panel_field() {
     local s inner=$((UI_W - 6))
-    s="$(pad_to "${C_DIM}$1${C_OFF}" "$UI_PANELW")  ${C_B}$2${C_OFF}"
+    _pad "${C_DIM}$1${C_OFF}" "$UI_PANELW"
+    s="$PD  ${C_B}$2${C_OFF}"
     if [ -n "${3:-}" ]; then
         # Two pairs share a row only when the row has room for both; below
         # that the second pair takes a row of its own rather than a letter.
         if [ "$inner" -ge 56 ]; then
-            s="$(pad_to "$s" $((inner / 2)))$(pad_to "${C_DIM}$3${C_OFF}" $((UI_PANELW - 2))) ${C_B}$4${C_OFF}"
+            _pad "$s" $((inner / 2))
+            s=$PD
+            _pad "${C_DIM}$3${C_OFF}" $((UI_PANELW - 2))
+            s="$s$PD ${C_B}$4${C_OFF}"
         else
             panel_row "$s"
-            s="$(pad_to "${C_DIM}$3${C_OFF}" "$UI_PANELW")  ${C_B}$4${C_OFF}"
+            _pad "${C_DIM}$3${C_OFF}" "$UI_PANELW"
+            s="$PD  ${C_B}$4${C_OFF}"
         fi
     fi
     panel_row "$s"
@@ -267,9 +303,11 @@ panel_field() {
 # field is the same pair on a plain screen, outside any box.
 UI_KEYW=11
 field() {
-    printf '    %s%s%s  %s\n' \
-        "$C_KEY" "$(pad_to "$1" "$UI_KEYW")" "$C_OFF" \
-        "$(trunc_to "$2" $((UI_W - UI_KEYW - 8)))"
+    local k
+    _pad "$1" "$UI_KEYW"
+    k=$PD
+    _trunc "$2" $((UI_W - UI_KEYW - 8))
+    printf '    %s%s%s  %s\n' "$C_KEY" "$k" "$C_OFF" "$TR"
 }
 
 # row prints cells padded to the widths in UI_COLS, which the caller sets
@@ -277,11 +315,13 @@ field() {
 row() {
     local i=0 out= cell
     for cell in "$@"; do
-        out=$out$(pad_to "$cell" "${UI_COLS[i]:-12}")'  '
+        _pad "$cell" "${UI_COLS[i]:-12}"
+        out=$out$PD'  '
         i=$((i + 1))
     done
     out=${out%  }
-    printf '   %s\n' "$(trunc_to "$out" $((UI_TERM - 3)))"
+    _trunc "$out" $((UI_TERM - 3))
+    printf '   %s\n' "$TR"
 }
 
 say()  { printf '%s\n' "$*"; }
@@ -293,21 +333,31 @@ fail() { say_wrapped "  ${C_RED}${MK_NO}${C_OFF} " "    " "$*"; }
 bad()  { fail "$@"; }
 # fold WIDTH TEXT - the text broken on spaces so that no line is wider than
 # WIDTH. Colour codes are carried through and not counted, so a coloured
-# word does not make a short line look long.
-fold() {
-    local w=$1 word line= out=
-    for word in $2; do
+# word does not make a short line look long. Split on single spaces, so a
+# run of them written to line something up stays a run - it was closed up to
+# one - and never globbed: a word was a pattern the shell expanded against
+# whatever directory the menu was run from. _fold leaves it in FD.
+fold() { _fold "$1" "$2"; printf '%s' "$FD"; }
+_fold() {
+    local w=$1 rest=$2 word line= cur=0 out= last=
+    rest=${rest//$'\n'/ }
+    rest=${rest//$'\t'/ }
+    while [ -z "$last" ]; do
+        case $rest in
+        *' '*) word=${rest%% *} rest=${rest#* } ;;
+        *) word=$rest last=1 ;;
+        esac
+        _vislen "$word"
         if [ -z "$line" ]; then
-            line=$word
-        elif [ "$(vislen "$line $word")" -le "$w" ]; then
-            line="$line $word"
+            [ -n "$word" ] && line=$word cur=$VL
+        elif [ $((cur + 1 + VL)) -le "$w" ]; then
+            line="$line $word" cur=$((cur + 1 + VL))
         else
-            out="$out$line
-"
-            line=$word
+            out=$out$line$'\n'
+            line=$word cur=$VL
         fi
     done
-    printf '%s' "$out$line"
+    FD=$out$line
 }
 
 # say_wrapped PREFIX INDENT TEXT - one of the lines below, folded at the
@@ -315,17 +365,14 @@ fold() {
 # column terminal, and a wrapped fix line lost its indent, which read as a
 # second item.
 say_wrapped() {
-    local prefix=$1 pad=$2 text=$3 first=1 line
-    while IFS= read -r line; do
-        if [ "$first" = 1 ]; then
-            printf '%s%s
-' "$prefix" "$line"
-            first=0
-        else
-            printf '%s%s
-' "$pad" "$line"
-        fi
-    done <<<"$(fold $((UI_W - ${#pad})) "$text")"
+    local lead=$1 pad=$2
+    _fold $((UI_TX - ${#pad})) "$3"
+    while [[ $FD == *$'\n'* ]]; do
+        printf '%s%s\n' "$lead" "${FD%%$'\n'*}"
+        FD=${FD#*$'\n'}
+        lead=$pad
+    done
+    printf '%s%s\n' "$lead" "$FD"
 }
 
 dim()  { say_wrapped "    ${C_DIM}" "    " "$*${C_OFF}"; }
@@ -335,9 +382,10 @@ dim()  { say_wrapped "    ${C_DIM}" "    " "$*${C_OFF}"; }
 # under itself. SEP goes between items; its first word ends a folded line,
 # so a comma list folds with a comma.
 dim_wrap() {
-    local lead=$1 sep=$2 w=$((UI_W - 4)) lw pad line cur n=0 item tail
-    lw=$(vislen "$lead")
-    pad=$(printf '%*s' "$lw" '')
+    local lead=$1 sep=$2 w=$((UI_TX - 4)) lw pad line cur n=0 item tail
+    _vislen "$lead"
+    lw=$VL
+    printf -v pad '%*s' "$lw" ''
     tail=${sep%%[[:space:]]*}
     line=$lead cur=$lw
     while IFS= read -r item; do
@@ -361,7 +409,8 @@ die()  { printf '\n  %s%s%s %s\n\n' "$C_RED" "$MK_NO" "$C_OFF" "$*" >&2; exit 1;
 # rule draws a horizontal line, with a title inside it when given one.
 rule() {
     if [ -z "${1:-}" ]; then
-        printf '  %s%s%s\n' "$C_GRY" "$(rep "$BX_H" "$UI_W")" "$C_OFF"
+        _rep "$BX_H" "$UI_W"
+        printf '  %s%s%s\n' "$C_GRY" "$RP" "$C_OFF"
         return
     fi
     head2 "$1"
@@ -369,11 +418,11 @@ rule() {
 
 # A section heading whose rule runs out to the panel width.
 head2() {
-    local t=" $1 " n
-    n=$(vislen "$t")
+    local t=" $1 "
+    _vislen "$t"
+    _rep "$BX_H" $((UI_W - VL - 4))
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
-        "$(rep "$BX_H" $((UI_W - n - 4)))" "$C_OFF"
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" "$RP" "$C_OFF"
 }
 
 # A label above a run of related menu entries.
@@ -383,18 +432,21 @@ group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 # label outruns it, so a long one can never end up glued to its hint.
 UI_ITEMW=24
 item() {
-    local w=$UI_ITEMW n hint=${3:-} hw
-    n=$(vislen "$2")
-    [ "$n" -ge "$w" ] && w=$((n + 2))
+    local w=$UI_ITEMW hint=${3:-} hw label
+    _vislen "$2"
+    [ "$VL" -ge "$w" ] && w=$((VL + 2))
     hw=$((UI_TERM - w - 9))
     if [ -n "$hint" ] && [ "$hw" -ge 6 ]; then
+        _pad "$2" "$w"
+        label=$PD
+        _trunc "$hint" "$hw"
         printf '   %s%2s%s %s%s%s %s%s%s%s\n' \
             "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
-            "$(pad_to "$2" "$w")" "$C_DIM" "$(trunc_to "$hint" "$hw")" "$C_OFF"
+            "$label" "$C_DIM" "$TR" "$C_OFF"
     else
+        _trunc "$2" $((UI_TERM - 9))
         printf '   %s%2s%s %s%s%s %s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
-            "$(trunc_to "$2" $((UI_TERM - 9)))"
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$TR"
     fi
 }
 # item2 is the same line with the current value of a setting on the right.
@@ -426,37 +478,39 @@ state_dot() {
 # terminal without a UTF-8 locale draws the block glyphs as question marks.
 # ---------------------------------------------------------------------------
 
-banner_art() {
+banner_art() { _banner_art; printf '%s\n' "${BA[@]}"; }
+_banner_art() {
     if [ "$UI_GLYPH" = utf8 ]; then
-        printf '%s\n' \
-            '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
-            '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
-            '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
-            '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
-            '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
-            '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
+        BA=('██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗'
+            '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝'
+            '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ '
+            '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  '
+            '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   '
+            '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   ')
     else
-        printf '%s\n' \
-            ' ____   ___  _   _   ____  ___  _____ __   __' \
-            '|  _ \ |_ _|| \ | | / ___||_ _||  ___|\ \ / /' \
-            '| |_) | | | |  \| || |  _  | | | |_    \ V / ' \
-            '|  __/  | | | |\  || |_| | | | |  _|    | |  ' \
-            '|_|    |___||_| \_| \____||___||_|      |_|  '
+        BA=(' ____   ___  _   _   ____  ___  _____ __   __'
+            '|  _ \ |_ _|| \ | | / ___||_ _||  ___|\ \ / /'
+            '| |_) | | | |  \| || |  _  | | | |_    \ V / '
+            '|  __/  | | | |\  || |_| | | | |  _|    | |  '
+            '|_|    |___||_| \_| \____||___||_|      |_|  ')
     fi
 }
 
 banner_line() {
-    local text=$1 colour=$2 inner=$((UI_W - 6)) pad
-    pad=$(((inner - $(vislen "$text")) / 2))
+    local text=$1 colour=$2 inner=$((UI_W - 6)) pad s
+    _vislen "$text"
+    pad=$(((inner - VL) / 2))
     [ "$pad" -lt 0 ] && pad=0
-    panel_row "$(printf '%*s%s%s%s' "$pad" '' "$colour" "$text" "$C_OFF")"
+    printf -v s '%*s%s%s%s' "$pad" '' "$colour" "$text" "$C_OFF"
+    panel_row "$s"
 }
 
 # wipe clears the screen at the top of a screen, and only there. It moves
 # the cursor home and erases what is on the screen without touching the
-# scrollback, so everything drawn before is still a page up.
+# scrollback, so everything drawn before is still a page up. A held screen
+# is on its way to a terminal, so it is cleared as well.
 wipe() {
-    [ -t 1 ] || return 0
+    [ -t 1 ] || [ -n "$UI_HELD" ] || return 0
     [ "$UI_COLOR" = none ] && return 0
     printf '\033[H\033[2J'
 }
@@ -473,14 +527,74 @@ banner() {
         blank
         return 0
     fi
+    # The same frame on every screen, so it is drawn once and kept: the
+    # blocks are measured glyph by glyph, which is too slow to do again for
+    # every screen on a busy server. Drawn again when the window, the glyphs
+    # or the colours change.
+    local key="$UI_W|$UI_GLYPH|$UI_COLOR|$extra"
+    if [ "$key" != "$UI_BANNER_KEY" ]; then
+        UI_BANNER=$(banner_draw "$extra")
+        UI_BANNER_KEY=$key
+    fi
+    printf '%s\n' "$UI_BANNER"
+}
+UI_BANNER= UI_BANNER_KEY=
+banner_draw() {
+    local line
     blank
     panel ""
-    while IFS= read -r line; do
+    _banner_art
+    for line in "${BA[@]}"; do
         banner_line "$line" "$C_CYN$C_B"
-    done < <(banner_art)
+    done
     banner_line "by Teejay   $BX_DOT   Iran $BX_ARR Kharej tunnel" "$C_DIM"
-    [ -n "$extra" ] && banner_line "$extra" "$C_DIM"
+    [ -n "${1:-}" ] && banner_line "$1" "$C_DIM"
     panel_end
+}
+
+# ---------------------------------------------------------------------------
+# a screen at once
+#
+# A menu screen is worked out as it is printed - the core asked for its
+# status, a file read, a service looked at - so on a server busy with its
+# users it drew itself from the top down over a second. ui_hold sends what
+# follows to a file and ui_show puts the lot on the terminal in one write:
+# the last screen stays until the next one is ready. Every question shows
+# what is held before it asks, so nothing is asked under a screen that has
+# not appeared. Only a terminal is held; a pipe or a test sees each line as
+# it is printed, as before.
+# ---------------------------------------------------------------------------
+
+UI_HELD= UI_BUF=
+ui_hold() {
+    [ -z "$UI_HELD" ] && [ -t 1 ] || return 0
+    if [ -z "$UI_BUF" ]; then
+        # Beside the state, which only root can write: a name in /tmp that
+        # can be guessed is a name another user could have linked elsewhere.
+        [ -d "${STATE_DIR:-}" ] || return 0
+        UI_BUF=$STATE_DIR/.screen.$$
+        ui_buf_sweep
+    fi
+    : >"$UI_BUF" 2>/dev/null || return 0
+    exec 4>&1 1>"$UI_BUF"
+    UI_HELD=1
+}
+ui_show() {
+    [ -n "$UI_HELD" ] || return 0
+    exec 1>&4 4>&-
+    UI_HELD=
+    cat "$UI_BUF"
+}
+ui_done() { ui_show; [ -z "$UI_BUF" ] || rm -f "$UI_BUF"; }
+# The screen file of a session that was killed rather than left.
+ui_buf_sweep() {
+    local f p
+    for f in "$STATE_DIR"/.screen.*; do
+        [ -e "$f" ] || continue
+        p=${f##*.}
+        case $p in '' | *[!0-9]*) continue ;; esac
+        [ "$p" = "$$" ] || kill -0 "$p" 2>/dev/null || rm -f "$f"
+    done
 }
 screen_top() { banner; }
 
@@ -502,11 +616,11 @@ wiz_end()   { WIZ_ACTIVE=0; WIZ_QUIT=0; }
 # wiz <title> [subtitle] - open a step.
 wiz() {
     WIZ_STEP=$((WIZ_STEP + 1))
-    local t="$WIZ_STEP $BX_DOT $1 " n
-    n=$(vislen " $t")
+    local t="$WIZ_STEP $BX_DOT $1 "
+    _vislen " $t"
+    _rep "$BX_H" $((UI_W - VL - 5))
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
-        "$(rep "$BX_H" $((UI_W - n - 5)))" "$C_OFF"
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" "$RP" "$C_OFF"
     [ -n "${2:-}" ] && { dim "$2"; blank; }
     return 0
 }
@@ -515,18 +629,20 @@ wiz() {
 # CHOICE_DEF marks the one enter picks, on the line itself.
 CHOICE_DEF=""
 choice() {
-    local mark="   " hint=${3:-}
+    local mark="   " hint=${3:-} name
     if [ "$1" = "$CHOICE_DEF" ]; then
         mark="${C_GRN}${BX_ARR}${C_OFF}  "
         hint="${hint}${hint:+  }${C_GRN}(default)${C_OFF}"
     fi
+    _pad "${C_B}$2${C_OFF}" 14
+    name=$PD
+    _trunc "$hint" $((UI_TERM - 25))
     printf '  %s%s%2s%s  %s  %s%s%s\n' \
-        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
-        "$(pad_to "${C_B}$2${C_OFF}" 14)" \
-        "$C_DIM" "$(trunc_to "$hint" $((UI_TERM - 25)))" "$C_OFF"
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" "$name" "$C_DIM" "$TR" "$C_OFF"
 }
 
 pause() {
+    ui_show
     printf '\n'
     read -rsp "  ${C_DIM}press enter${C_OFF}" _ || true
     printf '\n'
@@ -551,6 +667,7 @@ pause() {
 ask() {
     local _pk_var=$1 _pk_prompt=$2 _pk_def=${3:-} _pk_check=${4:-} _pk_in _pk_err _pk_rc
     [ "${WIZ_QUIT:-0}" = 1 ] && return 1
+    ui_show
     while :; do
         _pk_rc=0
         if [ -n "$_pk_def" ]; then
@@ -608,6 +725,7 @@ confirm() {
     local _pk_prompt=$1 _pk_def=${2:-n} _pk_in _pk_hint='[y/N]'
     [ "$_pk_def" = y ] && _pk_hint='[Y/n]'
     [ "${WIZ_QUIT:-0}" = 1 ] && return 1
+    ui_show
     while :; do
         if ! read -rp "  ${C_YEL}?${C_OFF} $_pk_prompt ${C_DIM}${_pk_hint}${C_OFF}${C_B}:${C_OFF} " _pk_in; then
             [ "${WIZ_ACTIVE:-0}" = 1 ] && WIZ_QUIT=1
@@ -637,6 +755,7 @@ confirm_yes() { confirm "$1" y; }
 # the menu entirely.
 menu_key() {
     local _pk_var=$1 _pk_in
+    ui_show
     read -rp "  ${C_CYN}${BX_ARR}${C_OFF} select${C_B}:${C_OFF} " _pk_in || return 1
     _pk_in=${_pk_in#"${_pk_in%%[![:space:]]*}"}
     _pk_in=${_pk_in%"${_pk_in##*[![:space:]]}"}
@@ -775,6 +894,7 @@ v_number() {
 spin() {
     local msg=$1
     shift
+    ui_show
     if [ ! -t 2 ] || [ "$UI_COLOR" = none ]; then "$@"; return $?; fi
     "$@" &
     local pid=$! i=0 frames='|/-\'
@@ -930,6 +1050,51 @@ toml_get() {
 # spaces: ["443", "udp:500"] becomes 443 udp:500.
 toml_arr() {
     toml_get "$1" "$2" "$3" | tr -d '[]"' | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
+}
+
+# toml_load FILE - every key of the file into TV["table.key"], in one read of
+# it. cfg_load asked awk for each of thirty keys, one process apiece, and on
+# a server busy with its users that was half a second of the Tuning screen.
+# The rules are toml_get's: the first key of a name in its table is the one,
+# a quoted value runs to its closing quote, a bare one to its comment.
+declare -gA TV=()
+toml_load() {
+    local line cur= k v
+    TV=()
+    [ -f "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#"${line%%[![:space:]]*}"}
+        case $line in
+        '['*)
+            cur=${line//[][[:space:]]/}
+            continue
+            ;;
+        '#'* | '') continue ;;
+        *=*) ;;
+        *) continue ;;
+        esac
+        k=${line%%=*}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${line#*=}
+        v=${v#"${v%%[![:space:]]*}"}
+        if [[ $v == \"* ]]; then
+            v=${v#\"}
+            v=${v%%\"*}
+        else
+            v=${v%%#*}
+            v=${v%"${v##*[![:space:]]}"}
+        fi
+        [ -n "${TV[$cur.$k]+set}" ] || TV[$cur.$k]=$v
+    done <"$1"
+}
+# tv_arr TABLE KEY - an array value from TV as words, as toml_arr prints it.
+tv_arr() {
+    local v=${TV[$1.$2]:-}
+    local -a w
+    v=${v//[][\"]/}
+    v=${v//,/ }
+    read -ra w <<<"$v"
+    TA="${w[*]}"
 }
 
 # toml_set replaces a value in place, keeping the file's order and the note
@@ -1284,33 +1449,49 @@ tun_stats() {
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
 
-    ST_VERSION=$(json_field "$json" version)
-    ST_UP=$(json_field "$json" up)
-    # Bytes in is the only thing on this report that says somebody is at the
-    # other end: the core's up means the carrier knows where to send.
-    ST_INB=$(json_field "$json" in_bytes)
-    ST_OUTB=$(json_field "$json" out_bytes)
-    ST_IN=$(json_field "$json" in_mbit)
-    ST_OUT=$(json_field "$json" out_mbit)
-    ST_LOST=$(json_field "$json" path_lost)
-    ST_LATE=$(json_field "$json" path_reordered)
-    ST_GAPS=$(json_field "$json" path_gaps)
-    ST_UPTIME=$(json_field "$json" uptime_sec)
-    ST_DROPPED=$(json_field "$json" dropped)
-    ST_TRANSPORT=$(json_field "$json" transport)
-    ST_PROFILE=$(json_field "$json" profile)
-    ST_SIDE=$(json_field "$json" side)
-    ST_MODE=$(json_field "$json" mode)
-    ST_FAR_RTT=$(json_field "$json" far_rtt_ms)
-    ST_FAR_SEEN=$(json_field "$json" far_seen_sec)
-    ST_BLOCKED=$(json_field "$json" data_blocked)
-    ST_PROBE_SEEN=$(json_field "$json" probe_seen_sec)
-    ST_TOWIRE=$(json_field "$json" to_wire)
-    ST_TODEV=$(json_field "$json" to_device)
-    ST_NOTOURS=$(json_field "$json" not_ours)
-    ST_SENDERR=$(json_field "$json" send_errors)
-    # With failover backups, the transport carrying now. Empty without them.
-    ST_ACTIVE=$(json_field "$json" transport_active)
+    # One pass over the report, which encoding/json writes a field to a line,
+    # in place of an awk for each field: twenty-four of those were a fifth of
+    # a second of every screen that shows a tunnel, on a server busy with its
+    # users. The first time a key appears is the one taken, as json_field did.
+    local line k v
+    while IFS= read -r line; do
+        case $line in *'": '*) ;; *) continue ;; esac
+        k=${line%%'": '*}
+        k=${k##*\"}
+        v=${line#*'": '}
+        v=${v%,}
+        v=${v#\"}
+        v=${v%\"}
+        case $k in
+        version) : "${ST_VERSION:=$v}" ;;
+        up) : "${ST_UP:=$v}" ;;
+        # Bytes in is the only thing on this report that says somebody is at
+        # the other end: the core's up means the carrier knows where to send.
+        in_bytes) : "${ST_INB:=$v}" ;;
+        out_bytes) : "${ST_OUTB:=$v}" ;;
+        in_mbit) : "${ST_IN:=$v}" ;;
+        out_mbit) : "${ST_OUT:=$v}" ;;
+        path_lost) : "${ST_LOST:=$v}" ;;
+        path_reordered) : "${ST_LATE:=$v}" ;;
+        path_gaps) : "${ST_GAPS:=$v}" ;;
+        uptime_sec) : "${ST_UPTIME:=$v}" ;;
+        dropped) : "${ST_DROPPED:=$v}" ;;
+        transport) : "${ST_TRANSPORT:=$v}" ;;
+        profile) : "${ST_PROFILE:=$v}" ;;
+        side) : "${ST_SIDE:=$v}" ;;
+        mode) : "${ST_MODE:=$v}" ;;
+        far_rtt_ms) : "${ST_FAR_RTT:=$v}" ;;
+        far_seen_sec) : "${ST_FAR_SEEN:=$v}" ;;
+        data_blocked) : "${ST_BLOCKED:=$v}" ;;
+        probe_seen_sec) : "${ST_PROBE_SEEN:=$v}" ;;
+        to_wire) : "${ST_TOWIRE:=$v}" ;;
+        to_device) : "${ST_TODEV:=$v}" ;;
+        not_ours) : "${ST_NOTOURS:=$v}" ;;
+        send_errors) : "${ST_SENDERR:=$v}" ;;
+        # With failover backups, the transport carrying now. Empty without.
+        transport_active) : "${ST_ACTIVE:=$v}" ;;
+        esac
+    done <<<"$json"
     return 0
 }
 
@@ -1502,17 +1683,101 @@ migrate_layout() {
 #
 # The single step that can want the network is a Go toolchain, and only when
 # this machine has none or has one older than the module asks for. That
-# download is described in plain words and confirmed before it happens.
+# download is described in plain words, confirmed before it happens, and
+# checked against go.dev's own sha256 before anything is unpacked.
 
 # The compiler ensure_go settled on. Empty until it has run.
 GO_BIN=
 
-# Where the Go tarball comes from. go.dev is Google's, and from an Iranian
-# server it is often unreachable or throttled to nothing; PINGIFY_GO_URL names
-# another place to fetch the same file - a mirror, or a copy on a server of
-# your own - and the sha256 of whatever arrived is printed so it can be
-# checked against https://go.dev/dl/ from anywhere.
-GO_DL_BASE=${PINGIFY_GO_URL:-https://go.dev/dl}
+# Where the Go tarball comes from, in the order tried. go.dev first, which is
+# Google's - and to a server in Iran dl.google.com answers every request with
+# a 404, measured on 2026-09-28. Then the copy of the very same file that this
+# project's release carries, and two mirrors that did answer from Iran that
+# day. PINGIFY_GO_URL, when it is set, is tried before all of them: a mirror
+# of your own, or a copy on your other server.
+go_sources() {
+    [ -n "${PINGIFY_GO_URL:-}" ] && printf '%s\n' "${PINGIFY_GO_URL%/}"
+    printf '%s\n' \
+        https://go.dev/dl \
+        "https://github.com/$PINGIFY_REPO/releases/download/v$PINGIFY_VERSION" \
+        https://mirrors.nju.edu.cn/golang \
+        https://mirrors.aliyun.com/golang
+}
+
+# go_sum NAME - go.dev's own sha256 of a tarball ensure_go can ask for, so that
+# whichever of those places a server could reach, what it unpacks is the file
+# Google published: a mirror is a stranger, and with the sum here it does not
+# have to be trusted. The tests check there is one for every tarball the
+# embedded go.mod can ask for, so a new go directive cannot ship without them.
+go_sum() {
+    case $1 in
+    go1.24.0.linux-amd64.tar.gz) printf 'dea9ca38a0b852a74e81c26134671af7c0fbe65d81b0dc1c5bfe22cf7d4c8858' ;;
+    go1.24.0.linux-arm64.tar.gz) printf 'c3fa6d16ffa261091a5617145553c71d21435ce547e44cc6dfb7470865527cc7' ;;
+    *) return 1 ;;
+    esac
+}
+
+# go_tarball ARCH - the file ensure_go fetches. A released minor always has a
+# .0, so the name comes from the go directive rather than from a version
+# typed here that could drift from it.
+go_tarball() {
+    local want tar_ver
+    want=$(go_version_needed) || return 1
+    tar_ver=$want
+    case $want in *.*.*) ;; *) tar_ver=$want.0 ;; esac
+    printf 'go%s.linux-%s.tar.gz' "$tar_ver" "$1"
+}
+
+# go_fetch NAME DEST - the tarball into DEST from the first source that has it
+# and serves go.dev's own bytes. A source that fails, or serves anything else,
+# is named and passed over, and so is one that trickles: a throttled source
+# used to hold the install for as long as it pleased. GO_FROM is the one used.
+go_fetch() {
+    local name=$1 dest=$2 want src host got
+    GO_FROM=
+    want=$(go_sum "$name") || want=
+    while IFS= read -r src; do
+        [ -n "$src" ] || continue
+        host=${src#*://}
+        host=${host%%/*}
+        rm -f "$dest"
+        if ! spin "fetching $name from $host" go_fetch_one "$src/$name" "$dest"; then
+            warn "$host: $(go_fetch_why)"
+            continue
+        fi
+        got=$(wiz_sha256 <"$dest" 2>/dev/null) || got=
+        if [ -z "$want" ] || [ -z "$got" ]; then
+            # Nothing to check it against, or nothing here to check with: the
+            # one case left unverified, and it says so.
+            warn "$name from $host could not be checked against go.dev's sha256"
+            [ -n "$got" ] && dim "sha256 $got - compare it with https://go.dev/dl/"
+            GO_FROM=$host
+            return 0
+        fi
+        if [ "$got" = "$want" ]; then
+            ok "$name from $host, sha256 matches go.dev"
+            GO_FROM=$host
+            return 0
+        fi
+        warn "$host: what arrived is not go.dev's file (sha256 ${got:0:16}) - not used"
+    done < <(go_sources)
+    rm -f "$dest"
+    return 1
+}
+go_fetch_one() {
+    if have curl; then
+        curl -fSL --retry 1 --connect-timeout 15 --speed-limit 20000 --speed-time 45 \
+            -o "$2" "$1" >"$STATE_DIR/fetch.log" 2>&1
+    else
+        wget -T 45 -O "$2" "$1" >"$STATE_DIR/fetch.log" 2>&1
+    fi
+}
+# go_fetch_why is the line of the fetch log that says why it failed.
+go_fetch_why() {
+    local l
+    l=$(grep -v '^[[:space:]]*$' "$STATE_DIR/fetch.log" 2>/dev/null | tail -n 1)
+    printf '%s' "${l:-no answer}"
+}
 
 # --------------------------------------------------------------------------
 # the sources
@@ -34803,7 +35068,7 @@ ver_ge() {
 # ensure_go finds a Go new enough for the module or offers to fetch one, and
 # sets GO_BIN. It never installs anything without being asked.
 ensure_go() {
-    local want cand out v found= arch tar_ver url tmp pid rc
+    local want cand out v found= arch tar_ver tmp
 
     if ! want=$(go_version_needed); then
         bad "the embedded go.mod could not be read, so I cannot tell what Go this needs"
@@ -34835,12 +35100,9 @@ ensure_go() {
         return 1
     fi
 
-    # A released minor always has a .0, so deriving the tarball from the go
-    # directive keeps this from drifting the way a hardcoded GO_FALLBACK did.
-    tar_ver=$want
-    case $want in *.*.*) ;; *) tar_ver=$want.0 ;; esac
-    url=$GO_DL_BASE/go$tar_ver.linux-$arch.tar.gz
-    GO_TARBALL=go$tar_ver.linux-$arch.tar.gz
+    GO_TARBALL=$(go_tarball "$arch") || return 1
+    tar_ver=${GO_TARBALL#go}
+    tar_ver=${tar_ver%.linux-*}
 
     blank
     if [ -n "$found" ]; then
@@ -34849,23 +35111,10 @@ ensure_go() {
         warn "there is no Go on this machine, and the core is built here"
     fi
     blank
-    dim "This is the one step that wants the network. It would fetch:"
-    dim "  $url"
-    field "size" "about 80 MB, roughly 250 MB unpacked"
-    field "into" "/usr/local/go, deleting whatever is there now"
-    blank
-    dim "Nothing verifies it beyond TLS to the server it comes from: this script"
-    dim "carries no checksum, and one fetched from the same place would prove"
-    dim "nothing. The sha256 of what arrives is printed, to check against"
-    dim "https://go.dev/dl/ from any machine that can see it."
-    blank
-    if [ -n "${PINGIFY_GO_URL:-}" ]; then
-        dim "PINGIFY_GO_URL is set, so the fetch goes to $PINGIFY_GO_URL"
-    else
-        dim "If go.dev cannot be reached from here: PINGIFY_GO_URL=https://<mirror>/dl"
-    fi
-    dim "Or skip the compiler altogether: build the core on the other server and"
-    dim "carry it here with  pingify core export  /  pingify core import FILE"
+    dim "This is the one step that wants the network: Go $tar_ver for $arch, about 80 MB, unpacked into /usr/local/go in place of whatever is there."
+    dim "It comes from go.dev, or where go.dev is out of reach - as it is from Iran - from this project's GitHub release or a mirror, and is checked against go.dev's own sha256 before it is used."
+    [ -n "${PINGIFY_GO_URL:-}" ] && dim "PINGIFY_GO_URL is set, so $PINGIFY_GO_URL is tried first."
+    dim "Or skip the compiler: build the core on the other server and carry it here with  pingify core export  and  pingify core import FILE."
     blank
 
     if ! confirm "fetch it?" y; then
@@ -34873,34 +35122,21 @@ ensure_go() {
         fix "install Go $want or newer, then run this again"
         return 1
     fi
+    if ! have curl && ! have wget; then
+        bad "neither curl nor wget is installed, so nothing here can fetch it"
+        fix "apt install curl"
+        return 1
+    fi
 
     tmp=$(mktemp) || return 1
     # Eighty megabytes, and /tmp is a tmpfs on a small server. Ctrl-C in the
     # middle of the fetch, or of the unpack, used to leave both behind.
     trap 'rm -f "$tmp"; rm -rf /usr/local/go.new' INT TERM
-    go_fetch_now() {
-        if have curl; then
-            curl -fSL --retry 2 --connect-timeout 20 -o "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1
-        else
-            wget -O "$tmp" "$url" >"$STATE_DIR/fetch.log" 2>&1
-        fi
-    }
-    if ! have curl && ! have wget; then
+    if ! go_fetch "$GO_TARBALL" "$tmp"; then
         rm -f "$tmp"
-        bad "neither curl nor wget is installed, so nothing here can fetch it"
-        fix "apt install curl   (or install Go yourself from $url)"
-        return 1
-    fi
-    spin "fetching go$tar_ver for $arch" go_fetch_now
-    rc=$?
-
-    if [ "$rc" != 0 ]; then
-        rm -f "$tmp"
-        bad "the download failed, exit $rc"
-        [ -s "$STATE_DIR/fetch.log" ] &&
-            tail -n 3 "$STATE_DIR/fetch.log" | sed 's/^/       /'
-        fix "from a machine that can reach it:  curl -fLO $url"
-        fix "copy it here, then:  tar -C /usr/local -xzf go$tar_ver.linux-$arch.tar.gz"
+        bad "no place this server can reach had go.dev's $GO_TARBALL"
+        fix "carry the core from the other server:  pingify core export  there, then  pingify core import FILE  here"
+        fix "or name a mirror that has it:  PINGIFY_GO_URL=https://<mirror>/golang bash Pingify.sh"
         return 1
     fi
 
@@ -34915,9 +35151,6 @@ ensure_go() {
         bad "the tarball would not unpack - it is probably a truncated download"
         fix "run this again, or unpack it by hand into /usr/local"
         return 1
-    fi
-    if have sha256sum; then
-        dim "sha256 of $GO_TARBALL: $(sha256sum "$tmp" | cut -c1-64)"
     fi
     rm -f "$tmp"
     if [ ! -x /usr/local/go.new/bin/go ]; then
@@ -36259,12 +36492,19 @@ wiz_token() {
     printf '%s' "$t"
 }
 
-token_print() {
-    local t h
-    t=$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    [ -n "$t" ] || { printf 'none'; return; }
-    h=$(printf '%s' "$t" | wiz_sha256) || { printf 'unknown'; return; }
-    printf '%s' "${h:0:8}"
+token_print() { _token_print "${1:-}"; printf '%s' "$TP"; }
+# _token_print leaves the fingerprint in TP, and keeps it: a tunnel's screens
+# all show the same token, and working it out is a sha256 process each time.
+declare -gA TP_SEEN=()
+_token_print() {
+    local t=${1:-} h
+    t=${t#"${t%%[![:space:]]*}"}
+    t=${t%"${t##*[![:space:]]}"}
+    if [ -z "$t" ]; then TP=none; return 0; fi
+    if [ -n "${TP_SEEN[$t]+set}" ]; then TP=${TP_SEEN[$t]}; return 0; fi
+    h=$(printf '%s' "$t" | wiz_sha256) || { TP=unknown; return 0; }
+    TP=${h:0:8}
+    TP_SEEN[$t]=$TP
 }
 
 # ---------------------------------------------------------------------------
@@ -36382,72 +36622,75 @@ preset_menu() {
 
 cfg_load() {
     local f
-    f=$(cfg_file "$1")
+    f=$CFG_DIR/$1.$CFG_EXT
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME=$(toml_get "$f" tunnel name)
+    # One read of the file rather than an awk for every key - see toml_load.
+    toml_load "$f"
+    T_NAME=${TV[tunnel.name]}
     [ -n "$T_NAME" ] || T_NAME=$1
-    T_SIDE=$(toml_get "$f" tunnel side)
-    T_TRANSPORT=$(toml_get "$f" transport type)
+    T_SIDE=${TV[tunnel.side]}
+    T_TRANSPORT=${TV[transport.type]}
     [ -n "$T_TRANSPORT" ] || T_TRANSPORT=udp
-    T_MODE=$(toml_get "$f" tunnel mode)
+    T_MODE=${TV[tunnel.mode]}
     [ -n "$T_MODE" ] || T_MODE=$(mode_of "$T_TRANSPORT")
     [ "$T_MODE" = tun ] && T_KIND=tun || T_KIND=tcp
-    T_DIALS=$(toml_get "$f" transport dials)
+    T_DIALS=${TV[transport.dials]}
     [ -n "$T_DIALS" ] || T_DIALS=kharej
-    T_IRAN=$(toml_get "$f" transport iran)
-    T_KHAREJ=$(toml_get "$f" transport kharej)
+    T_IRAN=${TV[transport.iran]}
+    T_KHAREJ=${TV[transport.kharej]}
     if [ "$T_SIDE" = iran ]; then T_PUBLIC_IP=$T_IRAN T_PEER_IP=$T_KHAREJ
     else T_PUBLIC_IP=$T_KHAREJ T_PEER_IP=$T_IRAN; fi
-    T_PORT=$(toml_get "$f" transport port)
-    T_PATH=$(toml_get "$f" transport path)
-    T_CONNS=$(toml_get "$f" transport connections)
+    T_PORT=${TV[transport.port]}
+    T_PATH=${TV[transport.path]}
+    T_CONNS=${TV[transport.connections]}
     [ -n "$T_CONNS" ] || T_CONNS=16
-    T_INSECURE=$(toml_get "$f" transport insecure)
-    T_TOKEN=$(toml_get "$f" security token)
-    T_PRESET=$(toml_get "$f" tuning profile)
+    T_INSECURE=${TV[transport.insecure]}
+    T_TOKEN=${TV[security.token]}
+    T_PRESET=${TV[tuning.profile]}
     [ -n "$T_PRESET" ] || T_PRESET=balanced
     [ "$T_PRESET" != download ] || T_PRESET=throughput # what 1.0.x called it
-    T_FEC=$(toml_get "$f" tuning fec)
-    T_QUEUE=$(toml_get "$f" tuning queue_packets)
-    T_LOG=$(toml_get "$f" logging level)
+    T_FEC=${TV[tuning.fec]}
+    T_QUEUE=${TV[tuning.queue_packets]}
+    T_LOG=${TV[logging.level]}
     [ -n "$T_LOG" ] || T_LOG=info
-    T_STATUS=$(toml_get "$f" status port)
-    T_HEALTH=$(toml_get "$f" status health_port)
+    T_STATUS=${TV[status.port]}
+    T_HEALTH=${TV[status.health_port]}
     T_FORWARDS=$(ports_of "$1")
-    T_BACKUPS=$(toml_arr "$f" failover backups)
-    T_FO_SWITCH=$(toml_get "$f" failover switch_after_sec)
-    T_FO_RETURN=$(toml_get "$f" failover return_after_sec)
-    T_FO_ENABLED=$(toml_get "$f" failover enabled)
-    T_FO_PREFER=$(toml_get "$f" failover prefer)
+    tv_arr failover backups
+    T_BACKUPS=$TA
+    T_FO_SWITCH=${TV[failover.switch_after_sec]}
+    T_FO_RETURN=${TV[failover.return_after_sec]}
+    T_FO_ENABLED=${TV[failover.enabled]}
+    T_FO_PREFER=${TV[failover.prefer]}
     if [ "$T_MODE" = tun ]; then
-        T_TUNIF=$(toml_get "$f" tun name)
+        T_TUNIF=${TV[tun.name]}
         [ -n "$T_TUNIF" ] || T_TUNIF=pfy0
         local a b
-        a=$(toml_get "$f" tun iran)
-        b=$(toml_get "$f" tun kharej)
+        a=${TV[tun.iran]}
+        b=${TV[tun.kharej]}
         if [ "$T_SIDE" = iran ]; then T_TUNLOCAL=$a T_TUNPEER=$b; else T_TUNLOCAL=$b T_TUNPEER=$a; fi
         T_OCTET=${a#10.}
         T_OCTET=${T_OCTET%%.*}
-        T_TUNMTU=$(toml_get "$f" tun mtu)
+        T_TUNMTU=${TV[tun.mtu]}
         [ -n "$T_TUNMTU" ] || T_TUNMTU=1320
     fi
     if [ "$T_TRANSPORT" = awg ]; then
-        T_AWG_IFACE=$(toml_get "$f" awg name)
-        T_AWG_PORT=$(toml_get "$f" awg port)
-        T_AWG_IKEY=$(toml_get "$f" awg iran_key)
-        T_AWG_IPUB=$(toml_get "$f" awg iran_pub)
-        T_AWG_KKEY=$(toml_get "$f" awg kharej_key)
-        T_AWG_KPUB=$(toml_get "$f" awg kharej_pub)
-        T_AWG_JC=$(toml_get "$f" awg jc)
-        T_AWG_JMIN=$(toml_get "$f" awg jmin)
-        T_AWG_JMAX=$(toml_get "$f" awg jmax)
-        T_AWG_S1=$(toml_get "$f" awg s1)
-        T_AWG_S2=$(toml_get "$f" awg s2)
-        T_AWG_H1=$(toml_get "$f" awg h1)
-        T_AWG_H2=$(toml_get "$f" awg h2)
-        T_AWG_H3=$(toml_get "$f" awg h3)
-        T_AWG_H4=$(toml_get "$f" awg h4)
+        T_AWG_IFACE=${TV[awg.name]}
+        T_AWG_PORT=${TV[awg.port]}
+        T_AWG_IKEY=${TV[awg.iran_key]}
+        T_AWG_IPUB=${TV[awg.iran_pub]}
+        T_AWG_KKEY=${TV[awg.kharej_key]}
+        T_AWG_KPUB=${TV[awg.kharej_pub]}
+        T_AWG_JC=${TV[awg.jc]}
+        T_AWG_JMIN=${TV[awg.jmin]}
+        T_AWG_JMAX=${TV[awg.jmax]}
+        T_AWG_S1=${TV[awg.s1]}
+        T_AWG_S2=${TV[awg.s2]}
+        T_AWG_H1=${TV[awg.h1]}
+        T_AWG_H2=${TV[awg.h2]}
+        T_AWG_H3=${TV[awg.h3]}
+        T_AWG_H4=${TV[awg.h4]}
     fi
     return 0
 }
@@ -37656,7 +37899,8 @@ review_panel() {
         panel_field "Private link" "$(addr_tint "${T_TUNLOCAL%%/*}") ${G_BOTH} $(addr_tint "${T_TUNPEER%%/*}")   $T_TUNIF   mtu $T_TUNMTU"
     fi
     [ -n "$T_FORWARDS" ] && panel_field "Ports" "$T_FORWARDS"
-    panel_field "Token" "$(token_print "$T_TOKEN")"
+    _token_print "$T_TOKEN"
+    panel_field "Token" "$TP"
     panel_field "Tuning" "${T_PRESET^}"
     panel_field "Logging" "$T_LOG"
     panel_end
@@ -38004,11 +38248,11 @@ peer_public() {
 # once per tunnel, is why a list of nine took thirteen seconds to draw.
 tun_rtt() {
     local name=$1 f out hp peer
-    f=$(cfg_file "$name")
+    f=$CFG_DIR/$name.$CFG_EXT
     if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
         tun_stats "$name" || return 0
-        case $ST_FAR_RTT in '' | 0 | *[!0-9.]*) return 0 ;; esac
-        LC_ALL=C awk -v t="$ST_FAR_RTT" 'BEGIN { printf "%.0f", t }'
+        st_rtt
+        printf '%s' "$RTT"
         return 0
     fi
     have curl || return 0
@@ -38020,6 +38264,15 @@ tun_rtt() {
     LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
 }
 
+# st_rtt leaves in RTT the round trip a forward tunnel measured itself, in
+# whole milliseconds, from the report tun_stats has just read - so a screen
+# that already asked the core does not ask it again for this one number.
+st_rtt() {
+    RTT=
+    case $ST_FAR_RTT in '' | 0 | *[!0-9.]*) return 0 ;; esac
+    LC_ALL=C printf -v RTT '%.0f' "$ST_FAR_RTT" 2>/dev/null || RTT=
+}
+
 # ---------------------------------------------------------------------------
 # status rendering
 # ---------------------------------------------------------------------------
@@ -38028,14 +38281,15 @@ tun_rtt() {
 # the token's fingerprint, and what the core says it is doing.
 tunnel_status_block() {
     local name=$1 f state colour
-    f=$(cfg_file "$name")
+    f=$CFG_DIR/$name.$CFG_EXT
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
     state=$(svc_state "$name")
     colour=$C_RED
     [ "$state" = active ] && colour=$C_GRN
+    toml_load "$f"
+    _token_print "${TV[security.token]}"
     printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
-        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
-        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" "$C_YEL" "$TP" "$C_OFF"
     if [ "$state" != active ]; then
         dim "not running - nothing to report"
         return 0
@@ -38053,22 +38307,27 @@ tunnel_status_block() {
         link="${C_YEL}waiting${C_OFF} for the other server, $(human_secs "$ST_UPTIME") so far"
     fi
     dim "$link"
-    dim "carrying $(round1 "$ST_IN") Mbit/s in, $(round1 "$ST_OUT") out"
+    # No Mbit/s here: the core's rate is the last second's, and on a still
+    # screen one second of bursty traffic read as a number nobody could
+    # trust. The live status screen shows it, once a second, where it means
+    # what it says.
     if [ "${ST_LOST:-0}" -gt 0 ] 2>/dev/null; then
         dim "the path has lost $ST_LOST packets in ${ST_GAPS:-0} runs, ${ST_LATE:-0} arrived late"
     fi
     local rtt
-    rtt=$(tun_rtt "$name")
+    if [ "$ST_MODE" = forward ]; then st_rtt; rtt=$RTT; else rtt=$(tun_rtt "$name"); fi
     [ -n "$rtt" ] && dim "round trip $(rtt_tint "${rtt}ms") to the other server"
     return 0
 }
 
-# One line per tunnel, for the overview table. NAME SIDE PROTO LINK RTT MBIT
+# One line per tunnel, for the overview table: NAME SIDE PROTO LINK RTT. No
+# Mbit/s column - see tunnel_status_block.
 tunnel_row() {
-    local name=$1 nw=${2:-13} num=${3:-} f side proto state dot link rtt=- rate=- lead=' '
-    f=$(cfg_file "$name")
+    local name=$1 nw=${2:-13} num=${3:-} f side type proto state dot link rtt=- lead=' ' cols
+    f=$CFG_DIR/$name.$CFG_EXT
     side=$(side_label "$(toml_get "$f" tunnel side)")
-    proto=$(transport_label "$(toml_get "$f" transport type)")
+    type=$(toml_get "$f" transport type)
+    proto=$(transport_label "$type")
     state=$(svc_state "$name")
     dot="$C_GRY$BX_OFF$C_OFF" link=-
     case $state in
@@ -38079,14 +38338,13 @@ tunnel_row() {
             else
                 dot="$C_YEL$BX_ON$C_OFF" link=alone
             fi
-            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
             # With failover, what is carrying now - and in yellow when that
             # is a backup, because it means the first choice has stopped.
             if [ -n "$ST_ACTIVE" ]; then
                 proto=$(transport_label "$ST_ACTIVE")
-                [ "$ST_ACTIVE" != "$(toml_get "$f" transport type)" ] && proto="$C_YEL$proto$C_OFF"
+                [ "$ST_ACTIVE" != "$type" ] && proto="$C_YEL$proto$C_OFF"
             fi
-            rtt=$(tun_rtt "$name")
+            if [ "$ST_MODE" = forward ]; then st_rtt; rtt=$RTT; else rtt=$(tun_rtt "$name"); fi
             [ -n "$rtt" ] && rtt="${rtt}ms" || rtt=-
         else
             dot="$C_YEL$BX_ON$C_OFF" link=starting
@@ -38096,15 +38354,16 @@ tunnel_row() {
     *) dot="$C_GRY$BX_OFF$C_OFF" link=disabled ;;
     esac
     # With a number in front it is a row to pick as well as to read.
-    [ -n "$num" ] && lead=$(printf '  %s%2s%s' "$C_CYN$C_B" "$num" "$C_OFF")
-    printf '%s %s %s %s %s %s %s%s%s %s\n' \
-        "$lead" "$dot" \
-        "$(pad_to "${C_B}${name}${C_OFF}" "$nw")" \
-        "$(pad_to "$side" 7)" \
-        "$(pad_to "$proto" 15)" \
-        "$(pad_to "$link" 9)" \
-        "$(rtt_colour "$rtt")" "$(pad_to "$rtt" 6)" "$C_OFF" \
-        "$rate"
+    [ -n "$num" ] && printf -v lead '  %s%2s%s' "$C_CYN$C_B" "$num" "$C_OFF"
+    _pad "${C_B}${name}${C_OFF}" "$nw"
+    cols=$PD
+    _pad "$side" 7
+    cols="$cols $PD"
+    _pad "$proto" 15
+    cols="$cols $PD"
+    _pad "$link" 9
+    cols="$cols $PD"
+    printf '%s %s %s %s%s%s\n' "$lead" "$dot" "$cols" "$(rtt_colour "$rtt")" "$rtt" "$C_OFF"
 }
 
 # list_tunnels [numbered] - the status table. With numbered, each row
@@ -38121,9 +38380,16 @@ list_tunnels() {
         [ "${#n}" -gt "$w" ] && w=${#n}
     done
     [ -n "$numbered" ] && ind='       '
-    printf '%s%s%s %s %s %s %s %s%s\n' "$ind" "$C_DIM" \
-        "$(pad_to NAME "$w")" "$(pad_to SIDE 7)" "$(pad_to PROTO 15)" \
-        "$(pad_to LINK 9)" "$(pad_to RTT 6)" "MBIT/S in/out" "$C_OFF"
+    local head
+    _pad NAME "$w"
+    head=$PD
+    _pad SIDE 7
+    head="$head $PD"
+    _pad PROTO 15
+    head="$head $PD"
+    _pad LINK 9
+    head="$head $PD"
+    printf '%s%s%s RTT%s\n' "$ind" "$C_DIM" "$head" "$C_OFF"
     # Every row at once, each in its own subshell, and printed in order:
     # a row asks the far end for its round trip, and nine of those one
     # after another is nine round trips before the screen appears.
@@ -38172,6 +38438,7 @@ pick_tunnel() {
 
 manage_tunnels() {
     while :; do
+        ui_hold
         banner
         head2 "Manage tunnels"
         list_tunnels numbered || { pause; return 0; }
@@ -38185,6 +38452,7 @@ tunnel_menu() {
     f=$(cfg_file "$name")
     while :; do
         [ -f "$f" ] || return 0
+        ui_hold
         side=$(toml_get "$f" tunnel side)
         mode=$(toml_get "$f" tunnel mode)
         banner
@@ -38319,6 +38587,7 @@ failover_menu() {
     local name=$1 c v sw ret
     while :; do
         cfg_load "$name" || return 1
+        ui_hold
         banner
         head2 "Failover: $name"
         panel "IF $(transport_label "$T_TRANSPORT") STOPS CARRYING"
@@ -38475,10 +38744,12 @@ tuning_menu() {
     while :; do
         cfg_load "$name" || return 1
         WIZ_KEEP=$name
+        ui_hold
         banner
         head2 "Tuning: $name"
         panel "IDENTITY"
-        panel_field "Token" "$(token_print "$T_TOKEN")" "Type" "$(kind_label "$T_TRANSPORT")"
+        _token_print "$T_TOKEN"
+        panel_field "Token" "$TP" "Type" "$(kind_label "$T_TRANSPORT")"
         panel_field "Link" "$(dials_text)"
         [ "$T_MODE" = forward ] && backups_panel
         panel_end
@@ -39758,10 +40029,6 @@ speed_test() {
         fix "run the Health check first"
         return 1
     fi
-    say "  What the link is carrying right now:"
-    field "in" "$(round1 "$ST_IN") Mbit/s"
-    field "out" "$(round1 "$ST_OUT") Mbit/s"
-    blank
     iperf_install || return 1
     if [ "$CK_MODE" = tun ]; then
         target=$CK_PEER
@@ -39815,6 +40082,7 @@ speed_test() {
 speed_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "iperf3"
         dim "Real bandwidth between your two servers. Sixteen parallel streams, six"
@@ -39842,6 +40110,7 @@ speed_menu() {
 health_menu() {
     local c n
     while :; do
+        ui_hold
         banner
         head2 "Health"
         list_tunnels
@@ -40627,9 +40896,11 @@ screen_ports() {
     local name=$1 f side peer cur tuples proto lo hi dsth dstp key
     f=$(cfg_file "$name")
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
+    ui_hold
     screen_top
 
     while :; do
+        ui_hold
         side=$(toml_get "$f" tunnel side)
         blank
         rule "Ports $G_CUR $name"
@@ -40638,6 +40909,7 @@ screen_ports() {
             warn "this is the KHAREJ side; nothing is forwarded here"
             fix "run this on the IRAN server, where users connect"
             blank
+            ui_show
             return 0
         fi
 
@@ -40852,6 +41124,7 @@ rebuild_core() {
 
 remove_menu() {
     local c n
+    ui_hold
     banner
     head2 "Remove"
     item 1 "Remove the core only" "tunnels and configs stay"
@@ -41059,6 +41332,7 @@ diag_system() {
 diagnostics_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "Diagnostics"
         group "Check"
@@ -41360,6 +41634,7 @@ sync_clock() {
 optimize_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "Optimize"
         panel "CURRENT"
@@ -41648,12 +41923,16 @@ remove_blocking() {
 blocking_menu() {
     local c
     while :; do
+        ui_hold
         banner
         head2 "Blocking"
         panel "RULES"
-        panel_row "$(pad_to "${C_DIM}Ping / ICMP${C_OFF}" 22)$(state_badge "$(block_state icmp)")"
-        panel_row "$(pad_to "${C_DIM}Speedtest sites${C_OFF}" 22)$(state_badge "$(block_state speedtest)")"
-        panel_row "$(pad_to "${C_DIM}UDP 443${C_OFF}" 22)$(state_badge "$(block_state quic)")"
+        _pad "${C_DIM}Ping / ICMP${C_OFF}" 22
+        panel_row "$PD$(state_badge "$(block_state icmp)")"
+        _pad "${C_DIM}Speedtest sites${C_OFF}" 22
+        panel_row "$PD$(state_badge "$(block_state speedtest)")"
+        _pad "${C_DIM}UDP 443${C_OFF}" 22
+        panel_row "$PD$(state_badge "$(block_state quic)")"
         panel_end
         blank
         item 1 "Ping / ICMP" "stop this server answering pings from the internet"
@@ -41888,6 +42167,7 @@ screen_home() {
 main_menu() {
     local c
     while :; do
+        ui_hold
         screen_home
         menu_key c || return 0
         case $c in
@@ -42041,6 +42321,7 @@ main() {
     new) new_tunnel; wiz_end ;;
     *) main_menu ;;
     esac
+    ui_done
 }
 
 # build.sh and the tests source this file to get at its functions; that must

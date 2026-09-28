@@ -45,11 +45,11 @@ peer_public() {
 # once per tunnel, is why a list of nine took thirteen seconds to draw.
 tun_rtt() {
     local name=$1 f out hp peer
-    f=$(cfg_file "$name")
+    f=$CFG_DIR/$name.$CFG_EXT
     if [ "$(toml_get "$f" tunnel mode)" = forward ]; then
         tun_stats "$name" || return 0
-        case $ST_FAR_RTT in '' | 0 | *[!0-9.]*) return 0 ;; esac
-        LC_ALL=C awk -v t="$ST_FAR_RTT" 'BEGIN { printf "%.0f", t }'
+        st_rtt
+        printf '%s' "$RTT"
         return 0
     fi
     have curl || return 0
@@ -61,6 +61,15 @@ tun_rtt() {
     LC_ALL=C awk -v t="$out" 'BEGIN { printf "%.0f", t * 1000 }'
 }
 
+# st_rtt leaves in RTT the round trip a forward tunnel measured itself, in
+# whole milliseconds, from the report tun_stats has just read - so a screen
+# that already asked the core does not ask it again for this one number.
+st_rtt() {
+    RTT=
+    case $ST_FAR_RTT in '' | 0 | *[!0-9.]*) return 0 ;; esac
+    LC_ALL=C printf -v RTT '%.0f' "$ST_FAR_RTT" 2>/dev/null || RTT=
+}
+
 # ---------------------------------------------------------------------------
 # status rendering
 # ---------------------------------------------------------------------------
@@ -69,14 +78,15 @@ tun_rtt() {
 # the token's fingerprint, and what the core says it is doing.
 tunnel_status_block() {
     local name=$1 f state colour
-    f=$(cfg_file "$name")
+    f=$CFG_DIR/$name.$CFG_EXT
     [ -f "$f" ] || { fail "no such tunnel: $name"; return 1; }
     state=$(svc_state "$name")
     colour=$C_RED
     [ "$state" = active ] && colour=$C_GRN
+    toml_load "$f"
+    _token_print "${TV[security.token]}"
     printf '  %s%s%s  service %s%s%s   token %s%s%s\n' \
-        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" \
-        "$C_YEL" "$(token_print "$(toml_get "$f" security token)")" "$C_OFF"
+        "$C_B" "$name" "$C_OFF" "$colour" "$state" "$C_OFF" "$C_YEL" "$TP" "$C_OFF"
     if [ "$state" != active ]; then
         dim "not running - nothing to report"
         return 0
@@ -94,22 +104,27 @@ tunnel_status_block() {
         link="${C_YEL}waiting${C_OFF} for the other server, $(human_secs "$ST_UPTIME") so far"
     fi
     dim "$link"
-    dim "carrying $(round1 "$ST_IN") Mbit/s in, $(round1 "$ST_OUT") out"
+    # No Mbit/s here: the core's rate is the last second's, and on a still
+    # screen one second of bursty traffic read as a number nobody could
+    # trust. The live status screen shows it, once a second, where it means
+    # what it says.
     if [ "${ST_LOST:-0}" -gt 0 ] 2>/dev/null; then
         dim "the path has lost $ST_LOST packets in ${ST_GAPS:-0} runs, ${ST_LATE:-0} arrived late"
     fi
     local rtt
-    rtt=$(tun_rtt "$name")
+    if [ "$ST_MODE" = forward ]; then st_rtt; rtt=$RTT; else rtt=$(tun_rtt "$name"); fi
     [ -n "$rtt" ] && dim "round trip $(rtt_tint "${rtt}ms") to the other server"
     return 0
 }
 
-# One line per tunnel, for the overview table. NAME SIDE PROTO LINK RTT MBIT
+# One line per tunnel, for the overview table: NAME SIDE PROTO LINK RTT. No
+# Mbit/s column - see tunnel_status_block.
 tunnel_row() {
-    local name=$1 nw=${2:-13} num=${3:-} f side proto state dot link rtt=- rate=- lead=' '
-    f=$(cfg_file "$name")
+    local name=$1 nw=${2:-13} num=${3:-} f side type proto state dot link rtt=- lead=' ' cols
+    f=$CFG_DIR/$name.$CFG_EXT
     side=$(side_label "$(toml_get "$f" tunnel side)")
-    proto=$(transport_label "$(toml_get "$f" transport type)")
+    type=$(toml_get "$f" transport type)
+    proto=$(transport_label "$type")
     state=$(svc_state "$name")
     dot="$C_GRY$BX_OFF$C_OFF" link=-
     case $state in
@@ -120,14 +135,13 @@ tunnel_row() {
             else
                 dot="$C_YEL$BX_ON$C_OFF" link=alone
             fi
-            rate="$(round1 "$ST_IN")/$(round1 "$ST_OUT")"
             # With failover, what is carrying now - and in yellow when that
             # is a backup, because it means the first choice has stopped.
             if [ -n "$ST_ACTIVE" ]; then
                 proto=$(transport_label "$ST_ACTIVE")
-                [ "$ST_ACTIVE" != "$(toml_get "$f" transport type)" ] && proto="$C_YEL$proto$C_OFF"
+                [ "$ST_ACTIVE" != "$type" ] && proto="$C_YEL$proto$C_OFF"
             fi
-            rtt=$(tun_rtt "$name")
+            if [ "$ST_MODE" = forward ]; then st_rtt; rtt=$RTT; else rtt=$(tun_rtt "$name"); fi
             [ -n "$rtt" ] && rtt="${rtt}ms" || rtt=-
         else
             dot="$C_YEL$BX_ON$C_OFF" link=starting
@@ -137,15 +151,16 @@ tunnel_row() {
     *) dot="$C_GRY$BX_OFF$C_OFF" link=disabled ;;
     esac
     # With a number in front it is a row to pick as well as to read.
-    [ -n "$num" ] && lead=$(printf '  %s%2s%s' "$C_CYN$C_B" "$num" "$C_OFF")
-    printf '%s %s %s %s %s %s %s%s%s %s\n' \
-        "$lead" "$dot" \
-        "$(pad_to "${C_B}${name}${C_OFF}" "$nw")" \
-        "$(pad_to "$side" 7)" \
-        "$(pad_to "$proto" 15)" \
-        "$(pad_to "$link" 9)" \
-        "$(rtt_colour "$rtt")" "$(pad_to "$rtt" 6)" "$C_OFF" \
-        "$rate"
+    [ -n "$num" ] && printf -v lead '  %s%2s%s' "$C_CYN$C_B" "$num" "$C_OFF"
+    _pad "${C_B}${name}${C_OFF}" "$nw"
+    cols=$PD
+    _pad "$side" 7
+    cols="$cols $PD"
+    _pad "$proto" 15
+    cols="$cols $PD"
+    _pad "$link" 9
+    cols="$cols $PD"
+    printf '%s %s %s %s%s%s\n' "$lead" "$dot" "$cols" "$(rtt_colour "$rtt")" "$rtt" "$C_OFF"
 }
 
 # list_tunnels [numbered] - the status table. With numbered, each row
@@ -162,9 +177,16 @@ list_tunnels() {
         [ "${#n}" -gt "$w" ] && w=${#n}
     done
     [ -n "$numbered" ] && ind='       '
-    printf '%s%s%s %s %s %s %s %s%s\n' "$ind" "$C_DIM" \
-        "$(pad_to NAME "$w")" "$(pad_to SIDE 7)" "$(pad_to PROTO 15)" \
-        "$(pad_to LINK 9)" "$(pad_to RTT 6)" "MBIT/S in/out" "$C_OFF"
+    local head
+    _pad NAME "$w"
+    head=$PD
+    _pad SIDE 7
+    head="$head $PD"
+    _pad PROTO 15
+    head="$head $PD"
+    _pad LINK 9
+    head="$head $PD"
+    printf '%s%s%s RTT%s\n' "$ind" "$C_DIM" "$head" "$C_OFF"
     # Every row at once, each in its own subshell, and printed in order:
     # a row asks the far end for its round trip, and nine of those one
     # after another is nine round trips before the screen appears.
@@ -213,6 +235,7 @@ pick_tunnel() {
 
 manage_tunnels() {
     while :; do
+        ui_hold
         banner
         head2 "Manage tunnels"
         list_tunnels numbered || { pause; return 0; }
@@ -226,6 +249,7 @@ tunnel_menu() {
     f=$(cfg_file "$name")
     while :; do
         [ -f "$f" ] || return 0
+        ui_hold
         side=$(toml_get "$f" tunnel side)
         mode=$(toml_get "$f" tunnel mode)
         banner
@@ -360,6 +384,7 @@ failover_menu() {
     local name=$1 c v sw ret
     while :; do
         cfg_load "$name" || return 1
+        ui_hold
         banner
         head2 "Failover: $name"
         panel "IF $(transport_label "$T_TRANSPORT") STOPS CARRYING"
@@ -516,10 +541,12 @@ tuning_menu() {
     while :; do
         cfg_load "$name" || return 1
         WIZ_KEEP=$name
+        ui_hold
         banner
         head2 "Tuning: $name"
         panel "IDENTITY"
-        panel_field "Token" "$(token_print "$T_TOKEN")" "Type" "$(kind_label "$T_TRANSPORT")"
+        _token_print "$T_TOKEN"
+        panel_field "Token" "$TP" "Type" "$(kind_label "$T_TRANSPORT")"
         panel_field "Link" "$(dials_text)"
         [ "$T_MODE" = forward ] && backups_panel
         panel_end

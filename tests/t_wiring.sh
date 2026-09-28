@@ -207,6 +207,60 @@ unset CORE_EXPORT_DIR
 unset -f require_root systemctl _fake
 rm -rf "$_cd"
 
+section "the Go toolchain comes from wherever the server can reach"
+
+# go.dev answers a server in Iran with a 404, so the tarball is fetched from
+# the first place that has it, and kept only if its sha256 is go.dev's own.
+if [ -f go.mod ]; then
+    _gv=$(awk '/^go [0-9]/ { print $2; exit }' go.mod)
+    case $_gv in *.*.*) ;; *) _gv=$_gv.0 ;; esac
+    for _a in amd64 arm64; do
+        check "the script carries go.dev's sum for go$_gv.linux-$_a.tar.gz" \
+            "$(go_sum "go$_gv.linux-$_a.tar.gz" | grep -cE '^[0-9a-f]{64}$')" "1"
+    done
+else
+    skip "a sum for every tarball the go.mod asks for" "no go.mod here"
+fi
+check "go.dev is tried first" "$(go_sources | head -n 1)" "https://go.dev/dl"
+check "then the copy this release carries" "$(go_sources | sed -n 2p)" \
+    "https://github.com/$PINGIFY_REPO/releases/download/v$PINGIFY_VERSION"
+check "and PINGIFY_GO_URL before all of them" \
+    "$(PINGIFY_GO_URL=https://mine.example/go/ go_sources | head -n 1)" "https://mine.example/go"
+_gf=$(mktemp -d)
+_right=$(printf 'the right bytes' | wiz_sha256)
+out=$(
+    STATE_DIR=$_gf
+    go_sources() { printf '%s\n' https://one.example/dl https://two.example/dl https://three.example/dl https://four.example/dl; }
+    go_sum() { printf '%s' "$_right"; }
+    spin() { shift; "$@"; }
+    curl() {
+        local o= u=
+        while [ $# -gt 0 ]; do case $1 in -o) o=$2; shift 2 ;; *) u=$1; shift ;; esac; done
+        case $u in
+        *one.example*) echo "curl: (22) The requested URL returned error: 404"; return 22 ;;
+        *two.example*) printf 'somebody else' >"$o" ;;
+        *) printf 'the right bytes' >"$o" ;;
+        esac
+    }
+    go_fetch go1.24.0.linux-amd64.tar.gz "$_gf/t" 2>&1
+    echo "rc=$? from=$GO_FROM kept=$(cat "$_gf/t" 2>/dev/null)"
+)
+check_contains "a source that fails is named, with why" "$out" "one.example: curl: (22)"
+check_contains "one that serves other bytes is refused" "$out" "two.example: what arrived is not go.dev's file"
+check_contains "the first with go.dev's bytes is the one kept" "$out" "rc=0 from=three.example kept=the right bytes"
+check_missing "and nothing after it is asked" "$out" "four.example"
+out=$(
+    STATE_DIR=$_gf
+    go_sources() { printf '%s\n' https://one.example/dl; }
+    go_sum() { printf '%s' "$_right"; }
+    spin() { shift; "$@"; }
+    curl() { echo "curl: (6) Could not resolve host: one.example"; return 6; }
+    go_fetch go1.24.0.linux-amd64.tar.gz "$_gf/t" 2>&1
+    echo "rc=$? left=$([ -e "$_gf/t" ] && echo a-file || echo nothing)"
+)
+check_contains "with nowhere to fetch from, it fails and leaves nothing" "$out" "rc=1 left=nothing"
+rm -rf "$_gf"
+
 section "what the core says about a filter reaches the health check"
 
 # On 2026-09-26 six transports to a filtered server said up and the check
@@ -218,7 +272,6 @@ if [ -f internal/status/status.go ]; then
 else
     skip "the core reports data_blocked" "no engine sources here"
 fi
-check "the shell reads that name" "$(grep -c 'json_field "$json" data_blocked' parts/10-sys.sh)" "1"
 _rep='{
   "up": true,
   "far_seen_sec": 2.1,
@@ -227,6 +280,15 @@ _rep='{
 }'
 check "a report saying so is read as true" "$(json_field "$_rep" data_blocked)" "true"
 check "and how long since a probe came back" "$(json_field "$_rep" probe_seen_sec)" "95.5"
+# And by tun_stats, which is what every screen and the check go through: it
+# reads the report in one pass rather than a json_field per key, so what is
+# checked is that the name arrives, not how the source spells the reading.
+curl() { printf '%s\n' "$_rep"; }
+tun_stats any-tunnel
+check "the shell reads that name" "$ST_BLOCKED" "true"
+check "and the age of the last probe" "$ST_PROBE_SEEN" "95.5"
+check "and the rest of the report beside it" "$ST_UP/$ST_FAR_SEEN" "true/2.1"
+unset -f curl
 check "and the check turns it into a verdict" "$(grep -c '"$ST_BLOCKED" = true' parts/45-health.sh)" "1"
 
 section "the machine gets its pings back, and not a moment sooner"

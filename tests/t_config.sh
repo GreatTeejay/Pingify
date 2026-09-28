@@ -61,6 +61,38 @@ check "name in [tun] is a different key" "$(toml_get "$f" tun name)" "pfy0"
 check "a key that is not there is empty" "$(toml_get "$f" tuning nonesuch)" ""
 check "a table that is not there is empty" "$(toml_get "$f" nosuchtable key)" ""
 
+# toml_load reads the whole file in one pass, where cfg_load used to run an
+# awk per key. It has to give toml_get's answer for every key, including the
+# awkward ones: a note after a value, a # inside quotes, an array, no spaces
+# around the equals, a key written twice.
+odd=$SANDBOX/odd.toml
+cat >"$odd" <<'TOML'
+# a note before any table
+[tunnel]
+  name="spaced-out"
+side = "kharej"   # a note after a value
+
+[ transport ]
+path = "/a#b"
+port = 443 # a number with a note
+dials = "kharej"
+dials = "iran"
+
+[failover]
+backups = ["tcp:8443", "utls:2053"]
+enabled = true
+TOML
+toml_load "$odd"
+for k in tunnel.name tunnel.side transport.path transport.port transport.dials failover.backups failover.enabled tuning.nonesuch; do
+    check "toml_load agrees with toml_get on $k" "${TV[$k]:-}" "$(toml_get "$odd" "${k%%.*}" "${k#*.}")"
+done
+tv_arr failover backups
+check "and on an array" "$TA" "$(toml_arr "$odd" failover backups)"
+toml_load "$f"
+for k in tunnel.name tunnel.side tunnel.mode transport.type transport.kharej transport.port security.token tun.name tun.iran tun.mtu tuning.profile logging.level; do
+    check "toml_load agrees with toml_get on the sample's $k" "${TV[$k]:-}" "$(toml_get "$f" "${k%%.*}" "${k#*.}")"
+done
+
 section "writing"
 
 toml_set "$f" tuning profile gaming

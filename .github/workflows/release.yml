@@ -133,3 +133,29 @@ jobs:
             gh release create "$tag" Pingify.sh \
               --title "Pingify $tag" --notes-file notes.md
           fi
+
+      # To a server in Iran dl.google.com answers every request with a 404,
+      # so the Go the script asks for rides along with the release, which that
+      # server can reach. It is fetched from go.dev here and must match the
+      # sha256 the script carries - the same check a server makes before it
+      # unpacks the file - or the release stops.
+      - name: Carry the Go toolchain the script asks for
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            tag="v$(grep -m1 '^PINGIFY_VERSION=' Pingify.sh | cut -d'"' -f2)"
+          fi
+          for arch in amd64 arm64; do
+            name=$(PINGIFY_NO_MAIN=1 bash -c '. ./Pingify.sh; go_tarball "$1"' _ "$arch")
+            want=$(PINGIFY_NO_MAIN=1 bash -c '. ./Pingify.sh; go_sum "$1"' _ "$name") || {
+              echo "::error::the script carries no sha256 for $name"; exit 1; }
+            curl -fsSL --retry 3 -o "$name" "https://go.dev/dl/$name"
+            got=$(sha256sum "$name" | cut -c1-64)
+            if [ "$got" != "$want" ]; then
+              echo "::error::$name from go.dev is $got, the script expects $want"
+              exit 1
+            fi
+            gh release upload "$tag" "$name" --clobber
+          done

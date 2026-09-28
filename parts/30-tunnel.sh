@@ -158,12 +158,19 @@ wiz_token() {
     printf '%s' "$t"
 }
 
-token_print() {
-    local t h
-    t=$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-    [ -n "$t" ] || { printf 'none'; return; }
-    h=$(printf '%s' "$t" | wiz_sha256) || { printf 'unknown'; return; }
-    printf '%s' "${h:0:8}"
+token_print() { _token_print "${1:-}"; printf '%s' "$TP"; }
+# _token_print leaves the fingerprint in TP, and keeps it: a tunnel's screens
+# all show the same token, and working it out is a sha256 process each time.
+declare -gA TP_SEEN=()
+_token_print() {
+    local t=${1:-} h
+    t=${t#"${t%%[![:space:]]*}"}
+    t=${t%"${t##*[![:space:]]}"}
+    if [ -z "$t" ]; then TP=none; return 0; fi
+    if [ -n "${TP_SEEN[$t]+set}" ]; then TP=${TP_SEEN[$t]}; return 0; fi
+    h=$(printf '%s' "$t" | wiz_sha256) || { TP=unknown; return 0; }
+    TP=${h:0:8}
+    TP_SEEN[$t]=$TP
 }
 
 # ---------------------------------------------------------------------------
@@ -281,72 +288,75 @@ preset_menu() {
 
 cfg_load() {
     local f
-    f=$(cfg_file "$1")
+    f=$CFG_DIR/$1.$CFG_EXT
     [ -f "$f" ] || return 1
     cfg_reset
-    T_NAME=$(toml_get "$f" tunnel name)
+    # One read of the file rather than an awk for every key - see toml_load.
+    toml_load "$f"
+    T_NAME=${TV[tunnel.name]}
     [ -n "$T_NAME" ] || T_NAME=$1
-    T_SIDE=$(toml_get "$f" tunnel side)
-    T_TRANSPORT=$(toml_get "$f" transport type)
+    T_SIDE=${TV[tunnel.side]}
+    T_TRANSPORT=${TV[transport.type]}
     [ -n "$T_TRANSPORT" ] || T_TRANSPORT=udp
-    T_MODE=$(toml_get "$f" tunnel mode)
+    T_MODE=${TV[tunnel.mode]}
     [ -n "$T_MODE" ] || T_MODE=$(mode_of "$T_TRANSPORT")
     [ "$T_MODE" = tun ] && T_KIND=tun || T_KIND=tcp
-    T_DIALS=$(toml_get "$f" transport dials)
+    T_DIALS=${TV[transport.dials]}
     [ -n "$T_DIALS" ] || T_DIALS=kharej
-    T_IRAN=$(toml_get "$f" transport iran)
-    T_KHAREJ=$(toml_get "$f" transport kharej)
+    T_IRAN=${TV[transport.iran]}
+    T_KHAREJ=${TV[transport.kharej]}
     if [ "$T_SIDE" = iran ]; then T_PUBLIC_IP=$T_IRAN T_PEER_IP=$T_KHAREJ
     else T_PUBLIC_IP=$T_KHAREJ T_PEER_IP=$T_IRAN; fi
-    T_PORT=$(toml_get "$f" transport port)
-    T_PATH=$(toml_get "$f" transport path)
-    T_CONNS=$(toml_get "$f" transport connections)
+    T_PORT=${TV[transport.port]}
+    T_PATH=${TV[transport.path]}
+    T_CONNS=${TV[transport.connections]}
     [ -n "$T_CONNS" ] || T_CONNS=16
-    T_INSECURE=$(toml_get "$f" transport insecure)
-    T_TOKEN=$(toml_get "$f" security token)
-    T_PRESET=$(toml_get "$f" tuning profile)
+    T_INSECURE=${TV[transport.insecure]}
+    T_TOKEN=${TV[security.token]}
+    T_PRESET=${TV[tuning.profile]}
     [ -n "$T_PRESET" ] || T_PRESET=balanced
     [ "$T_PRESET" != download ] || T_PRESET=throughput # what 1.0.x called it
-    T_FEC=$(toml_get "$f" tuning fec)
-    T_QUEUE=$(toml_get "$f" tuning queue_packets)
-    T_LOG=$(toml_get "$f" logging level)
+    T_FEC=${TV[tuning.fec]}
+    T_QUEUE=${TV[tuning.queue_packets]}
+    T_LOG=${TV[logging.level]}
     [ -n "$T_LOG" ] || T_LOG=info
-    T_STATUS=$(toml_get "$f" status port)
-    T_HEALTH=$(toml_get "$f" status health_port)
+    T_STATUS=${TV[status.port]}
+    T_HEALTH=${TV[status.health_port]}
     T_FORWARDS=$(ports_of "$1")
-    T_BACKUPS=$(toml_arr "$f" failover backups)
-    T_FO_SWITCH=$(toml_get "$f" failover switch_after_sec)
-    T_FO_RETURN=$(toml_get "$f" failover return_after_sec)
-    T_FO_ENABLED=$(toml_get "$f" failover enabled)
-    T_FO_PREFER=$(toml_get "$f" failover prefer)
+    tv_arr failover backups
+    T_BACKUPS=$TA
+    T_FO_SWITCH=${TV[failover.switch_after_sec]}
+    T_FO_RETURN=${TV[failover.return_after_sec]}
+    T_FO_ENABLED=${TV[failover.enabled]}
+    T_FO_PREFER=${TV[failover.prefer]}
     if [ "$T_MODE" = tun ]; then
-        T_TUNIF=$(toml_get "$f" tun name)
+        T_TUNIF=${TV[tun.name]}
         [ -n "$T_TUNIF" ] || T_TUNIF=pfy0
         local a b
-        a=$(toml_get "$f" tun iran)
-        b=$(toml_get "$f" tun kharej)
+        a=${TV[tun.iran]}
+        b=${TV[tun.kharej]}
         if [ "$T_SIDE" = iran ]; then T_TUNLOCAL=$a T_TUNPEER=$b; else T_TUNLOCAL=$b T_TUNPEER=$a; fi
         T_OCTET=${a#10.}
         T_OCTET=${T_OCTET%%.*}
-        T_TUNMTU=$(toml_get "$f" tun mtu)
+        T_TUNMTU=${TV[tun.mtu]}
         [ -n "$T_TUNMTU" ] || T_TUNMTU=1320
     fi
     if [ "$T_TRANSPORT" = awg ]; then
-        T_AWG_IFACE=$(toml_get "$f" awg name)
-        T_AWG_PORT=$(toml_get "$f" awg port)
-        T_AWG_IKEY=$(toml_get "$f" awg iran_key)
-        T_AWG_IPUB=$(toml_get "$f" awg iran_pub)
-        T_AWG_KKEY=$(toml_get "$f" awg kharej_key)
-        T_AWG_KPUB=$(toml_get "$f" awg kharej_pub)
-        T_AWG_JC=$(toml_get "$f" awg jc)
-        T_AWG_JMIN=$(toml_get "$f" awg jmin)
-        T_AWG_JMAX=$(toml_get "$f" awg jmax)
-        T_AWG_S1=$(toml_get "$f" awg s1)
-        T_AWG_S2=$(toml_get "$f" awg s2)
-        T_AWG_H1=$(toml_get "$f" awg h1)
-        T_AWG_H2=$(toml_get "$f" awg h2)
-        T_AWG_H3=$(toml_get "$f" awg h3)
-        T_AWG_H4=$(toml_get "$f" awg h4)
+        T_AWG_IFACE=${TV[awg.name]}
+        T_AWG_PORT=${TV[awg.port]}
+        T_AWG_IKEY=${TV[awg.iran_key]}
+        T_AWG_IPUB=${TV[awg.iran_pub]}
+        T_AWG_KKEY=${TV[awg.kharej_key]}
+        T_AWG_KPUB=${TV[awg.kharej_pub]}
+        T_AWG_JC=${TV[awg.jc]}
+        T_AWG_JMIN=${TV[awg.jmin]}
+        T_AWG_JMAX=${TV[awg.jmax]}
+        T_AWG_S1=${TV[awg.s1]}
+        T_AWG_S2=${TV[awg.s2]}
+        T_AWG_H1=${TV[awg.h1]}
+        T_AWG_H2=${TV[awg.h2]}
+        T_AWG_H3=${TV[awg.h3]}
+        T_AWG_H4=${TV[awg.h4]}
     fi
     return 0
 }
@@ -1555,7 +1565,8 @@ review_panel() {
         panel_field "Private link" "$(addr_tint "${T_TUNLOCAL%%/*}") ${G_BOTH} $(addr_tint "${T_TUNPEER%%/*}")   $T_TUNIF   mtu $T_TUNMTU"
     fi
     [ -n "$T_FORWARDS" ] && panel_field "Ports" "$T_FORWARDS"
-    panel_field "Token" "$(token_print "$T_TOKEN")"
+    _token_print "$T_TOKEN"
+    panel_field "Token" "$TP"
     panel_field "Tuning" "${T_PRESET^}"
     panel_field "Logging" "$T_LOG"
     panel_end

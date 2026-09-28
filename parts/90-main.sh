@@ -193,6 +193,7 @@ screen_home() {
 main_menu() {
     local c
     while :; do
+        ui_hold
         screen_home
         menu_key c || return 0
         case $c in
@@ -346,6 +347,7 @@ main() {
     new) new_tunnel; wiz_end ;;
     *) main_menu ;;
     esac
+    ui_done
 }
 
 # build.sh and the tests source this file to get at its functions; that must

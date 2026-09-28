@@ -22,7 +22,7 @@ curl -fsSLo Pingify.sh https://github.com/GreatTeejay/Pingify/releases/latest/do
 
 The script installs the `pingify` command, builds the core and writes the systemd units. It carries its own Go sources and vendored modules, so the build works on a server that cannot reach `proxy.golang.org` — which is most Iranian servers. Only the Go toolchain itself has to be fetched, and the script offers to do that when it is missing.
 
-If `go.dev` cannot be reached from the server, point the fetch at a mirror — `PINGIFY_GO_URL=https://<mirror>/dl bash Pingify.sh` — and the script prints the sha256 of what arrived, to check against go.dev from any machine that can see it. A server that cannot build at all, too small or cut off, takes the core from the other one:
+From Iran `go.dev` cannot be reached — Google's download server answers Iranian addresses with a 404 — so the script tries, in order, go.dev, the copy of the same file attached to this project's GitHub release, and the nju and aliyun mirrors, and unpacks only a file whose sha256 is go.dev's own, which the script carries. `PINGIFY_GO_URL=https://<mirror> bash Pingify.sh` names another place to try first. A server that cannot build at all, too small or cut off, takes the core from the other one:
 
 ```bash
 pingify core export            # on the server that built it: the binary, and its hash beside it

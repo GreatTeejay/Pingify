@@ -26,6 +26,9 @@ for w in 60 80 100; do
         panel_open "review"
         panel_field "Private link" "10.99.10.1 and 10.99.10.2 and a great deal more text than fits"
         panel_close
+        dim "a sentence long enough to be folded at every one of the three widths tried here, and then some more of it"
+        warn "a warning as long as the sentence above it, which has to fold at every width as well, with its indent"
+        choice 1 "Reverse" "KHAREJ connects in to IRAN"
     )
     longest=$(printf '%s\n' "$out" | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')
     if [ "$longest" -le "$w" ]; then
@@ -63,6 +66,33 @@ check "a value that fits is left alone" "$(trunc_to abcdef 10)" "abcdef"
 check "a value that does not fit is marked" "$(trunc_to abcdefghijkl 6)" "abcde~"
 check "padding fills to the width" "[$(pad_to ab 5)]" "[ab   ]"
 check "padding a long value cuts it first" "$(vislen "$(pad_to abcdefghij 5)")" "5"
+
+# The same answers without a subshell, which is how the screens measure now.
+_pad ab 5
+check "_pad leaves the padded value in PD" "[$PD]" "[ab   ]"
+_trunc abcdefghijkl 6
+check "_trunc leaves the cut value in TR" "$TR" "abcde~"
+_vislen "$(printf '\033[31mabc\033[0m')"
+check "_vislen leaves the width in VL" "$VL" "3"
+
+section "text folds where it was written to"
+
+# The sentences here are written seventy-six columns to a line. Folded at the
+# frames' sixty-four, every one of them left its last word alone on a line.
+PINGIFY_WIDTH=80 ui_detect
+out=$(dim "The tunnel moves to the best backup that answers, and back once a better one")
+check "a line written at 76 columns stays one line at 80" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" "1"
+PINGIFY_WIDTH=60 ui_detect
+out=$(dim "The tunnel moves to the best backup that answers, and back once a better one")
+longest=$(printf '%s\n' "$out" | awk '{ if (length($0) > m) m = length($0) } END { print m+0 }')
+check "and folds inside a narrow window" "$([ "$longest" -le 60 ] && echo fits || echo "$longest")" "fits"
+PINGIFY_WIDTH=80 ui_detect
+check "a run of spaces written to line things up is kept" "$(dim "one  two")" "    one  two"
+check "a paragraph folds on its words" "$(PINGIFY_WIDTH=40 ui_detect; dim "aaaa bbbb cccc dddd eeee ffff gggg hhhh")" "    aaaa bbbb cccc dddd eeee ffff gggg
+    hhhh"
+# A word is text, not a pattern: it used to be globbed against whatever
+# directory the menu was started from.
+check "a star is printed, not expanded" "$(cd tests && dim "ports *")" "    ports *"
 
 section "measuring what is on the screen"
 

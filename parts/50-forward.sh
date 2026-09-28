@@ -745,9 +745,11 @@ screen_ports() {
     local name=$1 f side peer cur tuples proto lo hi dsth dstp key
     f=$(cfg_file "$name")
     [ -f "$f" ] || { bad "there is no tunnel called $name"; return 1; }
+    ui_hold
     screen_top
 
     while :; do
+        ui_hold
         side=$(toml_get "$f" tunnel side)
         blank
         rule "Ports $G_CUR $name"
@@ -756,6 +758,7 @@ screen_ports() {
             warn "this is the KHAREJ side; nothing is forwarded here"
             fix "run this on the IRAN server, where users connect"
             blank
+            ui_show
             return 0
         fi
 

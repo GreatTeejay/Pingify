@@ -140,6 +140,51 @@ toml_arr() {
     toml_get "$1" "$2" "$3" | tr -d '[]"' | tr ',' ' ' | tr -s ' ' | sed 's/^ //; s/ $//'
 }
 
+# toml_load FILE - every key of the file into TV["table.key"], in one read of
+# it. cfg_load asked awk for each of thirty keys, one process apiece, and on
+# a server busy with its users that was half a second of the Tuning screen.
+# The rules are toml_get's: the first key of a name in its table is the one,
+# a quoted value runs to its closing quote, a bare one to its comment.
+declare -gA TV=()
+toml_load() {
+    local line cur= k v
+    TV=()
+    [ -f "$1" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#"${line%%[![:space:]]*}"}
+        case $line in
+        '['*)
+            cur=${line//[][[:space:]]/}
+            continue
+            ;;
+        '#'* | '') continue ;;
+        *=*) ;;
+        *) continue ;;
+        esac
+        k=${line%%=*}
+        k=${k%"${k##*[![:space:]]}"}
+        v=${line#*=}
+        v=${v#"${v%%[![:space:]]*}"}
+        if [[ $v == \"* ]]; then
+            v=${v#\"}
+            v=${v%%\"*}
+        else
+            v=${v%%#*}
+            v=${v%"${v##*[![:space:]]}"}
+        fi
+        [ -n "${TV[$cur.$k]+set}" ] || TV[$cur.$k]=$v
+    done <"$1"
+}
+# tv_arr TABLE KEY - an array value from TV as words, as toml_arr prints it.
+tv_arr() {
+    local v=${TV[$1.$2]:-}
+    local -a w
+    v=${v//[][\"]/}
+    v=${v//,/ }
+    read -ra w <<<"$v"
+    TA="${w[*]}"
+}
+
 # toml_set replaces a value in place, keeping the file's order and the note
 # beside the value. A key that is not there yet is appended to its table, and
 # a table nobody has written yet is created.
@@ -492,33 +537,49 @@ tun_stats() {
     json=$(curl -s --max-time 3 "http://127.0.0.1:$(status_port "$name")/" 2>/dev/null) || return 1
     [ -n "$json" ] || return 1
 
-    ST_VERSION=$(json_field "$json" version)
-    ST_UP=$(json_field "$json" up)
-    # Bytes in is the only thing on this report that says somebody is at the
-    # other end: the core's up means the carrier knows where to send.
-    ST_INB=$(json_field "$json" in_bytes)
-    ST_OUTB=$(json_field "$json" out_bytes)
-    ST_IN=$(json_field "$json" in_mbit)
-    ST_OUT=$(json_field "$json" out_mbit)
-    ST_LOST=$(json_field "$json" path_lost)
-    ST_LATE=$(json_field "$json" path_reordered)
-    ST_GAPS=$(json_field "$json" path_gaps)
-    ST_UPTIME=$(json_field "$json" uptime_sec)
-    ST_DROPPED=$(json_field "$json" dropped)
-    ST_TRANSPORT=$(json_field "$json" transport)
-    ST_PROFILE=$(json_field "$json" profile)
-    ST_SIDE=$(json_field "$json" side)
-    ST_MODE=$(json_field "$json" mode)
-    ST_FAR_RTT=$(json_field "$json" far_rtt_ms)
-    ST_FAR_SEEN=$(json_field "$json" far_seen_sec)
-    ST_BLOCKED=$(json_field "$json" data_blocked)
-    ST_PROBE_SEEN=$(json_field "$json" probe_seen_sec)
-    ST_TOWIRE=$(json_field "$json" to_wire)
-    ST_TODEV=$(json_field "$json" to_device)
-    ST_NOTOURS=$(json_field "$json" not_ours)
-    ST_SENDERR=$(json_field "$json" send_errors)
-    # With failover backups, the transport carrying now. Empty without them.
-    ST_ACTIVE=$(json_field "$json" transport_active)
+    # One pass over the report, which encoding/json writes a field to a line,
+    # in place of an awk for each field: twenty-four of those were a fifth of
+    # a second of every screen that shows a tunnel, on a server busy with its
+    # users. The first time a key appears is the one taken, as json_field did.
+    local line k v
+    while IFS= read -r line; do
+        case $line in *'": '*) ;; *) continue ;; esac
+        k=${line%%'": '*}
+        k=${k##*\"}
+        v=${line#*'": '}
+        v=${v%,}
+        v=${v#\"}
+        v=${v%\"}
+        case $k in
+        version) : "${ST_VERSION:=$v}" ;;
+        up) : "${ST_UP:=$v}" ;;
+        # Bytes in is the only thing on this report that says somebody is at
+        # the other end: the core's up means the carrier knows where to send.
+        in_bytes) : "${ST_INB:=$v}" ;;
+        out_bytes) : "${ST_OUTB:=$v}" ;;
+        in_mbit) : "${ST_IN:=$v}" ;;
+        out_mbit) : "${ST_OUT:=$v}" ;;
+        path_lost) : "${ST_LOST:=$v}" ;;
+        path_reordered) : "${ST_LATE:=$v}" ;;
+        path_gaps) : "${ST_GAPS:=$v}" ;;
+        uptime_sec) : "${ST_UPTIME:=$v}" ;;
+        dropped) : "${ST_DROPPED:=$v}" ;;
+        transport) : "${ST_TRANSPORT:=$v}" ;;
+        profile) : "${ST_PROFILE:=$v}" ;;
+        side) : "${ST_SIDE:=$v}" ;;
+        mode) : "${ST_MODE:=$v}" ;;
+        far_rtt_ms) : "${ST_FAR_RTT:=$v}" ;;
+        far_seen_sec) : "${ST_FAR_SEEN:=$v}" ;;
+        data_blocked) : "${ST_BLOCKED:=$v}" ;;
+        probe_seen_sec) : "${ST_PROBE_SEEN:=$v}" ;;
+        to_wire) : "${ST_TOWIRE:=$v}" ;;
+        to_device) : "${ST_TODEV:=$v}" ;;
+        not_ours) : "${ST_NOTOURS:=$v}" ;;
+        send_errors) : "${ST_SENDERR:=$v}" ;;
+        # With failover backups, the transport carrying now. Empty without.
+        transport_active) : "${ST_ACTIVE:=$v}" ;;
+        esac
+    done <<<"$json"
     return 0
 }
 

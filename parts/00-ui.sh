@@ -28,7 +28,9 @@ ui_detect() {
     UI_GLYPH=ascii
     case "${TERM:-dumb}" in dumb | "") UI_COLOR=none ;; esac
     [ -n "${NO_COLOR:-}" ] && UI_COLOR=none
-    [ -t 1 ] || UI_COLOR=none
+    # A held screen is still going to the terminal: a window resized while
+    # one is drawn must not take the colour away for the rest of the session.
+    [ -t 1 ] || [ -n "${UI_HELD:-}" ] || UI_COLOR=none
     if [ "$UI_COLOR" != none ] && [ "$(tput colors 2>/dev/null || echo 0)" -ge 256 ]; then
         UI_COLOR=256
     fi
@@ -59,6 +61,11 @@ ui_detect() {
     [ "$UI_TERM" -lt 40 ] && UI_TERM=40
     UI_W=$UI_TERM
     [ "$UI_W" -gt 68 ] && UI_W=68
+    # Text folds wider than the frames: the sentences on these screens were
+    # written seventy-six columns to a line, and folded at the frames' 64
+    # every one of those left its last word alone on a line of its own.
+    UI_TX=$UI_TERM
+    [ "$UI_TX" -gt 80 ] && UI_TX=80
 
     ui_palette
     ui_glyphs
@@ -109,61 +116,78 @@ ui_glyphs() {
 # measuring and cutting text
 # ---------------------------------------------------------------------------
 
-rep() {
-    local out
+# rep GLYPH N - N of the glyph. _rep leaves them in RP instead.
+rep() { _rep "$1" "${2:-0}"; printf '%s' "$RP"; }
+_rep() {
+    RP=
     [ "${2:-0}" -gt 0 ] 2>/dev/null || return 0
-    printf -v out '%*s' "$2" ''
-    printf '%s' "${out// /$1}"
+    printf -v RP '%*s' "$2" ''
+    RP=${RP// /$1}
 }
 
 # vislen is how many columns a string occupies once the escape codes are
 # gone. Columns, not characters: a CJK glyph is two and a combining mark is
-# none. Parameter expansion rather than sed, because this runs once per cell
-# and a subprocess per cell is how a menu comes to take a second over ssh.
-vislen() {
-    local LC_ALL=${UI_CTYPE:-C} s=$1 out= n i ch cp
-    while [ -n "$s" ]; do
-        case $s in
-        $'['*)
-            s=${s#$'['}
-            s=${s#*m}
-            continue
-            ;;
-        esac
-        out=$out${s:0:1}
-        s=${s:1}
+# none.
+#
+# The measuring is in _vislen, which leaves the answer in VL, and so are the
+# cutting and the padding below: every cell of every menu line is measured,
+# and a subshell around each measure was most of what a screen cost - 45 ms
+# a menu line on a server busy with its users, over a second a screen, drawn
+# visibly from the top down. vislen, trunc_to and pad_to print the same
+# answers, for the callers that want them that way.
+vislen() { _vislen "$1"; printf '%s' "$VL"; }
+_vislen() {
+    local LC_ALL=${UI_CTYPE:-C} s=$1 out= ch cp
+    # The escape codes out a sequence at a time, not a character at a time.
+    while [[ $s == *$'\033['* ]]; do
+        out+=${s%%$'\033['*}
+        s=${s#*$'\033['}
+        s=${s#*m}
     done
-    n=${#out}
+    out+=$s
+    VL=${#out}
+    # Plain ASCII is a column a character, and that is nearly every string.
+    [[ $out == *[![:ascii:]]* ]] || return 0
     # Bash counts characters; correct for the ones that are not one column.
     # By code point rather than by a bracket range: in en_US.UTF-8 a range
     # is collated, not ordered, and a box-drawing glyph fell inside the CJK
     # range on a server abroad, so every frame there came out shredded.
-    for ((i = 0; i < ${#out}; i++)); do
-        ch=${out:i:1}
+    # Only the characters past ASCII are looked at, each taken off the
+    # front: indexing into a multibyte string walks it from its start every
+    # time, and the banner's six lines of blocks cost a tenth of a second.
+    out=${out//[[:ascii:]]/}
+    while [ -n "$out" ]; do
+        ch=${out:0:1}
+        out=${out:1}
         printf -v cp '%d' "'$ch" 2>/dev/null || cp=0
         [ "$cp" -lt 768 ] && continue
         if ((cp <= 879 || (cp >= 1611 && cp <= 1631) || (cp >= 8204 && cp <= 8207))); then
-            n=$((n - 1))
+            VL=$((VL - 1))
         elif (((cp >= 4352 && cp <= 4447) || (cp >= 11904 && cp <= 42191) || (cp >= 44032 && cp <= 55203) ||
             (cp >= 63744 && cp <= 64255) || (cp >= 65072 && cp <= 65103) || (cp >= 65280 && cp <= 65376) ||
             (cp >= 65504 && cp <= 65510) || (cp >= 127744 && cp <= 129791))); then
-            n=$((n + 1))
+            VL=$((VL + 1))
         fi
     done
-    printf '%s' "$n"
 }
 
-# trunc_to cuts a string to a width and marks that it did. A value that does
-# not fit and is printed anyway takes the next column's place.
-# trunc_to STRING WIDTH - the string cut to fit, with the cut marked. Colour
-# codes are carried through and never counted, and a cut string always ends
-# with the colour reset so what was bold or dim does not run on into the
-# next line.
-trunc_to() {
+# trunc_to STRING WIDTH - the string cut to fit, with the cut marked, so a
+# value that does not fit never takes the next column's place. Colour codes
+# are carried through and never counted, and a cut string always ends with
+# the colour reset so what was bold or dim does not run on into the next
+# line. _trunc leaves it in TR.
+trunc_to() { _trunc "$1" "$2"; printf '%s' "$TR"; }
+_trunc() {
     local LC_ALL=${UI_CTYPE:-C} s=$1 w=$2 cut out= n=0 seen=0
-    [ "$(vislen "$s")" -le "$w" ] && { printf '%s' "$s"; return; }
+    _vislen "$s"
+    [ "$VL" -le "$w" ] && { TR=$s; return 0; }
     cut=$((w - 1))
     [ "$cut" -lt 1 ] && cut=1
+    # No colour and nothing wider than a column: the cut is one expansion.
+    if [[ $s != *$'\033'* && $s != *[![:ascii:]]* ]]; then
+        TR=${s:0:cut}$G_CUT
+        return 0
+    fi
     while [ -n "$s" ] && [ "$n" -lt "$cut" ]; do
         case $s in
         $'\033['*)
@@ -178,14 +202,16 @@ trunc_to() {
         n=$((n + 1))
     done
     [ "$seen" = 1 ] && out=$out$C_OFF
-    printf '%s%s' "$out" "$G_CUT"
+    TR=$out$G_CUT
 }
 
-pad_to() {
-    local s n
-    s=$(trunc_to "$1" "$2")
-    n=$(vislen "$s")
-    printf '%s%*s' "$s" "$(($2 - n))" ''
+# pad_to STRING WIDTH - cut to the width if it must be, then filled to it.
+# _pad leaves it in PD.
+pad_to() { _pad "$1" "$2"; printf '%s' "$PD"; }
+_pad() {
+    _trunc "$1" "$2"
+    _vislen "$TR"
+    printf -v PD '%s%*s' "$TR" "$(($2 - VL))" ''
 }
 
 # ---------------------------------------------------------------------------
@@ -219,30 +245,35 @@ rtt_tint() { printf '%s%s%s' "$(rtt_colour "$1")" "$1" "$C_OFF"; }
 # every rule and every box edge is measured rather than counted.
 fill_to() {
     local text=$1 glyph=$2 tail=${3:-} n
-    n=$((UI_W - $(vislen "$text") - $(vislen "$tail")))
+    _vislen "$text"
+    n=$VL
+    _vislen "$tail"
+    n=$((UI_W - n - VL))
     [ "$n" -lt 0 ] && n=0
-    printf '%s%s%s%s%s' "$text" "$C_RULE" "$(rep "$glyph" "$n")" "$tail" "$C_OFF"
+    _rep "$glyph" "$n"
+    printf '%s%s%s%s%s' "$text" "$C_RULE" "$RP" "$tail" "$C_OFF"
 }
 
 # A panel carries its title in the top border, so a screen full of them reads
 # as a list of labelled blocks rather than a wall of rules.
 panel() {
     if [ -z "${1:-}" ]; then
-        printf '%s\n' "$(fill_to "  $C_RULE$BX_TL" "$BX_H" "$BX_TR")"
-        return
+        fill_to "  $C_RULE$BX_TL" "$BX_H" "$BX_TR"
+    else
+        fill_to "  $C_RULE$BX_TL$BX_H$C_OFF $C_CYN$C_B$1$C_OFF " "$BX_H" "$BX_TR"
     fi
-    printf '%s\n' "$(fill_to "  $C_RULE$BX_TL$BX_H$C_OFF $C_CYN$C_B$1$C_OFF " "$BX_H" "$BX_TR")"
+    printf '\n'
 }
 panel_open() { panel "$1"; }
-panel_end() { printf '%s\n' "$(fill_to "  $C_RULE$BX_BL" "$BX_H" "$BX_BR")"; }
+panel_end() { fill_to "  $C_RULE$BX_BL" "$BX_H" "$BX_BR"; printf '\n'; }
 panel_close() { panel_end; }
 
 # One line inside a box, cut to fit: a value that overran pushed the closing
 # bar off the end and shredded the panel.
 panel_row() {
-    local inner=$((UI_W - 6))
+    _pad "$1" $((UI_W - 6))
     printf '  %s%s%s %s %s%s%s\n' \
-        "$C_RULE" "$BX_V" "$C_OFF" "$(pad_to "$1" "$inner")" "$C_RULE" "$BX_V" "$C_OFF"
+        "$C_RULE" "$BX_V" "$C_OFF" "$PD" "$C_RULE" "$BX_V" "$C_OFF"
 }
 
 # panel_field <label> <value> [label2] [value2] - a boxed key and value, two
@@ -250,15 +281,20 @@ panel_row() {
 UI_PANELW=13
 panel_field() {
     local s inner=$((UI_W - 6))
-    s="$(pad_to "${C_DIM}$1${C_OFF}" "$UI_PANELW")  ${C_B}$2${C_OFF}"
+    _pad "${C_DIM}$1${C_OFF}" "$UI_PANELW"
+    s="$PD  ${C_B}$2${C_OFF}"
     if [ -n "${3:-}" ]; then
         # Two pairs share a row only when the row has room for both; below
         # that the second pair takes a row of its own rather than a letter.
         if [ "$inner" -ge 56 ]; then
-            s="$(pad_to "$s" $((inner / 2)))$(pad_to "${C_DIM}$3${C_OFF}" $((UI_PANELW - 2))) ${C_B}$4${C_OFF}"
+            _pad "$s" $((inner / 2))
+            s=$PD
+            _pad "${C_DIM}$3${C_OFF}" $((UI_PANELW - 2))
+            s="$s$PD ${C_B}$4${C_OFF}"
         else
             panel_row "$s"
-            s="$(pad_to "${C_DIM}$3${C_OFF}" "$UI_PANELW")  ${C_B}$4${C_OFF}"
+            _pad "${C_DIM}$3${C_OFF}" "$UI_PANELW"
+            s="$PD  ${C_B}$4${C_OFF}"
         fi
     fi
     panel_row "$s"
@@ -267,9 +303,11 @@ panel_field() {
 # field is the same pair on a plain screen, outside any box.
 UI_KEYW=11
 field() {
-    printf '    %s%s%s  %s\n' \
-        "$C_KEY" "$(pad_to "$1" "$UI_KEYW")" "$C_OFF" \
-        "$(trunc_to "$2" $((UI_W - UI_KEYW - 8)))"
+    local k
+    _pad "$1" "$UI_KEYW"
+    k=$PD
+    _trunc "$2" $((UI_W - UI_KEYW - 8))
+    printf '    %s%s%s  %s\n' "$C_KEY" "$k" "$C_OFF" "$TR"
 }
 
 # row prints cells padded to the widths in UI_COLS, which the caller sets
@@ -277,11 +315,13 @@ field() {
 row() {
     local i=0 out= cell
     for cell in "$@"; do
-        out=$out$(pad_to "$cell" "${UI_COLS[i]:-12}")'  '
+        _pad "$cell" "${UI_COLS[i]:-12}"
+        out=$out$PD'  '
         i=$((i + 1))
     done
     out=${out%  }
-    printf '   %s\n' "$(trunc_to "$out" $((UI_TERM - 3)))"
+    _trunc "$out" $((UI_TERM - 3))
+    printf '   %s\n' "$TR"
 }
 
 say()  { printf '%s\n' "$*"; }
@@ -293,21 +333,31 @@ fail() { say_wrapped "  ${C_RED}${MK_NO}${C_OFF} " "    " "$*"; }
 bad()  { fail "$@"; }
 # fold WIDTH TEXT - the text broken on spaces so that no line is wider than
 # WIDTH. Colour codes are carried through and not counted, so a coloured
-# word does not make a short line look long.
-fold() {
-    local w=$1 word line= out=
-    for word in $2; do
+# word does not make a short line look long. Split on single spaces, so a
+# run of them written to line something up stays a run - it was closed up to
+# one - and never globbed: a word was a pattern the shell expanded against
+# whatever directory the menu was run from. _fold leaves it in FD.
+fold() { _fold "$1" "$2"; printf '%s' "$FD"; }
+_fold() {
+    local w=$1 rest=$2 word line= cur=0 out= last=
+    rest=${rest//$'\n'/ }
+    rest=${rest//$'\t'/ }
+    while [ -z "$last" ]; do
+        case $rest in
+        *' '*) word=${rest%% *} rest=${rest#* } ;;
+        *) word=$rest last=1 ;;
+        esac
+        _vislen "$word"
         if [ -z "$line" ]; then
-            line=$word
-        elif [ "$(vislen "$line $word")" -le "$w" ]; then
-            line="$line $word"
+            [ -n "$word" ] && line=$word cur=$VL
+        elif [ $((cur + 1 + VL)) -le "$w" ]; then
+            line="$line $word" cur=$((cur + 1 + VL))
         else
-            out="$out$line
-"
-            line=$word
+            out=$out$line$'\n'
+            line=$word cur=$VL
         fi
     done
-    printf '%s' "$out$line"
+    FD=$out$line
 }
 
 # say_wrapped PREFIX INDENT TEXT - one of the lines below, folded at the
@@ -315,17 +365,14 @@ fold() {
 # column terminal, and a wrapped fix line lost its indent, which read as a
 # second item.
 say_wrapped() {
-    local prefix=$1 pad=$2 text=$3 first=1 line
-    while IFS= read -r line; do
-        if [ "$first" = 1 ]; then
-            printf '%s%s
-' "$prefix" "$line"
-            first=0
-        else
-            printf '%s%s
-' "$pad" "$line"
-        fi
-    done <<<"$(fold $((UI_W - ${#pad})) "$text")"
+    local lead=$1 pad=$2
+    _fold $((UI_TX - ${#pad})) "$3"
+    while [[ $FD == *$'\n'* ]]; do
+        printf '%s%s\n' "$lead" "${FD%%$'\n'*}"
+        FD=${FD#*$'\n'}
+        lead=$pad
+    done
+    printf '%s%s\n' "$lead" "$FD"
 }
 
 dim()  { say_wrapped "    ${C_DIM}" "    " "$*${C_OFF}"; }
@@ -335,9 +382,10 @@ dim()  { say_wrapped "    ${C_DIM}" "    " "$*${C_OFF}"; }
 # under itself. SEP goes between items; its first word ends a folded line,
 # so a comma list folds with a comma.
 dim_wrap() {
-    local lead=$1 sep=$2 w=$((UI_W - 4)) lw pad line cur n=0 item tail
-    lw=$(vislen "$lead")
-    pad=$(printf '%*s' "$lw" '')
+    local lead=$1 sep=$2 w=$((UI_TX - 4)) lw pad line cur n=0 item tail
+    _vislen "$lead"
+    lw=$VL
+    printf -v pad '%*s' "$lw" ''
     tail=${sep%%[[:space:]]*}
     line=$lead cur=$lw
     while IFS= read -r item; do
@@ -361,7 +409,8 @@ die()  { printf '\n  %s%s%s %s\n\n' "$C_RED" "$MK_NO" "$C_OFF" "$*" >&2; exit 1;
 # rule draws a horizontal line, with a title inside it when given one.
 rule() {
     if [ -z "${1:-}" ]; then
-        printf '  %s%s%s\n' "$C_GRY" "$(rep "$BX_H" "$UI_W")" "$C_OFF"
+        _rep "$BX_H" "$UI_W"
+        printf '  %s%s%s\n' "$C_GRY" "$RP" "$C_OFF"
         return
     fi
     head2 "$1"
@@ -369,11 +418,11 @@ rule() {
 
 # A section heading whose rule runs out to the panel width.
 head2() {
-    local t=" $1 " n
-    n=$(vislen "$t")
+    local t=" $1 "
+    _vislen "$t"
+    _rep "$BX_H" $((UI_W - VL - 4))
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
-        "$(rep "$BX_H" $((UI_W - n - 4)))" "$C_OFF"
+        "$C_GRY" "$BX_H$BX_H" "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" "$RP" "$C_OFF"
 }
 
 # A label above a run of related menu entries.
@@ -383,18 +432,21 @@ group() { printf '\n  %s%s%s\n' "$C_DIM$C_B" "$1" "$C_OFF"; }
 # label outruns it, so a long one can never end up glued to its hint.
 UI_ITEMW=24
 item() {
-    local w=$UI_ITEMW n hint=${3:-} hw
-    n=$(vislen "$2")
-    [ "$n" -ge "$w" ] && w=$((n + 2))
+    local w=$UI_ITEMW hint=${3:-} hw label
+    _vislen "$2"
+    [ "$VL" -ge "$w" ] && w=$((VL + 2))
     hw=$((UI_TERM - w - 9))
     if [ -n "$hint" ] && [ "$hw" -ge 6 ]; then
+        _pad "$2" "$w"
+        label=$PD
+        _trunc "$hint" "$hw"
         printf '   %s%2s%s %s%s%s %s%s%s%s\n' \
             "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
-            "$(pad_to "$2" "$w")" "$C_DIM" "$(trunc_to "$hint" "$hw")" "$C_OFF"
+            "$label" "$C_DIM" "$TR" "$C_OFF"
     else
+        _trunc "$2" $((UI_TERM - 9))
         printf '   %s%2s%s %s%s%s %s\n' \
-            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" \
-            "$(trunc_to "$2" $((UI_TERM - 9)))"
+            "$C_CYN$C_B" "$1" "$C_OFF" "$C_GRY" "$BX_ARR" "$C_OFF" "$TR"
     fi
 }
 # item2 is the same line with the current value of a setting on the right.
@@ -426,37 +478,39 @@ state_dot() {
 # terminal without a UTF-8 locale draws the block glyphs as question marks.
 # ---------------------------------------------------------------------------
 
-banner_art() {
+banner_art() { _banner_art; printf '%s\n' "${BA[@]}"; }
+_banner_art() {
     if [ "$UI_GLYPH" = utf8 ]; then
-        printf '%s\n' \
-            '██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗' \
-            '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝' \
-            '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ ' \
-            '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  ' \
-            '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   ' \
-            '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   '
+        BA=('██████╗ ██╗███╗   ██╗ ██████╗ ██╗███████╗██╗   ██╗'
+            '██╔══██╗██║████╗  ██║██╔════╝ ██║██╔════╝╚██╗ ██╔╝'
+            '██████╔╝██║██╔██╗ ██║██║  ███╗██║█████╗   ╚████╔╝ '
+            '██╔═══╝ ██║██║╚██╗██║██║   ██║██║██╔══╝    ╚██╔╝  '
+            '██║     ██║██║ ╚████║╚██████╔╝██║██║        ██║   '
+            '╚═╝     ╚═╝╚═╝  ╚═══╝ ╚═════╝ ╚═╝╚═╝        ╚═╝   ')
     else
-        printf '%s\n' \
-            ' ____   ___  _   _   ____  ___  _____ __   __' \
-            '|  _ \ |_ _|| \ | | / ___||_ _||  ___|\ \ / /' \
-            '| |_) | | | |  \| || |  _  | | | |_    \ V / ' \
-            '|  __/  | | | |\  || |_| | | | |  _|    | |  ' \
-            '|_|    |___||_| \_| \____||___||_|      |_|  '
+        BA=(' ____   ___  _   _   ____  ___  _____ __   __'
+            '|  _ \ |_ _|| \ | | / ___||_ _||  ___|\ \ / /'
+            '| |_) | | | |  \| || |  _  | | | |_    \ V / '
+            '|  __/  | | | |\  || |_| | | | |  _|    | |  '
+            '|_|    |___||_| \_| \____||___||_|      |_|  ')
     fi
 }
 
 banner_line() {
-    local text=$1 colour=$2 inner=$((UI_W - 6)) pad
-    pad=$(((inner - $(vislen "$text")) / 2))
+    local text=$1 colour=$2 inner=$((UI_W - 6)) pad s
+    _vislen "$text"
+    pad=$(((inner - VL) / 2))
     [ "$pad" -lt 0 ] && pad=0
-    panel_row "$(printf '%*s%s%s%s' "$pad" '' "$colour" "$text" "$C_OFF")"
+    printf -v s '%*s%s%s%s' "$pad" '' "$colour" "$text" "$C_OFF"
+    panel_row "$s"
 }
 
 # wipe clears the screen at the top of a screen, and only there. It moves
 # the cursor home and erases what is on the screen without touching the
-# scrollback, so everything drawn before is still a page up.
+# scrollback, so everything drawn before is still a page up. A held screen
+# is on its way to a terminal, so it is cleared as well.
 wipe() {
-    [ -t 1 ] || return 0
+    [ -t 1 ] || [ -n "$UI_HELD" ] || return 0
     [ "$UI_COLOR" = none ] && return 0
     printf '\033[H\033[2J'
 }
@@ -473,14 +527,74 @@ banner() {
         blank
         return 0
     fi
+    # The same frame on every screen, so it is drawn once and kept: the
+    # blocks are measured glyph by glyph, which is too slow to do again for
+    # every screen on a busy server. Drawn again when the window, the glyphs
+    # or the colours change.
+    local key="$UI_W|$UI_GLYPH|$UI_COLOR|$extra"
+    if [ "$key" != "$UI_BANNER_KEY" ]; then
+        UI_BANNER=$(banner_draw "$extra")
+        UI_BANNER_KEY=$key
+    fi
+    printf '%s\n' "$UI_BANNER"
+}
+UI_BANNER= UI_BANNER_KEY=
+banner_draw() {
+    local line
     blank
     panel ""
-    while IFS= read -r line; do
+    _banner_art
+    for line in "${BA[@]}"; do
         banner_line "$line" "$C_CYN$C_B"
-    done < <(banner_art)
+    done
     banner_line "by Teejay   $BX_DOT   Iran $BX_ARR Kharej tunnel" "$C_DIM"
-    [ -n "$extra" ] && banner_line "$extra" "$C_DIM"
+    [ -n "${1:-}" ] && banner_line "$1" "$C_DIM"
     panel_end
+}
+
+# ---------------------------------------------------------------------------
+# a screen at once
+#
+# A menu screen is worked out as it is printed - the core asked for its
+# status, a file read, a service looked at - so on a server busy with its
+# users it drew itself from the top down over a second. ui_hold sends what
+# follows to a file and ui_show puts the lot on the terminal in one write:
+# the last screen stays until the next one is ready. Every question shows
+# what is held before it asks, so nothing is asked under a screen that has
+# not appeared. Only a terminal is held; a pipe or a test sees each line as
+# it is printed, as before.
+# ---------------------------------------------------------------------------
+
+UI_HELD= UI_BUF=
+ui_hold() {
+    [ -z "$UI_HELD" ] && [ -t 1 ] || return 0
+    if [ -z "$UI_BUF" ]; then
+        # Beside the state, which only root can write: a name in /tmp that
+        # can be guessed is a name another user could have linked elsewhere.
+        [ -d "${STATE_DIR:-}" ] || return 0
+        UI_BUF=$STATE_DIR/.screen.$$
+        ui_buf_sweep
+    fi
+    : >"$UI_BUF" 2>/dev/null || return 0
+    exec 4>&1 1>"$UI_BUF"
+    UI_HELD=1
+}
+ui_show() {
+    [ -n "$UI_HELD" ] || return 0
+    exec 1>&4 4>&-
+    UI_HELD=
+    cat "$UI_BUF"
+}
+ui_done() { ui_show; [ -z "$UI_BUF" ] || rm -f "$UI_BUF"; }
+# The screen file of a session that was killed rather than left.
+ui_buf_sweep() {
+    local f p
+    for f in "$STATE_DIR"/.screen.*; do
+        [ -e "$f" ] || continue
+        p=${f##*.}
+        case $p in '' | *[!0-9]*) continue ;; esac
+        [ "$p" = "$$" ] || kill -0 "$p" 2>/dev/null || rm -f "$f"
+    done
 }
 screen_top() { banner; }
 
@@ -502,11 +616,11 @@ wiz_end()   { WIZ_ACTIVE=0; WIZ_QUIT=0; }
 # wiz <title> [subtitle] - open a step.
 wiz() {
     WIZ_STEP=$((WIZ_STEP + 1))
-    local t="$WIZ_STEP $BX_DOT $1 " n
-    n=$(vislen " $t")
+    local t="$WIZ_STEP $BX_DOT $1 "
+    _vislen " $t"
+    _rep "$BX_H" $((UI_W - VL - 5))
     printf '\n  %s%s%s%s%s%s%s\n\n' \
-        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" \
-        "$(rep "$BX_H" $((UI_W - n - 5)))" "$C_OFF"
+        "$C_GRY" "$BX_H$BX_H " "$C_OFF$C_CYN$C_B" "$t" "$C_OFF$C_GRY" "$RP" "$C_OFF"
     [ -n "${2:-}" ] && { dim "$2"; blank; }
     return 0
 }
@@ -515,18 +629,20 @@ wiz() {
 # CHOICE_DEF marks the one enter picks, on the line itself.
 CHOICE_DEF=""
 choice() {
-    local mark="   " hint=${3:-}
+    local mark="   " hint=${3:-} name
     if [ "$1" = "$CHOICE_DEF" ]; then
         mark="${C_GRN}${BX_ARR}${C_OFF}  "
         hint="${hint}${hint:+  }${C_GRN}(default)${C_OFF}"
     fi
+    _pad "${C_B}$2${C_OFF}" 14
+    name=$PD
+    _trunc "$hint" $((UI_TERM - 25))
     printf '  %s%s%2s%s  %s  %s%s%s\n' \
-        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" \
-        "$(pad_to "${C_B}$2${C_OFF}" 14)" \
-        "$C_DIM" "$(trunc_to "$hint" $((UI_TERM - 25)))" "$C_OFF"
+        "$mark" "$C_CYN$C_B" "$1" "$C_OFF" "$name" "$C_DIM" "$TR" "$C_OFF"
 }
 
 pause() {
+    ui_show
     printf '\n'
     read -rsp "  ${C_DIM}press enter${C_OFF}" _ || true
     printf '\n'
@@ -551,6 +667,7 @@ pause() {
 ask() {
     local _pk_var=$1 _pk_prompt=$2 _pk_def=${3:-} _pk_check=${4:-} _pk_in _pk_err _pk_rc
     [ "${WIZ_QUIT:-0}" = 1 ] && return 1
+    ui_show
     while :; do
         _pk_rc=0
         if [ -n "$_pk_def" ]; then
@@ -608,6 +725,7 @@ confirm() {
     local _pk_prompt=$1 _pk_def=${2:-n} _pk_in _pk_hint='[y/N]'
     [ "$_pk_def" = y ] && _pk_hint='[Y/n]'
     [ "${WIZ_QUIT:-0}" = 1 ] && return 1
+    ui_show
     while :; do
         if ! read -rp "  ${C_YEL}?${C_OFF} $_pk_prompt ${C_DIM}${_pk_hint}${C_OFF}${C_B}:${C_OFF} " _pk_in; then
             [ "${WIZ_ACTIVE:-0}" = 1 ] && WIZ_QUIT=1
@@ -637,6 +755,7 @@ confirm_yes() { confirm "$1" y; }
 # the menu entirely.
 menu_key() {
     local _pk_var=$1 _pk_in
+    ui_show
     read -rp "  ${C_CYN}${BX_ARR}${C_OFF} select${C_B}:${C_OFF} " _pk_in || return 1
     _pk_in=${_pk_in#"${_pk_in%%[![:space:]]*}"}
     _pk_in=${_pk_in%"${_pk_in##*[![:space:]]}"}
@@ -775,6 +894,7 @@ v_number() {
 spin() {
     local msg=$1
     shift
+    ui_show
     if [ ! -t 2 ] || [ "$UI_COLOR" = none ]; then "$@"; return $?; fi
     "$@" &
     local pid=$! i=0 frames='|/-\'
