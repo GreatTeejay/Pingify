@@ -429,7 +429,9 @@ health_check() {
                     "the tunnel moves back by itself once $(transport_label "$CK_TRANSPORT") has been healthy for a while" \
                     "if it never does, the path is blocking it: journalctl -u pingify@$name -g failover"
             elif [ -n "$ST_ACTIVE" ]; then
-                chk_add ok failover "on $(transport_label "$ST_ACTIVE"), with backups ready: $(toml_arr "$CK_FILE" failover backups)"
+                local bl= b
+                for b in $(toml_arr "$CK_FILE" failover backups); do bl="${bl:+$bl, }$(backup_label "$b")"; done
+                chk_add ok failover "on $(transport_label "$ST_ACTIVE"), with backups ready: $bl"
             fi
             ;;
         *)

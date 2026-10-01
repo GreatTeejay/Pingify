@@ -212,8 +212,10 @@ tunnel_port_of() {
     case $p in '' | *[!0-9]*) return 1 ;; esac
     printf '%s %s\n' "$p" "$fam"
     for b in $(toml_arr "$f" failover backups); do
-        case ${b#*:} in '' | *[!0-9]*) continue ;; esac
-        printf '%s %s\n' "${b#*:}" "$(port_family "${b%%:*}")"
+        p=${b#*:}
+        p=${p%%@*}
+        case $p in '' | *[!0-9]*) continue ;; esac
+        printf '%s %s\n' "$p" "$(port_family "${b%%:*}")"
     done
 }
 

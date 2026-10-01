@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.1.2"
+PINGIFY_VERSION="1.1.3"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------

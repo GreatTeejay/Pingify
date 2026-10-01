@@ -1524,6 +1524,204 @@ once. A tunnel of one connection is not probed, and a private link has no
 forwarder to probe with: GRE FOU passed its check in this sweep while
 carrying nothing, and still would.
 
+## 44. Through Cloudflare at the evening peak: freezes, and the other roads
+
+On 2026-09-29 the users' tunnel on the second pair ran WSS MUX through a
+Cloudflare name that fronts the Iran server, sixteen connections, about a
+thousand users' connections on them. At 16:00 UTC, 19:30 in Tehran, its
+median was fine and its tail was not. Forty fresh connections through it, a
+byte and its echo, then ten round trips on each:
+
+	                                   median    p90    worst
+	  first byte of a new connection    112      272    3196 ms
+	  a round trip on an open one       109      159    3446 ms
+
+Nothing on the servers explained the tail. Neither was busy; the receive
+queues of Iran's carrier sockets were empty in six samples a second apart,
+so no reader was waiting on a slow user; the foreign server resolved names
+in 6 to 21 ms and reached Telegram's data centres in 20 to 30 and Instagram's
+in 10 to 40. What did explain it: 208 carrier connections ended in nine
+hours, most of them in bursts, and a connection the path stops carrying ends
+only when the kernel gives it up, twenty seconds without an acknowledgement
+(streamUserTimeout) - twenty seconds in which every stream pinned to it
+waits.
+
+So from 1.1.3 the side that dials listens to each connection on its own
+(stallAfter, in internal/carrier/stream.go). The far end acknowledges every
+sixteen kilobytes a stream takes, and a connection quiet for half a second is
+sent a beat the far end answers on it, so a connection that works has always
+heard within a second and a half. One quiet for three seconds, while at least
+half the others have heard within one and a half, is closed, which is what
+its ending would have done twenty seconds later: its slot is redialled and
+its streams carried on from the last byte the far end acknowledged. It holds
+back when most connections are quiet together - that is the path, not the
+connection, and the failover's to judge - and when the far end has never
+answered a beat, which a core before 1.1.3 does not.
+
+Two things the first build on the pair taught it. The minute after the
+restart a thousand programs reconnected at once and the foreign server's xray
+took its time with them; a reader handing a frame to a program that slow
+reads nothing more meanwhile, most connections went quiet that way together,
+and the rule rightly held back - while the one connection the path really had
+stopped waited twenty-nine seconds behind them. A reader busy handing a frame
+up now counts as hearing, and is never replaced. And a replacement through
+Cloudflare came up and carried nothing, and sat there for the thirty seconds a
+slot is left alone after a replacement; that pause is for a connection that
+worked and went quiet, and one that has heard nothing since it was made is now
+replaced again after three seconds, then six, doubling up to thirty.
+
+Ten minutes of the users' tunnel after the first build, at 32 connections,
+the same hour of the evening, felt through the tunnel the same way - eight
+connections held open and asked a byte four times a second, and a fresh
+connection every two seconds:
+
+	                                     before                 after
+	  new connections, median/p90/worst  112 / 272 / 3196 ms    97 / 101 / 330 ms
+	  of them over a second              2 of 40                0 of 293
+	  round trips on open ones           109 / p90 159 /        96 / p99 147 /
+	                                     worst 3446 ms          worst 721 ms
+	  of them over a second              (not counted)          0 of 13835
+
+Two connections were replaced in those ten minutes; the second was the
+replacement that never carried, above.
+
+The other roads between the same two servers, the same hour, each a test
+tunnel of its own for about a minute, the foreign server dialling:
+
+	                           new connection        idle round trip   down, 4 streams   ended
+	                           median / p90 / worst  median / worst
+	  WSS via Cloudflare       112 / 408 / 859        107 / 439         779 Mbit/s        6
+	  the same, again           97 / 101 / 101         96 / 101         781               9, 5 connections failed
+	  WS via Cloudflare, 8080   98 / 101 / 108         97 / 313         780               0
+	  Chrome TLS MUX, direct    77 /  82 /  83         76 /  97         661               0
+	  Decoy TLS MUX, direct     80 /  83 /  88         77 /  90         614               0
+	  WSS MUX, direct           77 /  83 /  90         75 /  84         744               2
+	  TCP MUX, direct           -                      -                -                 13, one every ten seconds
+	  UDP                       6 of 200 datagrams came back
+
+Pings to the foreign server's address lost 70 to 90 per cent from Iran while
+the router in front of it, on the same path, answered every one, and so did
+8.8.8.8, 1.1.1.1 and 9.9.9.9: the filter has that address, not the route. It
+shows in what it does to each transport - TCP MUX cut every ten seconds, UDP
+after six datagrams - and not, that hour, in what it did to the three that
+look like TLS to a site. A minute of a test's traffic is not the users' load,
+though: that morning WSS MUX direct, carrying the users, lost 166 to 173
+carrier connections in ten minutes, which is why they were moved to
+Cloudflare in the first place.
+
+## 45. A crowd: the forward tunnel, the packet level, and flagtun
+
+On 2026-09-30 the users of the second pair complained of a slow tunnel at
+the evening peak, and the forward tunnel's own log said why: a stream whose
+program read slowly held up every stream behind it on the same connection,
+and the resets that followed were users' connections given up on. Every
+TCP multiplexer has this - Backhaul's too - because a connection delivers in
+order: one lost packet, or one slow reader, and the forty users pinned to
+that connection wait together.
+
+A crowd through one test link filled to the top, 80 Mbit/s between Iran 1
+and Germany, 44 users on 32 connections - downloads, video, slow readers,
+sixteen chatting a byte four times a second, a new connection every quarter
+second - the chat's round trip:
+
+	                                        chat p90          fairness of the downloads
+	  the forward tunnel as it was          1072 - 1655 ms    0.65 - 0.99
+	  rewritten, 128 KB parked per stream    760 - 1111
+	  rewritten, 16 KB parked per stream     573 -  760       0.76 - 0.995
+	  the packet level, the same link        212 -  228       0.998
+
+The rewrite (internal/forward: a scheduler per connection, control first,
+then fresh streams, then busy ones in turn; a window per stream counted from
+what the far end's program has taken) halves the tail. What is parked in the
+kernel in front of it is outside its reach and waits in the kernel's order,
+so tuning.profile now parks 32 KB (64 for throughput and max): at 128 KB, 44
+users on 32 connections - two and a half megabits each - is 400 ms in front
+of every keystroke. The rest of the tail is the one ordered connection, and
+no scheduler above it can remove it; at the packet level each user's TCP runs
+end to end and a loss is that user's alone. Measured the same way at 44
+users with the link full: the forward tunnel's chatting users p90 900 ms and
+up to 3 s, jitter 315 - 366 ms; at the packet level 225 ms and at most 470,
+jitter 36 - 50. So the users' ports now go to a private link at the packet
+level while one answers (pingify-core -switch, internal/l3switch), and to the
+forward tunnel, Cloudflare first, when none does.
+
+That makes the private link the users' road, and it was compared with
+flagtun's ICMP, v1.69 at its defaults, on the same path in the same minutes,
+each a test link of its own, taking turns. Four fixes came out of it:
+
+- The device's queue. Germany's ICMP link had dropped 1.1 million packets on
+  the way out by evening, each a user's TCP halving its window. At
+  txqueuelen 10000 and an 8 MB receive buffer: 503 and 535 Mbit/s on one and
+  four streams, against flagtun's 483 and 509 and the old link's 424 and
+  364; 14 thousand dropped where the old link dropped 1.1 million.
+- The order. The readers of one socket are one per core, and a batch taken
+  second could reach the device first: on Iran 1, 28,013 packets captured on
+  the wire had two out of order, and the link, after its readers, twenty. The
+  batches are now numbered as they come off the socket and handed over in
+  that order (inOrder, internal/carrier/order.go).
+- The loss counter. A far end that restarted ahead of the old count showed
+  as hundreds of millions of packets lost; a jump past sixteen million is now
+  a new beginning.
+- A device queue per core, up to four (defaultQueues, internal/link). One
+  queue on Germany dropped 75 thousand packets and carried 451 - 584 Mbit/s;
+  four dropped 7 thousand and carried 561 - 579, flagtun 546 - 604.
+
+Ten minutes, three rounds, each round a normal crowd (about 36 Mbit/s) for
+25 s and then four downloads flat out while sixteen chat for 13 s; medians of
+the rounds:
+
+	                              normal: chat p50 / p99    full: Mbit/s   chat p50 / p99
+	  flagtun                          76 / 88               553           152 / 531
+	  ours, 4 queues, mtu 1360         76 / 91               575           224 / 685
+	  the same, txqueuelen 2000        76 / 83               578           222 / 984
+
+Under a normal load the two are the same. With the link full, ours carried
+more and answered later; section 46 is where that time was.
+
+## 46. Where a full link's time goes: a queue on the way out
+
+The full link's extra 70 ms of section 45, looked for directly. Four
+downloads flat out from Germany through a test link while sixteen chat,
+sampling every half second eth0's queue on Germany and the carrier sockets'
+receive queues on Iran 1, 2026-09-30 21:35 UTC:
+
+	                     downloads   chat p50 / p90 / p99   Germany's eth0: queue   dropped there
+	  flagtun              590        210 / 226 / 589        up to 9,005 packets      9,441
+	  ours                 588        229 / 339 / 877        up to 8,953             60,062
+	  ours, paced at 900   521        252 / 301 / 808        up to 8,945             19,151
+
+The receive side was empty throughout: Iran 1's sockets held at most 340 KB
+for a moment and dropped nothing, its interface dropped nothing. The time is
+all in one place, eth0's fq on Germany - the server's own way out, which
+carries about 600 Mbit/s and not more. The whole tunnel is one socket and so
+one flow to fq, one queue first in first out, and the downloads stand
+thousands of packets in it: 9,000 packets of 1,400 bytes at 600 Mbit/s is
+170 ms, in front of every other user's packet. flagtun stood the same queue.
+And the loss the link had been counting on this path - 59,208 packets in that
+run - was fq throwing ours away at its limit, 60,062: not the path at all.
+The TCP inside resent 8.8 per cent of what it sent.
+
+The queue can only be made short where the flows inside the tunnel can be
+seen, which is the tun device, and only if the device, not eth0, is the
+narrowest point. So cake on the device, a little under what eth0 carries,
+one queue per flow (tun.shape_kharej_mbit, internal/link/shape.go). The same
+test, the same minutes, the first three 13 s and the last two 20 s:
+
+	                  downloads   chat p50 / p90 / p99   TCP resent   eth0 queue   dropped at eth0
+	  no limit          614        219 / 365 / 894        8.8%         ~9,000       71,583
+	  cake 520          452         82 /  96 / 231        0.17%        0            0
+	  cake 560          451         88 / 133 / 399        0.10%        up to 1,617  0
+	  cake 600          538         85 / 106 / 171        0.08%        up to 4,086  0
+	  cake 660          552         94 / 158 / 324        0.10%        up to 2,912  0
+
+with the path's own round trip at 76 ms. At 600 the chat waits 9 ms over
+the path where it waited 143, the downloads keep 88 per cent of what they
+had, and the resending - traffic paid for twice - is gone. At 660 the queue
+starts to come back at eth0. Germany's two links to Iran 1 run at 600 since
+22:10 UTC the same day. Iran 1's way out and the Turkey pair are not limited:
+what their ways out carry has not been measured, and a number set above it
+does nothing while one set below costs speed.
+
 # How to measure, so the numbers mean something
 
 These cost as much time as the findings did.

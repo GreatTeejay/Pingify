@@ -10,7 +10,7 @@
 
 set -o pipefail
 
-PINGIFY_VERSION="1.1.2"
+PINGIFY_VERSION="1.1.3"
 PINGIFY_REPO="${PINGIFY_REPO:-GreatTeejay/Pingify}"
 
 # ---------------------------------------------------------------------------
@@ -1797,7 +1797,7 @@ go_fetch_why() {
 write_core_sources() {
     local d=$1
     mkdir -p "$d"
-    mkdir -p "$d/cmd/pingify" "$d/internal/buf" "$d/internal/carrier" "$d/internal/config" "$d/internal/forward" "$d/internal/kernel" "$d/internal/link" "$d/internal/logging" "$d/internal/status"
+    mkdir -p "$d/cmd/pingify" "$d/internal/buf" "$d/internal/carrier" "$d/internal/config" "$d/internal/forward" "$d/internal/kernel" "$d/internal/l3switch" "$d/internal/link" "$d/internal/logging" "$d/internal/status"
     cat > "$d/go.mod" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 module pingify
 
@@ -1974,7 +1974,7 @@ import (
 // from the first core is in docs/measured.md, and none of it is re-learned
 // here by accident: every finding in that file is either satisfied by this
 // code or has not been reached yet.
-const version = "1.1.2"
+const version = "1.1.3"
 
 func main() {
 	// Before anything else, because everything else is downstream of having
@@ -1987,6 +1987,7 @@ func main() {
 		showVer = flag.Bool("version", false, "print the version and stop")
 		ask     = flag.String("status", "", "ask a running tunnel how it is (host:port or just a port) and stop")
 		healthz = flag.String("healthz", "", "exit 0 only if the tunnel at this address is up")
+		sw      = flag.String("switch", "", "run the switch this file describes: users' ports onto private links at the packet level")
 	)
 	flag.Parse()
 
@@ -2007,6 +2008,10 @@ func main() {
 			logging.Die("could not ask the tunnel at %s: %v", *ask, err)
 		}
 		status.Print(r)
+		return
+	}
+	if *sw != "" {
+		runSwitch(*sw, *check)
 		return
 	}
 	if *cfgPath == "" {
@@ -2265,6 +2270,57 @@ func widenScheduler() {
 	}
 }
 PINGIFY_GO_SOURCE_EOF
+    cat > "$d/cmd/pingify/switch.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"pingify/internal/l3switch"
+	"pingify/internal/logging"
+)
+
+// runSwitch is `pingify-core -switch FILE`: the users' ports pointed at the
+// first private link that answers, at the packet level, and back at this
+// machine's own listeners - the forward tunnel - when none does. See
+// internal/l3switch.
+func runSwitch(path string, checkOnly bool) {
+	cfg, err := l3switch.Load(path)
+	if err != nil {
+		logging.Die("%v", err)
+	}
+	var ports, routes []string
+	for _, p := range cfg.Ports {
+		ports = append(ports, p.String())
+	}
+	for _, r := range cfg.Routes {
+		routes = append(routes, r.Target)
+	}
+	if checkOnly {
+		fmt.Printf("%s: good - switch %s, ports %s, routes %s in that order\n",
+			path, cfg.Name, strings.Join(ports, " "), strings.Join(routes, " then "))
+		return
+	}
+	logging.Info("core: pingify-core %s starting: switch %s, ports %s to %s in that order, else this machine",
+		version, cfg.Name, strings.Join(ports, " "), strings.Join(routes, " then "))
+	done := make(chan struct{})
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-stop
+		close(done)
+	}()
+	s := l3switch.New(cfg, l3switch.NewIPTables(cfg.Ports), l3switch.Healthz)
+	if err := s.Run(done); err != nil {
+		logging.Die("switch: %v", err)
+	}
+	logging.Info("switch: stopped; the ports are this machine's own again")
+}
+PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/buf/buf.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 package buf
 
@@ -2336,8 +2392,14 @@ func Take(head, n int) *[]byte {
 // The old core swept a map of counters on every packet to expire the ones
 // that had fallen out of the window, which is O(window) per packet to learn
 // something a shift already knows.
+//
+// Eight thousand and not four since the links read their device on a queue
+// per core: each queue stamps its packets as it sends them, so what one
+// queue sent a moment before another can arrive behind the other's, and a
+// packet further behind than the window is refused as a replay. Eight
+// thousand is a sixth of a second at fifty thousand packets a second.
 const (
-	ReplayDepth = 4096
+	ReplayDepth = 8192
 	replayWords = ReplayDepth / 64
 )
 
@@ -2352,6 +2414,14 @@ const (
 // that is inside the window and handled there; nothing on a path replays two
 // packets from four thousand ago back to back.
 const restartRun = 2
+
+// restartJump is how far ahead a counter may leap and still be the same run
+// of the far end. Further than this is not loss - sixteen million packets is
+// twenty gigabytes nothing arrived of - but the far end having restarted
+// with its counter somewhere random ahead of the old one, which the framer
+// does on purpose (see newFramer). Counted as loss, one restart showed the
+// Iran 2 to Turkey ICMP link as having lost 546,296,362 packets.
+const restartJump = 1 << 24
 
 type ReplayWindow struct {
 	top   uint32 // the highest counter seen
@@ -2397,7 +2467,14 @@ func (w *ReplayWindow) Fresh(seq uint32) bool {
 	case int32(seq-w.top) > 0:
 		// Newer than anything seen. Drag the window forward, clearing the
 		// bits that just fell off the bottom.
-		if d := seq - w.top; d > 1 {
+		if d := seq - w.top; d > restartJump {
+			// A new run of the far end, not a gap: start again from here.
+			w.top = seq
+			w.bits = [replayWords]uint64{}
+			w.set(0)
+			w.ancient = 0
+			return true
+		} else if d > 1 {
 			w.skipped += uint64(d - 1)
 			w.gaps++
 		}
@@ -2646,6 +2723,32 @@ func (r *batchReader) read(rc syscall.RawConn) (int, error) {
 	return n, nil
 }
 
+// readInOrder is read, numbering the batch with o's next ticket inside the
+// socket call itself - which the runtime makes one at a time - so the numbers
+// are the order the batches came off the socket. A read that took nothing,
+// because the socket closed under it, has noTicket and owes no turn.
+func (r *batchReader) readInOrder(rc syscall.RawConn, o *inOrder) (int, uint64, error) {
+	var n int
+	var errno syscall.Errno
+	t := noTicket
+	err := rc.Read(func(fd uintptr) bool {
+		ret, _, e := syscall.Syscall6(sysRecvmmsg, fd,
+			uintptr(unsafe.Pointer(&r.msgs[0])), uintptr(len(r.msgs)), 0, 0, 0)
+		if e == syscall.EAGAIN || e == syscall.EINTR {
+			return false
+		}
+		n, errno, t = int(ret), e, o.ticket()
+		return true
+	})
+	if err != nil {
+		return 0, t, err
+	}
+	if errno != 0 {
+		return 0, t, errno
+	}
+	return n, t, nil
+}
+
 // packet returns the i'th datagram of the batch and the address it came from.
 //
 // A datagram larger than the buffer arrives cut short, with MSG_TRUNC in its
@@ -2785,6 +2888,10 @@ type batchReader struct{ n int }
 func newBatchReader(size int) *batchReader { return &batchReader{} }
 
 func (r *batchReader) read(rc syscall.RawConn) (int, error) { return 0, errNoBatch }
+
+func (r *batchReader) readInOrder(rc syscall.RawConn, o *inOrder) (int, uint64, error) {
+	return 0, noTicket, errNoBatch
+}
 
 func (r *batchReader) packet(i int) ([]byte, [4]byte) { return nil, [4]byte{} }
 
@@ -2986,6 +3093,16 @@ type failover struct {
 	// held the same way, for the same reason.
 	probeKeepalive, probePatience, huntWait, huntGrace time.Duration
 
+	// A member the tunnel was moved to by hand and is to stay on: the side
+	// that dials does not go back to a better one while it is set. -1 is none.
+	// Silence still moves the tunnel, and clears it.
+	pinned atomic.Int32
+
+	// What the menu asks of the side that dials - check the members, move,
+	// stay, go back to deciding alone. Handled by decide, so a move asked for
+	// by hand and one decide makes itself can never run at once.
+	controls chan control
+
 	// A member's counters go with it when it closes, and a total that went
 	// backwards would read to the status page as the path taking bytes back.
 	retired struct {
@@ -3000,12 +3117,27 @@ type failover struct {
 type member struct {
 	idx  int
 	kind string
+	port int
+	host string // the address of its own, when it has one
 	cfg  *config.Config
 
 	car   atomic.Pointer[streamCarrier] // nil while it is not open
 	fresh bool                          // car has never been run, so it may be
 	heard atomic.Int64                  // unix nanos of the last record through it
 	kept  atomic.Pointer[streamCarrier] // the carrier its keepalive loop was started for
+
+	// The last time it was tried while it was not the one in use - by a
+	// check asked for from the menu, or by decide on its own: when, whether
+	// it answered, and its round trip. For the menu; nothing decides on it.
+	checkedAt  atomic.Int64 // unix nanos, 0 for never
+	checkedOK  atomic.Bool
+	checkedRTT atomic.Int64 // nanos
+}
+
+func (m *member) noteCheck(ok bool, rtt time.Duration) {
+	m.checkedOK.Store(ok)
+	m.checkedRTT.Store(int64(rtt))
+	m.checkedAt.Store(time.Now().UnixNano())
 }
 
 // How members are chosen among the ones that answer.
@@ -3040,6 +3172,7 @@ func newFailover(cfg *config.Config) (*failover, error) {
 		probeEvery:  time.Duration(cfg.Failover.ProbeEvery) * time.Second,
 		prefer:      cfg.Failover.Prefer,
 		done:        make(chan struct{}),
+		controls:    make(chan control),
 
 		probeKeepalive: probeKeepalive,
 		probePatience:  probePatience,
@@ -3047,6 +3180,7 @@ func newFailover(cfg *config.Config) (*failover, error) {
 		huntGrace:      huntGrace,
 	}
 	c.carrying.Store(-1)
+	c.pinned.Store(-1)
 	var kinds []string
 	for i, m := range cfg.Members() {
 		mc := cfg.For(m)
@@ -3055,7 +3189,7 @@ func newFailover(cfg *config.Config) (*failover, error) {
 			c.Close()
 			return nil, fmt.Errorf("%s on %d: %v", m.Type, m.Port, err)
 		}
-		mem := &member{idx: i, kind: m.Type, cfg: mc, fresh: true}
+		mem := &member{idx: i, kind: m.Type, port: m.Port, host: m.Host, cfg: mc, fresh: true}
 		c.members = append(c.members, mem)
 		c.attach(mem, car)
 		if car.Headroom() > c.head {
@@ -3064,7 +3198,11 @@ func newFailover(cfg *config.Config) (*failover, error) {
 		if p := car.MaxPayload(); c.maxPay == 0 || p < c.maxPay {
 			c.maxPay = p
 		}
-		kinds = append(kinds, fmt.Sprintf("%s/%d", m.Type, m.Port))
+		if m.Host != "" {
+			kinds = append(kinds, fmt.Sprintf("%s/%d to %s", m.Type, m.Port, m.Host))
+		} else {
+			kinds = append(kinds, fmt.Sprintf("%s/%d", m.Type, m.Port))
+		}
 	}
 	how := "in that order"
 	if c.prefer == preferFastest {
@@ -3420,6 +3558,26 @@ func (c *failover) decide() {
 		select {
 		case <-c.done:
 			return
+		case r := <-c.controls:
+			switch r.op {
+			case "check":
+				r.reply <- c.check(probes)
+			case "use":
+				stopProbes()
+				r.reply <- c.useByHand(r.to, r.stay)
+				since, lastRx, quick = time.Now(), 0, false
+				nextProbe = time.Now().Add(c.probeEvery)
+			case "auto":
+				was := c.pinned.Swap(-1)
+				nextProbe = time.Now()
+				if was >= 0 {
+					logging.Info("failover: deciding alone again; %s is no longer held", c.members[was].kind)
+					r.reply <- "deciding alone again: the tunnel goes back to a better member once it has answered for long enough"
+				} else {
+					r.reply <- "nothing was held; the tunnel decides alone as it was"
+				}
+			}
+			continue
 		case <-tk.C:
 		}
 		now := time.Now()
@@ -3439,6 +3597,9 @@ func (c *failover) decide() {
 		if now.Sub(since) > c.switchAfter {
 			stopProbes()
 			why := fmt.Sprintf("nothing has arrived on %s for %s", m.kind, c.switchAfter.Round(time.Second))
+			if c.pinned.Swap(-1) >= 0 {
+				why += ", and it was held there by hand - it is not any more"
+			}
 			if j := c.hunt(i, c.huntWait); j >= 0 {
 				c.switchTo(j, why, false)
 			} else {
@@ -3449,8 +3610,8 @@ func (c *failover) decide() {
 			continue
 		}
 
-		// Is there anywhere better to be?
-		if c.returnAfter == 0 {
+		// Is there anywhere better to be? Not while a member is held by hand.
+		if c.returnAfter == 0 || c.pinned.Load() >= 0 {
 			continue
 		}
 		cands := c.better(i)
@@ -3835,11 +3996,211 @@ func (p *probe) state(now time.Time, healthyFor time.Duration) probeResult {
 	return probeWaiting
 }
 
+// stop ends the probe and notes what it found on its member - if it found
+// anything: one stopped before its first answer could arrive, because a hunt
+// ended on a better member, says nothing either way.
 func (p *probe) stop() {
 	p.once.Do(func() {
 		close(p.done)
 		_ = p.car.Close()
+		if p.answers.Load() > 0 {
+			p.m.noteCheck(true, p.rtt())
+		} else if time.Since(p.started) >= p.patience {
+			p.m.noteCheck(false, 0)
+		}
 	})
+}
+
+// --- by hand -------------------------------------------------------------
+
+// A control is one thing asked from the menu, and the answer is a line for the
+// person who asked.
+type control struct {
+	op    string // check, use, auto
+	to    int
+	stay  bool
+	reply chan string
+}
+
+// Control is the menu asking the side that dials to check its members, to move
+// the tunnel to one of them - to stay there, or to go back to deciding alone
+// afterwards - or to stop holding one. The side that waits decides nothing,
+// so it can do none of it.
+func (c *failover) Control(op string, to int, stay bool) (string, error) {
+	if !c.dials {
+		return "", fmt.Errorf("the other server dials, and decides which member carries; ask there")
+	}
+	switch op {
+	case "check", "auto":
+	case "use":
+		if to < 0 || to >= len(c.members) {
+			return "", fmt.Errorf("there is no member %d; they are 0 to %d", to, len(c.members)-1)
+		}
+	default:
+		return "", fmt.Errorf("%q is not something the failover does", op)
+	}
+	r := control{op: op, to: to, stay: stay, reply: make(chan string, 1)}
+	// decide takes it between two of its seconds; a switch or a hunt under
+	// way holds it for as long as that takes.
+	select {
+	case c.controls <- r:
+	case <-c.done:
+		return "", fmt.Errorf("the tunnel is closing")
+	case <-time.After(controlWait):
+		return "", fmt.Errorf("the tunnel is busy moving between members; ask again in a moment")
+	}
+	select {
+	case line := <-r.reply:
+		return line, nil
+	case <-c.done:
+		return "", fmt.Errorf("the tunnel is closing")
+	case <-time.After(controlAnswer):
+		return "", fmt.Errorf("no answer yet; the tunnel carries on, look again in a moment")
+	}
+}
+
+// How long a control waits to be taken, and then for its answer. A check
+// takes a probe's patience at most; a move by hand waits for the member to
+// connect and be heard, which is a dial's wait twice at the very worst.
+var (
+	controlWait   = 20 * time.Second
+	controlAnswer = 2*streamDialWait + 5*time.Second
+)
+
+// check tries every member but the one in use, the way decide tries them,
+// and notes what each did. running is decide's own probes, whose members are
+// read from them rather than tried twice: two probes on one member would take
+// slot 0 from each other on the side that waits.
+func (c *failover) check(running []*probe) string {
+	active := int(c.active.Load())
+	busy := map[int]*probe{}
+	for _, p := range running {
+		busy[p.m.idx] = p
+	}
+	var watch, mine []*probe
+	for _, m := range c.members {
+		if m.idx == active {
+			continue
+		}
+		if p, ok := busy[m.idx]; ok {
+			watch = append(watch, p)
+			continue
+		}
+		if p := c.newProbe(m); p != nil {
+			watch, mine = append(watch, p), append(mine, p)
+		}
+	}
+	// Three answers each, for a round trip worth quoting, or a probe's
+	// patience and one keepalive more, which is what a member gets before it
+	// counts as not answering.
+	deadline := time.Now().Add(c.probePatience + c.probeKeepalive)
+	for time.Now().Before(deadline) {
+		all := true
+		for _, p := range watch {
+			if p.answers.Load() < 3 {
+				all = false
+			}
+		}
+		if all {
+			break
+		}
+		select {
+		case <-c.done:
+			return "the tunnel is closing"
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	for _, p := range mine {
+		p.stop()
+	}
+	for _, p := range watch {
+		if busy[p.m.idx] == p && p.answers.Load() > 0 {
+			p.m.noteCheck(true, p.rtt())
+		}
+	}
+	ok := 0
+	for _, p := range watch {
+		if p.m.checkedOK.Load() {
+			ok++
+		}
+	}
+	return fmt.Sprintf("%d of %d answered", ok, len(watch))
+}
+
+// useByHand moves the tunnel to member i, the careful way decide moves back
+// to a member: it has to connect before the one in use lets go. stay holds it
+// there until silence moves it or the menu lets it go.
+func (c *failover) useByHand(i int, stay bool) string {
+	from := int(c.active.Load())
+	moved := i == from || c.switchTo(i, "asked for by hand", true)
+	if !moved {
+		c.pinned.Store(-1)
+		return fmt.Sprintf("%s did not connect; the tunnel stays on %s", c.members[i].kind, c.members[from].kind)
+	}
+	if stay {
+		c.pinned.Store(int32(i))
+		logging.Info("failover: held on %s by hand, until the menu lets it go or it goes quiet", c.members[i].kind)
+	} else {
+		c.pinned.Store(-1)
+	}
+	switch {
+	case i == from && stay:
+		return fmt.Sprintf("already on %s, and held there now", c.members[i].kind)
+	case i == from:
+		return fmt.Sprintf("already on %s", c.members[i].kind)
+	case stay:
+		return fmt.Sprintf("moved to %s, and held there", c.members[i].kind)
+	case i == c.bestRank(-1):
+		return fmt.Sprintf("moved to %s", c.members[i].kind)
+	}
+	return fmt.Sprintf("moved to %s; the tunnel goes back to a better member once one has answered for %s",
+		c.members[i].kind, c.returnAfter.Round(time.Second))
+}
+
+// Lines is every member for the menu, one line each, fields apart by a space:
+// its number, kind, port, its own address or "-", "use" when it carries,
+// "held" when it is held there by hand, seconds since it was last tried or
+// "-", "ok" or "no" for that try, and the round trip in milliseconds or "-".
+// The member in use has the tunnel's own round trip, measured by its pings.
+// On the side that waits nothing is tried, and only "use" is known.
+func (c *failover) Lines() []string {
+	active := -1
+	if c.dials {
+		active = int(c.active.Load())
+	} else {
+		var bestHeard int64
+		for _, m := range c.members {
+			if h := m.heard.Load(); h > bestHeard && m.car.Load() != nil {
+				active, bestHeard = m.idx, h
+			}
+		}
+	}
+	held := int(c.pinned.Load())
+	out := make([]string, 0, len(c.members))
+	for _, m := range c.members {
+		host, use, hold, ago, ok, rtt := "-", "-", "-", "-", "-", "-"
+		if m.host != "" {
+			host = m.host
+		}
+		if m.idx == active {
+			use = "use"
+			if r := c.activeRTT(); c.dials && r > 0 {
+				ago, ok, rtt = "0", "ok", fmt.Sprint(r.Milliseconds())
+			}
+		} else if at := m.checkedAt.Load(); at > 0 {
+			ago = fmt.Sprint(int64(time.Since(time.Unix(0, at)).Seconds()))
+			if m.checkedOK.Load() {
+				ok, rtt = "ok", fmt.Sprint(time.Duration(m.checkedRTT.Load()).Milliseconds())
+			} else {
+				ok = "no"
+			}
+		}
+		if m.idx == held {
+			hold = "held"
+		}
+		out = append(out, fmt.Sprintf("%d %s %d %s %s %s %s %s %s", m.idx, m.kind, m.port, host, use, hold, ago, ok, rtt))
+	}
+	return out
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/fallback.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
@@ -3965,10 +4326,13 @@ func newFallbackCarrier(cfg *config.Config) (*streamCarrier, error) {
 	return c, nil
 }
 
-// fallbackSNI is the name this end pretends to be, which is the name the far
-// end dials when there is one. A tunnel dialled by address has no name to
-// borrow, and borrows the default.
+// fallbackSNI is the name this end pretends to be: the one the config gives,
+// else the name the far end dials when there is one. A tunnel dialled by
+// address with no name given has none to borrow, and borrows the default.
 func fallbackSNI(cfg *config.Config) string {
+	if cfg.Transport.SNI != "" {
+		return cfg.Transport.SNI
+	}
 	h := cfg.DialHost()
 	if config.IsName(h) {
 		return h
@@ -4894,32 +5258,49 @@ func (f *framer) seal(b []byte) {
 // It is called from one goroutine, which is what lets the replay window be a
 // plain sliding bitmap with no lock on it.
 func (f *framer) open(b []byte) ([]byte, bool) {
-	if len(b) < frameLen {
+	seq, body, ok := f.verify(b)
+	if !ok || !f.admit(seq) {
 		return nil, false
+	}
+	return body, true
+}
+
+// verify is open's first half, the costly one: the tag, and nothing that
+// depends on what arrived before. Readers of one socket do it side by side;
+// see inOrder.
+func (f *framer) verify(b []byte) (seq uint32, body []byte, ok bool) {
+	if len(b) < frameLen {
+		return 0, nil, false
 	}
 	var want [tagLen]byte
 	f.tag(want[:], covered(b))
 	if !hmac.Equal(want[:], b[:tagLen]) {
 		atomic.AddUint64(&f.badTag, 1)
-		return nil, false
+		return 0, nil, false
 	}
+	return binary.BigEndian.Uint32(b[tagLen:frameLen]), b[frameLen:], true
+}
+
+// admit is open's second half: the replay window, which is in the order the
+// packets are admitted. A reliable framer's stream cannot replay, and has none.
+func (f *framer) admit(seq uint32) bool {
 	if f.reliable {
-		return b[frameLen:], true
+		return true
 	}
 	f.mu.Lock()
-	fresh := f.seen.Fresh(binary.BigEndian.Uint32(b[tagLen:frameLen]))
+	fresh := f.seen.Fresh(seq)
 	f.mu.Unlock()
 	if !fresh {
 		atomic.AddUint64(&f.replayed, 1)
-		return nil, false
 	}
-	return b[frameLen:], true
+	return fresh
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/gre.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 package carrier
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"math/rand/v2"
@@ -5012,6 +5393,10 @@ type greCarrier struct {
 	done        chan struct{}
 	once        sync.Once
 
+	// The batches the readers take, handed to the device in the order they
+	// came off the socket. See inOrder.
+	order *inOrder
+
 	rxBytes, txBytes uint64
 	sendErrs         uint64
 	notOurs          uint64
@@ -5023,6 +5408,7 @@ func newGRECarrier(cfg *config.Config) (*greCarrier, error) {
 		key:   greKeyFrom(cfg.Token),
 		seen:  buf.NewReplayWindow(),
 		done:  make(chan struct{}),
+		order: newInOrder(),
 		burst: cfg.Tuning.SendBatch,
 	}
 	c.listen(cfg.Transport.Keepalive)
@@ -5146,6 +5532,60 @@ func (c *greCarrier) stamp(b []byte) {
 	binary.BigEndian.PutUint32(b[8:12], c.seq.Add(1))
 }
 
+// greKeepalive is what a keepalive carries after the GRE header: a packet,
+// because on this path a GRE packet with anything else inside does not cross.
+//
+// It used to carry nothing. Counted on both ends on 2026-09-30 while a new
+// link came up between Iran 1 and Germany, and again between Iran 2 and
+// Turkey: every keepalive Iran sent was lost on the way, and every packet
+// that carried a real IP packet - a ping, a SYN - arrived. The path parses
+// what is inside a GRE packet (see the top of this file), and an empty
+// payload is not a packet. So the side that waits never learned where the
+// far end was until something inside the link happened to send, and a link
+// with nothing on it went silent from that side however many keepalives
+// were sent - a test link waited out its whole minute and never came up.
+//
+// So it is IPv4 and UDP to the discard port, from and to the documentation
+// range, with a time to live of one: a core from before this that hands it to
+// its device sees the kernel throw it away rather than route it anywhere.
+var greKeepalive = func() []byte {
+	p := []byte{
+		0x45, 0, 0, 28, // version and header length, tos, total length
+		0, 0, 0x40, 0, // id, don't fragment
+		1, 17, 0, 0, // ttl, udp, checksum below
+		192, 0, 2, 1, // from 192.0.2.1
+		192, 0, 2, 2, // to 192.0.2.2
+		0, 9, 0, 9, // discard to discard
+		0, 8, 0, 0, // udp length, no checksum
+	}
+	var sum uint32
+	for i := 0; i < 20; i += 2 {
+		sum += uint32(p[i])<<8 | uint32(p[i+1])
+	}
+	for sum > 0xffff {
+		sum = sum>>16 + sum&0xffff
+	}
+	binary.BigEndian.PutUint16(p[10:12], ^uint16(sum))
+	return p
+}()
+
+// isGREKeepalive is whether a packet that arrived is a keepalive: nothing at
+// all from a core before greKeepalive, or greKeepalive itself.
+func isGREKeepalive(body []byte) bool {
+	return len(body) == 0 || bytes.Equal(body, greKeepalive)
+}
+
+// withKeepalive puts greKeepalive after the header of a packet with nothing
+// in it, which is what keepaliveLoop sends, and returns the packet.
+func withKeepalive(bp *[]byte) []byte {
+	b := *bp
+	if len(b) == greHdrLen {
+		b = append(b, greKeepalive...)
+		*bp = b
+	}
+	return b
+}
+
 func (c *greCarrier) Send(bp *[]byte) error {
 	peer := c.peer.Load()
 	b := *bp
@@ -5156,6 +5596,7 @@ func (c *greCarrier) Send(bp *[]byte) error {
 		}
 		return nil
 	}
+	b = withKeepalive(bp) // only keepalives come this way empty
 	c.stamp(b)
 
 	n, err := c.pc.WriteToIP(b, peer)
@@ -5269,10 +5710,16 @@ func (c *greCarrier) Run() {
 func (c *greCarrier) runBatched() {
 	r := newBatchReader(greReadBuf)
 	for {
-		n, err := r.read(c.rc)
-		for i := 0; i < n; i++ {
-			b, from := r.packet(i)
-			c.handle(b, from)
+		n, t, err := r.readInOrder(c.rc, c.order)
+		// GRE has no tag to check, only a key to compare, so there is nothing
+		// worth doing side by side: the whole batch goes in its turn.
+		if t != noTicket {
+			c.order.wait(t)
+			for i := 0; i < n; i++ {
+				b, from := r.packet(i)
+				c.handle(b, from)
+			}
+			c.order.done()
 		}
 		if err != nil {
 			select {
@@ -5353,7 +5800,7 @@ func (c *greCarrier) handle(b []byte, from [4]byte) {
 
 	c.touch()
 	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
-	if len(body) == 0 {
+	if isGREKeepalive(body) {
 		return // a keepalive, which has done its whole job by arriving
 	}
 	if f := c.onPacket.Load(); f != nil {
@@ -5495,6 +5942,10 @@ type icmpCarrier struct {
 	done chan struct{}
 	once sync.Once
 
+	// The batches the readers take, handed to the device in the order they
+	// came off the socket. See inOrder.
+	order *inOrder
+
 	rxBytes, txBytes uint64
 	sendErrs         uint64
 }
@@ -5504,6 +5955,7 @@ func newICMPCarrier(cfg *config.Config) (*icmpCarrier, error) {
 		fr:    newFramer(cfg.Token, "pingify icmp v1"),
 		id:    icmpIDFrom(cfg.Token),
 		done:  make(chan struct{}),
+		order: newInOrder(),
 		burst: cfg.Tuning.SendBatch,
 	}
 	c.listen(cfg.Transport.Keepalive)
@@ -5763,11 +6215,30 @@ func (c *icmpCarrier) Run() {
 
 func (c *icmpCarrier) runBatched() {
 	r := newBatchReader(icmpReadBuf)
+	type checked struct {
+		seq  uint32
+		body []byte
+		from [4]byte
+		size int
+	}
+	ready := make([]checked, 0, recvBatch)
 	for {
-		n, err := r.read(c.rc)
+		n, t, err := r.readInOrder(c.rc, c.order)
+		// The tags side by side with the other readers; the window and the
+		// device in the order the batches came off the socket.
+		ready = ready[:0]
 		for i := 0; i < n; i++ {
 			b, from := r.packet(i)
-			c.handle(b, from)
+			if seq, body, ok := c.check(b); ok {
+				ready = append(ready, checked{seq, body, from, len(b)})
+			}
+		}
+		if t != noTicket {
+			c.order.wait(t)
+			for _, p := range ready {
+				c.take(p.seq, p.body, p.from, p.size)
+			}
+			c.order.done()
 		}
 		if err != nil {
 			select {
@@ -5806,13 +6277,21 @@ func (c *icmpCarrier) runPlain() {
 // the socket and hands it to the private link from there - see link.fromWire
 // for why there is nothing in between.
 func (c *icmpCarrier) handle(b []byte, from [4]byte) {
+	if seq, body, ok := c.check(b); ok {
+		c.take(seq, body, from, len(b))
+	}
+}
+
+// check is everything about one echo that does not depend on the ones before
+// it: that it is ours, and its tag. Readers do it side by side.
+func (c *icmpCarrier) check(b []byte) (seq uint32, body []byte, ok bool) {
 	// A raw socket is given the IP header by the kernel. Whether the net
 	// package has already taken it off depends on which call read the packet,
 	// so it is looked for rather than assumed.
 	if len(b) >= 20 && b[0]>>4 == 4 {
 		ihl := int(b[0]&0x0f) * 4
 		if ihl < 20 || len(b) <= ihl {
-			return
+			return 0, nil, false
 		}
 		b = b[ihl:]
 		c.sawIPHeader.Do(func() {
@@ -5820,17 +6299,21 @@ func (c *icmpCarrier) handle(b []byte, from [4]byte) {
 		})
 	}
 	if len(b) < icmpHdrLen+frameLen {
-		return
+		return 0, nil, false
 	}
 	if b[0] != icmpEchoReq && b[0] != icmpEchoReply {
-		return
+		return 0, nil, false
 	}
 	if binary.BigEndian.Uint16(b[4:6]) != c.id {
-		return
+		return 0, nil, false
 	}
+	return c.fr.verify(b[icmpHdrLen:])
+}
 
-	body, ok := c.fr.open(b[icmpHdrLen:])
-	if !ok {
+// take is the rest, in order: the replay window, the far end's address, and
+// the device.
+func (c *icmpCarrier) take(seq uint32, body []byte, from [4]byte, size int) {
+	if !c.fr.admit(seq) {
 		return
 	}
 
@@ -5842,7 +6325,7 @@ func (c *icmpCarrier) handle(b []byte, from [4]byte) {
 	}
 
 	c.touch()
-	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
+	atomic.AddUint64(&c.rxBytes, uint64(size))
 	if len(body) == 0 {
 		return // a keepalive, which has done its whole job by arriving
 	}
@@ -6417,6 +6900,67 @@ func (c *kcpConn) watch(idle time.Duration) {
 		}
 	}
 }
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/carrier/order.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package carrier
+
+import (
+	"sync"
+	"sync/atomic"
+)
+
+// inOrder hands what several readers took off one socket over in the order it
+// came off, while each does the rest of its work - checking the tag, mostly -
+// at the same time as the others.
+//
+// The readers of a private link's socket are one per core, and each takes a
+// batch and hands it to the device. Two batches taken one after the other
+// could be handed over the other way round, whenever the second reader was
+// quicker with its checks: packets of one user's connection that the path
+// had kept in order arrived out of it, and that user's TCP took the gap for a
+// loss and sent again. Measured on Iran 1 on 2026-09-30, with the users on the
+// ICMP link at the packet level: 28,013 packets captured on the wire, two out
+// of order; the link, counting the same seconds after its readers, twenty.
+//
+// A batch is numbered where it is taken - inside the socket read, which the
+// runtime does one at a time - so the numbers are the socket's own order.
+type inOrder struct {
+	next atomic.Uint64 // the number the next batch taken gets
+
+	mu   sync.Mutex
+	cond *sync.Cond
+	turn uint64 // the number whose turn it is to hand over
+}
+
+func newInOrder() *inOrder {
+	o := &inOrder{}
+	o.cond = sync.NewCond(&o.mu)
+	return o
+}
+
+// ticket numbers a batch. Called where the batch was taken off the socket.
+func (o *inOrder) ticket() uint64 { return o.next.Add(1) - 1 }
+
+// wait blocks until it is t's turn to hand over.
+func (o *inOrder) wait(t uint64) {
+	o.mu.Lock()
+	for o.turn != t {
+		o.cond.Wait()
+	}
+	o.mu.Unlock()
+}
+
+// done passes the turn on. Every ticket taken has to come here exactly once,
+// handed over or not, or every batch after it waits for ever.
+func (o *inOrder) done() {
+	o.mu.Lock()
+	o.turn++
+	o.mu.Unlock()
+	o.cond.Broadcast()
+}
+
+// noTicket is a read that took nothing off the socket and so owes no turn.
+const noTicket = ^uint64(0)
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/carrier/pace_linux.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 //go:build linux
@@ -7524,6 +8068,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -7600,6 +8145,65 @@ const (
 	helloLen = 4
 )
 
+// How the side that dials notices one connection that has stopped carrying
+// while the others carry on.
+//
+// Every stream of a forward tunnel is pinned to one connection, so a
+// connection the path has stopped delivering freezes every program riding it
+// - about sixty of them on the user's pair, with a thousand connections on
+// sixteen - and nothing moved them until the kernel gave the connection up
+// twenty seconds later (streamUserTimeout). Measured through Cloudflare at the
+// evening peak on 2026-09-29: new connections answered in 112 ms at the
+// median and in up to 3.2 s at the worst, and 208 carrier connections ended
+// in nine hours (docs/measured.md, section 44).
+//
+// So each connection is listened to on its own. The far end acknowledges
+// every sixteen kilobytes a stream takes, and a connection quiet for
+// beatEvery is sent a beat that the far end answers on it; the watch looks
+// twice as often as that, so a connection that works has always heard within
+// about beatEvery and a half, and a round trip. One quiet for stallAfter,
+// while at least half the connections have heard within half of it, is
+// replaced: the same thing as the connection ending, sooner - its streams are
+// carried on from the last byte the far end acknowledged, on the connection
+// that takes its slot.
+//
+// Half of stallAfter is the line between hearing and not because of what a
+// path that stops everywhere at once looks like: its connections do not all
+// fall quiet at the same instant, but within a beat of each other. By the time
+// the first has been quiet for stallAfter, every other has been quiet for
+// longer than half of it, so none counts as hearing and nothing is replaced -
+// that is the path, not one connection, and the failover's to judge.
+//
+// Only once the far end has answered a beat: a core of the version before
+// never does, and on it a quiet connection means nothing. And a slot is
+// replaced this way at most once in stallRest, so a far end that is itself
+// slow to read cannot have its connections torn down every few seconds; past
+// that, the kernel's twenty seconds are still there.
+var (
+	beatEvery  = 500 * time.Millisecond
+	stallAfter = 3 * time.Second
+	stallRest  = 30 * time.Second
+)
+
+// A beat and its answer: four bytes each, like a hello, which a core of the
+// version before takes for a datagram too short to be anything and drops.
+var (
+	beatMark   = [4]byte{0xA5, 0x5B, 0, 0}
+	beatAnswer = [4]byte{0xA5, 0x5C, 0, 0}
+)
+
+// The kinds of frame the carrier deals with itself rather than passing up.
+type frameKind int
+
+const (
+	framePacket frameKind = iota
+	frameKeepalive
+	frameHello
+	frameBeat
+	frameBeatAnswer
+	frameBad
+)
+
 // How much a writer may leave unsent on one carrier connection, by profile.
 //
 // Every stream of a forward tunnel is pinned to one connection, so this is the
@@ -7616,11 +8220,11 @@ const (
 // none of 2.68 GB at any profile depth, so it was never a lever anyway. KCP is
 // not covered here: it is UDP underneath and never reaches prepStream.
 //
-// Balanced is 131072 because that is the number parts/70-host.sh already
-// writes as net.ipv4.tcp_notsent_lowat, so a server whose operator never
-// opened the Optimize screen now behaves like one who did. The per-socket
-// value wins over the sysctl, which is the point: it no longer depends on
-// somebody having found that screen.
+// Balanced was 131072 because that is the number parts/70-host.sh writes as
+// net.ipv4.tcp_notsent_lowat, so a server whose operator never opened the
+// Optimize screen behaved like one who did. The per-socket value wins over
+// the sysctl, which is the point: it does not depend on somebody having found
+// that screen - and it is why lowering it here, below, needed no sysctl.
 //
 // Measured, in docs/measured.md section 39, with a small request timed
 // through the tunnel while eight streams saturated it. 64 KB was the least
@@ -7631,12 +8235,22 @@ const (
 // profile, whatever it is called. What this bounds is only the unsent queue,
 // never what is in flight; the writer is woken again at half of it, a third
 // of a millisecond of data at this path's rate, so 64 KB does not underfill.
+//
+// And then lowered, on 2026-09-30, once the forwarder had a fair scheduler of
+// its own in front of each connection (internal/forward/sched.go): whatever
+// waits here waits in the kernel's order, first come first served, behind
+// the downloads, where the scheduler cannot reach it. Measured through a test
+// link filled to the top at 80 Mbit/s, 44 users on 32 connections - two and a
+// half megabits each - 128 KB is 400 ms in front of every keystroke, and the
+// rewritten forwarder's chatting users waited p90 760 and 1111 ms with it;
+// at 16 KB, 573 and 747, carrying as much. 32 KB is the least that keeps
+// every profile over the two-record floor below; throughput and max keep 64.
 func notsentLowat(cfg *config.Config) int {
 	switch cfg.Tuning.Profile {
-	case config.ProfileGaming, config.ProfileStable:
+	case config.ProfileThroughput, config.ProfileMax:
 		return 64 << 10
 	}
-	return 128 << 10
+	return 32 << 10
 }
 
 // The first frame a dialler sends says which slot it is filling.
@@ -7705,7 +8319,63 @@ type streamLink struct {
 	fm  framing
 	mu  sync.Mutex
 	seq uint64 // when it was accepted, so the oldest can be found
+
+	// When a frame last arrived on it, in nanoseconds since carrierStart;
+	// the time it came up until one has. See stallAfter.
+	rx atomic.Int64
+	// Whether a beat is still on its way into the connection. A beat waits
+	// for the writer like anything else, and a connection that has stopped
+	// can hold it there; one is enough.
+	beating atomic.Bool
+	// Whether its reader is handing a frame up. A forward tunnel's reader
+	// waits there when a stream's program is slow to take what it is given,
+	// and nothing more is read from the connection meanwhile - which is this
+	// end being slow, not the path. Seen on the user's pair the minute after
+	// a restart, when a thousand programs reconnected at once and the far
+	// end's xray took its time with them: most connections went quiet that
+	// way together, and one that was quiet for want of the path waited
+	// twenty-nine seconds behind them to be replaced.
+	busy atomic.Bool
+	// When it was made, which rx starts at.
+	born int64
+	// How long it may be quiet before it is sent a beat, drawn afresh after
+	// every beat; zero until the first is drawn. See beatDue.
+	nextBeat atomic.Int64
+	// When its reader last began handing a frame up, in nanoseconds since
+	// carrierStart. See tellBusy.
+	busyAt atomic.Int64
 }
+
+// beatDue is how long this connection may be quiet before a beat goes down
+// it: beatEvery, give or take half of it, drawn again after each beat. A beat
+// at exactly beatEvery on every quiet connection was a clock that anyone
+// watching the connections could have set theirs by - the same four bytes,
+// twice a second, on all thirty-two of them.
+func (l *streamLink) beatDue(every time.Duration) time.Duration {
+	if d := l.nextBeat.Load(); d != 0 {
+		return time.Duration(d)
+	}
+	d := jitter(every)
+	l.nextBeat.Store(int64(d))
+	return d
+}
+
+// jitter is somewhere between half of d and half as much again.
+func jitter(d time.Duration) time.Duration {
+	if d <= 1 {
+		return d
+	}
+	return d/2 + time.Duration(rand.Int64N(int64(d)))
+}
+
+func newStreamLink(nc net.Conn, fm framing, seq uint64) *streamLink {
+	l := &streamLink{c: nc, fm: fm, seq: seq, born: int64(time.Since(carrierStart))}
+	l.rx.Store(l.born)
+	return l
+}
+
+// heardSinceBorn is whether anything at all has arrived on it yet.
+func (l *streamLink) heardSinceBorn() bool { return l.rx.Load() != l.born }
 
 type streamCarrier struct {
 	cfg  *config.Config
@@ -7740,6 +8410,21 @@ type streamCarrier struct {
 	// riding knows what that means for it.
 	onLinkDown atomic.Pointer[func(int)]
 
+	// The side that dials listening to each connection on its own; see
+	// stallAfter. The clocks are copied from the package's at construction,
+	// so a test that shortens them cannot race a carrier already running.
+	beats                            atomic.Bool // the far end answers beats
+	beatEvery, stallAfter, stallRest time.Duration
+	replaced                         []atomic.Int64 // per slot: when a quiet connection was last replaced
+	stillborn                        []atomic.Int32 // per slot: replacements in a row that never heard
+	stalls                           atomic.Uint64
+
+	// How long a connection lives, on average, before a new one takes its
+	// slot; zero for as long as it works. The side that dials only. See
+	// dialForever.
+	rotate  time.Duration
+	renewed atomic.Uint64
+
 	done chan struct{}
 	once sync.Once
 
@@ -7763,18 +8448,24 @@ func newStreamCarrierOn(cfg *config.Config, kind string, head int,
 
 	n := cfg.Transport.Connections
 	c := &streamCarrier{
-		cfg:   cfg,
-		fr:    newStreamFramer(cfg.Token, "pingify "+kind+" v1"),
-		kind:  kind,
-		links: make([]atomic.Pointer[streamLink], n),
-		head:  head,
-		frame: streamMaxFrame,
-		done:  make(chan struct{}),
+		cfg:        cfg,
+		fr:         newStreamFramer(cfg.Token, "pingify "+kind+" v1"),
+		kind:       kind,
+		links:      make([]atomic.Pointer[streamLink], n),
+		head:       head,
+		frame:      streamMaxFrame,
+		done:       make(chan struct{}),
+		beatEvery:  beatEvery,
+		stallAfter: stallAfter,
+		stallRest:  stallRest,
+		replaced:   make([]atomic.Int64, n),
+		stillborn:  make([]atomic.Int32, n),
 	}
 	if cfg.Dials() {
 		if ln != nil {
 			_ = ln.Close()
 		}
+		c.rotate = time.Duration(cfg.Transport.RotateSec) * time.Second
 		smoothTheWire(cfg)
 		return c, nil
 	}
@@ -8004,21 +8695,194 @@ func (c *streamCarrier) Run() {
 		for i := range c.links {
 			go c.dialForever(i)
 		}
+		// One connection has no others to be the odd one out among, so it
+		// is never replaced this way, and its beats would only be answers
+		// arriving where a failover probe is timing its own keepalives.
+		if len(c.links) > 1 {
+			go c.watchLinks()
+		}
 		<-c.done
 		return
 	}
+	go c.tellBusy()
 	c.acceptForever()
 }
+
+// tellBusy is the side that waits saying, down a connection its reader has
+// been stuck on for a beat, that it is busy and not gone: an answer to a
+// beat nobody sent, which the side that dials takes as hearing.
+//
+// The reader is stuck when a stream's program is slow to take what it is
+// given - one user on a phone with a poor signal, a video arriving faster
+// than they can watch it - and while it is, nothing more is read from that
+// connection, beats included. The side that dials heard nothing, took the
+// connection for dead after stallAfter, and replaced it. Seen on the Iran 1
+// to Germany tunnel at the evening peak on 2026-09-30, 1340 users on 32
+// connections: nine of them held between one and thirteen megabytes Iran 1
+// had not yet read, 8.8.8.8 answered every ping without a loss, and the
+// tunnel replaced a connection every few seconds and reset 187 people in a
+// minute. The slow user came back to the same slot and it began again.
+//
+// Waiting for the slow one holds up the others on that connection, which is
+// what this design has always done and what TCP under it would do; replacing
+// the connection does that and resets them as well.
+func (c *streamCarrier) tellBusy() {
+	tk := time.NewTicker(c.beatEvery / 2)
+	defer tk.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-tk.C:
+		}
+		now := time.Duration(time.Since(carrierStart))
+		for i := range c.links {
+			l := c.links[i].Load()
+			if l == nil || !l.busy.Load() || now-time.Duration(l.busyAt.Load()) < c.beatEvery {
+				continue
+			}
+			if !l.beating.CompareAndSwap(false, true) {
+				continue
+			}
+			go func(l *streamLink) {
+				defer l.beating.Store(false)
+				c.answer(l, beatAnswer[:])
+			}(l)
+		}
+	}
+}
+
+// watchLinks is the side that dials listening to each connection on its own:
+// a beat down every one that has been quiet for beatEvery, and a connection
+// that has heard nothing for stallAfter, while at least half the others have
+// heard within half of it, closed - which its reader takes as the connection
+// ending, so the slot is redialled and its streams carried on. See stallAfter
+// for why, and for when it holds back.
+func (c *streamCarrier) watchLinks() {
+	tk := time.NewTicker(c.beatEvery / 2)
+	defer tk.Stop()
+	for {
+		select {
+		case <-c.done:
+			return
+		case <-tk.C:
+		}
+		now := time.Duration(time.Since(carrierStart))
+		live, heard := 0, 0
+		for i := range c.links {
+			if l := c.links[i].Load(); l != nil {
+				live++
+				if l.busy.Load() || now-time.Duration(l.rx.Load()) < c.stallAfter/2 {
+					heard++
+				}
+			}
+		}
+		for i := range c.links {
+			l := c.links[i].Load()
+			// A connection whose reader is handing a frame up has heard; it
+			// is this end that is slow. See streamLink.busy.
+			if l == nil || l.busy.Load() {
+				continue
+			}
+			quiet := now - time.Duration(l.rx.Load())
+			if quiet >= l.beatDue(c.beatEvery) && l.beating.CompareAndSwap(false, true) {
+				l.nextBeat.Store(0) // the next one is drawn afresh
+				// On its own goroutine: the write waits for the connection's
+				// writer, and on a connection that has stopped that can be
+				// the kernel's twenty seconds.
+				go func(l *streamLink) {
+					defer l.beating.Store(false)
+					bp := buf.Take(c.Headroom(), len(beatMark))
+					copy((*bp)[c.Headroom():], beatMark[:])
+					if err := c.sendOn(l, bp); err != nil {
+						buf.Put(bp)
+					}
+				}(l)
+			}
+			since := time.Duration(-1)
+			if last := c.replaced[i].Load(); last != 0 {
+				since = now - time.Duration(last)
+			}
+			// stallRest is for a connection that worked and went quiet. One
+			// that has not heard a thing since it was made never worked: on
+			// the user's pair a replacement through Cloudflare came up that
+			// way and sat there for the whole of stallRest, and the sixty
+			// programs moved onto it with it. It is replaced again after
+			// stallAfter, then twice that, doubling up to stallRest - so a
+			// slot the path will not carry at all is not redialled in a loop.
+			rest, worked := c.stallRest, l.heardSinceBorn()
+			if worked {
+				c.stillborn[i].Store(0)
+			} else if n := c.stillborn[i].Load(); n < 8 && c.stallAfter<<n < rest {
+				rest = c.stallAfter << n
+			}
+			if !c.stalled(quiet, heard, live, since, rest) {
+				continue
+			}
+			c.replaced[i].Store(int64(now))
+			c.stalls.Add(1)
+			if worked {
+				logging.Info("carrier: connection %d heard nothing for %.1fs while %d of %d did; replacing it",
+					i, quiet.Seconds(), heard, live)
+			} else {
+				c.stillborn[i].Add(1)
+				logging.Info("carrier: connection %d has heard nothing since it was made, %.1fs, while %d of %d did; replacing it",
+					i, quiet.Seconds(), heard, live)
+			}
+			_ = l.c.Close()
+		}
+	}
+}
+
+// stalled is the rule watchLinks applies to one connection: quiet for
+// stallAfter; the far end known to answer beats, so quiet means something;
+// at least half the connections hearing - heard within half of stallAfter,
+// or their reader busy handing a frame up - so this one is the odd one out
+// and not the path as a whole, which is the failover's to judge and TCP's to
+// ride out; and the slot not replaced this way within rest - stallRest, or
+// less for a connection that never heard (since is how long ago it was,
+// negative for never).
+func (c *streamCarrier) stalled(quiet time.Duration, heard, live int, since, rest time.Duration) bool {
+	switch {
+	case quiet < c.stallAfter, !c.beats.Load():
+		return false
+	case heard == 0, heard*2 < live:
+		return false
+	case since >= 0 && since < rest:
+		return false
+	}
+	return true
+}
+
+// Stalls is how many connections watchLinks has replaced.
+func (c *streamCarrier) Stalls() uint64 { return c.stalls.Load() }
 
 // dialForever keeps one slot filled. It dials, reads until the connection
 // ends, and dials again - backing off so that a server that is down does not
 // get eight connection attempts every half second all night, and resetting
 // the backoff the moment one succeeds.
 //
+// With rotate set, a connection that has lived its time is given a successor
+// before it goes: the new one is dialled while the old one carries on, takes
+// the slot, and only then is the old one closed. Its reader ending is the
+// connection ending, as it always was, so what it had in flight is carried on
+// down the new one by whatever rides the carrier. The side that waits closes
+// its end of the old one as soon as the new one names the slot.
+//
+// Why: a filter that gives up on a tunnel does it by the connection, and a
+// tunnel's connections were the longest-lived TLS on the path by days - the
+// ones between Germany and Iran 1 carried for hours on 2026-09-29 and were
+// then killed one by one within twenty seconds of being made. A browser's
+// connections live minutes. This is not a cure for being found; it is one
+// fewer way of standing out while not being.
+//
 // Only the first slot says anything about a failure. Eight slots failing the
 // same way is one fact, and printing it eight times buries the next one.
 func (c *streamCarrier) dialForever(slot int) {
 	wait := streamRedialMin
+	// Closed when the connection in this slot has ended; nil while the slot
+	// has none that this loop made.
+	var ended <-chan struct{}
 	for {
 		select {
 		case <-c.done:
@@ -8032,6 +8896,20 @@ func (c *streamCarrier) dialForever(slot int) {
 			case <-c.done:
 				return
 			default:
+			}
+			if ended != nil {
+				// A successor that could not be made. The connection that was
+				// to be replaced is still carrying: keep it, and try again
+				// after another lifetime, or at once if it ends first.
+				logging.Debug("carrier: connection %d could not be renewed: %v", slot, err)
+				select {
+				case <-c.done:
+					return
+				case <-ended:
+					ended = nil
+				case <-time.After(jitter(c.rotate)):
+				}
+				continue
 			}
 			if slot == 0 {
 				logging.Warn("carrier: %v - again in %s", err, wait)
@@ -8049,7 +8927,7 @@ func (c *streamCarrier) dialForever(slot int) {
 		wait = streamRedialMin
 		markDSCP(nc, c.cfg.Tuning.DSCP)
 
-		l := &streamLink{c: nc, fm: fm, seq: uint64(slot)}
+		l := newStreamLink(nc, fm, uint64(slot))
 		// Say which slot this is before anything else can be written on it:
 		// the link is not in the table yet, so nothing else can be.
 		bp := buf.Take(c.Headroom(), helloLen)
@@ -8059,27 +8937,63 @@ func (c *streamCarrier) dialForever(slot int) {
 			_ = nc.Close()
 			continue
 		}
-		c.links[slot].Store(l)
+		old := c.links[slot].Swap(l)
 		// Close may have emptied the table while this dial was in flight;
 		// a link stored after that has nobody left to close it.
 		select {
 		case <-c.done:
 			c.links[slot].CompareAndSwap(l, nil)
 			_ = nc.Close()
+			if old != nil {
+				_ = old.c.Close()
+			}
 			return
 		default:
 		}
-		if slot == 0 {
-			logging.Info("carrier: connected over %s", c.kind)
+		if old != nil {
+			// The one this replaces, renewed. Closing it ends its reader,
+			// which hands what it carried to l; see serve.
+			c.renewed.Add(1)
+			logging.Debug("carrier: connection %d renewed", slot)
+			_ = old.c.Close()
+		} else {
+			if slot == 0 {
+				logging.Info("carrier: connected over %s", c.kind)
+			}
+			logging.Debug("carrier: connection %d up", slot)
 		}
-		logging.Debug("carrier: connection %d up", slot)
 
+		ended = c.serve(slot, l)
+		var renew <-chan time.Time
+		if c.rotate > 0 {
+			renew = time.After(jitter(c.rotate))
+		}
+		select {
+		case <-c.done:
+			return
+		case <-ended:
+			ended = nil
+		case <-renew:
+			// Dial its successor while it carries on.
+		}
+	}
+}
+
+// serve reads one connection of the side that dials until it ends, on a
+// goroutine of its own, and then empties its slot - unless a successor has
+// taken it already - and says the connection ended. The channel closes when
+// all of that is done.
+func (c *streamCarrier) serve(slot int, l *streamLink) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
 		c.read(l)
 		c.links[slot].CompareAndSwap(l, nil)
-		_ = nc.Close()
+		_ = l.c.Close()
 		logging.Debug("carrier: connection %d dropped", slot)
 		c.linkDown(slot)
-	}
+	}()
+	return done
 }
 
 // acceptForever is the side that waits. It fills empty slots first, and when
@@ -8151,7 +9065,7 @@ func (c *streamCarrier) take(nc net.Conn, seq uint64) {
 		return
 	}
 
-	l := &streamLink{c: up, fm: fm, seq: seq}
+	l := newStreamLink(up, fm, seq)
 	slot, named := helloSlot(first)
 	if named && slot >= len(c.links) {
 		logging.Debug("carrier: %s asked for slot %d of %d", nc.RemoteAddr(), slot, len(c.links))
@@ -8213,18 +9127,39 @@ func (c *streamCarrier) readFrom(l *streamLink, r *bufio.Reader, body []byte) {
 			c.readEnded(err)
 			return
 		}
-		if c.handle(body[:n]) && c.echo && !c.cfg.Dials() {
-			// On its own goroutine: a write can wait for the far end's
-			// window, and this goroutine is the one that reads.
-			go c.answer(l)
+		l.busyAt.Store(int64(time.Since(carrierStart)))
+		l.busy.Store(true)
+		kind := c.handle(body[:n])
+		l.busy.Store(false)
+		if kind == frameBad {
+			continue
+		}
+		// After handing it up, not before: however long that took was this
+		// end's, and does not count as the path having been quiet.
+		l.rx.Store(int64(time.Since(carrierStart)))
+		// The answers are on goroutines of their own: a write can wait for
+		// the far end's window, and this goroutine is the one that reads.
+		// Only the side that waits answers, so the two can never answer each
+		// other.
+		switch {
+		case kind == frameKeepalive && c.echo && !c.cfg.Dials():
+			go c.answer(l, nil)
+		case kind == frameBeat && !c.cfg.Dials():
+			go c.answer(l, beatAnswer[:])
+		case kind == frameBeatAnswer && c.cfg.Dials():
+			if c.beats.CompareAndSwap(false, true) {
+				logging.Info("carrier: the far end answers beats; a connection quiet for %s while the others hear is replaced",
+					c.stallAfter)
+			}
 		}
 	}
 }
 
-// answer sends one keepalive back down the connection one arrived on. Only
-// the side that waits does it, so the two can never answer each other.
-func (c *streamCarrier) answer(l *streamLink) {
-	bp := buf.Take(c.Headroom(), 0)
+// answer sends one frame back down the connection one arrived on: an empty
+// one for a keepalive, the answer for a beat.
+func (c *streamCarrier) answer(l *streamLink, payload []byte) {
+	bp := buf.Take(c.Headroom(), len(payload))
+	copy((*bp)[c.Headroom():], payload)
 	if err := c.sendOn(l, bp); err != nil {
 		buf.Put(bp)
 	}
@@ -8243,24 +9178,33 @@ func (c *streamCarrier) readEnded(err error) {
 	logging.Debug("%s read: %v", c.kind, err)
 }
 
-// handle opens one frame and passes it up, and reports whether it was a
-// keepalive.
-func (c *streamCarrier) handle(b []byte) (keepalive bool) {
+// handle opens one frame and passes it up, and says what kind it was. A
+// frame that does not open under our key is frameBad, and counts for nothing:
+// not as a packet, and not as the connection having heard from the far end.
+func (c *streamCarrier) handle(b []byte) frameKind {
 	body, ok := c.fr.open(b)
 	if !ok {
-		return false
+		return frameBad
 	}
 	atomic.AddUint64(&c.rxBytes, uint64(len(b)))
 	if len(body) == 0 {
-		return true // a keepalive, which has done its whole job by arriving
+		return frameKeepalive // which has done its whole job by arriving
 	}
 	if _, isHello := helloSlot(body); isHello {
-		return false // a slot announcement, which take has already acted on
+		return frameHello // a slot announcement, which take has already acted on
+	}
+	if len(body) == len(beatMark) && body[0] == beatMark[0] {
+		switch body[1] {
+		case beatMark[1]:
+			return frameBeat
+		case beatAnswer[1]:
+			return frameBeatAnswer
+		}
 	}
 	if f := c.onPacket.Load(); f != nil {
 		(*f)(body)
 	}
-	return false
+	return framePacket
 }
 
 // Keepalive touches every connection, not one of them.
@@ -8996,6 +9940,13 @@ func newUTLSCarrier(cfg *config.Config) (*streamCarrier, error) {
 
 	host := cfg.DialHost()
 	addr := net.JoinHostPort(host, fmt.Sprint(cfg.Transport.Port))
+	// The name in the hello. Dialled by address with none given, it is the
+	// address, which a hello leaves out - and a hello with no name at all is
+	// one in a great many fewer than a hello with one.
+	sni := cfg.Transport.SNI
+	if sni == "" {
+		sni = host
+	}
 
 	c.dial = func() (net.Conn, framing, error) {
 		nc, err := net.DialTimeout("tcp4", addr, streamDialWait)
@@ -9013,7 +9964,7 @@ func newUTLSCarrier(cfg *config.Config) (*streamCarrier, error) {
 		// of it - a hello that was Chrome two years ago is its own
 		// fingerprint.
 		u := utls.UClient(nc, &utls.Config{
-			ServerName:         host,
+			ServerName:         sni,
 			InsecureSkipVerify: cfg.Transport.Insecure || cfg.Transport.Cert == "",
 		}, utls.HelloChrome_Auto)
 		if err := u.Handshake(); err != nil {
@@ -9057,7 +10008,10 @@ func utlsServerConfig(cfg *config.Config) (*tls.Config, error) {
 		}, nil
 	}
 
-	name := cfg.DialHost()
+	name := cfg.Transport.SNI
+	if name == "" {
+		name = cfg.DialHost()
+	}
 	if name == "" {
 		name = "localhost"
 	}
@@ -9627,10 +10581,11 @@ const (
 	// address. Set status.health_port to -1 to turn it off.
 	DefaultHealthPort = 19999
 
-	// How many packets the tun device holds for the link to read. A thousand
-	// carries what ten thousand carried and answers in less than half the
-	// time; the measurement is beside configureDevice.
-	DefaultTxQueueLen = 1000
+	// How many packets the tun device holds for the link to read. It was a
+	// thousand, which carried what ten thousand carried and answered sooner
+	// on the pair it was measured on; the measurements are beside
+	// configureDevice, the last of them why it is ten thousand now.
+	DefaultTxQueueLen = 10000
 )
 
 type Config struct {
@@ -9688,6 +10643,21 @@ type Config struct {
 		// guessed - see the note on DefaultConnections.
 		Connections int
 		Keepalive   int // seconds
+
+		// The name the side that dials shows in its hello, on the two
+		// transports that make one of their own: Chrome TLS and Decoy TLS.
+		// Empty is what they did before - the address being dialled, which
+		// a hello leaves out when it is an address, and a borrowed name for
+		// Decoy. A name of the owner's that points at the server is the one
+		// a watcher finds nothing odd in.
+		SNI string
+
+		// How long, on average, a connection of a stream carrier lives on
+		// the side that dials before a new one takes its place: somewhere
+		// between half of it and half as much again, so that no two go at
+		// once and no connection lives for days. Zero keeps each one for as
+		// long as it works, which is what every tunnel did before.
+		RotateSec int
 	}
 
 	Token string
@@ -9736,6 +10706,14 @@ type Config struct {
 		// read the packet off the socket carries it there itself, which is
 		// what this did before there was a choice.
 		WriteWorkers int
+
+		// The most each server sends into the link, in Mbit/s, with every
+		// flow inside it in a queue of its own (cake on the device). Zero
+		// is no limit. Two numbers so that the file stays the same on both
+		// servers: the abroad server's is the users' download. See
+		// shapeDevice for why a limit is worth having at all.
+		ShapeIranMbit   int
+		ShapeKharejMbit int
 	}
 
 	Level string
@@ -9849,9 +10827,30 @@ func isName(s string) bool {
 	})
 }
 
+// hostName is what the manager takes for a domain when it asks for one:
+// letters, digits, dots and dashes, a letter somewhere, and dots only between
+// labels.
+func hostName(s string) bool {
+	if !isName(s) || !strings.Contains(s, ".") || strings.HasPrefix(s, ".") || strings.HasSuffix(s, ".") || strings.Contains(s, "..") {
+		return false
+	}
+	return !strings.ContainsFunc(s, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-')
+	})
+}
+
 // IsName is isName for the carriers, so that there is one idea of what a
 // name is: not empty, not an address of either family, and has a letter.
 func IsName(s string) bool { return isName(s) }
+
+// ShapeMbit is the limit on what this server sends into the link, from the
+// one of the two numbers that is this side's. Zero is none.
+func (c *Config) ShapeMbit() int {
+	if c.Side == SideIran {
+		return c.TUN.ShapeIranMbit
+	}
+	return c.TUN.ShapeKharejMbit
+}
 
 // DialHost is what the side that dials connects to, which is the other
 // server's address - and that address is the domain when somebody typed one.
@@ -9890,6 +10889,14 @@ func (c *Config) Inert() []string {
 	if t != "ws" && t != "wss" {
 		inert("transport.path")
 	}
+	if t != "utls" && t != "fallback" {
+		inert("transport.sni")
+	}
+	switch t {
+	case "tcp", "ws", "wss", "utls", "fallback":
+	default:
+		inert("transport.rotate_sec")
+	}
 	if c.Mode == "tun" {
 		inert("transport.connections", "transport.listen_port")
 	}
@@ -9897,7 +10904,8 @@ func (c *Config) Inert() []string {
 	case "grefou":
 		inert("transport.keepalive_sec", "tuning.queue_packets", "tuning.rcvbuf_kb",
 			"tuning.sndbuf_kb", "tuning.send_batch", "tuning.pace", "tuning.pace_mbit",
-			"tuning.dscp", "tuning.fec", "tun.write_workers", "tun.queues")
+			"tuning.dscp", "tuning.fec", "tun.write_workers", "tun.queues",
+			"tun.shape_iran_mbit", "tun.shape_kharej_mbit")
 	case "tcp", "ws", "wss", "utls", "fallback":
 		inert("tuning.rcvbuf_kb", "tuning.sndbuf_kb", "tuning.send_batch", "tuning.pace_mbit", "tuning.fec")
 	case "kcp":
@@ -10083,6 +11091,10 @@ func assign(c *Config, table, key, raw string) error {
 		c.Transport.Key, err = str()
 	case "transport.insecure":
 		c.Transport.Insecure, err = boolean(raw)
+	case "transport.sni":
+		c.Transport.SNI, err = str()
+	case "transport.rotate_sec":
+		c.Transport.RotateSec, err = num()
 	case "transport.keepalive_sec":
 		c.Transport.Keepalive, err = num()
 
@@ -10125,6 +11137,10 @@ func assign(c *Config, table, key, raw string) error {
 		c.TUN.TxQueueLen, err = num()
 	case "tun.queues":
 		c.TUN.Queues, err = num()
+	case "tun.shape_iran_mbit":
+		c.TUN.ShapeIranMbit, err = num()
+	case "tun.shape_kharej_mbit":
+		c.TUN.ShapeKharejMbit, err = num()
 
 	case "logging.level":
 		c.Level, err = str()
@@ -10559,6 +11575,12 @@ func (c *Config) check() error {
 	if c.Transport.Connections == 0 {
 		c.Transport.Connections = profileConnections(c.Tuning.Profile)
 	}
+	if c.Transport.SNI != "" && !hostName(c.Transport.SNI) {
+		return fmt.Errorf("transport.sni %q: a name like www.example.com, which a hello can carry", c.Transport.SNI)
+	}
+	if r := c.Transport.RotateSec; r != 0 && (r < 60 || r > 86400) {
+		return fmt.Errorf("transport.rotate_sec %d: 0 keeps connections, otherwise 60 to 86400", r)
+	}
 	if c.Transport.Connections < 1 || c.Transport.Connections > 32 {
 		return fmt.Errorf("transport.connections %d: between 1 and 32", c.Transport.Connections)
 	}
@@ -10626,6 +11648,11 @@ func (c *Config) check() error {
 	if c.TUN.TxQueueLen < 100 || c.TUN.TxQueueLen > 100000 {
 		return fmt.Errorf("tun.txqueuelen %d: between 100 and 100000", c.TUN.TxQueueLen)
 	}
+	for k, v := range map[string]int{"tun.shape_iran_mbit": c.TUN.ShapeIranMbit, "tun.shape_kharej_mbit": c.TUN.ShapeKharejMbit} {
+		if v < 0 || v > 100000 {
+			return fmt.Errorf("%s %d: Mbit/s from 1 to 100000, or 0 for no limit", k, v)
+		}
+	}
 	if c.Tuning.DSCP < 0 || c.Tuning.DSCP > 63 {
 		return fmt.Errorf("tuning.dscp %d: a DSCP value is 0 to 63", c.Tuning.DSCP)
 	}
@@ -10674,9 +11701,18 @@ func (c *Config) check() error {
 }
 
 // A Member is one transport a tunnel can run on: the primary, or a backup.
+//
+// Host is where a backup goes when it names an address of its own, written
+// "fallback:8443@203.0.113.9"; empty is the tunnel's own address. It exists
+// for a tunnel whose primary rides behind a CDN: every backup used to dial the
+// same name, and a CDN carries WebSocket and nothing else, so the only backups
+// such a tunnel could have were more WebSocket through the same CDN - which
+// fail together with it. With an address of its own a backup can take a
+// different road on a different protocol.
 type Member struct {
 	Type string
 	Port int
+	Host string
 }
 
 // Forwarding is whether a transport carries streams, which is what a
@@ -10714,11 +11750,21 @@ func (c *Config) Members() []Member {
 // own out.
 func (c *Config) For(m Member) *Config {
 	cp := *c
-	if m.Type == c.Transport.Type && m.Port == c.Transport.Port {
+	if m.Type == c.Transport.Type && m.Port == c.Transport.Port && m.Host == "" {
 		return &cp
 	}
 	cp.Transport.Type, cp.Transport.Port = m.Type, m.Port
 	cp.Transport.ListenPort = 0
+	// A backup with an address of its own reads it as the address of the side
+	// that waits, which is the one the side that dials reaches - on either
+	// server, so both files agree on where that backup goes.
+	if m.Host != "" {
+		if cp.DialSide() == SideIran {
+			cp.Transport.Kharej = m.Host
+		} else {
+			cp.Transport.Iran = m.Host
+		}
+	}
 	return &cp
 }
 
@@ -10744,10 +11790,22 @@ func (c *Config) checkFailover() error {
 	}
 	members := []Member{{Type: c.Transport.Type, Port: c.Transport.Port}}
 	for _, b := range f.Backups {
-		kind, p, ok := strings.Cut(strings.TrimSpace(b), ":")
+		spec, host, hasHost := strings.Cut(strings.TrimSpace(b), "@")
+		kind, p, ok := strings.Cut(spec, ":")
 		port, err := strconv.Atoi(p)
 		if !ok || err != nil {
-			return fmt.Errorf("failover.backups %q: write a backup as \"kcp:8443\"", b)
+			return fmt.Errorf("failover.backups %q: write a backup as \"kcp:8443\", or \"utls:8444@203.0.113.9\" for one that goes to an address of its own", b)
+		}
+		if hasHost {
+			ip := net.ParseIP(host)
+			switch {
+			case host == "":
+				return fmt.Errorf("failover.backups %q: the address after the @ is missing", b)
+			case ip != nil && ip.To4() == nil:
+				return fmt.Errorf("failover.backups %q: %s is an IPv6 address; the tunnel runs over IPv4", b, host)
+			case ip == nil && !hostName(host):
+				return fmt.Errorf("failover.backups %q: %s is not an address or a name", b, host)
+			}
 		}
 		if !Forwarding(kind) {
 			return fmt.Errorf("failover.backups %q: a backup has to be tcp, ws, wss, utls, fallback or kcp", b)
@@ -10755,7 +11813,7 @@ func (c *Config) checkFailover() error {
 		if port <= 0 || port > 65535 {
 			return fmt.Errorf("failover.backups %q: %d is not a port", b, port)
 		}
-		members = append(members, Member{Type: kind, Port: port})
+		members = append(members, Member{Type: kind, Port: port, Host: host})
 	}
 	// Every member listens at once on the side that waits, so no two may want
 	// the same socket there.
@@ -10855,6 +11913,11 @@ const (
 	// resume.go.
 	cmdAck = 11 // body is 8 bytes: payload bytes this side has taken
 
+	// What this end can do that an older build cannot, so the far end knows
+	// what it may ask of it. Sent with every heartbeat and in answer to the
+	// far end's; a build without it ignores a command it does not know.
+	cmdHello = 12 // body is one byte of cap* flags
+
 	hdrLen = 5
 
 	// How many records may wait for one carrier connection. It was four
@@ -10945,11 +12008,18 @@ type Forwarder struct {
 	udpSeq  uint32
 
 	toWire, fromWire, dropped, refused uint64
-	farSeen                            int64 // unix nanos of the last record in
+	slowReset                          uint64 // streams given up for a program that could not keep up
+	farSeen                            int64  // unix nanos of the last record in
 	lastReset                          time.Time
 	rtt                                int64         // nanos, from the last pong
 	tooBig                             uint64        // datagrams bigger than one record will hold
 	epoch                              atomic.Uint64 // the far end's run, from its pings
+	farCaps                            atomic.Uint32 // cap* flags from the far end's hello
+
+	// Data for streams this end has no record of, while their SYN may still
+	// be on its way: id -> when the first of it arrived. See stray.
+	strayMu sync.Mutex
+	strays  map[uint32]time.Time
 
 	// The data probe (see probeEvery). pingGap is pingEvery, held in a field
 	// for the same reason as grace below: a test shortens it for its own
@@ -10969,23 +12039,22 @@ type Forwarder struct {
 	// reading, which is a race whatever the values happen to be.
 	grace time.Duration
 
-	// Records on their way out, one queue per carrier connection, each drained
-	// by a goroutine of its own. The receive path never writes to the carrier
+	// Records on their way out, one scheduler per carrier connection, each
+	// drained by a goroutine of its own. See sched.go. The receive path never writes to the carrier
 	// directly: it hands a pong or a refusal to these queues without blocking
 	// (recordNB), so a read goroutine is never stuck in a write while the far
 	// end waits to be read. Bulk data blocks here, and that block is the back
 	// pressure a fast local end should feel.
-	out []chan outRec
+	out []*sched
 
-	// Streams owing the far end an acknowledgement. They cannot be sent from
-	// the read goroutine that notices they are due: record blocks on a full
-	// queue, and that queue drains onto the connection the far end is trying
-	// to read, so both ends wedge. recordNB does not block but is allowed to
-	// drop, and a dropped acknowledgement is memory the sender never lets go
-	// of - worse, a stream whose first one was dropped is one it will not
-	// resume. So they go through here, where a goroutine of their own can
-	// afford to wait, and only the newest count for a stream is ever sent.
-	acks chan uint32
+	// Streams owing the far end an acknowledgement, sent by a goroutine of
+	// their own and only ever the newest count for each. A set and not a
+	// channel: a nudge dropped from a full channel was once only memory the
+	// sender kept a little longer, and with the window it is a sender that
+	// waits for room it already has, for ever.
+	ackMu   sync.Mutex
+	ackDue  map[uint32]struct{}
+	ackWake chan struct{}
 
 	closing chan struct{}
 	once    sync.Once
@@ -11006,12 +12075,14 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 		cfg: cfg, car: car, send: fs,
 		edge:    cfg.Side == config.SideIran,
 		streams: map[uint32]*stream{},
+		strays:  map[uint32]time.Time{},
 		udp:     map[uint32]*udpSess{},
 		udpEdge: map[string]*udpSess{},
 		closing: make(chan struct{}),
 		grace:   carrierGrace,
 		pingGap: pingEvery,
-		acks:    make(chan uint32, 4096),
+		ackDue:  map[uint32]struct{}{},
+		ackWake: make(chan struct{}, 1),
 	}
 	if f.edge {
 		rules, err := ParseAll(cfg.Forward.Ports)
@@ -11030,20 +12101,9 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 	if n < 1 {
 		n = 1
 	}
-	// In bytes, said in records. Sixty-four was measured at 2 KB records; a
-	// carrier with 16 KB ones would hold eight times as much in front of a
-	// small packet, and that is the 1.2 seconds above come back - measured
-	// again in 1.1.0, at 1185 ms, before this scaled. docs/measured.md 39.
-	depth := outDepth * 2048 / (car.MaxPayload() - hdrLen - offLen)
-	if depth > outDepth {
-		depth = outDepth
-	}
-	if depth < 4 {
-		depth = 4
-	}
-	f.out = make([]chan outRec, n)
+	f.out = make([]*sched, n)
 	for i := range f.out {
-		f.out[i] = make(chan outRec, depth)
+		f.out[i] = newSched()
 	}
 	car.OnPacket(f.onRecord)
 	// A stream carrier says when one of its connections ends. A datagram
@@ -11075,16 +12135,15 @@ func New(cfg *config.Config, car carrier.Full) (*Forwarder, error) {
 // had been told succeeded.
 var carrierGrace = 15 * time.Second
 
-// writer drains one outbound queue onto the carrier. One per connection,
-// so a stream's records leave in the order they were queued.
-func (f *Forwarder) writer(q chan outRec) {
+// writer drains one connection's scheduler onto the carrier. One per
+// connection; a stream's records leave in the order they were queued.
+func (f *Forwarder) writer(q *sched) {
 	for {
-		select {
-		case <-f.closing:
+		r, ok := q.next(f.closing)
+		if !ok {
 			return
-		case r := <-q:
-			f.put(r)
 		}
+		f.put(r)
 	}
 }
 
@@ -11188,14 +12247,22 @@ func (f *Forwarder) resetSlot(slot int) {
 // again, from the last byte it acknowledged.
 func (f *Forwarder) resume(slot int, streams []*stream) {
 	var carried, lost, bytes int
+	resumes := f.farCaps.Load()&capResume != 0
 	for _, s := range streams {
 		s.sendMu.Lock()
-		from, parts, fin, ok := s.out.replay()
+		from, parts, fin, fresh, ok := s.out.replay(resumes)
+		// A stream the far end has never acknowledged may never have been
+		// opened there: its SYN can have died with the connection as easily
+		// as its data. So it is named again first, and the far end takes a
+		// second SYN for a stream it has as nothing.
+		if ok && fresh && resumes && s.target != "" {
+			ok = f.record(cmdSYN, s.id, []byte(s.target))
+		}
 		for _, p := range parts {
 			if !ok {
 				break
 			}
-			ok = f.dataRec(s.id, from, p)
+			ok = f.dataRec(s.id, from, p, s.done)
 			from += uint64(len(p))
 			bytes += len(p)
 		}
@@ -11205,6 +12272,10 @@ func (f *Forwarder) resume(slot int, streams []*stream) {
 			f.record(cmdFIN, s.id, nil)
 		}
 		s.sendMu.Unlock()
+		// What this end last told the far end about the stream may have died
+		// with the connection too, and a far end keeping to the window that
+		// never hears it waits for room it already has.
+		f.owed(s.id)
 		if !ok {
 			// Said, and not only done. The far end's half may be one that lost
 			// nothing and is waiting to carry on, and without this it waits on
@@ -11269,6 +12340,9 @@ func (f *Forwarder) watch() {
 func (f *Forwarder) farEpoch(e uint64) {
 	old := f.epoch.Swap(e)
 	if old != 0 && old != e {
+		// A new run of the far end may be another build; what it can do
+		// is what its next hello says.
+		f.farCaps.Store(0)
 		f.resetAll("the far end restarted")
 	}
 }
@@ -11425,7 +12499,7 @@ func (f *Forwarder) maxBody() int { return f.car.MaxPayload() - hdrLen - offLen 
 // dataRec is a payload record with the offset it begins at in front of it.
 // Built here rather than by record so the two do not have to be concatenated
 // into a third buffer on the way.
-func (f *Forwarder) dataRec(id uint32, off uint64, body []byte) bool {
+func (f *Forwarder) dataRec(id uint32, off uint64, body []byte, done <-chan struct{}) bool {
 	head := f.car.Headroom()
 	bp := buf.Take(head, hdrLen+offLen+len(body))
 	b := (*bp)[head:]
@@ -11433,14 +12507,17 @@ func (f *Forwarder) dataRec(id uint32, off uint64, body []byte) bool {
 	binary.BigEndian.PutUint32(b[1:5], id)
 	binary.BigEndian.PutUint64(b[hdrLen:hdrLen+offLen], off)
 	copy(b[hdrLen+offLen:], body)
-	select {
-	case f.out[id%uint32(len(f.out))] <- outRec{id, bp}:
+	if f.out[id%uint32(len(f.out))].data(outRec{id, bp}, done, f.closing) {
 		return true
-	case <-f.closing:
-		buf.Put(bp)
-		return false
 	}
+	buf.Put(bp)
+	return false
 }
+
+// ordered is whether a record has to keep its place among its stream's
+// data: the end of a stream behind what it ends, and a datagram behind the
+// session's others. Everything else is control, and goes first.
+func ordered(cmd byte) bool { return cmd == cmdFIN || cmd == cmdUDP }
 
 func (f *Forwarder) record(cmd byte, id uint32, body []byte) bool {
 	head := f.car.Headroom()
@@ -11450,15 +12527,18 @@ func (f *Forwarder) record(cmd byte, id uint32, body []byte) bool {
 	binary.BigEndian.PutUint32(b[1:5], id)
 	copy(b[hdrLen:], body)
 	// Queued for the connection this id lives on, never written from here:
-	// see the note on Forwarder.out. A pump goroutine blocking on a full
+	// see the note on Forwarder.out. A pump waiting on its stream's full
 	// queue is the back pressure it should feel.
-	select {
-	case f.out[id%uint32(len(f.out))] <- outRec{id, bp}:
+	q := f.out[id%uint32(len(f.out))]
+	if ordered(cmd) {
+		if q.data(outRec{id, bp}, nil, f.closing) {
+			return true
+		}
+	} else if q.control(outRec{id, bp}, false) {
 		return true
-	case <-f.closing:
-		buf.Put(bp)
-		return false
 	}
+	buf.Put(bp)
+	return false
 }
 
 // recordNB is record for the one caller that must never block: the carrier's
@@ -11477,9 +12557,7 @@ func (f *Forwarder) recordNB(cmd byte, id uint32, body []byte) {
 	b[0] = cmd
 	binary.BigEndian.PutUint32(b[1:5], id)
 	copy(b[hdrLen:], body)
-	select {
-	case f.out[id%uint32(len(f.out))] <- outRec{id, bp}:
-	default:
+	if !f.out[id%uint32(len(f.out))].control(outRec{id, bp}, true) {
 		buf.Put(bp)
 	}
 }
@@ -11496,6 +12574,11 @@ func (f *Forwarder) onRecord(b []byte) {
 		f.recordNB(cmdPong, id, body)
 		if len(body) >= 16 {
 			f.farEpoch(binary.BigEndian.Uint64(body[8:16]))
+		}
+		f.hello()
+	case cmdHello:
+		if len(body) >= 1 {
+			f.farCaps.Store(uint32(body[0]))
 		}
 	case cmdPong:
 		if len(body) > pingLen {
@@ -11516,6 +12599,14 @@ func (f *Forwarder) onRecord(b []byte) {
 		if f.edge {
 			return // the edge opens streams; it does not take them
 		}
+		f.unstray(id)
+		if f.stream(id) != nil {
+			// A SYN for a stream this end already has is the edge sending it
+			// again, not knowing whether the first arrived (see resume).
+			// Taking it as new would dial the service a second time and
+			// leave the first connection with nobody behind it.
+			return
+		}
 		f.accept(id, string(body))
 	case cmdData:
 		if len(body) < offLen {
@@ -11528,10 +12619,10 @@ func (f *Forwarder) onRecord(b []byte) {
 			if len(payload) == 0 {
 				return // already had it, or it arrives before what it follows
 			}
+			s.got.took(len(payload))
 			s.deliver(payload)
-			if s.got.took(len(payload)) {
-				f.owed(id)
-			}
+		} else if !f.edge && f.farCaps.Load()&capResume != 0 && f.stray(id) {
+			// Its SYN may be right behind it: see stray.
 		} else {
 			// Data for a stream this end has no record of. It happens when
 			// this end restarted while the other went on sending, and before
@@ -11595,25 +12686,31 @@ func (f *Forwarder) acker() {
 		select {
 		case <-f.closing:
 			return
-		case id := <-f.acks:
+		case <-f.ackWake:
+		}
+		f.ackMu.Lock()
+		due := f.ackDue
+		f.ackDue = map[uint32]struct{}{}
+		f.ackMu.Unlock()
+		for id := range due {
 			s := f.stream(id)
 			if s == nil {
 				continue
 			}
-			// where reads the count now, not when the nudge was queued, so a
-			// backlog of nudges collapses into one true answer each.
+			// where reads the count now, not when the stream was marked, so
+			// many marks collapse into one true answer each.
 			f.record(cmdAck, id, be64(s.got.where()))
 		}
 	}
 }
 
-// owed queues a stream for an acknowledgement. Dropping the nudge is safe:
-// what is sent is always the current count, so the next one covers this.
+// owed marks a stream as owing the far end an acknowledgement. It never
+// drops one: see ackDue.
 func (f *Forwarder) owed(id uint32) {
-	select {
-	case f.acks <- id:
-	default:
-	}
+	f.ackMu.Lock()
+	f.ackDue[id] = struct{}{}
+	f.ackMu.Unlock()
+	signal(f.ackWake)
 }
 
 // processStart is what ping stamps count from; it is opaque to the far end,
@@ -11654,6 +12751,7 @@ func (f *Forwarder) pinger() {
 			binary.BigEndian.PutUint64(stamp[:8], uint64(time.Since(processStart)))
 			binary.BigEndian.PutUint64(stamp[8:], uint64(processStart.UnixNano()))
 			f.record(cmdPing, 0, stamp[:])
+			f.hello()
 			if probing && tick%probeEvery == 1 {
 				f.probe(size)
 			}
@@ -11672,22 +12770,14 @@ type stream struct {
 	f     *Forwarder
 	local net.Conn
 
+	// On the edge, the service this stream's SYN named, to name it again if
+	// the SYN may have died with the connection it rode. Empty at the origin.
+	target string
+
 	// Records from the wire, in order, waiting for the local socket to take
-	// them. A bounded channel, and that bound is the whole of this stream's
-	// flow control: when the local end cannot keep up, this fills, deliver
-	// blocks the carrier's read goroutine, that goroutine stops reading its
-	// connection, the connection's window closes, and the far end's write
-	// blocks - end to end, over the carrier's own TCP, with no credit scheme
-	// of our own on top of it.
-	//
-	// An earlier version did have one - a per-stream byte credit sent back as
-	// records. It deadlocked over a real path every time: the sender filled
-	// its window and waited for credit that was itself stuck behind the data
-	// it was meant to clear. TCP already does this correctly; doing it again
-	// above TCP only invents a way to get it wrong.
-	in     chan *[]byte
-	inEOF  chan struct{}
-	inOnce sync.Once
+	// them. See inbox.go: with a far end that keeps to the window it holds
+	// at most window bytes and never makes the carrier's reader wait.
+	in *inbox
 
 	// Set once the first record of this stream has been written to a
 	// carrier connection. Until then nothing of it is in flight anywhere,
@@ -11717,34 +12807,29 @@ type stream struct {
 	sendMu sync.Mutex
 }
 
-// inDepth is how many records a stream may hold before the carrier read
-// goroutine is made to wait on it. Deep enough that a stream on an idle path
-// never stalls on it, shallow enough that a slow local end pushes back before
-// megabytes pile up: a few hundred records is a few hundred kilobytes.
-const inDepth = 256
+// inBytes is how much of what arrived a stream may hold for a program slow to
+// take it, from a far end that keeps to no window - a build from before
+// capWindow - before the carrier's read goroutine has to wait on it; and
+// while that goroutine waits, every other stream on the same connection
+// waits too. With a far end that keeps to the window the inbox holds that
+// much and no more, and nothing waits. See window in resume.go.
+const inBytes = 2 << 20
 
-// depth is inDepth for this carrier's records. The bound that matters is the
-// bytes, and a carrier with larger records - KCP's are eight times the size -
-// would otherwise let every stream hold four megabytes, which on a one
-// gigabyte server with a few hundred users is the whole machine.
-func (f *Forwarder) depth() int {
-	n := inDepth * 2048 / f.maxBody()
-	if n > inDepth {
-		n = inDepth
-	}
-	if n < 16 {
-		n = 16
-	}
-	return n
-}
+// slowReaderWait is how long the carrier's read goroutine waits on a stream
+// whose program has fallen inBytes behind, from a far end without the
+// window. After it the stream is given up: its program is reset and
+// reconnects, and the forty others on its connection carry on. Measured at
+// the Iran 1 peak on 2026-09-30, before either: nine connections at a time
+// held up behind one slow user each, and the tunnel's own ping five seconds.
+const slowReaderWait = 2 * time.Second
 
 func (f *Forwarder) newStream(id uint32, local net.Conn) *stream {
 	s := &stream{
 		id: id, f: f, local: local,
-		in:    make(chan *[]byte, f.depth()),
-		inEOF: make(chan struct{}),
-		done:  make(chan struct{}),
+		in:   newInbox(),
+		done: make(chan struct{}),
 	}
+	s.out.more = make(chan struct{}, 1)
 	f.mu.Lock()
 	f.streams[id] = s
 	f.mu.Unlock()
@@ -11762,16 +12847,31 @@ func (f *Forwarder) newStream(id uint32, local net.Conn) *stream {
 func (s *stream) deliver(b []byte) {
 	bp := buf.Take(0, len(b))
 	copy(*bp, b)
-	select {
-	case s.in <- bp:
-	case <-s.done:
-		buf.Put(bp)
-	case <-s.f.closing:
-		buf.Put(bp)
+	// A far end that keeps to the window never sends more than the inbox
+	// holds: the record of slack is the one already on its way when the
+	// window closed. One that does not keep to it gets the old rule.
+	limit := inBytes
+	if s.f.windowed() {
+		limit = window + s.f.maxBody()
 	}
+	if s.in.push(bp, limit, slowReaderWait, s.done, s.f.closing) {
+		return
+	}
+	buf.Put(bp)
+	select {
+	case <-s.done:
+		return
+	case <-s.f.closing:
+		return
+	default:
+	}
+	atomic.AddUint64(&s.f.slowReset, 1)
+	logging.Debug("forward: stream %d could not keep up; reset so the others on its connection can", s.id)
+	s.f.recordNB(cmdRST, s.id, []byte("the program at this end could not keep up"))
+	s.kill()
 }
 
-func (s *stream) deliverEOF() { s.inOnce.Do(func() { close(s.inEOF) }) }
+func (s *stream) deliverEOF() { s.in.end() }
 
 func (s *stream) kill() {
 	s.doneOnce.Do(func() {
@@ -11784,6 +12884,7 @@ func (s *stream) kill() {
 		}
 		s.f.forget(s.id)
 		s.out.release()
+		s.in.drain()
 	})
 }
 
@@ -11799,8 +12900,15 @@ func (s *stream) pumpOut() {
 	for {
 		n, err := s.local.Read(b)
 		if n > 0 {
+			// Keep to the window: a far end whose program is not reading
+			// holds this pump here, this pump stops reading the program at
+			// this end, and TCP tells that program to wait. Outside the lock,
+			// which a resend takes.
+			if s.f.windowed() && !s.out.room(n, s.done, s.f.closing) {
+				return
+			}
 			s.sendMu.Lock()
-			ok := s.f.dataRec(s.id, s.out.at(), b[:n])
+			ok := s.f.dataRec(s.id, s.out.at(), b[:n], s.done)
 			if ok {
 				s.out.keep(b[:n])
 			}
@@ -11817,49 +12925,33 @@ func (s *stream) pumpOut() {
 }
 
 // pumpIn writes what arrived into the local socket, in order, until the far
-// end half-closes or the stream ends.
+// end half-closes or the stream ends, and tells the far end what has been
+// written - which is what opens its window again.
 func (s *stream) pumpIn() {
-	// The one place a delivered buffer is given back, on both outcomes.
-	writeOne := func(bp *[]byte) bool {
-		_ = s.local.SetWriteDeadline(time.Now().Add(localWriteWait))
-		_, err := s.local.Write(*bp)
-		buf.Put(bp)
-		if err != nil {
-			s.f.record(cmdRST, s.id, []byte("local write failed"))
-			s.kill()
-			return false
-		}
-		return true
-	}
 	for {
-		select {
-		case bp := <-s.in:
-			if !writeOne(bp) {
-				return
-			}
-		case <-s.inEOF:
-			// Whatever is still queued is ordered before the FIN it follows.
-			for {
-				select {
-				case bp := <-s.in:
-					if !writeOne(bp) {
-						return
-					}
-					continue
-				default:
-				}
-				break
-			}
+		bp, eof, ok := s.in.pop(s.done, s.f.closing)
+		if !ok {
+			return
+		}
+		if eof {
 			if cw, ok := s.local.(interface{ CloseWrite() error }); ok {
 				_ = cw.CloseWrite()
 			} else {
 				s.kill()
 			}
 			return
-		case <-s.done:
+		}
+		n := len(*bp)
+		_ = s.local.SetWriteDeadline(time.Now().Add(localWriteWait))
+		_, err := s.local.Write(*bp)
+		buf.Put(bp)
+		if err != nil {
+			s.f.record(cmdRST, s.id, []byte("local write failed"))
+			s.kill()
 			return
-		case <-s.f.closing:
-			return
+		}
+		if s.got.wrote(n, s.in.held() == 0) {
+			s.f.owed(s.id)
 		}
 	}
 }
@@ -11926,6 +13018,7 @@ func (f *Forwarder) open(c net.Conn, r Rule) {
 	}
 	id := f.freshID()
 	s := f.newStream(id, c)
+	s.target = r.Target
 	if !f.record(cmdSYN, id, []byte(r.Target)) {
 		s.kill()
 		return
@@ -12179,6 +13272,136 @@ func (f *Forwarder) reapUDP() {
 	}
 }
 PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/forward/inbox.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package forward
+
+import (
+	"sync"
+	"time"
+
+	"pingify/internal/buf"
+)
+
+// What has arrived for one stream and not yet been written to its program.
+//
+// It was a channel, and a full channel stopped the carrier connection's read
+// goroutine - and with it every other stream on the connection - until the
+// program behind this one caught up. With a far end that keeps to the window
+// (see window in resume.go) it never fills: the far end sends a stream no
+// more than its window beyond what this end has written out, and the window
+// is what the inbox holds. So a slow program slows its own stream and
+// nobody else's, and nobody is reset for being slow.
+//
+// A far end of the version before keeps to no window. For it the old rule
+// stands: wait up to slowReaderWait for room, then give the stream up.
+type inbox struct {
+	mu    sync.Mutex
+	q     []*[]byte
+	bytes int
+	eof   bool
+	wake  chan struct{} // something arrived, or the end
+	room  chan struct{} // something left
+}
+
+func newInbox() *inbox {
+	return &inbox{wake: make(chan struct{}, 1), room: make(chan struct{}, 1)}
+}
+
+func signal(c chan struct{}) {
+	select {
+	case c <- struct{}{}:
+	default:
+	}
+}
+
+// push adds a record. It never waits while the inbox holds less than limit;
+// past it, it waits for room up to patience, and says false if none came.
+func (b *inbox) push(bp *[]byte, limit int, patience time.Duration, done, closing <-chan struct{}) bool {
+	var timer *time.Timer
+	for {
+		b.mu.Lock()
+		if b.bytes+len(*bp) <= limit || len(b.q) == 0 {
+			b.q = append(b.q, bp)
+			b.bytes += len(*bp)
+			b.mu.Unlock()
+			signal(b.wake)
+			if timer != nil {
+				timer.Stop()
+			}
+			return true
+		}
+		b.mu.Unlock()
+		if timer == nil {
+			timer = time.NewTimer(patience)
+		}
+		select {
+		case <-b.room:
+		case <-timer.C:
+			return false
+		case <-done:
+			timer.Stop()
+			return false
+		case <-closing:
+			timer.Stop()
+			return false
+		}
+	}
+}
+
+// end marks that nothing more will come after what is queued.
+func (b *inbox) end() {
+	b.mu.Lock()
+	b.eof = true
+	b.mu.Unlock()
+	signal(b.wake)
+}
+
+// pop is the next record, waiting for one. eof is true when there is none and
+// never will be; ok is false when the stream or the forwarder went first.
+func (b *inbox) pop(done, closing <-chan struct{}) (bp *[]byte, eof, ok bool) {
+	for {
+		b.mu.Lock()
+		if len(b.q) > 0 {
+			bp = b.q[0]
+			b.q[0] = nil
+			b.q = b.q[1:]
+			b.bytes -= len(*bp)
+			b.mu.Unlock()
+			signal(b.room)
+			return bp, false, true
+		}
+		if b.eof {
+			b.mu.Unlock()
+			return nil, true, true
+		}
+		b.mu.Unlock()
+		select {
+		case <-b.wake:
+		case <-done:
+			return nil, false, false
+		case <-closing:
+			return nil, false, false
+		}
+	}
+}
+
+// held is how much is waiting, for a test to look at.
+func (b *inbox) held() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.bytes
+}
+
+// drain lets go of everything still waiting, when the stream is gone.
+func (b *inbox) drain() {
+	b.mu.Lock()
+	for _, bp := range b.q {
+		buf.Put(bp)
+	}
+	b.q, b.bytes = nil, 0
+	b.mu.Unlock()
+}
+PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/forward/resume.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 package forward
 
@@ -12218,6 +13441,7 @@ import (
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"pingify/internal/logging"
 )
@@ -12250,7 +13474,101 @@ const (
 	// thirteen bytes, so they are close to free, and each one is memory the
 	// sender can let go of: fine is better than frugal here.
 	ackEvery = 16 << 10
+
+	// capResume, in a hello, says this end carries on a stream the far end
+	// never acknowledged. It takes a SYN for a stream it already has as a
+	// resend and not a second connection, and it holds off resetting data
+	// for a stream it has no record of while that stream's SYN may still be
+	// coming (stray). With it, a connection that dies takes none of its
+	// streams with it for want of an acknowledgement.
+	//
+	// Why it is needed, from the Iran 1 to Germany tunnel on 2026-09-30,
+	// riding an ICMP link that loses a burst of packets every few minutes:
+	// in four hours 57 carrier connections were replaced, about half of
+	// them carried every stream on, and the rest reset 295 people's
+	// connections between them - up to 46 at once. The streams reset were
+	// the ones younger than a round trip or opened during the three seconds
+	// the connection was silent before it was replaced: nothing of theirs
+	// had been acknowledged yet, and a stream nobody has acknowledged was
+	// one this end would not carry on, because an older far end might take
+	// the resend as new.
+	capResume = 1
+
+	// capWindow, in a hello, says this end keeps to the window: it sends a
+	// stream no more than window bytes beyond what the far end has written
+	// out to its program, and it holds window bytes of any stream for its
+	// own program. See window.
+	capWindow = 2
+
+	// window is how far a stream may run ahead of its program at the far
+	// end - what is on the wire, in the far end's kernel and in its inbox
+	// together. Two megabytes over the path's eighty milliseconds is two
+	// hundred megabits a second for one stream on its own, and a program
+	// that stops reading costs its own stream this much of the far end's
+	// memory and nothing else.
+	//
+	// It is how smux gives every stream of a session a buffer of its own,
+	// which is what Backhaul's TCP MUX runs on, and it is what this tunnel
+	// had not: one slow reader stopped the carrier connection's read
+	// goroutine, and forty people's downloads with it (see inbox.go).
+	window = 2 << 20
+
+	// How long data for an unknown stream is dropped quietly before it is
+	// answered with a reset. The SYN it waits for is queued on the same
+	// connection right behind it, so this is generous.
+	strayWait = 5 * time.Second
+	// And how many such streams are waited for at once, so a far end
+	// sending nonsense cannot grow the table without end.
+	strayMax = 4096
 )
+
+// hello tells the far end what this end can do.
+func (f *Forwarder) hello() {
+	f.recordNB(cmdHello, 0, []byte{capResume | capWindow})
+}
+
+// windowed says the far end keeps to the window, so this end does too.
+func (f *Forwarder) windowed() bool { return f.farCaps.Load()&capWindow != 0 }
+
+// stray says whether data for a stream this end has no record of should be
+// dropped quietly, because the stream's SYN may still be coming: the edge
+// sends a SYN again for a stream whose first one may have died with its
+// connection, and records that were queued for the stream before the SYN was
+// sent again arrive first. Answering those with a reset, as this end always
+// had, reset the stream the SYN was about to open. Past strayWait it is a
+// stream that is not coming, and the reset goes as before.
+func (f *Forwarder) stray(id uint32) bool {
+	f.strayMu.Lock()
+	defer f.strayMu.Unlock()
+	now := time.Now()
+	if at, ok := f.strays[id]; ok {
+		if now.Sub(at) < strayWait {
+			return true
+		}
+		delete(f.strays, id)
+		return false
+	}
+	if len(f.strays) >= strayMax {
+		for k, at := range f.strays {
+			if now.Sub(at) >= strayWait {
+				delete(f.strays, k)
+			}
+		}
+		if len(f.strays) >= strayMax {
+			return false
+		}
+	}
+	f.strays[id] = now
+	return true
+}
+
+// unstray is a SYN arriving: whatever came before it for this stream is no
+// longer waiting for it.
+func (f *Forwarder) unstray(id uint32) {
+	f.strayMu.Lock()
+	delete(f.strays, id)
+	f.strayMu.Unlock()
+}
 
 // budget is the memory every stream on this tunnel is holding, together.
 var budget atomic.Int64
@@ -12264,6 +13582,11 @@ type held struct {
 	acked uint64
 	parts [][]byte
 	bytes int
+	// peer is the most the far end has said it wrote out, which acked lags
+	// behind by up to a record; the window is measured from it. more says
+	// it moved, to a pump waiting for room.
+	peer uint64
+	more chan struct{}
 	// gap is set when something that should have been held was not, because
 	// a cap was reached. A stream with a gap cannot be carried on: the bytes
 	// it would need to send again are not there. It clears when everything
@@ -12342,6 +13665,15 @@ func (h *held) ack(n uint64) {
 	if n > h.sent {
 		n = h.sent // a far end that claims more than was sent is not believed
 	}
+	if n > h.peer {
+		h.peer = n
+		if h.more != nil {
+			select {
+			case h.more <- struct{}{}:
+			default:
+			}
+		}
+	}
 	if n <= h.acked {
 		return
 	}
@@ -12366,26 +13698,50 @@ func (h *held) ack(n uint64) {
 }
 
 // replay is what has to be sent again after the connection a stream was on
-// died: the offset the first record begins at, the records, and whether the
-// stream can be carried on at all.
-func (h *held) replay() (from uint64, parts [][]byte, fin bool, ok bool) {
+// died: the offset the first record begins at, the records, whether the far
+// end has never acknowledged any of it (fresh), and whether the stream can
+// be carried on at all. farResumes is the far end having said capResume:
+// then a stream it never acknowledged is carried on like any other.
+func (h *held) replay(farResumes bool) (from uint64, parts [][]byte, fin, fresh, ok bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	fresh = !h.seen
 	// A stream with nothing outstanding lost nothing, whatever it has been
 	// told: the next record it sends follows the last one that arrived. Most
 	// streams are in this state most of the time - a direction that only
 	// answers, or one between requests.
 	if h.sent == h.acked && !h.gap {
-		return h.acked, nil, h.fin, true
+		return h.acked, nil, h.fin, fresh, true
 	}
-	if h.gap || !h.seen {
+	if h.gap || (!h.seen && !farResumes) {
 		logging.Debug("a stream cannot be carried on: outran what was held=%v, never acknowledged=%v, sent %d taken %d",
 			h.gap, !h.seen, h.sent, h.acked)
-		return 0, nil, false, false
+		return 0, nil, false, fresh, false
 	}
 	out := make([][]byte, len(h.parts))
 	copy(out, h.parts)
-	return h.acked, out, h.fin, true
+	return h.acked, out, h.fin, fresh, true
+}
+
+// room waits until n more bytes keep the stream within window of what the
+// far end has written out, and says false if the stream or the forwarder
+// ended first.
+func (h *held) room(n int, done, closing <-chan struct{}) bool {
+	for {
+		h.mu.Lock()
+		ok := h.sent+uint64(n) <= h.peer+window
+		h.mu.Unlock()
+		if ok {
+			return true
+		}
+		select {
+		case <-h.more:
+		case <-done:
+			return false
+		case <-closing:
+			return false
+		}
+	}
 }
 
 // finish notes that the local side has said its last.
@@ -12395,10 +13751,14 @@ func (h *held) finish() {
 	h.mu.Unlock()
 }
 
-// taken is what one stream has received.
+// taken is what one stream has received, and what of it has been written
+// out to the program. The acknowledgement is the second: for the resend it
+// is what cannot be lost any more, and for the window it is what has left
+// this end's hands.
 type taken struct {
 	mu   sync.Mutex
 	rcvd uint64
+	used uint64
 	told uint64
 }
 
@@ -12420,28 +13780,37 @@ func (t *taken) accept(off uint64, b []byte) []byte {
 	return b[skip:]
 }
 
-// took counts what has been handed to the local socket and says whether the
-// far end is owed an acknowledgement.
-func (t *taken) took(n int) bool {
+// took counts what has arrived and been queued for the program.
+func (t *taken) took(n int) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	first := t.told == 0
 	t.rcvd += uint64(n)
-	// The first record is acknowledged at once, whatever its size. Not for
-	// the sender's memory - there is nothing to let go of yet - but because
-	// an acknowledgement is how it learns the far end understands them at
-	// all, and a stream it has never heard one for is one it will not carry
-	// on. Without this, a connection that had moved less than ackEvery was
-	// still lost with its carrier, which is most of them.
-	return first || t.rcvd-t.told >= ackEvery
+	t.mu.Unlock()
 }
 
-// where is what this end has taken, and marks it as told.
+// wrote counts what has been written out to the program and says whether the
+// far end is owed an acknowledgement.
+//
+// The first is owed at once, whatever its size. Not for the sender's memory -
+// there is nothing to let go of yet - but because an acknowledgement is how
+// it learns the far end understands them at all, and a stream it has never
+// heard one for is one an older far end will not carry on. Then one every
+// ackEvery, and one whenever nothing more is waiting: a sender keeping to its
+// window hears the moment there is room, and a stream of small exchanges -
+// a chat, a game - never waits on a window it has long since given back.
+func (t *taken) wrote(n int, idle bool) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	first := t.used == 0
+	t.used += uint64(n)
+	return first || t.used-t.told >= ackEvery || (idle && t.used > t.told)
+}
+
+// where is what this end has written out, and marks it as told.
 func (t *taken) where() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.told = t.rcvd
-	return t.rcvd
+	t.told = t.used
+	return t.used
 }
 
 func be64(n uint64) []byte {
@@ -12588,6 +13957,210 @@ func validHost(s string) bool {
 		}
 	}
 	return true
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/forward/sched.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package forward
+
+import (
+	"sync"
+
+	"pingify/internal/buf"
+)
+
+// What leaves on one carrier connection, and in what order.
+//
+// It was one queue per connection, first in first out, and every stream on
+// the connection waited in it behind every other. A download that filled it
+// put its sixty-four kilobytes in front of the next keystroke of the forty
+// other people on the same connection. Measured on 2026-09-30 through a test
+// link filled to the top between Iran 1 and Germany, a crowd of 44 users:
+// the ones only chatting waited p90 900 ms and up to 3 s, jitter 315 ms,
+// while the same crowd with each user's TCP on its own - no queue of ours in
+// between - waited p90 225 and at most 470.
+//
+// So each stream has a queue of its own, and the connection is shared the
+// way fq_codel shares a link:
+//
+//   - control first, always: acknowledgements, heartbeats, SYNs, resets. An
+//     acknowledgement stuck behind data is a window that never opens (see
+//     window in resume.go), and that is how the credit scheme before this one
+//     deadlocked;
+//   - then a stream that has just come to life - someone's request, a
+//     keystroke, the first bytes of a page - ahead of the ones that have been
+//     sending all along;
+//   - then the busy ones in turn, one record each.
+//
+// A stream's own queue is short, and its pump waits when it is full: that is
+// the back pressure, and it falls on the stream that is sending and nobody
+// else.
+type sched struct {
+	mu     sync.Mutex
+	ctrl   []outRec
+	fresh  []*flowQ // became active since they were last served
+	busy   []*flowQ // served at least once since they became active
+	flows  map[uint32]*flowQ
+	wake   chan struct{}
+	closed bool
+}
+
+type flowQ struct {
+	id     uint32
+	q      []outRec
+	listed bool
+	room   chan struct{} // a record left: a pump waiting for room may go on
+}
+
+const (
+	// Records one stream may have waiting on its connection. Four of the
+	// largest is 64 KB: enough to keep a fast stream's connection busy
+	// between two turns, little enough that a thousand of them are not the
+	// machine's memory.
+	flowDepth = 4
+
+	// Control records that may wait; past this a heartbeat or a pong is
+	// dropped rather than queued, which recordNB has always allowed.
+	ctrlMax = 4096
+)
+
+func newSched() *sched {
+	return &sched{flows: map[uint32]*flowQ{}, wake: make(chan struct{}, 1)}
+}
+
+func (s *sched) poke() {
+	select {
+	case s.wake <- struct{}{}:
+	default:
+	}
+}
+
+// control queues a record ahead of all data. With drop it gives up rather
+// than grow past ctrlMax; without, it never refuses.
+func (s *sched) control(r outRec, drop bool) bool {
+	s.mu.Lock()
+	if s.closed || (drop && len(s.ctrl) >= ctrlMax) {
+		s.mu.Unlock()
+		return false
+	}
+	s.ctrl = append(s.ctrl, r)
+	s.mu.Unlock()
+	s.poke()
+	return true
+}
+
+// data queues one of a stream's records behind its others, waiting while the
+// stream already has flowDepth waiting. It gives up when done or closing is.
+func (s *sched) data(r outRec, done, closing <-chan struct{}) bool {
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return false
+		}
+		fq := s.flows[r.id]
+		if fq == nil {
+			fq = &flowQ{id: r.id, room: make(chan struct{}, 1)}
+			s.flows[r.id] = fq
+		}
+		if len(fq.q) < flowDepth {
+			fq.q = append(fq.q, r)
+			if !fq.listed {
+				fq.listed = true
+				s.fresh = append(s.fresh, fq)
+			}
+			s.mu.Unlock()
+			s.poke()
+			return true
+		}
+		room := fq.room
+		s.mu.Unlock()
+		select {
+		case <-room:
+		case <-done:
+			return false
+		case <-closing:
+			return false
+		}
+	}
+}
+
+// next is the record to send now, waiting for one; ok is false once closed.
+func (s *sched) next(closing <-chan struct{}) (outRec, bool) {
+	for {
+		s.mu.Lock()
+		if r, ok := s.take(); ok {
+			s.mu.Unlock()
+			return r, true
+		}
+		s.mu.Unlock()
+		select {
+		case <-s.wake:
+		case <-closing:
+			return outRec{}, false
+		}
+	}
+}
+
+// take picks, with the lock held: control, then a fresh stream, then the
+// busy ones in turn.
+func (s *sched) take() (outRec, bool) {
+	if len(s.ctrl) > 0 {
+		r := s.ctrl[0]
+		s.ctrl[0] = outRec{}
+		s.ctrl = s.ctrl[1:]
+		return r, true
+	}
+	var fq *flowQ
+	for fq == nil {
+		switch {
+		case len(s.fresh) > 0:
+			fq = s.fresh[0]
+			s.fresh[0] = nil
+			s.fresh = s.fresh[1:]
+		case len(s.busy) > 0:
+			fq = s.busy[0]
+			s.busy[0] = nil
+			s.busy = s.busy[1:]
+		default:
+			return outRec{}, false
+		}
+		if len(fq.q) == 0 { // forgotten while it waited its turn
+			fq.listed = false
+			fq = nil
+		}
+	}
+	r := fq.q[0]
+	fq.q[0] = outRec{}
+	fq.q = fq.q[1:]
+	if len(fq.q) > 0 {
+		s.busy = append(s.busy, fq) // it has had its turn; to the back
+	} else {
+		fq.listed = false
+		delete(s.flows, fq.id)
+	}
+	select {
+	case fq.room <- struct{}{}:
+	default:
+	}
+	return r, true
+}
+
+// close ends the queue: everything waiting is let go, and nothing more is taken.
+func (s *sched) close() {
+	s.mu.Lock()
+	s.closed = true
+	for _, r := range s.ctrl {
+		buf.Put(r.bp)
+	}
+	s.ctrl = nil
+	for _, fq := range s.flows {
+		for _, r := range fq.q {
+			buf.Put(r.bp)
+		}
+	}
+	s.flows, s.fresh, s.busy = map[uint32]*flowQ{}, nil, nil
+	s.mu.Unlock()
+	s.poke()
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/kernel/kernel.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
@@ -12751,6 +14324,493 @@ func (l *Link) String() string {
 		l.dev, toWire, toDevice, l.Dropped())
 }
 PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/l3switch/iptables.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package l3switch
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+
+	"pingify/internal/logging"
+)
+
+// The switch's own chains, one per table it touches, so taking it out is
+// taking these out and nothing of anyone else's is ever edited.
+const (
+	chainDNAT = "PINGIFY_L3"      // nat PREROUTING: the users' ports, pointed at a route
+	chainMasq = "PINGIFY_L3_POST" // nat POSTROUTING: users leave as this end of the link
+	chainMSS  = "PINGIFY_L3_MSS"  // mangle FORWARD: SYNs told the link's size
+	chainFwd  = "PINGIFY_L3_FWD"  // filter FORWARD: let them through whatever the policy
+)
+
+// IPTables points the ports with iptables. Every change of where they point
+// is one iptables-restore: the chain is emptied and filled in one commit, so
+// no connection ever arrives to find it half written.
+type IPTables struct {
+	Ports []PortRange
+
+	// The two ways to the tools, replaced in tests.
+	restore func(input string) error
+	run     func(args ...string) error
+}
+
+// NewIPTables is the real thing.
+func NewIPTables(ports []PortRange) *IPTables {
+	return &IPTables{Ports: ports, restore: iptablesRestore, run: iptables}
+}
+
+func iptablesRestore(input string) error {
+	cmd := exec.Command("iptables-restore", "--noflush", "-w", "5")
+	cmd.Stdin = strings.NewReader(input)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("iptables-restore: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+func iptables(args ...string) error {
+	out, err := exec.Command("iptables", append([]string{"-w", "5"}, args...)...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("iptables %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+var hooks = [][3]string{
+	{"nat", "PREROUTING", chainDNAT},
+	{"nat", "POSTROUTING", chainMasq},
+	{"mangle", "FORWARD", chainMSS},
+	{"filter", "FORWARD", chainFwd},
+}
+
+// Setup makes the chains, fills the parts that never change - leaving the
+// link as its own end, the size SYNs are told, and forwarding allowed to and
+// from every route - and hooks them in first. The ports point nowhere yet.
+func (t *IPTables) Setup(routes []Route) error {
+	var b strings.Builder
+	b.WriteString("*nat\n:" + chainDNAT + " - [0:0]\n:" + chainMasq + " - [0:0]\n")
+	b.WriteString("-F " + chainDNAT + "\n-F " + chainMasq + "\n")
+	for _, r := range routes {
+		fmt.Fprintf(&b, "-A %s -d %s -j MASQUERADE\n", chainMasq, r.Target)
+	}
+	b.WriteString("COMMIT\n*mangle\n:" + chainMSS + " - [0:0]\n-F " + chainMSS + "\n")
+	for _, r := range routes {
+		fmt.Fprintf(&b, "-A %s -d %s -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu\n", chainMSS, r.Target)
+	}
+	b.WriteString("COMMIT\n*filter\n:" + chainFwd + " - [0:0]\n-F " + chainFwd + "\n")
+	for _, r := range routes {
+		fmt.Fprintf(&b, "-A %s -d %s -j ACCEPT\n-A %s -s %s -j ACCEPT\n", chainFwd, r.Target, chainFwd, r.Target)
+	}
+	b.WriteString("COMMIT\n")
+	if err := t.restore(b.String()); err != nil {
+		return err
+	}
+	for _, h := range hooks {
+		if t.run("-t", h[0], "-C", h[1], "-j", h[2]) == nil {
+			continue
+		}
+		if err := t.run("-t", h[0], "-I", h[1], "1", "-j", h[2]); err != nil {
+			return err
+		}
+	}
+	forwarding()
+	return nil
+}
+
+// forwarding turns on IPv4 forwarding if it is off: without it every packet
+// the switch points at a link is dropped at the door.
+func forwarding() {
+	const p = "/proc/sys/net/ipv4/ip_forward"
+	if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) == "0" {
+		if err := os.WriteFile(p, []byte("1\n"), 0o644); err != nil {
+			logging.Warn("switch: IPv4 forwarding is off and could not be turned on: %v", err)
+			return
+		}
+		logging.Info("switch: turned IPv4 forwarding on")
+	}
+}
+
+// rules is the DNAT chain pointing every port at target, or empty.
+func (t *IPTables) rules(target string) string {
+	var b strings.Builder
+	b.WriteString("*nat\n:" + chainDNAT + " - [0:0]\n-F " + chainDNAT + "\n")
+	if target != "" {
+		// multiport takes fifteen ports or ranges to a rule.
+		for i := 0; i < len(t.Ports); i += 15 {
+			j := min(i+15, len(t.Ports))
+			var ps []string
+			for _, p := range t.Ports[i:j] {
+				ps = append(ps, p.String())
+			}
+			for _, proto := range []string{"tcp", "udp"} {
+				// Only new connections to this machine's own addresses: the
+				// nat table never sees a reply, and traffic passing through
+				// to somewhere else is none of the switch's business.
+				fmt.Fprintf(&b, "-A %s -p %s -m addrtype --dst-type LOCAL -m multiport --dports %s -j DNAT --to-destination %s\n",
+					chainDNAT, proto, strings.Join(ps, ","), target)
+			}
+		}
+	}
+	b.WriteString("COMMIT\n")
+	return b.String()
+}
+
+// Point sends the ports' new connections to target, or to this machine's own
+// listeners for "". Connections already made keep the way they came.
+func (t *IPTables) Point(target string) error { return t.restore(t.rules(target)) }
+
+// Teardown unhooks and removes every chain the switch made.
+func (t *IPTables) Teardown() error {
+	var first error
+	for _, h := range hooks {
+		for t.run("-t", h[0], "-D", h[1], "-j", h[2]) == nil {
+		}
+		if err := t.run("-t", h[0], "-F", h[2]); err != nil && first == nil {
+			first = err
+		}
+		if err := t.run("-t", h[0], "-X", h[2]); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/l3switch/switch.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+// Package l3switch puts users' connections on a private link at the packet
+// level, and moves them to the next link, or back to this machine's own
+// ports, when a link stops answering.
+//
+// Why packets and not a forward tunnel's streams: a forward tunnel carries
+// forty users on each of its connections, so one of them losing a packet, or
+// one of them reading slowly, holds up the other thirty-nine. On a private
+// link each user's TCP connection runs end to end on its own and a loss is
+// that user's alone - which is how flagtun and a GRE tunnel carry them, and
+// why they feel smooth under load. Measured on 2026-09-30 with a crowd of
+// 44 users through a test ICMP link filled to the top between Iran 1 and
+// Germany (docs/measured.md section 45): the forward tunnel's interactive
+// users waited p90 900 ms and up to 3 s, the same users at the packet level
+// 225 ms and at most 470, jitter 315-366 ms against 36-50.
+//
+// What it costs is the forward tunnel's other strengths: every user's
+// connection has its handshake crossed the link, one round trip more, and
+// there is no Cloudflare at the packet level. So the forward tunnel stays,
+// listening on the same ports, and this only points them elsewhere while a
+// link answers: first healthy route in the file's order, else nothing, and
+// then the ports reach the forward tunnel as before.
+package l3switch
+
+import (
+	"bufio"
+	"fmt"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"pingify/internal/logging"
+)
+
+// PortRange is one run of ports, both ends included.
+type PortRange struct{ From, To int }
+
+func (p PortRange) String() string {
+	if p.From == p.To {
+		return strconv.Itoa(p.From)
+	}
+	return fmt.Sprintf("%d:%d", p.From, p.To)
+}
+
+// Route is one way to the far end: the address users are sent to, and the
+// health port its link's core answers on at that address.
+type Route struct {
+	Target string
+	Health string // host:port
+}
+
+// Config is what a switch file says.
+type Config struct {
+	Name        string
+	Ports       []PortRange
+	Routes      []Route
+	Every       time.Duration // how often every route is asked
+	Rise, Fall  int           // answers in a row to count as up, misses to count as down
+	ReturnAfter time.Duration // how long a better route answers before users go back to it
+}
+
+// Load reads a switch file:
+//
+//	name   = "iran1-users"
+//	ports  = ["8002-8010"]
+//	routes = ["10.1.10.2:19999", "10.3.10.2:19998"]   # best first
+//	every_ms = 1000; rise = 2; fall = 3; return_after_sec = 30
+func Load(path string) (*Config, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	c := &Config{Every: time.Second, Rise: 2, Fall: 3, ReturnAfter: 30 * time.Second}
+	sc := bufio.NewScanner(f)
+	n := 0
+	for sc.Scan() {
+		n++
+		line := strings.TrimSpace(uncomment(sc.Text()))
+		if line == "" || strings.HasPrefix(line, "[") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			return nil, fmt.Errorf("%s:%d: not key = value", path, n)
+		}
+		k, v = strings.TrimSpace(k), strings.TrimSpace(v)
+		switch k {
+		case "name":
+			c.Name = strings.Trim(v, "\"")
+		case "ports":
+			for _, s := range list(v) {
+				pr, err := parseRange(s)
+				if err != nil {
+					return nil, fmt.Errorf("%s:%d: %v", path, n, err)
+				}
+				c.Ports = append(c.Ports, pr)
+			}
+		case "routes":
+			for _, s := range list(v) {
+				host, port, err := net.SplitHostPort(s)
+				if err != nil || net.ParseIP(host).To4() == nil {
+					return nil, fmt.Errorf("%s:%d: route %q is not address:health_port", path, n, s)
+				}
+				if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+					return nil, fmt.Errorf("%s:%d: route %q has no health port", path, n, s)
+				}
+				c.Routes = append(c.Routes, Route{Target: host, Health: s})
+			}
+		case "every_ms", "rise", "fall", "return_after_sec":
+			x, err := strconv.Atoi(v)
+			if err != nil || x < 1 {
+				return nil, fmt.Errorf("%s:%d: %s = %s is not a positive number", path, n, k, v)
+			}
+			switch k {
+			case "every_ms":
+				c.Every = time.Duration(x) * time.Millisecond
+			case "rise":
+				c.Rise = x
+			case "fall":
+				c.Fall = x
+			case "return_after_sec":
+				c.ReturnAfter = time.Duration(x) * time.Second
+			}
+		default:
+			return nil, fmt.Errorf("%s:%d: %s is not a switch setting", path, n, k)
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return nil, err
+	}
+	if len(c.Ports) == 0 || len(c.Routes) == 0 {
+		return nil, fmt.Errorf("%s: a switch needs ports and at least one route", path)
+	}
+	if c.Every < 100*time.Millisecond {
+		return nil, fmt.Errorf("%s: every_ms under 100 asks the links more than they need", path)
+	}
+	if c.Name == "" {
+		c.Name = "switch"
+	}
+	return c, nil
+}
+
+// uncomment is a line without its comment: from the first # outside quotes.
+func uncomment(line string) string {
+	quoted := false
+	for i, r := range line {
+		switch {
+		case r == '"':
+			quoted = !quoted
+		case r == '#' && !quoted:
+			return line[:i]
+		}
+	}
+	return line
+}
+
+func list(v string) []string {
+	v = strings.TrimSpace(v)
+	v = strings.TrimPrefix(v, "[")
+	v = strings.TrimSuffix(v, "]")
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.Trim(strings.TrimSpace(s), "\""); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func parseRange(s string) (PortRange, error) {
+	a, b, isRange := strings.Cut(s, "-")
+	from, err1 := strconv.Atoi(a)
+	to := from
+	var err2 error
+	if isRange {
+		to, err2 = strconv.Atoi(b)
+	}
+	if err1 != nil || err2 != nil || from < 1 || to > 65535 || from > to {
+		return PortRange{}, fmt.Errorf("ports %q: a port or a range like 8002-8010", s)
+	}
+	return PortRange{from, to}, nil
+}
+
+// NAT is what points the ports: at a route's target, or at nothing, which
+// leaves them to this machine's own listeners.
+type NAT interface {
+	Setup(routes []Route) error
+	Point(target string) error // "" is nothing
+	Teardown() error
+}
+
+// Switch is one switch running.
+type Switch struct {
+	cfg   *Config
+	nat   NAT
+	check func(Route) bool
+
+	up      []bool
+	streak  []int       // answers (positive) or misses (negative) in a row
+	upSince []time.Time // when each route last came up
+	failed  []bool      // has missed Fall checks in a row at some point
+	active  int         // index of the route in use, -1 for none
+	now     func() time.Time
+}
+
+// New is a switch with the checks and NAT given.
+func New(cfg *Config, nat NAT, check func(Route) bool) *Switch {
+	n := len(cfg.Routes)
+	return &Switch{cfg: cfg, nat: nat, check: check, up: make([]bool, n), streak: make([]int, n),
+		upSince: make([]time.Time, n), failed: make([]bool, n), active: -1, now: time.Now}
+}
+
+// Healthz asks a link's core whether it is up, across the link itself: an
+// answer at all is the packet path working, and a 200 is the far core saying
+// its link hears. The deadline is short on purpose; a path that takes a
+// second to answer a request this small is not one to send users down.
+func Healthz(r Route) bool {
+	c := http.Client{Timeout: 1500 * time.Millisecond}
+	resp, err := c.Get("http://" + r.Health + "/healthz")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// Step asks every route once and moves the ports if the best has changed.
+// It returns the index of the route in use afterwards, -1 for none.
+func (s *Switch) Step() int {
+	now := s.now()
+	// All at once: a route that has stopped answering costs its whole
+	// deadline, and asked in turn it would hold up the one behind it.
+	oks := make([]bool, len(s.cfg.Routes))
+	var wg sync.WaitGroup
+	for i, r := range s.cfg.Routes {
+		wg.Add(1)
+		go func(i int, r Route) {
+			defer wg.Done()
+			oks[i] = s.check(r)
+		}(i, r)
+	}
+	wg.Wait()
+	for i, r := range s.cfg.Routes {
+		ok := oks[i]
+		switch {
+		case ok && s.streak[i] >= 0:
+			s.streak[i]++
+		case ok:
+			s.streak[i] = 1
+		case s.streak[i] <= 0:
+			s.streak[i]--
+		default:
+			s.streak[i] = -1
+		}
+		if !s.up[i] && s.streak[i] >= s.cfg.Rise {
+			s.up[i], s.upSince[i] = true, now
+			logging.Info("switch: %s answers", r.Target)
+		}
+		if -s.streak[i] >= s.cfg.Fall {
+			s.failed[i] = true
+			if s.up[i] {
+				s.up[i] = false
+				logging.Warn("switch: %s stopped answering", r.Target)
+			}
+		}
+	}
+	want := -1
+	for i := range s.cfg.Routes {
+		if !s.up[i] {
+			continue
+		}
+		// A route that has failed is trusted again only once it has
+		// answered for ReturnAfter - whatever the users are on meanwhile,
+		// this machine's own listeners included. The route in use is kept
+		// for as long as it answers.
+		//
+		// It was only a better route than the one in use that had to wait.
+		// On 2026-09-30 at the Iran 1 evening peak both links went half dead
+		// at once, each missing checks by turns: with the users on this
+		// machine's listeners, the first link to answer twice took them
+		// straight back, lost them again seconds later, and the switch went
+		// ICMP, GRE, here, ICMP every few seconds - every move a user's new
+		// connection on a path that was dying.
+		if i != s.active && s.failed[i] && now.Sub(s.upSince[i]) < s.cfg.ReturnAfter {
+			continue
+		}
+		want = i
+		break
+	}
+	if want != s.active {
+		target, what := "", "this machine's own listeners"
+		if want >= 0 {
+			target = s.cfg.Routes[want].Target
+			what = target
+		}
+		if err := s.nat.Point(target); err != nil {
+			logging.Warn("switch: could not point the ports at %s: %v", what, err)
+			return s.active
+		}
+		logging.Info("switch: users' new connections now go to %s", what)
+		s.active = want
+	}
+	return s.active
+}
+
+// Run asks the routes every Every until done is closed, and takes its rules
+// out again at the end.
+func (s *Switch) Run(done <-chan struct{}) error {
+	if err := s.nat.Setup(s.cfg.Routes); err != nil {
+		return err
+	}
+	defer func() {
+		if err := s.nat.Teardown(); err != nil {
+			logging.Warn("switch: taking the rules out: %v", err)
+		}
+	}()
+	tk := time.NewTicker(s.cfg.Every)
+	defer tk.Stop()
+	s.Step()
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-tk.C:
+			s.Step()
+		}
+	}
+}
+PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/link/link.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 package link
 
@@ -12834,6 +14894,15 @@ func New(cfg *config.Config, car carrier.Carrier) (*Link, error) {
 		return nil, err
 	}
 	logging.Info("link: %s up, %s, mtu %d, %d queues", l.name, mine, cfg.TUN.MTU, n)
+	// Without cake the link still carries everything, only with the queue
+	// back where it was; so a server without it is told, not refused.
+	if m := cfg.ShapeMbit(); m > 0 {
+		if err := shapeDevice(l.name, m, l.car.Headroom()+outerIPv4); err != nil {
+			logging.Warn("link: %s is not limited to %d Mbit/s: %v", l.name, m, err)
+		} else {
+			logging.Info("link: %s sends at most %d Mbit/s, a queue for each flow (cake)", l.name, m)
+		}
+	}
 	return l, nil
 }
 
@@ -13068,8 +15137,26 @@ func flowHash(p []byte) uint32 {
 }
 
 // defaultQueues is how many device queues to open when the config does not
-// say. See the note on reordering in readQueue for why more is not better.
-func defaultQueues() int { return 1 }
+// say: one per core, up to four, each read by a goroutine of its own that
+// puts what it read on the wire. The kernel keeps every connection on one
+// queue, so a connection's packets still leave in order.
+//
+// It was one, and one goroutine could not keep up. Measured on 2026-09-30
+// between Iran 1 and Germany, four downloads flat out through an ICMP link:
+// on one queue the device dropped 75 thousand packets the goroutine had not
+// come for, and carried 451 to 584 Mbit/s round to round; on four it dropped
+// 7 thousand and carried 561 to 579 - ahead of flagtun, which sends with a
+// worker per core, at 546 to 604.
+func defaultQueues() int {
+	n := runtime.NumCPU()
+	if n < 1 {
+		return 1
+	}
+	if n > 4 {
+		return 4
+	}
+	return n
+}
 
 // defaultWriteWorkers is one per core, up to four - the same rule the carrier
 // uses for how many goroutines read the socket, and for the same reason: a
@@ -13197,6 +15284,58 @@ func rawOf(f *os.File) syscall.RawConn { return nil }
 
 func readNow(rc syscall.RawConn, b []byte) (int, bool) { return 0, false }
 PINGIFY_GO_SOURCE_EOF
+    cat > "$d/internal/link/shape.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
+package link
+
+import "fmt"
+
+// Why a link would send less than it could.
+//
+// The whole tunnel is one flow to everything past this process: one socket,
+// one queue in the interface's fq, first in first out. When the server's own
+// way out is the narrowest point - Germany's, 2026-09-30, at about 600 Mbit/s
+// - four downloads pushing flat out stand thousands of packets in that queue,
+// and every other user's packet waits behind them. Measured on the Iran 1 to
+// Germany path with a test link of its own beside the users' (docs/measured.md
+// section 46), four downloads flat out while sixteen users chat:
+//
+//	                   downloads    chat p50 / p90 / p99    TCP resent
+//	no limit           614 Mbit/s    219 / 365 / 894 ms       8.8%
+//	cake 600           538            85 / 106 / 171          0.08%
+//	cake 660           552            94 / 158 / 324          0.1%
+//
+// with the path's own round trip at 76. Without a limit eth0's fq held
+// 6,000 to 9,000 of our packets for the whole transfer and threw away 72
+// thousand of them at its end - which the loss counter at the far end had
+// been reporting as the path losing them. flagtun, on the same path in the
+// same minutes, stood the same queue.
+//
+// With the limit just under what the way out carries, the queue forms here
+// instead, on the device, in front of the one discipline that can see the
+// flows inside the tunnel: cake gives each its own queue and keeps each
+// queue short, so a chat's packet goes past a download's instead of behind
+// it, and the downloads are slowed by a few dropped packets rather than by a
+// queue everybody shares. The price is the gap between the limit and what
+// the way out could carry at its best.
+//
+// The number has to be the operator's. It is what this server's way out
+// carries, less a margin, and nothing here can measure that without filling
+// it; set above it, the limit does nothing, and below it, it costs speed.
+
+// cakeArgs is the tc command line that puts cake on the device: a limit of
+// mbit, one queue per flow (every flow in the tunnel is between the same two
+// addresses, so cake's per-host fairness would see one host), no priority
+// classes, and each packet counted at its size on the wire - overhead is
+// what the carrier and the outer IP header add to it.
+func cakeArgs(dev string, mbit, overhead int) []string {
+	return []string{"qdisc", "replace", "dev", dev, "root", "cake",
+		"bandwidth", fmt.Sprintf("%dmbit", mbit), "besteffort", "flows",
+		"overhead", fmt.Sprint(overhead)}
+}
+
+// outerIPv4 is the header every carrier's packet travels inside.
+const outerIPv4 = 20
+PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/link/tun_linux.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 //go:build linux
 
@@ -13322,13 +15461,32 @@ func configureDevice(name, addr string, mtu, txqueuelen int) error {
 	// txqueuelen 500, and 1,789,354 at 10000, with nothing dropped at either.
 	// The read path has become fast enough that the queue stops building, so
 	// this is one value for every profile now and not a thing a profile
-	// trades. The table stays because it is why the value is a thousand and
+	// trades. The table stays because it is why the value was a thousand and
 	// not ten. docs/measured.md section 35.
+	//
+	// And then it dropped again, on another pair, with the users on the link
+	// at the packet level: Germany's ICMP link to Iran 1, 2026-09-30, had
+	// dropped 588 thousand packets on the way out by evening, and 1.1 million
+	// an hour later - each one a user's TCP halving its window. Ten thousand,
+	// side by side with a thousand on the same path in the same minutes,
+	// dropped 14 thousand and carried 503 and 535 Mbit/s on one and four
+	// streams where the thousand carried 424 and 364, with the round trip
+	// under a normal load unchanged. With a device queue per core (see
+	// defaultQueues) the queue is read fast enough that it rarely stands.
 	if err := run("link", "set", "dev", name, "mtu", fmt.Sprint(mtu),
 		"txqueuelen", fmt.Sprint(txqueuelen), "up"); err != nil {
 		return err
 	}
 	return run("addr", "add", addr, "dev", name)
+}
+
+// shapeDevice puts cake on the device with a limit of mbit. See shape.go.
+func shapeDevice(name string, mbit, overhead int) error {
+	args := cakeArgs(name, mbit, overhead)
+	if out, err := exec.Command("tc", args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("tc %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/link/tun_other.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
@@ -13354,6 +15512,8 @@ var errNoTUN = errors.New("a tun device needs Linux")
 func openTUN(name string, multi bool) (*os.File, error) { return nil, errNoTUN }
 
 func configureDevice(name, addr string, mtu, txqueuelen int) error { return errNoTUN }
+
+func shapeDevice(name string, mbit, overhead int) error { return errNoTUN }
 PINGIFY_GO_SOURCE_EOF
     cat > "$d/internal/logging/log.go" <<'PINGIFY_GO_SOURCE_EOF' || return 1
 package logging
@@ -13423,6 +15583,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -13467,6 +15628,13 @@ type Repairer interface{ Repaired() uint64 }
 type failover interface {
 	Members() []string
 	Active() string
+}
+
+// controlled is a failover the manager's menu can ask things of: how each
+// member stands, and to check them, move to one, or stop holding one.
+type controlled interface {
+	Lines() []string
+	Control(op string, to int, stay bool) (string, error)
 }
 
 type Report struct {
@@ -13541,8 +15709,13 @@ func New(cfg *config.Config, ver string, car Source, l Link) *Server {
 // Serve answers on the loopback address until the process ends. A port that
 // cannot be opened is not fatal: the tunnel's job is to carry traffic, and it
 // carries it just as well with nobody watching.
-func (s *Server) handler() http.Handler {
+// handler is what both addresses answer; with control it also takes what the
+// menu asks of the failover, which is for this machine only - see Serve.
+func (s *Server) handler(control bool) http.Handler {
 	mux := http.NewServeMux()
+	if control {
+		s.failoverRoutes(mux)
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		enc := json.NewEncoder(w)
@@ -13587,14 +15760,15 @@ func (s *Server) handler() http.Handler {
 // this tunnel and nowhere else, so what is open here is open to one server.
 func (s *Server) Serve(port, linkPort int) {
 	go s.sample()
-	h := s.handler()
 	if port > 0 {
-		go serveOn(fmt.Sprintf("127.0.0.1:%d", port), h, "status")
+		// A move asked for by hand can take a dial's wait twice before it is
+		// done, and the answer is written only then.
+		go serveOn(fmt.Sprintf("127.0.0.1:%d", port), s.handler(true), "status", 90*time.Second)
 	}
 	if linkPort > 0 {
 		mine, _ := s.cfg.Mine()
 		if ip, _, ok := strings.Cut(mine, "/"); ok && ip != "" {
-			go serveOn(fmt.Sprintf("%s:%d", ip, linkPort), h, "health")
+			go serveOn(fmt.Sprintf("%s:%d", ip, linkPort), s.handler(false), "health", 10*time.Second)
 		}
 	}
 }
@@ -13605,7 +15779,7 @@ func (s *Server) Serve(port, linkPort int) {
 // brought up moments earlier by another goroutine. Two seconds of retrying
 // costs nothing and removes a race that would otherwise show up as "no health
 // port" on a tunnel that is working perfectly well.
-func serveOn(addr string, h http.Handler, what string) {
+func serveOn(addr string, h http.Handler, what string, write time.Duration) {
 	var ln net.Listener
 	var err error
 	for i := 0; i < 10; i++ {
@@ -13623,7 +15797,7 @@ func serveOn(addr string, h http.Handler, what string) {
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      10 * time.Second,
+		WriteTimeout:      write,
 		IdleTimeout:       30 * time.Second,
 	}
 	_ = srv.Serve(ln)
@@ -13828,6 +16002,70 @@ func (s *Server) repaired() uint64 {
 		return r.Repaired()
 	}
 	return 0
+}
+
+// failoverRoutes is the menu's way to the failover, on the loopback address
+// only: the far server reads this one's report on the link address of a
+// private link, and has no business moving its tunnel.
+//
+//	GET  /failover            one line per member, as failover.Lines says
+//	POST /failover/check      try every member but the one in use, then the lines
+//	POST /failover/use?to=N   move to member N; stay=1 holds it there
+//	POST /failover/auto       stop holding a member
+//
+// Plain text, because a shell script reads it.
+func (s *Server) failoverRoutes(mux *http.ServeMux) {
+	lines := func(w http.ResponseWriter, f controlled) {
+		for _, l := range f.Lines() {
+			fmt.Fprintln(w, l)
+		}
+	}
+	get := func(w http.ResponseWriter, r *http.Request) (controlled, bool) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		f, ok := s.car.(controlled)
+		if !ok {
+			http.Error(w, "this tunnel has no backups", http.StatusNotFound)
+		}
+		return f, ok
+	}
+	mux.HandleFunc("/failover", func(w http.ResponseWriter, r *http.Request) {
+		if f, ok := get(w, r); ok {
+			lines(w, f)
+		}
+	})
+	do := func(op string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			f, ok := get(w, r)
+			if !ok {
+				return
+			}
+			if r.Method != http.MethodPost {
+				http.Error(w, "POST, to change something", http.StatusMethodNotAllowed)
+				return
+			}
+			to := -1
+			if v := r.FormValue("to"); v != "" {
+				n, err := strconv.Atoi(v)
+				if err != nil {
+					http.Error(w, "to is a member's number", http.StatusBadRequest)
+					return
+				}
+				to = n
+			}
+			said, err := f.Control(op, to, r.FormValue("stay") == "1")
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusConflict)
+				return
+			}
+			fmt.Fprintln(w, said)
+			if op == "check" {
+				lines(w, f)
+			}
+		}
+	}
+	mux.HandleFunc("/failover/check", do("check"))
+	mux.HandleFunc("/failover/use", do("use"))
+	mux.HandleFunc("/failover/auto", do("auto"))
 }
 PINGIFY_GO_SOURCE_EOF
     base64 -d <<'PINGIFY_GO_SOURCE_EOF' | tar -xzf - -C "$d"
@@ -36174,8 +38412,10 @@ tunnel_port_of() {
     case $p in '' | *[!0-9]*) return 1 ;; esac
     printf '%s %s\n' "$p" "$fam"
     for b in $(toml_arr "$f" failover backups); do
-        case ${b#*:} in '' | *[!0-9]*) continue ;; esac
-        printf '%s %s\n' "${b#*:}" "$(port_family "${b%%:*}")"
+        p=${b#*:}
+        p=${p%%@*}
+        case $p in '' | *[!0-9]*) continue ;; esac
+        printf '%s %s\n' "$p" "$(port_family "${b%%:*}")"
     done
 }
 
@@ -36369,8 +38609,9 @@ cfg_reset() {
     T_FORWARDS=
     T_OCTET= T_TUNIF= T_TUNLOCAL= T_TUNPEER= T_TUNMTU=1320
     T_FEC= T_QUEUE=
-    # Failover: "kcp:8443 utls:8444", in the order they are tried.
-    T_BACKUPS= T_FO_SWITCH= T_FO_RETURN= T_FO_ENABLED= T_FO_PREFER=
+    # Failover: "kcp:8443 utls:8444", in the order they are tried, and
+    # "utls:8444@203.0.113.9" for one that goes to an address of its own.
+    T_BACKUPS= T_FO_SWITCH= T_FO_RETURN= T_FO_ENABLED= T_FO_PREFER= BK_HOST=
     T_AWG_PORT=51820 T_AWG_IFACE= T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
     T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
     T_AWG_H1= T_AWG_H2= T_AWG_H3= T_AWG_H4=
@@ -36782,7 +39023,7 @@ cfg_render() {
         kv iran "$(q "10.$T_OCTET.10.1/24")"
         kv kharej "$(q "10.$T_OCTET.10.2/24")"
         kv mtu "${T_TUNMTU:-1320}"
-        kv txqueuelen 1000
+        kv txqueuelen 10000
         # A tun device this core opens and reads. GRE FOU's is a kernel gre
         # device that no goroutine of ours ever touches, so these two would be
         # settings for a thing that is not there.
@@ -36790,7 +39031,7 @@ cfg_render() {
         grefou) ;;
         *)
             kv write_workers 0
-            kv queues 1
+            kv queues 0
             ;;
         esac
     fi
@@ -37221,11 +39462,13 @@ setup_token_check() {
         v_port "$T_AWG_PORT" >/dev/null 2>&1 || { setup_token_bad "the AmneziaWG port is invalid"; return 1; }
         v_mtu_awg "$T_TUNMTU" >/dev/null 2>&1 || { setup_token_bad "the private MTU does not fit inside AmneziaWG"; return 1; }
     fi
-    local b
+    local b bp
     for b in $T_BACKUPS; do
         [ "$T_MODE" = forward ] || { setup_token_bad "a private link cannot have failover backups"; return 1; }
         forwarding_transport "${b%%:*}" || { setup_token_bad "unknown backup transport ${b%%:*}"; return 1; }
-        v_port "${b#*:}" >/dev/null 2>&1 || { setup_token_bad "a backup port is invalid"; return 1; }
+        bp=${b#*:}
+        v_port "${bp%%@*}" >/dev/null 2>&1 || { setup_token_bad "a backup port is invalid"; return 1; }
+        case $bp in *@*) v_host "${bp#*@}" >/dev/null 2>&1 || { setup_token_bad "a backup address is invalid"; return 1; } ;; esac
     done
     case $T_PRESET in
     gaming | stable | balanced | throughput | max) ;;
@@ -37636,15 +39879,19 @@ v_backups() {
 # the backups already chosen in the same family, of every other tunnel here,
 # and on the side that waits, of anything listening.
 backup_port() {
-    local kind=$1 fam p b taken
+    local kind=$1 fam p b bp taken
     fam=$(port_family "$kind")
     p=$T_PORT
     [ "$fam" = "$(port_family "$T_TRANSPORT")" ] && p=$((T_PORT + 1))
     while [ "$p" -le 65535 ]; do
         taken=
         [ "$fam" = "$(port_family "$T_TRANSPORT")" ] && [ "$p" = "$T_PORT" ] && taken=1
+        # Windows file sharing's ports, which providers filter for its worms:
+        # a backup there is one that never connects.
+        case $p in 135 | 137 | 138 | 139 | 445) taken=1 ;; esac
         for b in $T_BACKUPS; do
-            [ "${b#*:}" = "$p" ] && [ "$(port_family "${b%%:*}")" = "$fam" ] && taken=1
+            bp=${b#*:}
+            [ "${bp%%@*}" = "$p" ] && [ "$(port_family "${b%%:*}")" = "$fam" ] && taken=1
         done
         [ -z "$taken" ] && [ -n "$(tunnel_port_owner "$p" "$kind" "${WIZ_KEEP:-}")" ] && taken=1
         [ -z "$taken" ] && this_side_waits && ! port_free "$p" "$fam" && taken=1
@@ -37656,28 +39903,66 @@ backup_port() {
 
 # backups_from CHOICE - "6,4" as "kcp:8443 utls:8444", into T_BACKUPS.
 backups_from() {
-    local n k port b prev=$T_BACKUPS
+    local n k port host b prev=$T_BACKUPS
     T_BACKUPS=
     for n in ${1//,/ }; do
         k=$(printf '%s\n' $BACKUP_KINDS | sed -n "${n}p")
         # A backup the tunnel already had keeps its port: that one is in use by
         # this very tunnel, so it would never look free, and moving it would
         # mean opening a new one in the firewall for nothing.
-        port=
-        for b in $prev; do [ "${b%%:*}" = "$k" ] && port=${b#*:}; done
+        # So does the address of its own it had: a WSS backup through
+        # Cloudflare, beside a primary that goes straight to the server, lost
+        # its domain the first time the list was chosen again.
+        port= host=
+        for b in $prev; do
+            [ "${b%%:*}" = "$k" ] || continue
+            port=${b#*:}
+            case $port in *@*) host=${port#*@} ;; esac
+            port=${port%%@*}
+        done
         if [ -z "$port" ]; then
             port=$(backup_port "$k") || { fail "no free port for $(transport_label "$k")"; return 1; }
         fi
-        T_BACKUPS="${T_BACKUPS:+$T_BACKUPS }$k:$port"
+        # One asked for now wins: behind a domain it is the IP all of them go to.
+        [ -n "${BK_HOST:-}" ] && host=$BK_HOST
+        T_BACKUPS="${T_BACKUPS:+$T_BACKUPS }$k:$port${host:+@$host}"
     done
     return 0
+}
+
+# ask_backup_host - where the backups go, into BK_HOST. Behind a domain it
+# cannot be where the tunnel goes: Cloudflare carries WebSocket on a few
+# ports and nothing else, so a backup sent there would never connect - and a
+# block on WebSocket would take it down with the tunnel. They go to the IP of
+# the server that waits instead. Empty when the tunnel dials an IP anyway.
+ask_backup_host() {
+    BK_HOST=
+    is_name "$(dial_host)" || return 0
+    local def= b
+    for b in $T_BACKUPS; do case $b in *@*) def=${b#*@} ;; esac; done
+    [ -z "$def" ] && this_side_waits && def=$(wiz_public_ips | head -1)
+    blank
+    dim "Behind a domain, backups skip Cloudflare and go to the server's own IP."
+    ask BK_HOST "IP of the $(side_label "$(waits_side)") server" "$def" v_backup_ip
+}
+v_backup_ip() {
+    v_host "$1" || return 1
+    [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "the IP itself - a name may lead to Cloudflare again"; return 1; }
+}
+
+# backup_label B - "Chrome TLS MUX 8444/tcp", and where it goes when that is
+# an address of its own.
+backup_label() {
+    local p=${1#*:}
+    printf '%s %s/%s' "$(transport_label "${1%%:*}")" "${p%%@*}" "$(port_family "${1%%:*}")"
+    case $p in *@*) printf ' to %s' "${p#*@}" ;; esac
 }
 
 backups_text() {
     local b out=
     [ -n "$T_BACKUPS" ] || { printf 'none'; return; }
     for b in $T_BACKUPS; do
-        out="${out:+$out, then }$(transport_label "${b%%:*}") ${b#*:}/$(port_family "${b%%:*}")"
+        out="${out:+$out, then }$(backup_label "$b")"
     done
     [ "$T_FO_ENABLED" = false ] && out="off - kept: $out"
     [ "$T_FO_PREFER" = fastest ] && out="$out, fastest first"
@@ -37693,9 +39978,9 @@ backups_panel() {
     for b in $T_BACKUPS; do
         i=$((i + 1))
         if [ "$i" = 1 ]; then
-            panel_field "Failover" "1. $(transport_label "${b%%:*}") ${b#*:}/$(port_family "${b%%:*}")$tail"
+            panel_field "Failover" "1. $(backup_label "$b")$tail"
         else
-            panel_field "" "$i. $(transport_label "${b%%:*}") ${b#*:}/$(port_family "${b%%:*}")"
+            panel_field "" "$i. $(backup_label "$b")"
         fi
     done
     [ "$T_FO_PREFER" = fastest ] && panel_field "" "whichever answers fastest is preferred"
@@ -37716,13 +40001,6 @@ ask_backups() {
     [ "$T_MODE" = forward ] || return 0
     local v
     wiz "Backups" "Where the tunnel moves if $(transport_label "$T_TRANSPORT") stops carrying."
-    # A backup dials the same host on a port of its own. Behind a domain that
-    # host is Cloudflare, which proxies a few HTTP ports and nothing else, so
-    # a backup there would never connect - and the move to it never happen.
-    if is_name "$(dial_host)"; then
-        dim "None behind a domain - Cloudflare would not carry a backup."
-        return 0
-    fi
     backups_menu
     blank
     dim "In the order to try them, like 6,4 - or press enter for none."
@@ -37730,6 +40008,7 @@ ask_backups() {
     blank
     ask v "backups" "" v_backups || return 1
     [ -n "${v//[, ]/}" ] || return 0
+    ask_backup_host || return 1
     backups_from "$v" || return 1
     dim "failover: $(backups_text)"
     this_side_waits && dim "leave those ports open in this server's firewall too"
@@ -38148,6 +40427,7 @@ import_tunnel() {
         local b bport bfam
         for b in $T_BACKUPS; do
             bport=${b#*:} bfam=$(port_family "${b%%:*}")
+            bport=${bport%%@*}
             own=$(tunnel_port_owner "$bport" "${b%%:*}")
             if [ -n "$own" ]; then
                 fail "${bport}/$bfam, for the $(transport_label "${b%%:*}") backup, is already $own's tunnel port here"
@@ -38173,8 +40453,8 @@ import_tunnel() {
         pause; return 1
     fi
     if [ -n "$T_PORT" ] && this_side_waits; then
-        local open_ports="$(cfg_listen_port)/$(port_family "$T_TRANSPORT")" ob
-        for ob in $T_BACKUPS; do open_ports="$open_ports ${ob#*:}/$(port_family "${ob%%:*}")"; done
+        local open_ports="$(cfg_listen_port)/$(port_family "$T_TRANSPORT")" ob obp
+        for ob in $T_BACKUPS; do obp=${ob#*:}; open_ports="$open_ports ${obp%%@*}/$(port_family "${ob%%:*}")"; done
         dim "leave $open_ports open in this server's firewall"
     fi
     [ "$T_TRANSPORT" = awg ] && dim "leave ${T_AWG_PORT}/udp open in this server's firewall"
@@ -38478,6 +40758,7 @@ tunnel_menu() {
         item 9 "Tuning" "profile, queue, mtu, direction, logging"
         item 10 "Scheduled restart" "$(recycle_hint "$name")"
         item 11 "Setup token" "the line the other server is built from"
+        [ "$mode" = forward ] && item 12 "Failover" "$(failover_hint "$f")"
         blank
         item 0 "Back"
         blank
@@ -38495,6 +40776,8 @@ tunnel_menu() {
         9) tuning_menu "$name" ;;
         10) recycle_menu "$name" ;;
         11) show_setup_token "$name" ;;
+        12) [ "$mode" = forward ] || { blank; warn "a private link has no backups"; sleep 1; continue; }
+            failover_menu "$name" ;;
         0 | '') return 0 ;;
         *) blank; warn "there is nothing on $c"; sleep 1 ;;
         esac
@@ -38584,9 +40867,13 @@ v_return_after() {
 # how patient to be. The list is kept when it is switched off, so turning it
 # back on is one key.
 failover_menu() {
-    local name=$1 c v sw ret
+    local name=$1 c v sw ret live held i n stay
     while :; do
         cfg_load "$name" || return 1
+        live=
+        [ -n "$T_BACKUPS" ] && [ "$T_FO_ENABLED" != false ] && fo_live "$name" && live=1
+        FO_WAITS=
+        this_side_waits && FO_WAITS=1
         ui_hold
         banner
         head2 "Failover: $name"
@@ -38597,17 +40884,34 @@ failover_menu() {
             panel_field "Move on after" "${T_FO_SWITCH:-25}s of silence" "Move back after" "$([ "${T_FO_RETURN:-120}" = 0 ] && printf 'never' || printf '%ss healthy' "${T_FO_RETURN:-120}")"
         fi
         panel_end
+        held=
+        if [ -n "$live" ]; then
+            panel "NOW"
+            for i in "${!FO_KIND[@]}"; do
+                panel_field "$(fo_name "$i")" "$(fo_label "$i")"
+                panel_field "" "  $(fo_state "$i")"
+                [ "${FO_HELD[i]}" = held ] && held=$i
+            done
+            panel_end
+        fi
         blank
-        dim "The tunnel moves to the best backup that answers, and back once a better one"
-        dim "has answered for long enough. Connections carry on across a move; a single"
-        dim "stream at full speed is reset so its program reconnects."
-        dim "Set the same on the other server."
+        dim "The tunnel moves to the best backup that answers, and back once a better one has answered for long enough. Connections carry on across a move; a single stream at full speed is reset so its program reconnects. Set the same on the other server."
+        if [ -n "$T_BACKUPS" ] && [ "$T_FO_ENABLED" != false ] && [ -z "$live" ]; then
+            dim "The tunnel is not answering, so there is nothing live to show or move."
+        elif [ -n "$live" ] && this_side_waits; then
+            dim "$(side_label "${T_DIALS:-kharej}") dials, and decides which of them carries: check them and move the tunnel from this menu there."
+        fi
         rule
         item 1 "Backups" "which transports, in the order to try them"
         if [ -n "$T_BACKUPS" ]; then
             item 2 "Switch" "$([ "$T_FO_ENABLED" = false ] && printf 'off - the list is kept; turn it on' || printf 'on - turn it off and keep the list')"
             item 3 "Prefer" "$([ "$T_FO_PREFER" = fastest ] && printf 'fastest - change to the order above' || printf 'order - change to whichever answers fastest')"
             item 4 "Timings" "${T_FO_SWITCH:-25}s to move on, ${T_FO_RETURN:-120}s to move back"
+        fi
+        if [ -n "$live" ] && ! this_side_waits; then
+            item 5 "Check them now" "try each backup once, without moving"
+            item 6 "Move now" "to a backup, or back to the primary"
+            [ -n "$held" ] && item 7 "Let it decide again" "stop holding it on $(fo_name "$held" | tr 'A-Z' 'a-z')"
         fi
         item 0 "Back"
         blank
@@ -38624,6 +40928,7 @@ failover_menu() {
                 pause; continue
             fi
             [ -n "${v//[, ]/}" ] || continue
+            ask_backup_host || continue
             backups_from "$v" || { pause; continue; }
             BACKUPS_WANT=$T_BACKUPS ENABLED_WANT=true PREFER_WANT=${T_FO_PREFER:-order}
             SWITCH_WANT=${T_FO_SWITCH:-25} RETURN_WANT=${T_FO_RETURN:-120}
@@ -38652,12 +40957,117 @@ failover_menu() {
             SWITCH_WANT=$sw RETURN_WANT=$ret
             cfg_apply "$name" _edit_fo_timings yes && ok "moving on after ${sw}s, back after ${ret}s"
             pause ;;
+        5) [ -n "$live" ] && ! this_side_waits || continue
+            blank
+            dim "trying every backup once, a few seconds"
+            if fo_post /failover/check "" 30; then ok "$FO_SAID"; else fail "${FO_SAID:-the tunnel did not answer}"; fi
+            pause ;;
+        6) [ -n "$live" ] && ! this_side_waits || continue
+            blank
+            for i in "${!FO_KIND[@]}"; do
+                choice "$((i + 1))" "$(fo_name "$i")" "$(fo_label "$i")$([ "${FO_USE[i]}" = use ] && printf ' - carrying now')"
+            done
+            blank
+            pick n "move to" "" "${#FO_KIND[@]}" || continue
+            stay=0
+            if [ "$n" != 1 ]; then
+                dim "Held, it stays there until you let it go or it goes quiet. Not held, it goes back to the primary once that has answered for ${T_FO_RETURN:-120}s."
+                confirm "hold it there?" && stay=1
+            fi
+            dim "moving: the new one connects before the old one lets go"
+            if fo_post /failover/use "to=$((n - 1))&stay=$stay" 80; then ok "$FO_SAID"; else fail "${FO_SAID:-the tunnel did not answer}"; fi
+            pause ;;
+        7) [ -n "$held" ] || continue
+            blank
+            if fo_post /failover/auto "" 30; then ok "$FO_SAID"; else fail "${FO_SAID:-the tunnel did not answer}"; fi
+            pause ;;
         0 | '') return 0 ;;
         *) blank; warn "there is nothing on $c"; sleep 1 ;;
         esac
     done
 }
 v_backups_or_none() { [ "${1// /}" = 0 ] && return 0; v_backups "$1"; }
+
+# failover_hint FILE - one line for the tunnel's menu: whether it has
+# backups, whether it moves, and what carries now when that is known.
+failover_hint() {
+    local f=$1 n=0 b
+    for b in $(toml_arr "$f" failover backups); do n=$((n + 1)); done
+    if [ "$n" = 0 ]; then
+        printf 'none - where to move if this transport stops'
+    elif [ "$(toml_get "$f" failover enabled)" = false ]; then
+        printf 'off - %d kept' "$n"
+    elif [ -n "${ST_ACTIVE:-}" ]; then
+        printf 'on %s - %d backup%s' "$(transport_label "$ST_ACTIVE")" "$n" "$([ "$n" = 1 ] || printf s)"
+    else
+        printf 'on - %d backup%s' "$n" "$([ "$n" = 1 ] || printf s)"
+    fi
+}
+
+# fo_live NAME - what the core says of each member, into the FO_ arrays, the
+# primary first: kind, port, own address or -, "use", "held", seconds since
+# it was last tried, ok or no, round trip in ms. Fails when the tunnel does
+# not answer, or its core is older than 1.1.3 and cannot say.
+fo_live() {
+    local _i=0 _idx _k _p _h _u _hd _a _o _r
+    FO_KIND=() FO_PORT=() FO_HOST=() FO_USE=() FO_HELD=() FO_AGO=() FO_OK=() FO_RTT=()
+    FO_STATUS=$(status_port "$1") || return 1
+    while read -r _idx _k _p _h _u _hd _a _o _r; do
+        [ -n "$_r" ] || continue
+        FO_KIND[_i]=$_k FO_PORT[_i]=$_p FO_HOST[_i]=$_h FO_USE[_i]=$_u
+        FO_HELD[_i]=$_hd FO_AGO[_i]=$_a FO_OK[_i]=$_o FO_RTT[_i]=$_r
+        _i=$((_i + 1))
+    done < <(curl -s -f --max-time 3 "http://127.0.0.1:$FO_STATUS/failover" 2>/dev/null)
+    [ "$_i" -gt 0 ]
+}
+
+# fo_post PATH DATA SECONDS - ask the core something; its first line is in
+# FO_SAID, and it fails unless the core agreed.
+fo_post() {
+    local out code
+    out=$(curl -s --max-time "$3" -X POST ${2:+-d "$2"} -w '\n%{http_code}' "http://127.0.0.1:$FO_STATUS$1" 2>/dev/null)
+    code=${out##*$'\n'}
+    out=${out%$'\n'*}
+    FO_SAID=${out%%$'\n'*}
+    [ "$code" = 200 ]
+}
+
+fo_name() { if [ "$1" = 0 ]; then printf 'Primary'; else printf 'Backup %s' "$1"; fi; }
+
+# fo_label I - "Chrome TLS MUX 2053/tcp", and where it goes when that is its own.
+fo_label() {
+    printf '%s %s/%s' "$(transport_label "${FO_KIND[$1]}")" "${FO_PORT[$1]}" "$(port_family "${FO_KIND[$1]}")"
+    [ "${FO_HOST[$1]}" != - ] && printf ' to %s' "${FO_HOST[$1]}"
+    return 0
+}
+
+# fo_ago SECONDS - "just now", "40s ago", "3 min ago", "2 h ago".
+fo_ago() {
+    if [ "$1" -lt 5 ]; then printf 'just now'
+    elif [ "$1" -lt 120 ]; then printf '%ss ago' "$1"
+    elif [ "$1" -lt 7200 ]; then printf '%s min ago' "$(($1 / 60))"
+    else printf '%s h ago' "$(($1 / 3600))"
+    fi
+}
+
+# fo_state I - what is known of member I, in words.
+fo_state() {
+    local i=$1 s
+    if [ "${FO_USE[i]}" = use ]; then
+        s="carrying now"
+        [ "${FO_RTT[i]}" != - ] && s="$s, ${FO_RTT[i]} ms round trip"
+        [ "${FO_HELD[i]}" = held ] && s="$s - held here by hand"
+    elif [ "${FO_OK[i]}" = ok ]; then
+        s="answered in ${FO_RTT[i]} ms, $(fo_ago "${FO_AGO[i]}")"
+    elif [ "${FO_OK[i]}" = no ]; then
+        s="did not answer, $(fo_ago "${FO_AGO[i]}")"
+    elif [ "${FO_WAITS:-}" = 1 ]; then
+        s="listening here, for when the other server moves to it"
+    else
+        s="not tried yet"
+    fi
+    printf '%s' "$s"
+}
 
 # The certificate a TLS transport serves on the end that waits. Without one
 # it makes its own, which a passive watcher accepts and a probe does not.
@@ -39475,7 +41885,9 @@ health_check() {
                     "the tunnel moves back by itself once $(transport_label "$CK_TRANSPORT") has been healthy for a while" \
                     "if it never does, the path is blocking it: journalctl -u pingify@$name -g failover"
             elif [ -n "$ST_ACTIVE" ]; then
-                chk_add ok failover "on $(transport_label "$ST_ACTIVE"), with backups ready: $(toml_arr "$CK_FILE" failover backups)"
+                local bl= b
+                for b in $(toml_arr "$CK_FILE" failover backups); do bl="${bl:+$bl, }$(backup_label "$b")"; done
+                chk_add ok failover "on $(transport_label "$ST_ACTIVE"), with backups ready: $bl"
             fi
             ;;
         *)

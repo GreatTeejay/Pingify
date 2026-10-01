@@ -275,6 +275,7 @@ tunnel_menu() {
         item 9 "Tuning" "profile, queue, mtu, direction, logging"
         item 10 "Scheduled restart" "$(recycle_hint "$name")"
         item 11 "Setup token" "the line the other server is built from"
+        [ "$mode" = forward ] && item 12 "Failover" "$(failover_hint "$f")"
         blank
         item 0 "Back"
         blank
@@ -292,6 +293,8 @@ tunnel_menu() {
         9) tuning_menu "$name" ;;
         10) recycle_menu "$name" ;;
         11) show_setup_token "$name" ;;
+        12) [ "$mode" = forward ] || { blank; warn "a private link has no backups"; sleep 1; continue; }
+            failover_menu "$name" ;;
         0 | '') return 0 ;;
         *) blank; warn "there is nothing on $c"; sleep 1 ;;
         esac
@@ -381,9 +384,13 @@ v_return_after() {
 # how patient to be. The list is kept when it is switched off, so turning it
 # back on is one key.
 failover_menu() {
-    local name=$1 c v sw ret
+    local name=$1 c v sw ret live held i n stay
     while :; do
         cfg_load "$name" || return 1
+        live=
+        [ -n "$T_BACKUPS" ] && [ "$T_FO_ENABLED" != false ] && fo_live "$name" && live=1
+        FO_WAITS=
+        this_side_waits && FO_WAITS=1
         ui_hold
         banner
         head2 "Failover: $name"
@@ -394,17 +401,34 @@ failover_menu() {
             panel_field "Move on after" "${T_FO_SWITCH:-25}s of silence" "Move back after" "$([ "${T_FO_RETURN:-120}" = 0 ] && printf 'never' || printf '%ss healthy' "${T_FO_RETURN:-120}")"
         fi
         panel_end
+        held=
+        if [ -n "$live" ]; then
+            panel "NOW"
+            for i in "${!FO_KIND[@]}"; do
+                panel_field "$(fo_name "$i")" "$(fo_label "$i")"
+                panel_field "" "  $(fo_state "$i")"
+                [ "${FO_HELD[i]}" = held ] && held=$i
+            done
+            panel_end
+        fi
         blank
-        dim "The tunnel moves to the best backup that answers, and back once a better one"
-        dim "has answered for long enough. Connections carry on across a move; a single"
-        dim "stream at full speed is reset so its program reconnects."
-        dim "Set the same on the other server."
+        dim "The tunnel moves to the best backup that answers, and back once a better one has answered for long enough. Connections carry on across a move; a single stream at full speed is reset so its program reconnects. Set the same on the other server."
+        if [ -n "$T_BACKUPS" ] && [ "$T_FO_ENABLED" != false ] && [ -z "$live" ]; then
+            dim "The tunnel is not answering, so there is nothing live to show or move."
+        elif [ -n "$live" ] && this_side_waits; then
+            dim "$(side_label "${T_DIALS:-kharej}") dials, and decides which of them carries: check them and move the tunnel from this menu there."
+        fi
         rule
         item 1 "Backups" "which transports, in the order to try them"
         if [ -n "$T_BACKUPS" ]; then
             item 2 "Switch" "$([ "$T_FO_ENABLED" = false ] && printf 'off - the list is kept; turn it on' || printf 'on - turn it off and keep the list')"
             item 3 "Prefer" "$([ "$T_FO_PREFER" = fastest ] && printf 'fastest - change to the order above' || printf 'order - change to whichever answers fastest')"
             item 4 "Timings" "${T_FO_SWITCH:-25}s to move on, ${T_FO_RETURN:-120}s to move back"
+        fi
+        if [ -n "$live" ] && ! this_side_waits; then
+            item 5 "Check them now" "try each backup once, without moving"
+            item 6 "Move now" "to a backup, or back to the primary"
+            [ -n "$held" ] && item 7 "Let it decide again" "stop holding it on $(fo_name "$held" | tr 'A-Z' 'a-z')"
         fi
         item 0 "Back"
         blank
@@ -421,6 +445,7 @@ failover_menu() {
                 pause; continue
             fi
             [ -n "${v//[, ]/}" ] || continue
+            ask_backup_host || continue
             backups_from "$v" || { pause; continue; }
             BACKUPS_WANT=$T_BACKUPS ENABLED_WANT=true PREFER_WANT=${T_FO_PREFER:-order}
             SWITCH_WANT=${T_FO_SWITCH:-25} RETURN_WANT=${T_FO_RETURN:-120}
@@ -449,12 +474,117 @@ failover_menu() {
             SWITCH_WANT=$sw RETURN_WANT=$ret
             cfg_apply "$name" _edit_fo_timings yes && ok "moving on after ${sw}s, back after ${ret}s"
             pause ;;
+        5) [ -n "$live" ] && ! this_side_waits || continue
+            blank
+            dim "trying every backup once, a few seconds"
+            if fo_post /failover/check "" 30; then ok "$FO_SAID"; else fail "${FO_SAID:-the tunnel did not answer}"; fi
+            pause ;;
+        6) [ -n "$live" ] && ! this_side_waits || continue
+            blank
+            for i in "${!FO_KIND[@]}"; do
+                choice "$((i + 1))" "$(fo_name "$i")" "$(fo_label "$i")$([ "${FO_USE[i]}" = use ] && printf ' - carrying now')"
+            done
+            blank
+            pick n "move to" "" "${#FO_KIND[@]}" || continue
+            stay=0
+            if [ "$n" != 1 ]; then
+                dim "Held, it stays there until you let it go or it goes quiet. Not held, it goes back to the primary once that has answered for ${T_FO_RETURN:-120}s."
+                confirm "hold it there?" && stay=1
+            fi
+            dim "moving: the new one connects before the old one lets go"
+            if fo_post /failover/use "to=$((n - 1))&stay=$stay" 80; then ok "$FO_SAID"; else fail "${FO_SAID:-the tunnel did not answer}"; fi
+            pause ;;
+        7) [ -n "$held" ] || continue
+            blank
+            if fo_post /failover/auto "" 30; then ok "$FO_SAID"; else fail "${FO_SAID:-the tunnel did not answer}"; fi
+            pause ;;
         0 | '') return 0 ;;
         *) blank; warn "there is nothing on $c"; sleep 1 ;;
         esac
     done
 }
 v_backups_or_none() { [ "${1// /}" = 0 ] && return 0; v_backups "$1"; }
+
+# failover_hint FILE - one line for the tunnel's menu: whether it has
+# backups, whether it moves, and what carries now when that is known.
+failover_hint() {
+    local f=$1 n=0 b
+    for b in $(toml_arr "$f" failover backups); do n=$((n + 1)); done
+    if [ "$n" = 0 ]; then
+        printf 'none - where to move if this transport stops'
+    elif [ "$(toml_get "$f" failover enabled)" = false ]; then
+        printf 'off - %d kept' "$n"
+    elif [ -n "${ST_ACTIVE:-}" ]; then
+        printf 'on %s - %d backup%s' "$(transport_label "$ST_ACTIVE")" "$n" "$([ "$n" = 1 ] || printf s)"
+    else
+        printf 'on - %d backup%s' "$n" "$([ "$n" = 1 ] || printf s)"
+    fi
+}
+
+# fo_live NAME - what the core says of each member, into the FO_ arrays, the
+# primary first: kind, port, own address or -, "use", "held", seconds since
+# it was last tried, ok or no, round trip in ms. Fails when the tunnel does
+# not answer, or its core is older than 1.1.3 and cannot say.
+fo_live() {
+    local _i=0 _idx _k _p _h _u _hd _a _o _r
+    FO_KIND=() FO_PORT=() FO_HOST=() FO_USE=() FO_HELD=() FO_AGO=() FO_OK=() FO_RTT=()
+    FO_STATUS=$(status_port "$1") || return 1
+    while read -r _idx _k _p _h _u _hd _a _o _r; do
+        [ -n "$_r" ] || continue
+        FO_KIND[_i]=$_k FO_PORT[_i]=$_p FO_HOST[_i]=$_h FO_USE[_i]=$_u
+        FO_HELD[_i]=$_hd FO_AGO[_i]=$_a FO_OK[_i]=$_o FO_RTT[_i]=$_r
+        _i=$((_i + 1))
+    done < <(curl -s -f --max-time 3 "http://127.0.0.1:$FO_STATUS/failover" 2>/dev/null)
+    [ "$_i" -gt 0 ]
+}
+
+# fo_post PATH DATA SECONDS - ask the core something; its first line is in
+# FO_SAID, and it fails unless the core agreed.
+fo_post() {
+    local out code
+    out=$(curl -s --max-time "$3" -X POST ${2:+-d "$2"} -w '\n%{http_code}' "http://127.0.0.1:$FO_STATUS$1" 2>/dev/null)
+    code=${out##*$'\n'}
+    out=${out%$'\n'*}
+    FO_SAID=${out%%$'\n'*}
+    [ "$code" = 200 ]
+}
+
+fo_name() { if [ "$1" = 0 ]; then printf 'Primary'; else printf 'Backup %s' "$1"; fi; }
+
+# fo_label I - "Chrome TLS MUX 2053/tcp", and where it goes when that is its own.
+fo_label() {
+    printf '%s %s/%s' "$(transport_label "${FO_KIND[$1]}")" "${FO_PORT[$1]}" "$(port_family "${FO_KIND[$1]}")"
+    [ "${FO_HOST[$1]}" != - ] && printf ' to %s' "${FO_HOST[$1]}"
+    return 0
+}
+
+# fo_ago SECONDS - "just now", "40s ago", "3 min ago", "2 h ago".
+fo_ago() {
+    if [ "$1" -lt 5 ]; then printf 'just now'
+    elif [ "$1" -lt 120 ]; then printf '%ss ago' "$1"
+    elif [ "$1" -lt 7200 ]; then printf '%s min ago' "$(($1 / 60))"
+    else printf '%s h ago' "$(($1 / 3600))"
+    fi
+}
+
+# fo_state I - what is known of member I, in words.
+fo_state() {
+    local i=$1 s
+    if [ "${FO_USE[i]}" = use ]; then
+        s="carrying now"
+        [ "${FO_RTT[i]}" != - ] && s="$s, ${FO_RTT[i]} ms round trip"
+        [ "${FO_HELD[i]}" = held ] && s="$s - held here by hand"
+    elif [ "${FO_OK[i]}" = ok ]; then
+        s="answered in ${FO_RTT[i]} ms, $(fo_ago "${FO_AGO[i]}")"
+    elif [ "${FO_OK[i]}" = no ]; then
+        s="did not answer, $(fo_ago "${FO_AGO[i]}")"
+    elif [ "${FO_WAITS:-}" = 1 ]; then
+        s="listening here, for when the other server moves to it"
+    else
+        s="not tried yet"
+    fi
+    printf '%s' "$s"
+}
 
 # The certificate a TLS transport serves on the end that waits. Without one
 # it makes its own, which a passive watcher accepts and a probe does not.

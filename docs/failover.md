@@ -30,6 +30,17 @@ Decoy TLS and KCP - because they all carry the same streams the same way. Each
 member needs its own port, and two members may share a number only when one is
 TCP and the other UDP (KCP).
 
+A member goes where the primary goes, unless it names an address of its own
+after an `@`: `utls:8444@203.0.113.9`. That is for a tunnel behind a CDN. The
+primary dials the domain, and Cloudflare carries WebSocket on a few ports and
+nothing else, so a backup that dialled the domain would never connect - and
+one that used WebSocket as well would be blocked along with the primary. A
+Chrome TLS or Decoy TLS backup to the server's own IP is another protocol on
+another road. On the side that dials, the address replaces the other server's;
+on the side that waits it changes nothing, since every member listens on all
+of that server's addresses. It is an IPv4 address or a name, and the wizard
+asks for an IP: a name could be the proxied one again.
+
 ## How it behaves
 
 **The side that waits listens on every member at once.** It never decides
@@ -71,6 +82,32 @@ stream that cannot be made whole is reset so its program reconnects.
 **Record size is the smallest any member allows.** KCP alone uses 16 KB
 records; mixed with a TCP-family member the tunnel uses TCP's, so a record can
 cross whichever transport is in use.
+
+## From the menu
+
+**Manage ▸ the tunnel ▸ Failover** shows the backups and the settings above,
+and, while the tunnel runs, a panel of what is happening now: the member that
+carries, with the tunnel's own round trip, and each other member with how it
+answered the last time it was tried - by a check, or by the tunnel itself
+while it probed on its way back. Three things can be asked of it there:
+
+- **Check them now** tries every member but the one in use, the way the
+  tunnel tries them - one connection each, carrying only keepalives, timed -
+  and the panel then says which answered and how fast. The tunnel does not
+  move.
+- **Move now** moves the tunnel to a member, carefully: the new one has to
+  connect before the old one lets go. Held there, it stays until you let it
+  go or it goes quiet; not held, it goes back to the primary once that has
+  answered for `return_after_sec`, as after any move.
+- **Let it decide again** stops holding a member.
+
+Only the server that dials decides which member carries, so these three are on
+its screen; the other one shows which member carries and says where to go to
+move it. They go to the core through its status port, on the loopback address
+only: `GET /failover` for the panel, `POST /failover/check`, `/failover/use`
+(`to` is the member, 0 the primary, `stay=1` holds it) and `/failover/auto`.
+The status the far server can read over a private link's address has none of
+this.
 
 ## What it did on the real pair
 

@@ -273,22 +273,40 @@ section "a WSS tunnel behind a Cloudflare domain, either way round"
 if [ -z "$CORE" ]; then
     skip "the domain wizard" "no core could be built"
 else
-    # Reverse: the domain fronts IRAN, which waits on 80 behind the edge.
-    out=$(answers 1 3 "" wd.example.com 46.247.109.83 "" "3092" 3 3 y | new_tunnel 2>&1)
+    # Reverse: the domain fronts IRAN, which waits on 80 behind the edge. Its
+    # backups cannot go where it goes - Cloudflare carries WebSocket alone -
+    # so they go to IRAN's own IP: another protocol on another road, which is
+    # what is left the day WebSocket or the domain is blocked.
+    out=$(answers 1 3 "" wd.example.com 46.247.109.83 "" "5,4" 198.51.100.15 "3092" 3 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-wss-443.toml
     check_contains "the addresses step says IRAN's may be the domain" "$out" "IRAN's may be a Cloudflare domain"
     check_contains "and how Cloudflare has to be set" "$out" "SSL/TLS on Flexible"
     check_contains "IRAN is told it listens on 80" "$out" "behind Cloudflare this end listens on 80"
-    check_contains "backups are left out behind a domain" "$out" "None behind a domain"
+    check_contains "backups are offered behind a domain too" "$out" "In the order to try them"
+    check_contains "and why they go to an IP" "$out" "backups skip Cloudflare and go to the server's own IP"
     check "IRAN's address is the domain" "$(val "$f" transport iran)" "wd.example.com"
     check "the waiting end listens on 80" "$(val "$f" transport listen_port)" "80"
     check "KHAREJ dials" "$(val "$f" transport dials)" "kharej"
-    check "no backups were written" "$(toml_arr "$f" failover backups)" ""
+    check "the backups go to IRAN's IP, and skip 445, which providers filter" "$(toml_arr "$f" failover backups)" "fallback:444@198.51.100.15 utls:446@198.51.100.15"
+    check_contains "the review says where they go" "$out" "Decoy TLS MUX 444/tcp to 198.51.100.15"
     check "the core accepts it" "$("$CORE" -c "$f" -check >/dev/null 2>&1 && echo yes || echo no)" "yes"
+    cfg_load iran-wss-443
+    t=$(cfg_setup_token)
+    cfg_reset
+    setup_token_read "$t" || { FAIL=$((FAIL + 1)); printf '    [31mx[0m %s
+' "$SETUP_TOKEN_ERROR"; }
+    check "the IP travels in the token" "$T_BACKUPS" "fallback:444@198.51.100.15 utls:446@198.51.100.15"
+    check "a backup with an IP still holds its port here" "$(tunnel_port_owner 446 utls)" "iran-wss-443"
+    # Manage > Failover asks again, the IP it had offered as the default and
+    # a backup kept keeping its port.
+    out=$(answers 1 4 "" "" 0 | failover_menu iran-wss-443 2>&1)
+    check "a backup chosen again keeps its port and its IP" "$(toml_arr "$f" failover backups)" "utls:446@198.51.100.15"
+    out=$(answers 1 4 wd.example.com "" 0 | failover_menu iran-wss-443 2>&1)
+    check_contains "the domain itself is refused as the backups' IP" "$out" "a name may lead to Cloudflare again"
 
     # Direct: the domain fronts KHAREJ, which waits - and the paste there has
     # to name 80, the port the core really binds, not the one dialled.
-    out=$(answers 1 3 1 185.31.8.129 wd2.example.com 2053 "3093" 3 3 y | new_tunnel 2>&1)
+    out=$(answers 1 3 1 185.31.8.129 wd2.example.com 2053 "" "3093" 3 3 y | new_tunnel 2>&1)
     f=$CFG_DIR/iran-wss-2053.toml
     check_contains "Direct says KHAREJ's may be the domain" "$out" "KHAREJ's may be a Cloudflare domain"
     check "KHAREJ's address is the domain" "$(val "$f" transport kharej)" "wd2.example.com"
@@ -374,6 +392,101 @@ else
     check_contains "the transport it already runs on is refused as a backup" "$out" "already runs on"
     check_contains "and so is a backup named twice" "$out" "in the list twice"
 fi
+
+section "the failover screen says what carries, checks the backups, and moves the tunnel"
+
+# A KHAREJ tunnel shaped like the user's pair: Decoy TLS straight to Iran, a
+# WSS backup through a domain and a Chrome TLS one. The core's status port is
+# a stub that answers the way the core does, and writes down what it was
+# asked, so what is checked is what the screen sends and shows.
+fo_file() { # side
+    cat > "$CFG_DIR/fo-$1.toml" <<EOF
+[tunnel]
+name = "fo-$1"
+side = "$1"
+mode = "forward"
+[transport]
+type = "fallback"
+iran = "198.51.100.15"
+kharej = "203.0.113.167"
+port = 443
+dials = "kharej"
+[security]
+token = "a token for the failover screen"
+[forward]
+ports = ["8002"]
+[status]
+port = 19998
+[failover]
+backups = ["wss:2083@edge.example.com", "utls:2053"]
+enabled = true
+prefer = "order"
+switch_after_sec = 25
+return_after_sec = 120
+EOF
+}
+fo_file kharej
+fo_file iran
+_fo_asked=$SANDBOX/fo-asked
+curl() {
+    local a
+    for a in "$@"; do case $a in http://*) printf '%s' "$a" >>"$_fo_asked" ;; esac; done
+    case "$*" in *" -d "*) printf ' %s' "$(printf '%s\n' "$@" | grep -A1 -x -- -d | tail -1)" >>"$_fo_asked" ;; esac
+    printf '\n' >>"$_fo_asked"
+    case "$*" in
+    *"/failover/check"*) printf '2 of 2 answered\n0 fallback 443 - use - 0 ok 71\n\n200' ;;
+    *"/failover/use"*) printf 'moved to wss, and held there\n\n200' ;;
+    *"/failover/auto"*) printf 'deciding alone again\n\n200' ;;
+    *"/failover"*) printf '%b' "$_fo_lines" ;;
+    *) return 1 ;;
+    esac
+}
+# The side that dials tries members and knows how they did; the side that
+# waits only knows which one carries.
+_fo_lines='0 fallback 443 - use - 0 ok 71\n1 wss 2083 edge.example.com - - 190 ok 98\n2 utls 2053 - - - 400 no -\n'
+: >"$_fo_asked"
+
+fo_live fo-kharej
+check "the core's lines are read, a member to each" "${#FO_KIND[@]}/${FO_KIND[1]}/${FO_HOST[1]}/${FO_RTT[0]}" "3/wss/edge.example.com/71"
+check "the member in use says so, with the tunnel's own round trip" "$(fo_state 0)" "carrying now, 71 ms round trip"
+check "a backup that answered says when and how fast" "$(fo_state 1)" "answered in 98 ms, 3 min ago"
+check "and one that did not, says that" "$(fo_state 2)" "did not answer, 6 min ago"
+check "each is named where it goes" "$(fo_label 1)" "WSS MUX 2083/tcp to edge.example.com"
+ST_ACTIVE=fallback
+check "the tunnel's menu says what carries" "$(failover_hint "$CFG_DIR/fo-kharej.toml")" "on Decoy TLS MUX - 2 backups"
+ST_ACTIVE=
+
+out=$(answers 0 | failover_menu fo-kharej 2>&1)
+check_contains "the screen shows what carries now" "$out" "carrying now, 71 ms round trip"
+check_contains "and offers to check the backups" "$out" "Check them now"
+check_contains "and to move" "$out" "Move now"
+
+: >"$_fo_asked"
+out=$(answers 6 2 y "" 0 | failover_menu fo-kharej 2>&1)
+check_contains "moving to backup 1, held, asks the core for member 1 held" "$(cat "$_fo_asked")" "/failover/use to=1&stay=1"
+check_contains "and says what the core answered" "$out" "moved to wss, and held there"
+
+: >"$_fo_asked"
+out=$(answers 5 "" 0 | failover_menu fo-kharej 2>&1)
+check_contains "checking asks the core to" "$(cat "$_fo_asked")" "/failover/check"
+check_contains "and says what came of it" "$out" "2 of 2 answered"
+
+_fo_lines='0 fallback 443 - use - - - -\n1 wss 2083 - - - - - -\n2 utls 2053 - - - - - -\n'
+out=$(answers 0 | failover_menu fo-iran 2>&1)
+check_contains "the side that waits says the other side decides" "$out" "KHAREJ dials, and decides which of them carries"
+check_missing "and offers no move of its own" "$out" "Move now"
+check_contains "its backups are listening" "$out" "listening here"
+
+# Choosing the backups again keeps each one's address of its own: the WSS one
+# through the domain lost it before, beside a primary that dials an IP.
+cfg_load fo-kharej
+BK_HOST=
+backups_from "4,3"
+check "a backup chosen again keeps its domain" "$T_BACKUPS" "utls:2053 wss:2083@edge.example.com"
+cfg_reset
+unset -f curl
+curl() { return 1; }
+rm -f "$CFG_DIR/fo-kharej.toml" "$CFG_DIR/fo-iran.toml"
 
 section "a kernel-carried GRE FOU tunnel"
 

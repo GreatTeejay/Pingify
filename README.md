@@ -33,6 +33,8 @@ pingify core import FILE       # on the other: hash, architecture and version ch
 
 **1.1.1 and 1.1.2 change only the manager.** 1.1.1: the wizard asks Reverse by default, says it in fewer words, and fixes what a domain behind Cloudflare got wrong. 1.1.2: menus appear whole and several times sooner, the one-second Mbit/s snapshot is gone from the still screens, and Go comes from this project's release or a mirror where go.dev is blocked, checked against go.dev's own sha256. Nothing on the wire changed, so the two servers can be updated one at a time; each rebuilds its core under the new number and restarts its tunnels once.
 
+**1.1.3 gives a tunnel behind a domain its backups, and stops a stuck connection holding its users for twenty seconds.** A backup can name an address of its own, `utls:8444@203.0.113.9`, so behind Cloudflare the backups skip it and go straight to the waiting server's IP. And a carrier connection that goes quiet while the others carry is replaced after three seconds, its streams carried on, where the kernel used to take twenty ([docs/measured.md](docs/measured.md), section 44). A core before 1.1.3 refuses such a backup list, and a manager before it such a token; the quick replacement needs 1.1.3 at both ends and does nothing until it has it. Update both servers.
+
 Run `pingify` again at any time for the menu.
 
 <p align="center"><img src="assets/pingify-cover.png" alt="Pingify multi-transport tunnel" width="100%"></p>
@@ -115,7 +117,7 @@ So the number is not "how many connections the traffic needs". It is how many pl
 
 ## Failover
 
-A forward tunnel can be given backups: other forwarding transports to move to, by itself, when the one it runs on stops carrying — and to move back from once the first has been healthy again for a while. Choose them in the wizard's **Backups** step, or later under **Manage ▸ Tuning ▸ Failover**, in the order to try them. Behind a Cloudflare domain the wizard offers none: a backup dials the same domain on a port of its own, and Cloudflare would not carry it.
+A forward tunnel can be given backups: other forwarding transports to move to, by itself, when the one it runs on stops carrying — and to move back from once the first has been healthy again for a while. Choose them in the wizard's **Backups** step, or later under **Manage ▸ the tunnel ▸ Failover**, in the order to try them. Behind a Cloudflare domain a backup cannot go where the tunnel goes, since Cloudflare carries WebSocket alone, so it goes to the waiting server's own IP, which the wizard asks for: `utls:8444@203.0.113.9` in the file. That is another protocol on another road, and it still carries the day WebSocket or the domain is blocked.
 
 ```toml
 [failover]
@@ -126,7 +128,7 @@ switch_after_sec = 25                 # silence before moving on
 return_after_sec = 120                # a better member must answer this long to be moved back to; 0 never
 ```
 
-The server that waits listens on every member at once and simply answers on whichever one records arrive on, so the two servers never have to agree on anything. The server that dials decides: after `switch_after_sec` with nothing arriving it tries every other member at once and takes the best that answers - the first in your list, or with `prefer = "fastest"` the one with the least round trip - and while it is on a lesser member it keeps probing the better ones and moves back to the best that has stayed healthy. **Tuning ▸ Failover** switches it on or off without losing the list. Connections move with the tunnel, from the last byte the far end acknowledged; a single stream running flat out, with more in flight than a stream may hold, is reset instead so its program reconnects.
+The server that waits listens on every member at once and simply answers on whichever one records arrive on, so the two servers never have to agree on anything. The server that dials decides: after `switch_after_sec` with nothing arriving it tries every other member at once and takes the best that answers - the first in your list, or with `prefer = "fastest"` the one with the least round trip - and while it is on a lesser member it keeps probing the better ones and moves back to the best that has stayed healthy. The **Failover** screen switches it on or off without losing the list, shows which member carries now and how each backup answered when last tried, checks them all on request without moving the tunnel, and moves the tunnel by hand - held there until you let it go, or back to deciding alone once a better member has answered for `return_after_sec`. The server that dials does the checking and the moving, so those two are on its screen. Connections move with the tunnel, from the last byte the far end acknowledged; a single stream running flat out, with more in flight than a stream may hold, is reset instead so its program reconnects.
 
 Measured on the pair this was built for, with the primary's port blocked mid-transfer: the tunnel moved to KCP in fifteen seconds and back thirty seconds after the block lifted, and a 16 Mbit/s stream carried on across both moves. Details in [docs/failover.md](docs/failover.md). Private-link (TUN) transports cannot be backups.
 

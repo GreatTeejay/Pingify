@@ -35,8 +35,9 @@ cfg_reset() {
     T_FORWARDS=
     T_OCTET= T_TUNIF= T_TUNLOCAL= T_TUNPEER= T_TUNMTU=1320
     T_FEC= T_QUEUE=
-    # Failover: "kcp:8443 utls:8444", in the order they are tried.
-    T_BACKUPS= T_FO_SWITCH= T_FO_RETURN= T_FO_ENABLED= T_FO_PREFER=
+    # Failover: "kcp:8443 utls:8444", in the order they are tried, and
+    # "utls:8444@203.0.113.9" for one that goes to an address of its own.
+    T_BACKUPS= T_FO_SWITCH= T_FO_RETURN= T_FO_ENABLED= T_FO_PREFER= BK_HOST=
     T_AWG_PORT=51820 T_AWG_IFACE= T_AWG_IKEY= T_AWG_IPUB= T_AWG_KKEY= T_AWG_KPUB=
     T_AWG_JC= T_AWG_JMIN= T_AWG_JMAX= T_AWG_S1= T_AWG_S2=
     T_AWG_H1= T_AWG_H2= T_AWG_H3= T_AWG_H4=
@@ -448,7 +449,7 @@ cfg_render() {
         kv iran "$(q "10.$T_OCTET.10.1/24")"
         kv kharej "$(q "10.$T_OCTET.10.2/24")"
         kv mtu "${T_TUNMTU:-1320}"
-        kv txqueuelen 1000
+        kv txqueuelen 10000
         # A tun device this core opens and reads. GRE FOU's is a kernel gre
         # device that no goroutine of ours ever touches, so these two would be
         # settings for a thing that is not there.
@@ -456,7 +457,7 @@ cfg_render() {
         grefou) ;;
         *)
             kv write_workers 0
-            kv queues 1
+            kv queues 0
             ;;
         esac
     fi
@@ -887,11 +888,13 @@ setup_token_check() {
         v_port "$T_AWG_PORT" >/dev/null 2>&1 || { setup_token_bad "the AmneziaWG port is invalid"; return 1; }
         v_mtu_awg "$T_TUNMTU" >/dev/null 2>&1 || { setup_token_bad "the private MTU does not fit inside AmneziaWG"; return 1; }
     fi
-    local b
+    local b bp
     for b in $T_BACKUPS; do
         [ "$T_MODE" = forward ] || { setup_token_bad "a private link cannot have failover backups"; return 1; }
         forwarding_transport "${b%%:*}" || { setup_token_bad "unknown backup transport ${b%%:*}"; return 1; }
-        v_port "${b#*:}" >/dev/null 2>&1 || { setup_token_bad "a backup port is invalid"; return 1; }
+        bp=${b#*:}
+        v_port "${bp%%@*}" >/dev/null 2>&1 || { setup_token_bad "a backup port is invalid"; return 1; }
+        case $bp in *@*) v_host "${bp#*@}" >/dev/null 2>&1 || { setup_token_bad "a backup address is invalid"; return 1; } ;; esac
     done
     case $T_PRESET in
     gaming | stable | balanced | throughput | max) ;;
@@ -1302,15 +1305,19 @@ v_backups() {
 # the backups already chosen in the same family, of every other tunnel here,
 # and on the side that waits, of anything listening.
 backup_port() {
-    local kind=$1 fam p b taken
+    local kind=$1 fam p b bp taken
     fam=$(port_family "$kind")
     p=$T_PORT
     [ "$fam" = "$(port_family "$T_TRANSPORT")" ] && p=$((T_PORT + 1))
     while [ "$p" -le 65535 ]; do
         taken=
         [ "$fam" = "$(port_family "$T_TRANSPORT")" ] && [ "$p" = "$T_PORT" ] && taken=1
+        # Windows file sharing's ports, which providers filter for its worms:
+        # a backup there is one that never connects.
+        case $p in 135 | 137 | 138 | 139 | 445) taken=1 ;; esac
         for b in $T_BACKUPS; do
-            [ "${b#*:}" = "$p" ] && [ "$(port_family "${b%%:*}")" = "$fam" ] && taken=1
+            bp=${b#*:}
+            [ "${bp%%@*}" = "$p" ] && [ "$(port_family "${b%%:*}")" = "$fam" ] && taken=1
         done
         [ -z "$taken" ] && [ -n "$(tunnel_port_owner "$p" "$kind" "${WIZ_KEEP:-}")" ] && taken=1
         [ -z "$taken" ] && this_side_waits && ! port_free "$p" "$fam" && taken=1
@@ -1322,28 +1329,66 @@ backup_port() {
 
 # backups_from CHOICE - "6,4" as "kcp:8443 utls:8444", into T_BACKUPS.
 backups_from() {
-    local n k port b prev=$T_BACKUPS
+    local n k port host b prev=$T_BACKUPS
     T_BACKUPS=
     for n in ${1//,/ }; do
         k=$(printf '%s\n' $BACKUP_KINDS | sed -n "${n}p")
         # A backup the tunnel already had keeps its port: that one is in use by
         # this very tunnel, so it would never look free, and moving it would
         # mean opening a new one in the firewall for nothing.
-        port=
-        for b in $prev; do [ "${b%%:*}" = "$k" ] && port=${b#*:}; done
+        # So does the address of its own it had: a WSS backup through
+        # Cloudflare, beside a primary that goes straight to the server, lost
+        # its domain the first time the list was chosen again.
+        port= host=
+        for b in $prev; do
+            [ "${b%%:*}" = "$k" ] || continue
+            port=${b#*:}
+            case $port in *@*) host=${port#*@} ;; esac
+            port=${port%%@*}
+        done
         if [ -z "$port" ]; then
             port=$(backup_port "$k") || { fail "no free port for $(transport_label "$k")"; return 1; }
         fi
-        T_BACKUPS="${T_BACKUPS:+$T_BACKUPS }$k:$port"
+        # One asked for now wins: behind a domain it is the IP all of them go to.
+        [ -n "${BK_HOST:-}" ] && host=$BK_HOST
+        T_BACKUPS="${T_BACKUPS:+$T_BACKUPS }$k:$port${host:+@$host}"
     done
     return 0
+}
+
+# ask_backup_host - where the backups go, into BK_HOST. Behind a domain it
+# cannot be where the tunnel goes: Cloudflare carries WebSocket on a few
+# ports and nothing else, so a backup sent there would never connect - and a
+# block on WebSocket would take it down with the tunnel. They go to the IP of
+# the server that waits instead. Empty when the tunnel dials an IP anyway.
+ask_backup_host() {
+    BK_HOST=
+    is_name "$(dial_host)" || return 0
+    local def= b
+    for b in $T_BACKUPS; do case $b in *@*) def=${b#*@} ;; esac; done
+    [ -z "$def" ] && this_side_waits && def=$(wiz_public_ips | head -1)
+    blank
+    dim "Behind a domain, backups skip Cloudflare and go to the server's own IP."
+    ask BK_HOST "IP of the $(side_label "$(waits_side)") server" "$def" v_backup_ip
+}
+v_backup_ip() {
+    v_host "$1" || return 1
+    [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "the IP itself - a name may lead to Cloudflare again"; return 1; }
+}
+
+# backup_label B - "Chrome TLS MUX 8444/tcp", and where it goes when that is
+# an address of its own.
+backup_label() {
+    local p=${1#*:}
+    printf '%s %s/%s' "$(transport_label "${1%%:*}")" "${p%%@*}" "$(port_family "${1%%:*}")"
+    case $p in *@*) printf ' to %s' "${p#*@}" ;; esac
 }
 
 backups_text() {
     local b out=
     [ -n "$T_BACKUPS" ] || { printf 'none'; return; }
     for b in $T_BACKUPS; do
-        out="${out:+$out, then }$(transport_label "${b%%:*}") ${b#*:}/$(port_family "${b%%:*}")"
+        out="${out:+$out, then }$(backup_label "$b")"
     done
     [ "$T_FO_ENABLED" = false ] && out="off - kept: $out"
     [ "$T_FO_PREFER" = fastest ] && out="$out, fastest first"
@@ -1359,9 +1404,9 @@ backups_panel() {
     for b in $T_BACKUPS; do
         i=$((i + 1))
         if [ "$i" = 1 ]; then
-            panel_field "Failover" "1. $(transport_label "${b%%:*}") ${b#*:}/$(port_family "${b%%:*}")$tail"
+            panel_field "Failover" "1. $(backup_label "$b")$tail"
         else
-            panel_field "" "$i. $(transport_label "${b%%:*}") ${b#*:}/$(port_family "${b%%:*}")"
+            panel_field "" "$i. $(backup_label "$b")"
         fi
     done
     [ "$T_FO_PREFER" = fastest ] && panel_field "" "whichever answers fastest is preferred"
@@ -1382,13 +1427,6 @@ ask_backups() {
     [ "$T_MODE" = forward ] || return 0
     local v
     wiz "Backups" "Where the tunnel moves if $(transport_label "$T_TRANSPORT") stops carrying."
-    # A backup dials the same host on a port of its own. Behind a domain that
-    # host is Cloudflare, which proxies a few HTTP ports and nothing else, so
-    # a backup there would never connect - and the move to it never happen.
-    if is_name "$(dial_host)"; then
-        dim "None behind a domain - Cloudflare would not carry a backup."
-        return 0
-    fi
     backups_menu
     blank
     dim "In the order to try them, like 6,4 - or press enter for none."
@@ -1396,6 +1434,7 @@ ask_backups() {
     blank
     ask v "backups" "" v_backups || return 1
     [ -n "${v//[, ]/}" ] || return 0
+    ask_backup_host || return 1
     backups_from "$v" || return 1
     dim "failover: $(backups_text)"
     this_side_waits && dim "leave those ports open in this server's firewall too"
@@ -1814,6 +1853,7 @@ import_tunnel() {
         local b bport bfam
         for b in $T_BACKUPS; do
             bport=${b#*:} bfam=$(port_family "${b%%:*}")
+            bport=${bport%%@*}
             own=$(tunnel_port_owner "$bport" "${b%%:*}")
             if [ -n "$own" ]; then
                 fail "${bport}/$bfam, for the $(transport_label "${b%%:*}") backup, is already $own's tunnel port here"
@@ -1839,8 +1879,8 @@ import_tunnel() {
         pause; return 1
     fi
     if [ -n "$T_PORT" ] && this_side_waits; then
-        local open_ports="$(cfg_listen_port)/$(port_family "$T_TRANSPORT")" ob
-        for ob in $T_BACKUPS; do open_ports="$open_ports ${ob#*:}/$(port_family "${ob%%:*}")"; done
+        local open_ports="$(cfg_listen_port)/$(port_family "$T_TRANSPORT")" ob obp
+        for ob in $T_BACKUPS; do obp=${ob#*:}; open_ports="$open_ports ${obp%%@*}/$(port_family "${ob%%:*}")"; done
         dim "leave $open_ports open in this server's firewall"
     fi
     [ "$T_TRANSPORT" = awg ] && dim "leave ${T_AWG_PORT}/udp open in this server's firewall"

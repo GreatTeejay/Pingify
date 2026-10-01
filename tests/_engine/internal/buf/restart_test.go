@@ -46,3 +46,30 @@ func TestOldPacketsSpacedOutAreStillReplays(t *testing.T) {
 		w.Fresh(100001 + i) // a live packet, which is what a real path sends
 	}
 }
+
+// A far end that restarts with its counter somewhere far ahead - the framer
+// starts it at random on purpose - is a new run, not millions of lost
+// packets. The Iran 2 ICMP link reported 546,296,362 lost after one. A real
+// gap still counts.
+func TestAFarEndThatRestartedAheadIsNotALoss(t *testing.T) {
+	w := NewReplayWindow()
+	for seq := uint32(1000); seq < 1100; seq++ {
+		w.Fresh(seq)
+	}
+	if !w.Fresh(1100 + 50) {
+		t.Fatal("a packet after a real gap was refused")
+	}
+	if missing, _, _ := w.Lost(); missing != 50 {
+		t.Fatalf("a gap of fifty counted as %d lost", missing)
+	}
+	jump := uint32(1150 + 1<<30)
+	if !w.Fresh(jump) {
+		t.Fatal("the first packet of the far end's new run was refused")
+	}
+	if missing, _, _ := w.Lost(); missing != 50 {
+		t.Fatalf("a restart far ahead counted %d lost; only the real fifty should be", missing)
+	}
+	if !w.Fresh(jump+1) || w.Fresh(jump+1) {
+		t.Fatal("the window does not work after the new run began")
+	}
+}

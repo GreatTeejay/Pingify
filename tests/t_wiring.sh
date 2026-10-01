@@ -355,6 +355,15 @@ out=$(forwards_clash "" "8003" 2>&1)
 check_contains "a new tunnel owns nothing yet, so a bound port is refused" "$out" "held by pingify-core"
 unset -f cfg_list forwards_of fwd_listeners
 
+section "a backup says where it goes, on every screen alike"
+
+# The menus, the review and the check all name a backup through this, so a
+# tunnel behind a domain shows its backups going to the IP rather than to
+# Cloudflare - and the check puts them on one line, not one to a line.
+check "a backup that goes where the tunnel goes" "$(backup_label kcp:8443)" "KCP MUX 8443/udp"
+check "and one with an address of its own" "$(backup_label utls:2053@198.51.100.15)" "Chrome TLS MUX 2053/tcp to 198.51.100.15"
+check "the check names them the same way" "$(grep -c 'backup_label' parts/45-health.sh)" "1"
+
 section "the guard that lets this file be sourced at all"
 
 # build.sh and every test here source the script. Without the guard on the

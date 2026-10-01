@@ -16,14 +16,17 @@ func TestTheProfileMovesWhatAStreamMayPark(t *testing.T) {
 		profile string
 		want    int
 	}{
-		{config.ProfileGaming, 64 << 10},
-		{config.ProfileBalanced, 128 << 10},
+		// What waits here waits in the kernel's order, behind the downloads,
+		// out of reach of the forwarder's fair scheduler - so as little as
+		// the floor below allows (docs/measured.md section 45).
+		{config.ProfileGaming, 32 << 10},
+		{config.ProfileBalanced, 32 << 10},
 		// Not 512: measured to stall a small stream past five seconds for
 		// no throughput (docs/measured.md section 39).
-		{config.ProfileThroughput, 128 << 10},
-		{config.ProfileStable, 64 << 10}, // a lossy path: the small stream first
-		{config.ProfileMax, 128 << 10},
-		{"", 128 << 10}, // an unnamed profile is balanced
+		{config.ProfileThroughput, 64 << 10},
+		{config.ProfileStable, 32 << 10}, // a lossy path: the small stream first
+		{config.ProfileMax, 64 << 10},
+		{"", 32 << 10}, // an unnamed profile is balanced
 	} {
 		cfg := &config.Config{}
 		cfg.Tuning.Profile = c.profile
